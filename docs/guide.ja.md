@@ -887,6 +887,15 @@ mcp-writ namespaced-run --policy <path> --upstream <ip> \
 
 既知の限界は PoC からそのまま引き継がれ、同じように開示される: IPv4 のみ、IPv6・断片・非 TCP/UDP の drop、共有 IP 応答の曖昧性、[残存リスク](#83-egress-宛先制御の残存リスク) に列挙する DoH/DoT とリゾルバ迂回の範囲。
 
+**選択導入前の `run` からの移行。** PR-16 以前、Linux ネイティブの `run` は常に Landlock+seccomp 経路であり、フラグも選択も存在しなかった。現在の既定は `auto` であり、対応ホストでは namespaced 経路を優先する — 同一ポリシーが以前と異なる機構で起動し得る: ワークロードからはプライベート `/tmp`・マスクされた `/run`・loopback と TUN のみ（IPv4）に見え、宛先 IP+ポートと DNS はカーネルの一部強制ではなくプロキシで強制される。目に見える変更点:
+
+- native が*試みるだけ*で黙って弱めていたポリシー — 代表例は deny-all 下の UDP を含む `allow`（datagram ソケット生成が一括拒否され、許可は死んだ規則だった）— は `native` 指定時は選択段階で拒否され（ゲスト内 runner が通る機構選択なしの旧経路でも同様に拒否）、`auto` では実際に強制される namespaced 経路へ回る。
+- namespaced が満たせないが native が満たせるポリシー（例: マスクされる `/run` 配下への fs 許可、AF_UNIX の opt-in）は `auto` では理由を記録した上で native で起動する。一方 `--linux-mechanism namespaced` はフォールバックせず拒否する。
+- どの経路も満たせないポリシー（例: IPv6 宛先）は `auto` で部分強制のまま走るのではなく起動を拒否する。
+- `--linux-mechanism native` は選択導入前の経路をそのまま復元する — 劣化モードではなくロールバック経路である。
+
+**方式選択がポリシーではなくフラグである理由（決定事項）。** 機構は*ホスト*依存 — カーネル版・非特権 userns・`/dev/net/tun`・Landlock ABI — であり、ワークロードの意味論ではないため、ポータブルなポリシー事実にはなり得ない: 同一ポリシーは全ホストで同一の権限を意味し、機構はホストがそれを*どう*届けるかを答える。ポリシー側の選択子は非対応ホストで嘘になるか起動フラグの重複になる — よって `plan`/`--report` が判定（`requested`・`selected`・`violations`・`probe`）を記録し、ポリシーは成立すべき内容だけを宣言する。
+
 ### 4.12 `ebpf-run` — cgroup eBPF socket-addr フック特権 opt-in
 
 `ebpf-run` は **Linux 専用・opt-in の特権経路**（改善計画 PR-10）である。`-- <command>` を通常のサンドボックスパイプライン（`no_new_privs` → Landlock → seccomp）に加え、**カーネル内** IP 層強制 — 子プロセスが `pre_exec` で参加する**私有 cgroup** に attach された `BPF_CGROUP_INET4_CONNECT`/`INET6_CONNECT` と `BPF_CGROUP_UDP4_SENDMSG`/`UDP6_SENDMSG` の socket-addr プログラム — の下で起動する。プログラムは `connect(2)` の宛先と、未接続 UDP ソケットへの `sendto`/`sendmsg` のデータグラム宛先を、ポリシーの IP 層射影 — `allow`/`deny cidr=` 規則、`host=` の IP リテラル、`proto`/`port` 修飾、`dns-gate --allowlist-export` スナップショット由来の live な TTL スコープ grant — に照らして判定し、拒否はカーネル内で `EPERM` を返す。ring buffer が各カーネル内拒否を drain スレッドへ運び、launch の相関で commit された `sandbox.network_denied`（`layer=ip`、`proto`、`dest`、`port`、`pid`、`decision`、`rule`、`session_id`）へ変換する。

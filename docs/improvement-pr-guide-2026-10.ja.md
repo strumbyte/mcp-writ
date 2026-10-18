@@ -12,7 +12,7 @@
 
 本書のPR番号は本計画内の番号です。旧手順書 [archive/implementation-pr-guide.ja.md](archive/implementation-pr-guide.ja.md) のPR-01〜32とは無関係です。
 
-ロードマップ対応: PR-01〜08 が v0.3（§2 全部＋§1.1／§1.2／§1.3(a)／§1.6／§2.5）、PR-09〜13 が v0.4（§1.3(c)／§1.3(b)／§1.5／§3.3 Windows／§3.1）、PR-14〜16 が v0.5+（§5.1-5.2／netns 本番化／§1.7 継続評価）に対応します。PR-17〜29 は外部レビュー対応（§8）で、P0 の PR-17〜22 は v0.5+ に必須、P1 の PR-23〜26 は v0.5+ に含める範囲をリリース時に判断、P2 の PR-27〜29 は次版以降です。各リリースでバージョンを上げる条件と手順は、作業の流れの中のリリース節（[v0.3.0](#release-v0-3)／[v0.4.0](#release-v0-4)／[v0.5+](#release-v0-5)）に記載します — その時点で確認するものなので、先読みは不要です。
+ロードマップ対応: PR-01〜08 が v0.3（§2 全部＋§1.1／§1.2／§1.3(a)／§1.6／§2.5）、PR-09〜13 が v0.4（§1.3(c)／§1.3(b)／§1.5／§3.3 Windows／§3.1）、PR-14〜16 が v0.5+（§5.1-5.2／netns 本番化／§1.7 継続評価）に対応します。PR-17〜29 は外部レビュー対応（§8）で、P0 の PR-17〜22 は v0.5+ に必須、P1 の PR-23〜26 は v0.5+ に含める範囲をリリース時に判断（PR-16 の残存限界を解消する PR-26a はリリース前対応として含める）、P2 の PR-27〜29 は次版以降です。各リリースでバージョンを上げる条件と手順は、作業の流れの中のリリース節（[v0.3.0](#release-v0-3)／[v0.4.0](#release-v0-4)／[v0.5+](#release-v0-5)）に記載します — その時点で確認するものなので、先読みは不要です。
 
 ## 共通手順
 
@@ -112,7 +112,8 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 - [PR-24 合成ポリシーの可視化と、継承規則の警告・スキーマ厳格化](#pr-24)
 - [PR-25 実サーバーの通し試験](#pr-25)
 - [PR-26 PR-16 の残作業](#pr-26)
-- [リリース: v0.5+ — PR-14〜16 と PR-17〜22 の完了後（PR-23〜26 は含める範囲を判断）](#release-v0-5)
+- [PR-26a namespaced 経路の IPv6 対応](#pr-26a)
+- [リリース: v0.5+ — PR-14〜16 と PR-17〜22 の完了後（PR-23〜26 は含める範囲を判断、PR-26a は含める）](#release-v0-5)
 - [PR-27 監査ログの再オープンと、容量が尽きたときの扱い](#pr-27)
 - [PR-28 ポリシー v3 — 既定は追加、置換は明示、複数 profile](#pr-28)
 - [PR-29 unsafe の Safety 注記と lint](#pr-29)
@@ -131,6 +132,7 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 | PR-24 | P1 | PR-19 の後 | `src/policy`、新規コマンド |
 | PR-25 | P1 | PR-17・PR-21・PR-22 の後 | `tests/real_servers_e2e.rs`、fixtures |
 | PR-26 | P1 | PR-18 の後（`select.rs` が重なる） | `src/warden/select.rs`、`src/bin/mcp-secure-runner.rs`、tests |
+| PR-26a | P1 | PR-26 の後 | `src/warden/namespaced`、`src/warden/select.rs`、`src/dnsgate`、tests |
 | PR-27 | P2 | なし | `src/audit_log*` |
 | PR-28 | P2 | PR-19（祖先の版の検証）と PR-24 の後 | `src/policy` |
 | PR-29 | P2 | PR-18・PR-26 の後 | `src/warden` |
@@ -580,12 +582,12 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 状態は 2026-10-16 に、merge #67（`330c394`・`7f28243`）のコードと記録から照合しました。未完の分は PR-26 へ繰り越します。
 
-- [x] PR-09 の PoC を製品経路へ統合し、[Linux の方式選択](#linux-egress-selection) の自動選択と明示選択を実装する。CLI/ポリシーの指定方法・優先順位・従来設定の移行を確定し、既定の非特権起動で namespaced を優先する。→ `run`/`plan` に `--linux-mechanism auto|namespaced|native`（既定 `auto`、`src/execution.rs`・`src/cli/parse_run.rs`・`parse_plan.rs`）、選択は `warden::select`（`select_linux_mechanism`/`decide`）。指定は CLI のみで、ポリシー側の指定は設けていない。**残:** Linux `run` の既定が `auto` に変わったことの移行注記と、ポリシー側の指定の要否判断 → PR-26
+- [x] PR-09 の PoC を製品経路へ統合し、[Linux の方式選択](#linux-egress-selection) の自動選択と明示選択を実装する。CLI/ポリシーの指定方法・優先順位・従来設定の移行を確定し、既定の非特権起動で namespaced を優先する。→ `run`/`plan` に `--linux-mechanism auto|namespaced|native`（既定 `auto`、`src/execution.rs`・`src/cli/parse_run.rs`・`parse_plan.rs`）、選択は `warden::select`（`select_linux_mechanism`/`decide`）。指定は CLI のみで、ポリシー側の指定は設けていない。**残→PR-26 で解消（2026-10-17）:** 既定 `auto` の移行注記を guide 英日（§4.11「Migrating from pre-selection `run`」）と quickstart 英日（§10）に記載。ポリシー側指定の要否は**設けない**と判断 — 機構はホスト依存（カーネル・userns・TUN・Landlock ABI）でワークロード意味論ではなく、ポータブルなポリシー事実にできないため。判断記録は guide 英日の「Why mechanism selection is a flag, not a policy key」節
 - [x] 起動前に要求能力と実機の能力を照合する。native で満たせる場合の切り替え、UDP/IP 制御等の不足による起動拒否、明示 namespaced の失敗を区別する。起動前診断と実際のセットアップの結果を照合し、必須制御を `allow_degraded` で省略しない。→ `select.rs` の `native_policy_violations` が要求と能力を照合し、明示 `native` はプローブを省略（`7f28243`）。**残:** `allow_degraded` が選択時の Landlock ABI 検査を緩める点と、ABI 1〜3 で `auto` が native を選び起動時に EACCES になる点 → PR-18（§8.3 F-12）
 - [x] 選択方式・利用不可理由・適用するプロトコルと宛先粒度・残る制約を `plan` / `--report` / JSONL に同じ情報源から出力する。native の Landlock ポート制限を IP/CIDR 強制や UDP 対応として表示しない。→ `enforcement/json.rs`・`warden/plan/linux.rs` が同じ選択結果から出力し、拒否時は `linux_selection_refused` を立てる。一致の記録は [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) の *PR-16 product integration*。ただし native の AF_UNIX・シグナルについての過大表示は別件 → PR-18（§8.2 F-01）
-- [ ] PR-09 の UDP 明示許可を製品のポリシー・継承・生成・export と各実行経路へ反映する。未対応 backend は要求を拒否し、UDP/QUIC を全開放する回避策を作らない。→ **未完。** `proto="udp"` の構文と namespaced の UDP 中継は PR-09 のもの。`generate-policy` は UDP 規則を出さず、ゲスト内 `mcp-secure-runner` は方式選択の無い従来経路（native）のまま → PR-26 へ繰越
-- [x] 中断・部分失敗・後始末のライフサイクル契約を製品化し、稼働中の制御喪失時はワークロードを停止する。障害時の native 再起動や直接通信への切り替えを行わない。→ 監査を閉じる前に proxy を停止し、稼働中の proxy 喪失は `SupervisionLost` でワークロードを停止（`src/runtime/wait.rs`）。**未確認:** 通信中の proxy 強制終了は検証文書の未確認一覧に記録 → PR-26 の e2e に含める
-- [ ] 手動 CI/証跡収集へ登録する。→ **未完。** 選択の検証は `warden::select` の単体試験と手動脚のみで、`cargo test` のターゲットもワークフロー登録も無い（[test-matrix.md](test-matrix.md) の PR-16 行） → PR-26 へ繰越
+- [x] PR-09 の UDP 明示許可を製品のポリシー・継承・生成・export と各実行経路へ反映する。未対応 backend は要求を拒否し、UDP/QUIC を全開放する回避策を作らない。→ PR-26 で完結（2026-10-17）: `generate-policy` は `network` ノードや規則を出力せず、`build_network_section` が助言コメントのみを出す — TCP テンプレートと、send/receive syscall 証拠がある場合の UDP 注記。blocked 時は datagram syscall を REVIEW 行で開示 — UDP は推論せず、許可は常に利用者の明示記述が起点（`policy_generator.rs`）。継承は `egress_rules` の汎用マージで透過、export・KDL emit・parse の往復は回帰試験で固定（`policy_export`・generator 試験）。方式選択の無い従来経路（コンテナゲスト内 `mcp-secure-runner` が通る `linux_mechanism: None` ディスパッチ）は、`select.rs` の `dead_udp_allows_without_selection` 共有述語を `runtime/launch.rs` でゲートし、deny-all 下の UDP 許可を spawn 前に拒否（dead policy を黙って抱えない）。native の UDP 拒否は `native_policy_violations` が理由付きで行い、UDP/QUIC 全開放の回避策は作らない
+- [x] 中断・部分失敗・後始末のライフサイクル契約を製品化し、稼働中の制御喪失時はワークロードを停止する。障害時の native 再起動や直接通信への切り替えを行わない。→ 監査を閉じる前に proxy を停止し、稼働中の proxy 喪失は `SupervisionLost` でワークロードを停止（`src/runtime/wait.rs`）。通信中の proxy 強制終了は PR-26 の e2e で実機検証済み — `linux_mechanism_e2e::proxy_loss_during_active_udp_traffic_kills_workload` が故障注入（`MCP_WRIT_NS_PROXY_KILL_AFTER_MS`）で稼働中 UDP 通信中の proxy 終了を起こし、ワークロード kill・`run` exit 1・`proxy_lost=true`・`reason=supervision_lost` の監査閉鎖を確認
+- [x] 手動 CI/証跡収集へ登録する。→ PR-26 で完結（2026-10-17）: [linux_mechanism_e2e.rs](../tests/linux_mechanism_e2e.rs)（`MCP_WRIT_REQUIRE_E2E_TESTS` 対象・実機 6 レグ）を追加し、[linux-tests.yml](../.github/workflows/linux-tests.yml) の integration ステップと [test-matrix.md](test-matrix.md) に登録。`net_probe` fixture（`tests/fixtures/namespaced/`）で UDP echo/2先振分け/loop を実カーネル駆動し、既定 `auto` → namespaced 選択・UDP 許可の中継・native の UDP 拒否・充足不能ポリシーの無フォールバック拒否・稼働中 proxy 喪失の fail-closed を網羅
 - [x] §1.7 残存リスクの継続評価を本番化の受入条件に含める — プロキシ信頼性・DoH/ECH/共有 IP の残存を当該版で再評価して記録する。→ [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) の *§1.7 residual-risk re-evaluation (PR-16 acceptance)* に記録
 
 **検証:** T-BASE、T-POLICY、T-NATIVE、T-DOC、PR-09 の実機 e2e と性能基準。選択表の全行を試験し、特に「能力不足でも native で要求を満たす場合の起動」と「UDP 等の必須要求があり拒否する場合」を対にする。正常な既存 MCP ワークロード、起動中の障害、表示・監査の一致、後始末も確認する。
@@ -971,21 +973,52 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] PR-16 タスク 4: UDP の許可を、生成・export・コンテナ経路に反映する。ゲスト内の runner は方式選択の無い従来経路（native）で動くため、UDP の許可を拒否するかを決める。
-- [ ] PR-16 タスク 6: `tests/linux_mechanism_e2e.rs`（`MCP_WRIT_REQUIRE_E2E_TESTS` 対象）を作り、`linux-tests.yml` と [test-matrix.md](test-matrix.md) に登録する。検証文書の未確認一覧にある「通信中の proxy 強制終了」もこの e2e に含める。
-- [ ] Linux の `run` の既定が `auto` に変わったことについて、移行の注記を guide と quickstart に書く。方式をポリシー側でも指定できるようにするかを判断する。
-- [ ] 完了したら、本書の PR-16 節のタスク 4・6 にチェックを付ける。
-- [ ] 任意: capability matrix に成熟度（stable / opt-in PoC）を加える（review1 の「安定版の境界を絞る」提案）。
+- [x] PR-16 タスク 4: UDP の許可を、生成・export・コンテナ経路に反映する。ゲスト内の runner は方式選択の無い従来経路（native）で動くため、UDP の許可を拒否するかを決める。→ `generate-policy` はネットワーク規則を生成せず、`build_network_section` が助言コメントのみを出力（TCP テンプレート + send/recv syscall 証拠時の UDP 注記）。export・継承・KDL 往復は透過を回帰試験で固定。**ゲスト経路の決定: deny-all 下の UDP 許可は拒否する** — `runtime/launch.rs` が `linux_mechanism: None`（従来ディスパッチ＝ゲスト runner の経路）で `select::dead_udp_allows_without_selection` 違反を spawn 前に拒否。dead policy を黙って抱えず、UDP/QUIC 全開放もしない。launch 単体試験・select 試験で固定
+- [x] PR-16 タスク 6: `tests/linux_mechanism_e2e.rs`（`MCP_WRIT_REQUIRE_E2E_TESTS` 対象）を作り、`linux-tests.yml` と [test-matrix.md](test-matrix.md) に登録する。検証文書の未確認一覧にある「通信中の proxy 強制終了」もこの e2e に含める。→ 6 レグ実機検証: 既定 auto→namespaced 選択・UDP echo 中継・TCP allow/deny 振分け・native の UDP 拒否・充足不能の無フォールバック拒否・`MCP_WRIT_NS_PROXY_KILL_AFTER_MS` 故障注入による稼働中 proxy 喪失（kill・exit 1・`proxy_lost`・`supervision_lost`）。fixture `net_probe` は TUN を実際に通るようホスト実 IP 宛を使う（netns 内 loopback 回避）。文書側の未確認一覧と残存リスク節も更新済み（[linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md)）
+- [x] Linux の `run` の既定が `auto` に変わったことについて、移行の注記を guide と quickstart に書く。方式をポリシー側でも指定できるようにするかを判断する。→ guide 英日 §4.11「Migrating from pre-selection `run`」（dead policy 解消・`/tmp` 私設化・`/run` マスク・部分強制の拒否化・`native` がロールバック経路）と quickstart 英日 §10 に注記。**ポリシー側指定は設けないと判断** — 機構はホスト依存（kernel・userns・TUN・Landlock ABI）でワークロード意味論ではなく、同一ポリシーが全ホストで同一権限を意味するには CLI 側に置くべきとの決定を guide 英日の「Why mechanism selection is a flag, not a policy key」節に記録
+- [x] 完了したら、本書の PR-16 節のタスク 4・6 にチェックを付ける。→ 実施済み（タスク 5 の proxy-kill 未確認注記とタスク 1 の残項目注記も解消済みへ更新）
+- [x] 任意: capability matrix に成熟度（stable / opt-in PoC）を加える（review1 の「安定版の境界を絞る」提案）。→ **判断: 追加しない。** カタログの `status` ボキャブラリ（`adopted`/`adopted-conditional`/`poc`/`none`、`src/enforcement/capability.rs`）が成熟度を既に表現し、namespaced 行は `adopted, conditional`・namespaced-run PoC 行は `poc` で区別済み。新フィールドは冗長になるため見送り（`capability_matrix` 6 件 pass で現行スキーマを再確認）
 
 **検証:** T-BASE、T-DOC と、Linux 実機での `linux_mechanism_e2e`。
+
+**実施記録（2026-10-17・WSL2 Ubuntu 24.04・kernel 6.18.54.1・x86-64・rustc 1.99.0）:** T-BASE（`cargo fmt --all -- --check` / `clippy --locked --all-targets -D warnings` / `test --locked --lib --bins` 2402 件 / `doc --locked --no-deps` / `test --locked --doc` 0 件）全 pass — `cargo doc` は既存クラスの警告 3 件（`cli/mod.rs`・`policy_resolve.rs` の intra-doc link、`provenance.rs` の HTML タグ、いずれも未編集ファイル）。T-DOC: `docs_check` 12 件・`capability_matrix` 6 件 pass。実機 e2e: `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --locked --test linux_mechanism_e2e` で 6 レグ全 pass（約 6 秒）。変更範囲の追加試験: `policy_export` の UDP 透過・`policy_generator` の network セクション/datagram REVIEW・`select` の dead-UDP 述語と native 拒否・`launch` の従来経路 UDP 拒否は lib 単体試験で固定済み。
+
+**レビュー対応（2026-10-18・PR #77 自動レビュー指摘）:** `net_probe` の宛先パースを `SocketAddr` リテラル限定に厳格化し（ホスト名は名前解決せず拒否）、モード別 arity も厳密化して不正入力を usage exit で確定的に拒否する形にした。`MCP_WRIT_NS_PROXY_KILL_AFTER_MS` は `#[cfg(debug_assertions)]` で dev プロファイル限定とし、リリースバイナリには env 読み取りコード自体を残さない（e2e は dev プロファイルの `CARGO_BIN_EXE_mcp-writ` を使うため従来どおり到達する）。`linux-tests.yml` の namespaced レグ条件に `runner.arch == 'X64'` を追加し、`ubuntu-latest` ラベルの arch 再指し替えへの暗黙依存を解消した。
 
 **完了条件:** PR-16 の全タスクにチェックが付き、PR-16 の完了条件を満たす。
 
 **移行・戻し方:** 試験・文書・記録が中心。UDP の扱いで判定が変わる場合は、PR 本文に記録する。
 
+<a id="pr-26a"></a>
+
+### PR-26a namespaced 経路の IPv6 対応
+
+対応論点: PR-09 で既定拒否としたアドレスファミリー（§1.3(c) の残存限界、§1.7 の継続評価）。直接依存: PR-26（namespaced 製品経路と e2e 基盤）。着手・公開条件: P1 — v0.5+ に含める（リリース前に対応する）。
+
+**目的:** namespaced 経路をデュアルスタック化し、IPv6 宛先の TCP/UDP 許可・拒否と DNS AAAA 連携を IPv4 と同等に強制する。検査不能な v6 要素は引き続き既定拒否とし、v6 を素通しする経路は作らない。ポリシー・評価器（`ip_eval` の `IpAddr` 汎用評価）・DNS ゲートの A/AAAA 制御面・ワークロード側 seccomp の `AF_INET6` 許可は PR-09 時点で対応済みのため、変更はデータプレーンと選択層に限定される。native 経路と選択契約（`auto`/`namespaced`/`native`）は変えない。
+
+**主な変更先:** [init.rs](../src/warden/namespaced/init.rs)、[stack.rs](../src/warden/namespaced/stack.rs)、[nat.rs](../src/warden/namespaced/nat.rs)、[probe.rs](../src/warden/namespaced/probe.rs)、[report.rs](../src/warden/namespaced/report.rs)、[select.rs](../src/warden/select.rs)、[dnsgate](../src/dnsgate)、[linux_mechanism_e2e.rs](../tests/linux_mechanism_e2e.rs)・[net_probe.rs](../tests/fixtures/namespaced/net_probe.rs)、英日ガイド・[linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md)・capability matrix。
+
+**タスク**
+
+- [ ] netns 内で IPv6 を有効化する。`disable_ipv6` を外し、egress0 に v6 アドレスと `default dev egress0` の v6 既定経路を設定する（点対点 TUN のため NDP・ゲートウェイ不要）。capability probe に v6 設定ステージを追加し、不可なら選択拒否の `missing` に載せる。
+- [ ] フレーム分類器を v6 に拡張する。固定 40B ヘッダの src/dst/next-header を解析し TCP/UDP のみ受理 — 拡張ヘッダ連鎖・フラグメント・未知 proto は従来どおり drop。ICMPv6 は Packet-Too-Big の扱いを決めて仕様化する（全 drop だと PMTUD ブラックホール化の恐れ — TUN 側で代理生成するか MTU 固定＋開示で済ませるか）。
+- [ ] NAT/フロー表を `IpAddr` に汎化する。`nat.rs` の DNAT キーと v6 ヘッダ書換え（src 8..24 / dst 24..40）、`stack.rs` のフローキーと deny 監査の重複抑止キーを両ファミリー対応にする。
+- [ ] TCP splice と UDP リレーを AF_INET6 に対応させる。評価通過後のホスト側接続・送信ソケットを宛先ファミリーで選択し、ホストに v6 到達性が無い場合は当該フローのみ拒否（fail-closed、v4 には影響しない）。
+- [ ] DNS AAAA 経路を接続する。ゲートの A/AAAA 評価と grant mint は既存 — mint された v6 grant が実際に proxy で使えることを e2e で固定し、v6 上流リゾルバ転送の可否と `select.rs` の "IPv6 resolvers are unusable" 注記を更新する。
+- [ ] `namespaced_policy_violations` の v6 拒否を撤去し、`deny host="*"` が v6 も包含することを確認する。ホストに v6 到達性が無い場合の選択挙動（v6 要求を含むポリシーは理由付きで拒否）を `select` に反映する。
+- [ ] e2e を拡張する。`net_probe` に v6 モード（udp-echo・tcp-two・udp-loop の v6 版）を追加し、`::1` または ULA 宛のホストローカルレグで外部 v6 到達性に依存せずデータパスを検証、外部 v6 宛は環境依存レグとして分離する。`linux-tests.yml`・[test-matrix.md](test-matrix.md) を更新する。
+- [ ] 開示を更新する。report/probe の "IPv4 only" 表示、guide 英日・capability matrix・検証文書の限界記述を実装と照合して更新する。
+
+**検証:** T-BASE、T-DOC と、Linux 実機での `linux_mechanism_e2e`（v6 レグ含む）。v6 非対応ホストでの選択・拒否挙動も確認する。
+
+**完了条件:** namespaced 経路で IPv6 の TCP/UDP 許可・拒否・DNS AAAA 許可連携が IPv4 と同等に強制・監査され、拡張ヘッダ等の検査不能な v6 要素は既定拒否のまま。v6 を持たないホストでは v6 宛要求が理由付きで拒否される。
+
+**移行・戻し方:** v6 対応は追加のみで v4 の挙動は変えない。切り戻しが必要な場合に `disable_ipv6` 復帰で v4-only に戻せるよう、有効化を一箇所に集約する。
+
 <a id="release-v0-5"></a>
 
-### リリース: v0.5+ — PR-14〜16 と PR-17〜22 の完了後（PR-23〜26 は含める範囲を判断）
+### リリース: v0.5+ — PR-14〜16 と PR-17〜22 の完了後（PR-23〜26 は含める範囲を判断、PR-26a は含める）
 
 実装PRではなく、ここに到達した時点で確認する条件と手順です。バージョン更新・タグ付け・リリース実行は git／リリース操作のため、実施は別途指示を受けてから行います。
 
@@ -993,7 +1026,7 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 - [ ] PR-14〜16 のうち当該リリースに含める範囲がマージ済み
 - [ ] PR-17〜22（改善計画 §8 の P0）が全てマージ済み
-- [ ] PR-23〜26（§8 の P1）のうち当該リリースに含める範囲を決め、マージ済み。PR-16 を含める場合は PR-26 のタスク 4・6 も完了している
+- [ ] PR-23〜26（§8 の P1）のうち当該リリースに含める範囲を決め、マージ済み。PR-16 を含める場合は PR-26 のタスク 4・6 も完了している。PR-26a（namespaced の IPv6 対応）はリリース前対応として含める
 - [ ] 判断事項 D-1〜D-6（§8.9）のうち、含める PR に関わるものの結論が記録されている
 - [ ] 含める項目が確定した時点で版番号（`0.5.0` かそれ以降か）を決めた
 - [ ] PR-15 の限界開示を含める場合、その記述が実装挙動と照合済み。PR-18 の IPC 限界の開示も同様

@@ -487,3 +487,59 @@ fn refused_reasons_carry_the_real_violations() {
     assert_eq!(sel.selected, None);
     assert!(sel.reason.contains("IPv6"), "reason: {}", sel.reason);
 }
+
+// --- PR-26: legacy-dispatch dead-UDP gate -----------------------------
+
+/// The no-selection dispatch (the in-guest runner's `linux_mechanism:
+/// None` contract) must flag exactly the allows the native route can
+/// never honor — UDP-covered rules under deny-all.
+#[test]
+fn dead_udp_allows_flags_udp_covering_rules_under_deny_all() {
+    let dead = dead_udp_allows_without_selection(&udp_allow_policy());
+    assert_eq!(dead.len(), 1);
+    assert!(dead[0].contains("grants UDP"), "{dead:?}");
+    assert!(dead[0].contains("dead policy"), "{dead:?}");
+
+    // `proto="any"` covers UDP → dead too.
+    let mut p = Policy::default();
+    p.network.outbound.egress_rules = vec![EgressRule {
+        allow: true,
+        dest: EgressDest::Host("203.0.113.5".to_string()),
+        proto: EgressProto::Any,
+        port: None,
+    }];
+    assert_eq!(dead_udp_allows_without_selection(&p).len(), 1);
+}
+
+/// TCP-only allows and deny rules are not dead on the native route;
+/// an open posture applies no socket pin, so a UDP allow there is
+/// redundant rather than violated.
+#[test]
+fn dead_udp_allows_ignores_tcp_denies_and_open_posture() {
+    assert!(dead_udp_allows_without_selection(&bare_port_policy()).is_empty());
+    // A destination-scoped TCP-only allow is widened on the legacy
+    // native route (Landlock binds the port, not the host) but is not
+    // *dead* — out of this gate's scope.
+    let mut p = Policy::default();
+    p.network.outbound.egress_rules = vec![EgressRule {
+        allow: true,
+        dest: EgressDest::Host("api.example.com".to_string()),
+        proto: EgressProto::Tcp,
+        port: Some(443),
+    }];
+    assert!(dead_udp_allows_without_selection(&p).is_empty());
+    // A deny rule is not an allow — never flagged.
+    let mut p = Policy::default();
+    p.network.outbound.egress_rules = vec![EgressRule {
+        allow: false,
+        dest: EgressDest::Host("203.0.113.5".to_string()),
+        proto: EgressProto::Any,
+        port: None,
+    }];
+    assert!(dead_udp_allows_without_selection(&p).is_empty());
+    // Open posture: the native socket pin is not applied — the UDP
+    // grant is redundant, not dead.
+    let mut p = udp_allow_policy();
+    p.network.outbound.deny_all_others = false;
+    assert!(dead_udp_allows_without_selection(&p).is_empty());
+}

@@ -398,6 +398,16 @@ policy refuses rather than narrowing silently. Known limits (IPv4-only,
 no fragments/non-TCP-UDP, shared-IP ambiguity, DoH/DoT bypass) are in
 the [guide](guide.md#411-namespaced-run--namespace--tun-tcpudp-proxy-poc).
 
+> **Migration note:** before the mechanism selection landed, a Linux
+> `run` was always the native Landlock+seccomp route — `auto` is the
+> new default, so an unchanged policy may now launch namespaced (proxy
+> enforcement of TCP/UDP destination+port and DNS) or refuse where it
+> previously ran partially enforced. A UDP `allow` that was dead policy
+> on native is the visible case: `auto` enforces it, `native` refuses
+> it. `--linux-mechanism native` restores the old route. The mechanism
+> is deliberately a launch flag, not policy — the policy says what must
+> hold; the host decides how it can be delivered.
+
 ## Caveats
 
 - Landlock/seccomp is a Linux-only requirement — sandboxed launch on Linux

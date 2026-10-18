@@ -373,6 +373,16 @@ mcp-writ run --linux-mechanism namespaced --policy policy.kdl \
 [ガイド](guide.ja.md#411-namespaced-run--名前空間--tun-tcpudp-プロキシ-poc)
 を参照してください。
 
+> **移行注記:** 機構選択が入る以前、Linux の `run` は常に native の
+> Landlock+seccomp 経路でした — `auto` が新しい既定であり、同一ポリシー
+> でも namespaced で起動する（TCP/UDP の宛先+ポートと DNS がプロキシで
+> 強制される）か、以前は部分強制で走った箇所が拒否されるようになります。
+> native で死んだ規則だった UDP `allow` が代表的な例: `auto` では実際に
+> 強制され、`native` では拒否されます。`--linux-mechanism native` が旧来
+> 経路の復元です。機構は意図的にポリシーではなく起動フラグです —
+> ポリシーは成立すべき内容を宣言し、機構はホストがそれをどう届けられる
+> かを決めます。
+
 ## 注意点
 
 - Landlock/seccomp は Linux のみの要件です — Linux のサンドボックス起動に

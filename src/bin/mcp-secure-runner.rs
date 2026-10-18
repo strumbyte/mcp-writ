@@ -502,7 +502,11 @@ async fn main() {
             // The in-guest runner keeps the legacy dispatch (`None` =
             // no egress selection at all): the Linux mechanism choice is
             // a host `run`/`plan` decision, not part of the guest launch
-            // contract.
+            // contract. The dispatch is still gated inside `launch` —
+            // a UDP-covered allow under deny-all is dead policy on the
+            // native route and refuses before spawn (PR-26), so a guest
+            // policy carrying one fails visibly instead of launching a
+            // workload whose declared grant can never apply.
             linux_mechanism: None,
             dns_upstream: None,
             component: "mcp-secure-runner",

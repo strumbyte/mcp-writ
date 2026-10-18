@@ -136,12 +136,6 @@ or retry in the path).
   practical test duration; the spec'd behavior is recorded above)
 - Grant isolation across two concurrent sessions
 - IPv6 extension-header packets and crafted fragmentation
-- Proxy/gate kill under active traffic (the TUN fd closes with the
-  parent; workload teardown is verified, mid-flow behavior is not
-  separately exercised)
-- `git log`-committed runnable fixture: the manual commands and
-  policy above are the reproduction recipe; a `cargo test` harness is
-  future work
 
 ## Files
 
@@ -229,11 +223,17 @@ not possible without a second kernel.
 
 - **Proxy reliability** — unchanged assessment: the userspace stack is
   part of the boundary; bounded tables/counters, counted drops, and
-  fail-closed teardown hold. New in this round: a dead proxy while the
-  workload lives is now detected (`wait_for_natural_exit` →
-  `SupervisionLost`) and kills the workload — verified by construction
-  (`proxy_lost` flag) but a mid-flow forced kill was not exercised;
-  it stays on the unverified list above.
+  fail-closed teardown hold. A dead proxy while the workload lives is
+  detected (`wait_for_natural_exit` → `SupervisionLost`) and kills the
+  workload — now exercised end-to-end: PR-26's
+  `tests/linux_mechanism_e2e.rs` ends the proxy task mid-`udp-loop`
+  via the `MCP_WRIT_NS_PROXY_KILL_AFTER_MS` test hook (supervisor env,
+  never forwarded into the namespace, and compiled in only under
+  `debug_assertions` — release binaries carry neither the env read
+  nor the kill switch) and
+  asserts the workload is
+  killed, `run` exits 1, `mechanism.namespaced.proxy_lost=true`, and
+  the audit closes with `reason=supervision_lost`.
 - **DoH / ECH / hardcoded resolvers** — unchanged: while a DNS
   upstream is configured, port-53 UDP/TCP is intercepted whatever
   destination the workload picks (a destination-scoped `:53` allow is
@@ -245,3 +245,34 @@ not possible without a second kernel.
 - **New boundary noted**: `auto` selection itself adds no new bypass —
   the verdict is computed from the same probe the launch performs, and
   an unsatisfiable combination refuses rather than degrading.
+
+## PR-26 — committed `cargo test` harness (`linux_mechanism_e2e`)
+
+Recorded 2026-10-18 on the same host (WSL2 Ubuntu 24.04 x86-64, kernel
+6.18.54.1-microsoft-standard-WSL2, rustc/cargo 1.99.0, working tree
+uncommitted). `tests/linux_mechanism_e2e.rs` turns the manual `run`-side
+legs above into a committed target — registered in
+`.github/workflows/linux-tests.yml` under
+`MCP_WRIT_REQUIRE_E2E_TESTS=1` and listed in `docs/test-matrix.md`.
+Workload fixture: `tests/fixtures/namespaced/net_probe.rs` (plain
+`rustc`, `SocketAddr` literals only — hostnames and arity violations
+are deterministic usage failures, never resolved or defaulted);
+compile/run scratch lands under `target/linux-mechanism-e2e/` because
+init masks `/tmp` and `/run` (a grant naming them is a selection
+violation, not a dead mount).
+
+Legs, all asserted against the real `run` binary's exit code,
+`--report`, and audit JSONL:
+
+| Test | Verdict |
+|---|---|
+| `auto_selects_namespaced_for_udp_policy` | `requested="auto"` → `selected="linux-namespaced"`; `udp-two` — allowed echo + dropped denied datagram; `udp_datagrams>=1`, `udp_denied>=1`, `sandbox.network_allowed`/`network_denied` records |
+| `namespaced_tcp_allow_and_deny` | `tcp-two` — allowed flow spliced to the host echo; denied leg kept the granted *port* on a different host so it passes the in-ns Landlock netport rule and dies at the proxy evaluator (`tcp_denied>=1`, `dest=203.0.113.9` deny record) |
+| `run_default_is_auto_and_prefers_namespaced` | no flag → `requested="auto"`; even a native-satisfiable `allow host="*" proto=tcp port=N` selects `linux-namespaced` |
+| `native_refuses_udp_allow_before_spawn` | exit 1, `selected=null`, `result.status="failed"`, refusal detail names the dead-policy UDP allow; no `server.connected` in the audit |
+| `namespaced_refuses_unsatisfiable_policy_without_fallback` | `allow "/run/…"` masked-tree grant → exit 1, `selected=null`, "masked tree" refusal on stderr; no `server.connected` |
+| `proxy_loss_during_active_udp_traffic_kills_workload` | `MCP_WRIT_NS_PROXY_KILL_AFTER_MS=3000` ends the proxy mid-`udp-loop` (`NETPROBE-HB` on stderr proves live traffic, `udp_datagrams>=1`); workload killed, `run` exits 1, `proxy_lost=true`, `result.status="failed"`, audit `reason=supervision_lost` |
+
+Result: `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --test
+linux_mechanism_e2e` — 6/6 passed (plus the shared `common::tests`
+helpers in the same target).
