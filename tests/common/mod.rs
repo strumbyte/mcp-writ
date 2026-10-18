@@ -982,7 +982,7 @@ pub fn host_defaults_kdl(argv0: &str) -> String {
 /// `None` when `i` is ordinary code. Slashdashed nodes (`\\`) and raw
 /// strings (`#"..."#`) are not expected in generated test policies.
 fn kdl_skip_trivia(bytes: &[u8], i: usize) -> Option<usize> {
-    match bytes[i] {
+    match bytes.get(i).copied()? {
         b'"' if bytes.get(i + 1) == Some(&b'"') && bytes.get(i + 2) == Some(&b'"') => {
             let mut j = i + 3;
             while j < bytes.len()
@@ -1054,6 +1054,9 @@ pub fn kdl_block_open(text: &str, name: &str, from: usize) -> Option<usize> {
                     continue;
                 }
             }
+            // Leading boundary: `name` must start its line's content —
+            // only spaces/tabs may precede it, so a hit inside a longer
+            // identifier (`xdefaults`) or mid-line is not the node.
             let indented_only = text[..i]
                 .rsplit('\n')
                 .next()
@@ -1349,4 +1352,92 @@ pub fn elf_verneed_glibc(b: &[u8]) -> Option<(u32, u32)> {
         }
     }
     max
+}
+
+#[cfg(test)]
+mod tests {
+    //! Boundary and brace matching for the `kdl_*` block-edit helpers —
+    //! a node-name hit must be a whole token that starts its line's
+    //! content, and braces inside strings or comments must not count.
+    use super::{kdl_block_open, kdl_matching_brace, kdl_named_insert_pos};
+
+    #[test]
+    fn block_open_finds_line_initial_node() {
+        let text = "server \"x\" {\n    defaults {\n        filesystem {\n        }\n    }\n}\n";
+        let open = kdl_block_open(text, "defaults", 0).expect("defaults node");
+        assert_eq!(text.as_bytes()[open], b'{');
+        assert_eq!(text[..open].lines().last().unwrap().trim(), "defaults");
+    }
+
+    #[test]
+    fn block_open_rejects_name_inside_longer_identifier() {
+        // A hit that is the suffix of a longer identifier fails the
+        // leading boundary — only whitespace may precede the name.
+        assert_eq!(kdl_block_open("xdefaults {\n", "defaults", 0), None);
+        assert_eq!(kdl_block_open("    xdefaults {\n", "defaults", 0), None);
+        // A trailing token char means the hit is a prefix of a longer
+        // identifier, not the node.
+        assert_eq!(kdl_block_open("defaults-2 {\n", "defaults", 0), None);
+        assert_eq!(kdl_block_open("defaultsx {\n", "defaults", 0), None);
+    }
+
+    #[test]
+    fn block_open_rejects_mid_line_name() {
+        assert_eq!(kdl_block_open("x defaults {\n", "defaults", 0), None);
+        assert_eq!(
+            kdl_block_open("} defaults {\n", "defaults", 0),
+            None,
+            "a name after another token on the line is not a node start"
+        );
+    }
+
+    #[test]
+    fn block_open_skips_comments_and_strings() {
+        assert_eq!(kdl_block_open("// defaults {\n", "defaults", 0), None);
+        assert_eq!(kdl_block_open("/* defaults { */", "defaults", 0), None);
+        assert_eq!(kdl_block_open("\"defaults\" {\n", "defaults", 0), None);
+    }
+
+    #[test]
+    fn block_open_allows_trivia_between_name_and_brace() {
+        let text = "defaults // {\n    {\n";
+        let open = kdl_block_open(text, "defaults", 0).expect("comment hides no brace");
+        assert_eq!(text.as_bytes()[open], b'{');
+        assert_eq!(text[..open].lines().last().unwrap(), "    ");
+    }
+
+    #[test]
+    fn block_open_requires_a_brace() {
+        assert_eq!(kdl_block_open("defaults x\n", "defaults", 0), None);
+        assert_eq!(kdl_block_open("defaults\n", "defaults", 0), None);
+        assert_eq!(kdl_block_open("defaults", "defaults", 0), None);
+    }
+
+    #[test]
+    fn block_open_from_offset_stays_in_enclosing_block() {
+        // inject_fs_grants relies on this: searching for `filesystem`
+        // from `defaults`'s brace must find the nested block, not the
+        // later top-level one.
+        let text = "defaults {\n    filesystem {\n    }\n}\nfilesystem {\n}\n";
+        let d_open = kdl_block_open(text, "defaults", 0).unwrap();
+        let fs_open = kdl_block_open(text, "filesystem", d_open).expect("nested filesystem");
+        assert!(fs_open < kdl_matching_brace(text, d_open));
+    }
+
+    #[test]
+    fn matching_brace_skips_braces_in_comments_and_strings() {
+        let text = "defaults {\n    // }\n    x \"{\"\n}\n";
+        let open = kdl_block_open(text, "defaults", 0).unwrap();
+        let close = kdl_matching_brace(text, open);
+        assert_eq!(text.as_bytes()[close], b'}');
+        assert_eq!(&text[close..], "}\n");
+    }
+
+    #[test]
+    fn named_insert_pos_lands_on_closing_line() {
+        let text = "defaults {\n    filesystem {\n        a 1\n    }\n}\n";
+        let pos = kdl_named_insert_pos(text, "filesystem", 0).expect("filesystem block");
+        assert!(text[..pos].ends_with("        a 1\n"), "{pos}");
+        assert!(text[pos..].starts_with("    }"), "{pos}");
+    }
 }

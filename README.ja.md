@@ -123,7 +123,7 @@ server "auto-generated" {
     // REVIEW: workload hashes pin this host's files — recompute them on the deployment host
     binary-hash     "sha256:…" target="…/bin/node"
     entrypoint-hash "sha256:…" target="…/@modelcontextprotocol/server-filesystem/dist/index.js"
-    tools-list-hash "sha256:1ef36fd7…"  // 提示された 14 ツール面
+    tools-list-hash "sha256:356bc86b…"  // 提示された 14 ツール面
     // Matched: Capability(file:read) ∩ Intent(file:read) [Case A]
     tool "read_file" side_effect="read_only" args_schema="{…}"
     // REVIEW: Tool 'directory_tree' requires file:read but source lacks a matching sink

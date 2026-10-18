@@ -823,6 +823,20 @@ fn stage1_review_draft(spec: &ServerSpec, work: &Path, allow_tools: &[&str]) -> 
     path
 }
 
+/// Stage 1 as the run stages consume it: live discovery, then the
+/// simulated review of the generated draft (`deny` lifted on
+/// `allow_tools` only). Returns the reviewed draft the run policy's
+/// `extends` points at.
+fn stage1_discover_and_review(
+    spec: &ServerSpec,
+    argv: &[String],
+    work: &Path,
+    allow_tools: &[&str],
+) -> PathBuf {
+    stage1_live_discovery(spec, argv, work);
+    stage1_review_draft(spec, work, allow_tools)
+}
+
 // ─── shared session drivers ───────────────────────────────────────────────
 
 /// Canonicalized temp root so resolved paths compare cleanly. The `\\?\`
@@ -1044,8 +1058,12 @@ async fn filesystem_stages() {
         Some(a) => a,
         None => return,
     };
-    stage1_live_discovery(spec, &argv_main, &root);
-    let reviewed = stage1_review_draft(spec, &root, &["read_file", "read_multiple_files"]);
+    let reviewed = stage1_discover_and_review(
+        spec,
+        &argv_main,
+        &root,
+        &["read_file", "read_multiple_files"],
+    );
 
     // host policy: tool fs = srv/** (Auditor scope), defaults grant = data
     // only — `restricted` is never granted, so the OS layer denies it.
@@ -1330,8 +1348,7 @@ async fn memory_stages() {
 
     // stage 1: live discovery, then the reviewed draft as the run policy's
     // workload half.
-    stage1_live_discovery(spec, &argv, &root);
-    let reviewed = stage1_review_draft(spec, &root, &["create_entities"]);
+    let reviewed = stage1_discover_and_review(spec, &argv, &root, &["create_entities"]);
 
     // The server's data file is chosen by MEMORY_FILE_PATH, not by an RPC
     // argument — the OS sandbox (defaults grant) is the only layer that can
@@ -1413,6 +1430,11 @@ async fn memory_stages() {
     assert!(
         audit_denied_line(&audit5_text).is_none(),
         "stage5 memory: OS-layer deny must not log tool_call.denied: {audit5_text}"
+    );
+    assert!(
+        !mem_file_outside.exists(),
+        "stage5 memory: denied write must leave {} uncreated",
+        mem_file_outside.display()
     );
     match resp5 {
         Some(r) => assert!(
@@ -1574,8 +1596,7 @@ async fn time_stages() {
 
     // stage 1: live discovery, then the reviewed draft as the run policy's
     // workload half.
-    stage1_live_discovery(spec, &argv, &root);
-    let reviewed = stage1_review_draft(spec, &root, &["get_current_time"]);
+    let reviewed = stage1_discover_and_review(spec, &argv, &root, &["get_current_time"]);
 
     // A granted scratch dir gives the sandboxed child a valid working
     // directory (Windows refuses to spawn a child whose inherited cwd is
@@ -1775,8 +1796,8 @@ async fn git_stages() {
     // stage 1: live discovery, then the reviewed draft as the run policy's
     // workload half. The stages exercise three tools — the review lifts
     // exactly those denies.
-    stage1_live_discovery(spec, &argv, &root);
-    let reviewed = stage1_review_draft(spec, &root, &["git_log", "git_status", "git_branch"]);
+    let reviewed =
+        stage1_discover_and_review(spec, &argv, &root, &["git_log", "git_status", "git_branch"]);
 
     // defaults: interpreter runtime + the repo + the child cwd `work/` +
     // git's own prefix for the subprocess image. `work/` is granted so the
@@ -2123,8 +2144,7 @@ async fn fetch_stages() {
 
     // stage 1: live discovery, then the reviewed draft as the run policy's
     // workload half — the single `fetch` tool's deny is lifted.
-    stage1_live_discovery(spec, &argv, &root);
-    let reviewed = stage1_review_draft(spec, &root, &["fetch"]);
+    let reviewed = stage1_discover_and_review(spec, &argv, &root, &["fetch"]);
 
     // Two fixture servers on distinct ports: the allowed one and the one
     // whose port the OS grant never names (stage 5). Each binds only the

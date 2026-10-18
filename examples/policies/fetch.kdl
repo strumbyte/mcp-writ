@@ -15,8 +15,22 @@
 //   defaults {
 //       network {
 //           deny host="*"
-//           allow host="docs.example.com"      // destinations the tool may reach
-//           allow host="10.1.2.3:8080"         // `host:port` narrows the port too
+//           // An OS-layer allow is mechanism-shaped — what each native
+//           // path accepts under deny-all:
+//           //   Linux   `allow host="443"` — the only grant Landlock
+//           //           netport expresses (a TCP port, any host). A
+//           //           named/addressed allow makes the native route
+//           //           unselectable: `auto` then picks the namespaced
+//           //           TUN proxy, which evaluates host/cidr/port
+//           //           destinations end to end.
+//           //   macOS   `allow host="localhost:8080"` — SBPL pins
+//           //           loopback TCP ports only; a remote `host=`
+//           //           allow under deny-all refuses the spawn.
+//           //   Windows none — AppContainer egress is all-or-none and
+//           //           an allow list under deny-all is a load error;
+//           //           `allow host="*"` opens egress, or the opt-in
+//           //           `--windows-mechanism psec` grants IPv4 /32
+//           //           literals (no names, no ports).
 //       }
 //       filesystem { ... }
 //   }
@@ -29,10 +43,14 @@
 //       }
 //   }
 //
-// A `host` rule in `defaults.network` is the OS-layer posture (Landlock
-// netport / AppContainer capability / SBPL endpoint); the per-tool
-// `network` block is the RPC-layer destination list the Auditor checks
-// `url` arguments against. Keep both lists aligned with the destinations
+// Hostname enforcement stays at the RPC layer on every native path: the
+// per-tool `network` block is the destination list the Auditor checks
+// `url` arguments against, and `defaults.network` is the OS-layer
+// posture the mechanism can express. A `host:port` spelling does not
+// narrow the RPC-layer check — the Auditor's identity is the host; the
+// port qualifier is applied only where the mechanism can express it
+// (the namespaced proxy, a macOS loopback pin) and refused where it
+// cannot (PSEC, unotify). Keep both lists aligned with the destinations
 // the deployment actually uses.
 extends "runtime/python.kdl"
 policy version=1
@@ -65,6 +83,14 @@ server "fetch" {
             allow none=#true
             require-path #false
         }
+        // RPC-layer destination allow-list: the Auditor checks the `url`
+        // argument only. The server follows redirects internally, so a
+        // redirect target is never rechecked against this list — when
+        // the destination list is a security boundary, bound redirects
+        // at the OS layer instead: a destination-capable route (the
+        // Linux namespaced TUN proxy, the macOS CONNECT proxy, or
+        // Windows PSEC) evaluates every connect against
+        // `defaults.network`.
         network {
             deny host="*"
             allow host="<FETCH_HOST>"

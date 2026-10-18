@@ -197,7 +197,7 @@ Hyper-V分離はWindowsコンテナに個別のカーネルを持たせる方式
 
 **導入・運用の再確認:** GAで追加された保存先設定を使い、WSLCのsession VHD・イメージ・build cache・一時領域をD:側に置く構成を検証します。Consommé／virtiofs、health check、ネットワーク接続変更、Intuneの利用・registry制限が、既存のポリシー・停止・監査契約に与える影響を試験します。MDE連携は可視化のための機能として扱い、Warden／Auditorの代替にしません。GA発表だけからSDK projectionや企業向けplug-inまで同じ提供段階と推定せず、採用時に各版を確認します。
 
-**現時点の不足:** 読み取り確認時の空き容量はC:約39.7 GiB、D:約28.3 GiBで、手元のWSLは上記の2.4.12.0です。今回の計画更新ではインストール・cleanup・VM起動を行いません。将来の重いbuild／実機試験は[ディスク管理規則](../../AGENTS.md)に従い、対象ドライブの空きを再確認し、40 GiB未満なら先に`cargo clean`を実施したうえで試験用容量を確保します。OS／WSL更新は利用者の作業中distroと検証資源を確認して実施する別作業です。
+**現時点の不足:** 読み取り確認時の空き容量はC:約39.7 GiB、D:約28.3 GiBで、手元のWSLは上記の2.4.12.0です。今回の計画更新ではインストール・cleanup・VM起動を行いません。将来の重いbuild／実機試験は[ディスク管理規則](../development.md#disk-hygiene-for-container-tests)に従い、対象ドライブの空きを再確認し、40 GiB未満なら先に`cargo clean`を実施したうえで試験用容量を確保します。OS／WSL更新は利用者の作業中distroと検証資源を確認して実施する別作業です。
 
 ### 共通の採用ゲート
 
