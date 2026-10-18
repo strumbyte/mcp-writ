@@ -8,6 +8,12 @@
 //!   1. `generate-policy --live-discovery` — the generated policy's
 //!      `tools-list-hash` must equal the hash pinned in
 //!      `examples/policies/<name>.kdl`, and the tool count must match.
+//!      PR-25: the draft is then "reviewed" (the `auto-generated` server
+//!      block is renamed to the real identity and the deny is lifted on
+//!      exactly the tools the stages exercise) and the *reviewed draft* —
+//!      not a hand-written example — is the workload half of the host
+//!      policy stages 2–6 `extend`. The generated `args_schema` pins the
+//!      argument contract those calls run under.
 //!   2. `run --dry-run` — initialize + tools/list + an allowed tools/call.
 //!      The Auditor runs; the OS sandbox does not.
 //!   3. `run` sandboxed — the same allowed call must succeed at the OS.
@@ -60,13 +66,13 @@ struct ServerSpec {
 const FILESYSTEM: ServerSpec = ServerSpec {
     name: "filesystem",
     runtime: "node",
-    expected_hash: "sha256:1ef36fd736d82bacdbb5bce1dda540553a2b59e07c625249845296845a335a26",
+    expected_hash: "sha256:356bc86bb96625f3c4cd1dc9405ed09425d441ea884972148bec3dd1808cfea2",
     tool_count: 14,
 };
 const MEMORY: ServerSpec = ServerSpec {
     name: "memory",
     runtime: "node",
-    expected_hash: "sha256:0ae46ff5e9dee8192e577615964eb12d3b3b4ddcaee608049c201267842c3fa8",
+    expected_hash: "sha256:75e8f7889cc05510689e9fe237983e2ae9490155eb38aab8a99b5396a047b1f8",
     tool_count: 9,
 };
 const TIME: ServerSpec = ServerSpec {
@@ -81,8 +87,18 @@ const TIME: ServerSpec = ServerSpec {
 const GIT: ServerSpec = ServerSpec {
     name: "git",
     runtime: "python",
-    expected_hash: "sha256:6d33f714008a03d44fcb8458e95fa8b5374240837f04e6bd5db86e49ac7e6410",
+    expected_hash: "sha256:185000d12e4a14677cc13bda254c6f2b54c4d583e908c7896751bd13913506fc",
     tool_count: 12,
+};
+const FETCH: ServerSpec = ServerSpec {
+    name: "fetch",
+    runtime: "python",
+    // Launched with `--allow-private-ips --ignore-robots-txt`: the flags do
+    // not change tools/list, they make the local HTTP fixture reachable —
+    // without `--allow-private-ips` the server itself refuses
+    // loopback/RFC1918 destinations before policy is consulted.
+    expected_hash: "sha256:ce464f2ab20921047330f580117eb0d5d9c04640021ee2c1e7d26a3acef78eaa",
+    tool_count: 1,
 };
 
 fn fixtures_dir() -> PathBuf {
@@ -164,6 +180,7 @@ fn server_argv(spec: &ServerSpec, extra_args: &[String]) -> Option<Vec<String>> 
             let module = match spec.name {
                 "time" => "mcp_server_time",
                 "git" => "mcp_server_git",
+                "fetch" => "mcp_server_fetch",
                 other => panic!("unknown python server: {other}"),
             };
             let mut argv = vec![
@@ -176,6 +193,16 @@ fn server_argv(spec: &ServerSpec, extra_args: &[String]) -> Option<Vec<String>> 
             // pinned in time.kdl — is host-independent.
             if spec.name == "time" {
                 argv.extend(["--local-timezone".to_string(), "UTC".to_string()]);
+            }
+            // mcp-server-fetch refuses loopback/private destinations and
+            // honours robots.txt by default; the e2e fetches a local HTTP
+            // fixture, so both restrictions are lifted at launch — the
+            // destination list still lives in the policy.
+            if spec.name == "fetch" {
+                argv.extend([
+                    "--allow-private-ips".to_string(),
+                    "--ignore-robots-txt".to_string(),
+                ]);
             }
             argv.extend(extra_args.iter().cloned());
             Some(argv)
@@ -497,14 +524,18 @@ fn example_policy_path(spec: &ServerSpec) -> PathBuf {
         .join(format!("{}.kdl", spec.name))
 }
 
-/// Insert `allow` entries into the `filesystem` block of a host policy
-/// (the first `    }` line closes it — `host_defaults_kdl` emits the
-/// filesystem block first inside `defaults`).
+/// Insert `allow` entries into the `filesystem` block inside `defaults`
+/// of a host policy — the match is brace-scoped to `defaults`, so a
+/// `filesystem` node in appended server KDL cannot be hit instead.
 fn inject_fs_grants(policy: &mut String, grants: &[(&Path, &str)]) {
     if grants.is_empty() {
         return;
     }
-    let at = policy.find("    }\n").expect("filesystem block");
+    let d_open = common::kdl_block_open(policy, "defaults", 0).expect("defaults block");
+    let fs_open = common::kdl_block_open(policy, "filesystem", d_open)
+        .filter(|&o| o < common::kdl_matching_brace(policy, d_open))
+        .expect("filesystem block inside defaults");
+    let at = common::kdl_insert_pos(policy, fs_open);
     let mut inject = String::new();
     for (dir, mode) in grants {
         inject.push_str(&format!(
@@ -516,15 +547,10 @@ fn inject_fs_grants(policy: &mut String, grants: &[(&Path, &str)]) {
 }
 
 /// Insert an `environment { allow ... }` block into the `defaults` block of
-/// a host policy (the defaults close is the first `}` at column 0). A
-/// non-empty overlay replaces an `environment` block inherited via
-/// `extends` — the same rule as `syscalls`.
+/// a host policy. A non-empty overlay replaces an `environment` block
+/// inherited via `extends` — the same rule as `syscalls`.
 fn inject_environment(policy: &mut String, allow_names: &[&str]) {
-    let start = policy.find("defaults {").expect("defaults block");
-    let close = policy[start..]
-        .find("\n}\n")
-        .map(|i| start + i + 1)
-        .expect("defaults close");
+    let at = common::kdl_named_insert_pos(policy, "defaults", 0).expect("defaults block");
     let mut inject = String::from("    environment {\n");
     if !allow_names.is_empty() {
         inject.push_str("        allow");
@@ -534,16 +560,35 @@ fn inject_environment(policy: &mut String, allow_names: &[&str]) {
         inject.push('\n');
     }
     inject.push_str("    }\n");
-    policy.insert_str(close, &inject);
+    policy.insert_str(at, &inject);
 }
 
-/// host.kdl = extends <example> + host defaults + logging + extra server
+/// Insert a `network { ... }` block into `defaults` — `inner` is the
+/// block's body (the `allow`/`deny` lines at the 8-space child indent).
+/// Merged `network` blocks union their allow/deny entries, while the
+/// posture spellings (`deny host="*"` / `allow host="*"`) move the
+/// `deny_all_others` flag — an open posture in the overlay is the only
+/// spelling AppContainer accepts when outbound is needed at all.
+fn inject_network(policy: &mut String, inner: &str) {
+    if inner.is_empty() {
+        return;
+    }
+    let at = common::kdl_named_insert_pos(policy, "defaults", 0).expect("defaults block");
+    let mut inject = String::from("    network {\n");
+    inject.push_str(inner);
+    inject.push_str("    }\n");
+    policy.insert_str(at, &inject);
+}
+
+/// host.kdl = extends <base> + host defaults + logging + extra server
 /// overrides (per-tool fs with real paths, or a corrupted hash pin).
-fn host_policy(spec: &ServerSpec, argv0: &str, extra_kdl: &str) -> String {
+/// `version` is the extended file's `policy version` — a v2 base (the
+/// generated draft) requires a v2 overlay.
+fn host_policy_base(base: &Path, version: u32, argv0: &str, extra_kdl: &str) -> String {
     #[allow(unused_mut)]
     let mut out = format!(
-        "policy version=1\nextends \"{}\"\n{}logging level=\"info\" fail_closed=#false\n{}",
-        kdl_path(&example_policy_path(spec)),
+        "policy version={version}\nextends \"{}\"\n{}logging level=\"info\" fail_closed=#false\n{}",
+        kdl_path(base),
         common::host_defaults_kdl(argv0),
         extra_kdl
     );
@@ -559,6 +604,16 @@ fn host_policy(spec: &ServerSpec, argv0: &str, extra_kdl: &str) -> String {
     out
 }
 
+fn host_policy(spec: &ServerSpec, argv0: &str, extra_kdl: &str) -> String {
+    host_policy_base(&example_policy_path(spec), 1, argv0, extra_kdl)
+}
+
+/// The run stages' host policy when the workload half is the reviewed
+/// generated draft (v2), not `examples/policies/<spec>.kdl`.
+fn draft_host_policy(draft: &Path, argv0: &str, extra_kdl: &str) -> String {
+    host_policy_base(draft, 2, argv0, extra_kdl)
+}
+
 fn write_policy(dir: &Path, name: &str, text: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, text).expect("write host policy");
@@ -569,20 +624,36 @@ fn write_policy(dir: &Path, name: &str, text: &str) -> PathBuf {
 
 fn stage1_live_discovery(spec: &ServerSpec, argv: &[String], work: &Path) {
     let out = work.join(format!("genpol-{}.kdl", spec.name));
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"))
-        .args(["generate-policy", "--live-discovery", "--output"])
-        .arg(&out)
-        .arg("--")
-        .args(argv)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("spawn generate-policy");
+    // First-run imports (fetch pulls httpx/lxml/…) can overrun the
+    // discovery handshake's 5s response budget on a contended host —
+    // discovery is read-only and idempotent, so one retry exercises the
+    // same live path with a warm module cache.
+    let mut stderr = String::new();
+    let mut succeeded = false;
+    for attempt in 0..2 {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"))
+            .args(["generate-policy", "--live-discovery", "--output"])
+            .arg(&out)
+            .arg("--")
+            .args(argv)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn generate-policy");
+        if output.status.success() {
+            succeeded = true;
+            break;
+        }
+        stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if attempt == 1 || !stderr.contains("Timed out") {
+            break;
+        }
+        eprintln!("stage1 {}: discovery timed out — retrying once", spec.name);
+    }
     assert!(
-        output.status.success(),
-        "stage1 {0}: generate-policy --live-discovery failed: {1}",
-        spec.name,
-        String::from_utf8_lossy(&output.stderr)
+        succeeded,
+        "stage1 {}: generate-policy --live-discovery failed: {stderr}",
+        spec.name
     );
     let text = std::fs::read_to_string(&out).expect("generated policy readable");
     let hash = pinned_hash_in(&text).expect("generated policy has tools-list-hash");
@@ -666,6 +737,104 @@ fn stage1_workload_hashes(spec: &ServerSpec, text: &str, out: &Path) {
             e.hash_value
         );
     }
+}
+
+/// PR-25: turn the stage-1 generated draft into the policy the run stages
+/// actually extend. The draft is dispatcher-shaped — every discovered tool
+/// was emitted `deny=#true` under a `server "auto-generated"` block — so
+/// the simulated review is the minimal honest transform: rename the server
+/// to its real identity and lift the deny on exactly the tools the stages
+/// exercise (`deny=#false`). Every other tool stays denied, the generated
+/// `args_schema`, `tools-list-hash`, and workload hash entries are
+/// untouched — except the Node `entrypoint-hash`, which the review drops
+/// because the pinned-payload exec cannot resolve `node_modules` — and the
+/// `// REVIEW` markers ride along (warn mode) — the same state a
+/// maintainer's partial review leaves. The returned path is the file
+/// `extends` points at in `draft_host_policy`.
+fn stage1_review_draft(spec: &ServerSpec, work: &Path, allow_tools: &[&str]) -> PathBuf {
+    let generated = work.join(format!("genpol-{}.kdl", spec.name));
+    let draft = std::fs::read_to_string(&generated).expect("stage1 draft readable");
+    let mut reviewed = draft.replacen(
+        "server \"auto-generated\" {",
+        &format!("server \"{}\" {{", spec.name),
+        1,
+    );
+    assert_ne!(
+        reviewed, draft,
+        "stage1 {}: draft must carry the auto-generated server block",
+        spec.name
+    );
+    for tool in allow_tools {
+        let denied = format!("tool \"{tool}\" deny=#true");
+        assert!(
+            reviewed.contains(&denied),
+            "stage1 {}: draft must emit `{denied}`",
+            spec.name
+        );
+        reviewed = reviewed.replacen(&denied, &format!("tool \"{tool}\" deny=#false"), 1);
+    }
+    if spec.runtime == "node" {
+        // The entrypoint pin is dropped at review: `run` binds the pinned
+        // script by exec'ing a snapshot — an inherited sealed memfd on
+        // Linux, an owner-only staged copy on macOS and Windows — and
+        // Node's ESM resolver walks ancestors of *that* path, so the
+        // server's `import` statements never reach the real node_modules
+        // and the process dies before initialize. The pin is verified
+        // emitted (and target-correct) in stage1; the launch still binds
+        // node itself via `binary-hash` and the tool surface via
+        // `tools-list-hash`.
+        let mut stripped = String::with_capacity(reviewed.len());
+        let mut found = false;
+        for line in reviewed.lines() {
+            if line.trim_start().starts_with("entrypoint-hash \"") {
+                found = true;
+                stripped.push_str(
+                    "    // REVIEW: entrypoint-hash dropped — pinned-payload exec cannot \
+                     resolve node_modules\n",
+                );
+                continue;
+            }
+            stripped.push_str(line);
+            stripped.push('\n');
+        }
+        assert!(
+            found,
+            "stage1 {}: node draft must carry the entrypoint-hash line",
+            spec.name
+        );
+        reviewed = stripped;
+    }
+    let path = work.join(format!("genpol-{}-reviewed.kdl", spec.name));
+    std::fs::write(&path, &reviewed).expect("write reviewed draft");
+    // The reviewed draft is what `run` extends — it must still load, keep
+    // its pins, and carry the workload hash entries.
+    let policy =
+        mcp_writ::policy::kdl_loader::load_kdl_policy(&path).expect("reviewed draft must load");
+    assert!(
+        !policy.tools_list_hashes.is_empty(),
+        "stage1 {}: reviewed draft must keep the tools-list-hash",
+        spec.name
+    );
+    assert!(
+        !policy.hash_entries.is_empty(),
+        "stage1 {}: reviewed draft must keep the workload hash entries",
+        spec.name
+    );
+    path
+}
+
+/// Stage 1 as the run stages consume it: live discovery, then the
+/// simulated review of the generated draft (`deny` lifted on
+/// `allow_tools` only). Returns the reviewed draft the run policy's
+/// `extends` points at.
+fn stage1_discover_and_review(
+    spec: &ServerSpec,
+    argv: &[String],
+    work: &Path,
+    allow_tools: &[&str],
+) -> PathBuf {
+    stage1_live_discovery(spec, argv, work);
+    stage1_review_draft(spec, work, allow_tools)
 }
 
 // ─── shared session drivers ───────────────────────────────────────────────
@@ -778,10 +947,14 @@ async fn stage3_spawn(
 }
 
 /// Stage 6: a corrupted `tools-list-hash` pin must fail tools/list. The bad
-/// policy carries the same OS grants as the main one so the failure can only
-/// come from the pin mismatch.
+/// policy extends the same workload base (`base`) at the same `version` as
+/// the main host policy and carries the same OS grants so the failure can
+/// only come from the pin mismatch.
+#[expect(clippy::too_many_arguments)]
 async fn stage6_bad_hash(
     spec: &ServerSpec,
+    base: &Path,
+    base_version: u32,
     argv0: &str,
     argv: &[String],
     env: &[(&str, &str)],
@@ -803,8 +976,9 @@ async fn stage6_bad_hash(
             .collect::<String>()
     );
     assert_ne!(wrong_hash, spec.expected_hash);
-    let mut bad = host_policy(
-        spec,
+    let mut bad = host_policy_base(
+        base,
+        base_version,
         argv0,
         &format!(
             "server \"{}\" {{\n    tools-list-hash \"{wrong_hash}\"\n}}\n",
@@ -854,25 +1028,50 @@ async fn filesystem_stages() {
     let marker = format!("MARKER-FS-{}", std::process::id());
     let marker_file = data.join("marker.txt");
     std::fs::write(&marker_file, format!("{marker}\n")).expect("marker");
+    // Numbered lines for `head` (optional argument), and a ~9MiB file for
+    // the large-response path.
+    let numbered = data.join("numbered.txt");
+    std::fs::write(
+        &numbered,
+        "FS-LINE-1\nFS-LINE-2\nFS-LINE-3\nFS-LINE-4\nFS-LINE-5\n",
+    )
+    .expect("numbered");
+    // Two sizes bracket the PR-20 frame cap: the filesystem server returns
+    // the body twice in one frame (content + structuredContent), so ~4MiB
+    // lands near it (~8.4MB) and ~9MiB (~18.9MB) is refused by it.
+    let mid = data.join("mid.bin");
+    let mut mid_body = vec![b'X'; 4 * 1024 * 1024];
+    mid_body.extend_from_slice(b"\nMARKER-FS-MID-TAIL\n");
+    std::fs::write(&mid, &mid_body).expect("mid file");
+    let big = data.join("big.bin");
+    let mut big_body = vec![b'X'; 9 * 1024 * 1024];
+    big_body.extend_from_slice(b"\nMARKER-FS-BIG-TAIL\n");
+    std::fs::write(&big, &big_body).expect("big file");
     let restricted_file = restricted.join("secret.txt");
     std::fs::write(&restricted_file, "SECRET-FS\n").expect("restricted");
     let ssh_file = secret_dir.join("id_rsa");
     std::fs::write(&ssh_file, "FAKE-PRIVATE-KEY\n").expect("ssh file");
 
-    // stage 1: live discovery (argv allowed dir = data)
+    // stage 1: live discovery (argv allowed dir = data), then the reviewed
+    // draft — the workload half of the host policy the run stages extend.
     let argv_main = match server_argv(spec, &[kdl_path(&data)]) {
         Some(a) => a,
         None => return,
     };
-    stage1_live_discovery(spec, &argv_main, &root);
+    let reviewed = stage1_discover_and_review(
+        spec,
+        &argv_main,
+        &root,
+        &["read_file", "read_multiple_files"],
+    );
 
     // host policy: tool fs = srv/** (Auditor scope), defaults grant = data
     // only — `restricted` is never granted, so the OS layer denies it.
     let srv_glob = format!("{}/**", kdl_path(&srv));
     let server_extra = format!(
-        "server \"filesystem\" {{\n    tool \"read_file\" {{\n        filesystem {{\n            allow \"{srv_glob}\"\n        }}\n    }}\n}}\n"
+        "server \"filesystem\" {{\n    tool \"read_file\" {{\n        filesystem {{\n            allow \"{srv_glob}\"\n        }}\n    }}\n    tool \"read_multiple_files\" {{\n        filesystem {{\n            allow \"{srv_glob}\"\n        }}\n    }}\n}}\n"
     );
-    let mut host_kdl = host_policy(spec, &argv_main[0], &server_extra);
+    let mut host_kdl = draft_host_policy(&reviewed, &argv_main[0], &server_extra);
     let fs_grants: &[(&Path, &str)] = &[(&data, "read")];
     inject_fs_grants(&mut host_kdl, fs_grants);
     let policy_path = write_policy(&root, "host-fs.kdl", &host_kdl);
@@ -906,6 +1105,66 @@ async fn filesystem_stages() {
     assert!(
         resp.as_deref().is_some_and(|r| r.contains(&marker)),
         "stage3 filesystem: marker must reach the client: {resp:?}"
+    );
+
+    // Optional argument on the same tool: `head` truncates the read — the
+    // schema accepts it and the server applies it (line 5 never arrives).
+    let head_args = format!("{{\"path\":{},\"head\":2}}", json_str(&kdl_path(&numbered)));
+    let head_resp = s3.call("read_file", &head_args).await;
+    let head_resp = head_resp.expect("stage3 filesystem: head call must answer");
+    assert!(
+        !json_has_error(&head_resp) && !is_error_result(&head_resp),
+        "stage3 filesystem: optional `head` call must succeed: {head_resp}"
+    );
+    assert!(
+        head_resp.contains("FS-LINE-1") && !head_resp.contains("FS-LINE-5"),
+        "stage3 filesystem: head=2 must return the first lines only: {head_resp}"
+    );
+
+    // `paths` — the array-valued selector — through the same fs scope.
+    let multi_args = format!(
+        "{{\"paths\":[{},{}]}}",
+        json_str(&kdl_path(&marker_file)),
+        json_str(&kdl_path(&numbered))
+    );
+    let multi_resp = s3.call("read_multiple_files", &multi_args).await;
+    let multi_resp = multi_resp.expect("stage3 filesystem: read_multiple_files must answer");
+    assert!(
+        !json_has_error(&multi_resp) && !is_error_result(&multi_resp),
+        "stage3 filesystem: read_multiple_files must succeed: {multi_resp}"
+    );
+    assert!(
+        multi_resp.contains(&marker) && multi_resp.contains("FS-LINE-5"),
+        "stage3 filesystem: both files' contents must arrive: {multi_resp}"
+    );
+
+    // Large response at the PR-20 frame cap: ~4MiB of content (~8.4MB as
+    // the server frames it) must arrive intact — the tail marker proves
+    // the whole body was delivered.
+    let mid_args = format!("{{\"path\":{}}}", json_str(&kdl_path(&mid)));
+    let mid_resp = s3.call("read_file", &mid_args).await;
+    let mid_resp = mid_resp.expect("stage3 filesystem: mid read must answer");
+    assert!(
+        !json_has_error(&mid_resp) && !is_error_result(&mid_resp),
+        "stage3 filesystem: ~4MiB read must succeed: {}",
+        &mid_resp[..mid_resp.len().min(400)]
+    );
+    assert!(
+        mid_resp.len() > 8 * 1024 * 1024 && mid_resp.contains("MARKER-FS-MID-TAIL"),
+        "stage3 filesystem: the full body must arrive — len={}",
+        mid_resp.len()
+    );
+
+    // …and the over-cap side of the same boundary: ~9MiB is ~18.9MB on the
+    // wire, so the frame cap refuses it — the PR-20 refusal itself is the
+    // asserted evidence.
+    let big_args = format!("{{\"path\":{}}}", json_str(&kdl_path(&big)));
+    let big_resp = s3.call("read_file", &big_args).await;
+    let big_resp = big_resp.expect("stage3 filesystem: big read must answer");
+    assert!(
+        json_has_error(&big_resp) && big_resp.contains("frame-too-large"),
+        "stage3 filesystem: ~9MiB read must hit the frame cap: {}",
+        &big_resp[..big_resp.len().min(400)]
     );
 
     // stage 4: Auditor deny — secret-overlay on .ssh inside the allowed root
@@ -980,9 +1239,12 @@ async fn filesystem_stages() {
         }
     }
 
-    // stage 6: corrupted hash pin must fail tools/list
+    // stage 6: corrupted hash pin must fail tools/list — the bad policy
+    // extends the same reviewed draft as the main one.
     stage6_bad_hash(
         spec,
+        &reviewed,
+        2,
         &argv_main[0],
         &argv_main,
         &[],
@@ -1084,13 +1346,17 @@ async fn memory_stages() {
         None => return,
     };
 
-    // stage 1: live discovery
-    stage1_live_discovery(spec, &argv, &root);
+    // stage 1: live discovery, then the reviewed draft as the run policy's
+    // workload half.
+    let reviewed = stage1_discover_and_review(spec, &argv, &root, &["create_entities"]);
 
     // The server's data file is chosen by MEMORY_FILE_PATH, not by an RPC
     // argument — the OS sandbox (defaults grant) is the only layer that can
     // scope it. data/ is granted read-write; restricted/ is never granted.
-    let mut host_kdl = host_policy(spec, &argv[0], "");
+    // The tool takes no path argument: the explicit empty fs block keeps the
+    // inherited `defaults.filesystem` grants from requiring one.
+    let server_extra = "server \"memory\" {\n    tool \"create_entities\" {\n        filesystem {\n            allow none=#true\n            require-path #false\n        }\n    }\n}\n";
+    let mut host_kdl = draft_host_policy(&reviewed, &argv[0], server_extra);
     let mem_grants: &[(&Path, &str)] = &[(&data, "write")];
     inject_fs_grants(&mut host_kdl, mem_grants);
     // The restricted default environment drops unlisted names — the
@@ -1165,23 +1431,41 @@ async fn memory_stages() {
         audit_denied_line(&audit5_text).is_none(),
         "stage5 memory: OS-layer deny must not log tool_call.denied: {audit5_text}"
     );
+    assert!(
+        !mem_file_outside.exists(),
+        "stage5 memory: denied write must leave {} uncreated",
+        mem_file_outside.display()
+    );
     match resp5 {
         Some(r) => assert!(
             json_has_error(&r) || is_error_result(&r),
             "stage5 memory: write outside the grant must fail: {r}"
         ),
-        // The server resolves MEMORY_FILE_PATH lazily, so the sandboxed
-        // startup must succeed — a silent session is a failure, not a
-        // recorded OS deny.
-        None => panic!(
-            "stage5 memory: sandboxed session produced no response (init5={init5:?}); \
-             the server must start and fail at the write"
-        ),
+        None => {
+            // server-memory@1.0.0 wraps writes in a `.lock` retry loop:
+            // under AppContainer the denied create reports EPERM — which
+            // the server reads as "lock held" — and its ENOENT continue
+            // path bypasses the retry deadline, so the write denial
+            // manifests as a permanently hung call (verified: >130s, no
+            // response) rather than a tool error. The denial evidence
+            // stands on the missing file + absent denied event + the
+            // stage-3 success on the granted path.
+            assert!(
+                cfg!(windows) && init5.is_some(),
+                "stage5 memory: sandboxed session produced no response (init5={init5:?}); \
+                 the server must start and fail at the write"
+            );
+            eprintln!(
+                "stage5 memory: Windows deny surfaces as a hung call (server-memory lock retry) — recorded divergence"
+            );
+        }
     }
 
     // stage 6: corrupted hash pin must fail tools/list
     stage6_bad_hash(
         spec,
+        &reviewed,
+        2,
         &argv[0],
         &argv,
         &env_refs,
@@ -1197,7 +1481,10 @@ async fn memory_stages() {
 /// server writes to the granted path; unlisted, the variable never reaches
 /// the child and the server falls back to `dist/memory.jsonl` inside the
 /// read-only package tree — the mutation then fails at the OS layer (the
-/// server resolves the path lazily, so startup itself still succeeds).
+/// server resolves the path lazily, so startup itself still succeeds). On
+/// Windows the failure surfaces as a hung call — server-memory@1.0.0's
+/// lock retry reads the denied EPERM as "held" and its ENOENT path never
+/// reaches the retry deadline.
 #[tokio::test]
 async fn real_memory_server_needs_listed_env() {
     let _stage_lock = STAGE_LOCK.lock().await;
@@ -1277,12 +1564,21 @@ async fn real_memory_server_needs_listed_env() {
             json_has_error(&r) || is_error_result(&r),
             "unlisted MEMORY_FILE_PATH: fallback write outside the grant must fail: {r}"
         ),
-        // The path is resolved lazily, so startup must succeed — a
-        // silent session is a failure, not recorded evidence.
-        None => panic!(
-            "env-blocked memory: sandboxed session produced no response (init={init:?}): \
-             {audit_b_text}"
-        ),
+        None => {
+            // Same server-memory lock-retry divergence as stage5: on
+            // Windows the denied write hangs the call with no response
+            // (the EPERM-as-busy retry never reaches its deadline on the
+            // ENOENT path). The block evidence is the missing file and
+            // the absence of a denied audit event.
+            assert!(
+                cfg!(windows) && init.is_some(),
+                "env-blocked memory: sandboxed session produced no response (init={init:?}): \
+                 {audit_b_text}"
+            );
+            eprintln!(
+                "env-blocked memory: Windows deny surfaces as a hung call (server-memory lock retry) — recorded divergence"
+            );
+        }
     }
 }
 
@@ -1298,15 +1594,18 @@ async fn time_stages() {
         None => return,
     };
 
-    // stage 1: live discovery
-    stage1_live_discovery(spec, &argv, &root);
+    // stage 1: live discovery, then the reviewed draft as the run policy's
+    // workload half.
+    let reviewed = stage1_discover_and_review(spec, &argv, &root, &["get_current_time"]);
 
     // A granted scratch dir gives the sandboxed child a valid working
     // directory (Windows refuses to spawn a child whose inherited cwd is
-    // outside the grant).
+    // outside the grant). The tool is pathless: the empty fs block keeps the
+    // inherited defaults from demanding a path argument it does not take.
     let scratch = root.join("scratch");
     std::fs::create_dir_all(&scratch).expect("mkdir scratch");
-    let mut host_kdl = host_policy(spec, &argv[0], "");
+    let server_extra = "server \"time\" {\n    tool \"get_current_time\" {\n        filesystem {\n            allow none=#true\n            require-path #false\n        }\n    }\n}\n";
+    let mut host_kdl = draft_host_policy(&reviewed, &argv[0], server_extra);
     let time_grants: &[(&Path, &str)] = &[(&scratch, "read")];
     inject_fs_grants(&mut host_kdl, time_grants);
     let policy_path = write_policy(&root, "host-time.kdl", &host_kdl);
@@ -1357,6 +1656,8 @@ async fn time_stages() {
     // stage 6: corrupted hash pin must fail tools/list
     stage6_bad_hash(
         spec,
+        &reviewed,
+        2,
         &argv[0],
         &argv,
         &[],
@@ -1492,8 +1793,11 @@ async fn git_stages() {
         None => return,
     };
 
-    // stage 1: live discovery
-    stage1_live_discovery(spec, &argv, &root);
+    // stage 1: live discovery, then the reviewed draft as the run policy's
+    // workload half. The stages exercise three tools — the review lifts
+    // exactly those denies.
+    let reviewed =
+        stage1_discover_and_review(spec, &argv, &root, &["git_log", "git_status", "git_branch"]);
 
     // defaults: interpreter runtime + the repo + the child cwd `work/` +
     // git's own prefix for the subprocess image. `work/` is granted so the
@@ -1503,9 +1807,9 @@ async fn git_stages() {
     // policy-visible; the OS grant is what differentiates them.
     let root_glob = format!("{}/**", kdl_path(&root));
     let server_extra = format!(
-        "server \"git\" {{\n    tool \"git_log\" {{\n        filesystem {{\n            allow \"{root_glob}\"\n        }}\n    }}\n}}\n"
+        "server \"git\" {{\n    tool \"git_log\" {{\n        filesystem {{\n            allow \"{root_glob}\"\n        }}\n    }}\n    tool \"git_status\" {{\n        filesystem {{\n            allow \"{root_glob}\"\n        }}\n    }}\n    tool \"git_branch\" {{\n        filesystem {{\n            allow \"{root_glob}\"\n        }}\n    }}\n}}\n"
     );
-    let mut host_kdl = host_policy(spec, &argv[0], &server_extra);
+    let mut host_kdl = draft_host_policy(&reviewed, &argv[0], &server_extra);
     let mut git_grant_dirs = vec![repo.clone(), cwd.clone()];
     git_grant_dirs.extend(common::exe_read_grant_dirs(&git_exe));
     let git_grants: Vec<(&Path, &str)> = git_grant_dirs
@@ -1524,6 +1828,12 @@ async fn git_stages() {
     let policy_path = write_policy(&root, "host-git.kdl", &host_kdl);
 
     let log_args = format!("{{\"repo_path\":{}}}", json_str(&kdl_path(&repo)));
+    // Optional args the generated args_schema accepts: max_count and the
+    // timestamp window — the window exercises them for real.
+    let log_args_optional = format!(
+        "{{\"repo_path\":{},\"max_count\":1,\"start_timestamp\":\"1970-01-01\",\"end_timestamp\":\"2099-12-31\"}}",
+        json_str(&kdl_path(&repo))
+    );
 
     // stage 2: dry-run
     stage2_dry_run(
@@ -1534,8 +1844,8 @@ async fn git_stages() {
         Some(&cwd),
         PositiveCall {
             tool: "git_log",
-            args: &log_args,
-            marker: "",
+            args: &log_args_optional,
+            marker: "init",
         },
     )
     .await;
@@ -1554,6 +1864,51 @@ async fn git_stages() {
     assert!(
         !json_has_error(&r) && !is_error_result(&r),
         "stage3 git: sandboxed git_log on granted paths must succeed: {r}"
+    );
+
+    // The omitted-vs-explicit optional-argument matrix: a window in the
+    // future filters the single commit out — the optional args reached the
+    // server and were applied, which is what distinguishes this from a
+    // bare required-argument call.
+    let r_opt = s3.call("git_log", &log_args_optional).await;
+    let r_opt = r_opt.expect("stage3 git: optional-args call must answer");
+    assert!(
+        !json_has_error(&r_opt) && !is_error_result(&r_opt) && r_opt.contains("init"),
+        "stage3 git: windowed git_log must return the commit: {r_opt}"
+    );
+    let filtered_args = format!(
+        "{{\"repo_path\":{},\"start_timestamp\":\"2030-01-01\",\"end_timestamp\":\"2030-12-31\"}}",
+        json_str(&kdl_path(&repo))
+    );
+    let r_f = s3.call("git_log", &filtered_args).await;
+    let r_f = r_f.expect("stage3 git: filtered call must answer");
+    assert!(
+        !json_has_error(&r_f) && !is_error_result(&r_f) && !r_f.contains("init"),
+        "stage3 git: a future window must filter the commit out: {r_f}"
+    );
+
+    // Two more reviewed tools — `git_status` takes only the required
+    // `repo_path`; `git_branch` adds the required `branch_type` while its
+    // `contains`/`not_contains` options stay omitted.
+    let status_resp = s3.call("git_status", &log_args).await;
+    let status_resp = status_resp.expect("stage3 git: git_status must answer");
+    assert!(
+        !json_has_error(&status_resp) && !is_error_result(&status_resp),
+        "stage3 git: sandboxed git_status must succeed: {status_resp}"
+    );
+    let branch_args = format!(
+        "{{\"repo_path\":{},\"branch_type\":\"local\"}}",
+        json_str(&kdl_path(&repo))
+    );
+    let branch_resp = s3.call("git_branch", &branch_args).await;
+    let branch_resp = branch_resp.expect("stage3 git: git_branch must answer");
+    assert!(
+        !json_has_error(&branch_resp) && !is_error_result(&branch_resp),
+        "stage3 git: sandboxed git_branch must succeed: {branch_resp}"
+    );
+    assert!(
+        branch_resp.contains("master"),
+        "stage3 git: git_branch must list the seed branch: {branch_resp}"
     );
 
     // stage 4: Auditor deny — repo_path outside the tool's fs allow. An
@@ -1646,12 +2001,400 @@ async fn git_stages() {
     // stage 6: corrupted hash pin must fail tools/list
     stage6_bad_hash(
         spec,
+        &reviewed,
+        2,
         &argv[0],
         &argv,
         env_refs,
         &root,
         &git_grants,
         Some(&cwd),
+    )
+    .await;
+}
+
+// ─── fetch ────────────────────────────────────────────────────────────────
+
+/// Deterministic local HTTP fixture for the fetch server. Binds only the
+/// single address the test URLs name — `127.0.0.1` on macOS (its loopback
+/// allowance) and the machine's LAN IPv4 elsewhere (Windows AppContainer
+/// children cannot loop back to the host, and Linux names the LAN spelling
+/// so any namespace-level routing still reaches it) — so no interface the
+/// test never uses is exposed. Static bodies except `/big` (~200KB,
+/// exercises the `max_length`/`start_index` pagination contract).
+struct LocalHttp {
+    port: u16,
+}
+
+impl LocalHttp {
+    fn start(bind_ip: &str) -> Self {
+        let listener = std::net::TcpListener::bind((bind_ip, 0)).expect("bind fixture http");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                std::thread::spawn(move || serve_http_conn(stream));
+            }
+        });
+        Self { port }
+    }
+}
+
+fn fetch_big_body() -> String {
+    // HEAD at 0, TAIL near the end — pagination assertions name both.
+    format!("MARKER-BIG-HEAD\n{}\nMARKER-BIG-TAIL", "x".repeat(200_000))
+}
+
+fn serve_http_conn(mut stream: std::net::TcpStream) {
+    use std::io::{Read, Write};
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 16 * 1024 {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let path = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let (status, ctype, body) = match path {
+        "/" => (200, "text/plain", "MARKER-FSERVE-OK\n".to_string()),
+        "/big" => (200, "text/plain", fetch_big_body()),
+        "/html" => (
+            200,
+            "text/html",
+            "<html><body>MARKER-HTML-PAGE</body></html>\n".to_string(),
+        ),
+        // A permissive robots file — the server is also launched with
+        // --ignore-robots-txt, so this is only a fallback.
+        "/robots.txt" => (200, "text/plain", "User-agent: *\nAllow: /\n".to_string()),
+        _ => (404, "text/plain", "not found\n".to_string()),
+    };
+    let resp = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        if status == 200 { "OK" } else { "Not Found" },
+        body.len(),
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+/// The LAN IPv4 the sandboxed child uses to reach the fixture — a UDP
+/// `connect` picks the source address without sending anything. A host
+/// with no non-loopback interface cannot run the fetch stages at all —
+/// every other route to the child is the restricted one.
+#[cfg(not(target_os = "macos"))]
+fn lan_ipv4() -> Option<String> {
+    let sock = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    sock.connect(("192.0.2.1", 80)).ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+        std::net::IpAddr::V6(_) => None,
+    }
+}
+
+/// True only where a granted TCP connect(2) port cannot be expressed at
+/// all — a sub-V4 Landlock ABI (kernel < 6.7, e.g. WSL2) drops ConnectTcp
+/// handling, so the ungranted-port call *succeeds* as a recorded
+/// divergence. macOS pins the SBPL endpoint port (the denied port is
+/// refused at the RPC layer there — the same rules feed both layers), and
+/// Windows AppContainer isolation blocks the local connect wholesale, so
+/// those paths take the error branch, not this one.
+#[cfg(target_os = "linux")]
+fn port_grant_unexpressible() -> bool {
+    common::linux_below_landlock_v4()
+}
+#[cfg(not(target_os = "linux"))]
+fn port_grant_unexpressible() -> bool {
+    false
+}
+
+/// The host spelling the fetch URL uses. macOS names 127.0.0.1 — its
+/// loopback proxy is the destination-aware layer and the SBPL endpoint is
+/// port-pinned. Everywhere else names the LAN IPv4: Windows AppContainer
+/// children cannot loop back to the host at all, and the Linux netport
+/// grant does not care which address a connect(2) targets.
+fn fetch_url_host() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        Some("127.0.0.1".to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        lan_ipv4()
+    }
+}
+
+#[tokio::test]
+async fn fetch_stages() {
+    let _stage_lock = STAGE_LOCK.lock().await;
+    let spec = &FETCH;
+    let (_t, root) = temp_root("mcp_writ_rs_fetch_");
+    let scratch = root.join("scratch");
+    std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+
+    let argv = match server_argv(spec, &[]) {
+        Some(a) => a,
+        None => return,
+    };
+
+    // stage 1: live discovery, then the reviewed draft as the run policy's
+    // workload half — the single `fetch` tool's deny is lifted.
+    let reviewed = stage1_discover_and_review(spec, &argv, &root, &["fetch"]);
+
+    // Two fixture servers on distinct ports: the allowed one and the one
+    // whose port the OS grant never names (stage 5). Each binds only the
+    // address the URLs below use.
+    let Some(host) = fetch_url_host() else {
+        common::skip_server_test("no LAN IPv4 address for the fetch fixture");
+        return;
+    };
+    let http = LocalHttp::start(&host);
+    let http2 = LocalHttp::start(&host);
+    let page_url = format!("http://{host}:{}/", http.port);
+    let big_url = format!("http://{host}:{}/big", http.port);
+    let html_url = format!("http://{host}:{}/html", http.port);
+    let other_url = format!("http://{host}:{}/", http2.port);
+
+    // defaults.network — the OS-layer egress shape per mechanism:
+    //   Linux   deny-all + `allow host="*" port=<P>` — the bare-port
+    //           spelling is the only egress shape a ConnectTcp netport
+    //           rule can express (a port with no destination bound); the
+    //           flat `allow host="<ip>"` is Auditor-only, so the granted
+    //           port reaches the OS while the ungranted one passes the
+    //           RPC layer and dies in connect(2).
+    //   macOS   deny-all + `allow host="127.0.0.1:<P>"` becomes a
+    //           port-pinned `remote tcp` endpoint.
+    //   Windows AppContainer capabilities are all-or-none — a deny posture
+    //           withholds them entirely, so the only network-capable
+    //           policy is the open posture.
+    #[cfg(target_os = "linux")]
+    let net_inner = format!(
+        "        deny host=\"*\"\n        allow host=\"*\" port={0}\n        allow host=\"{1}\"\n",
+        http.port, host
+    );
+    #[cfg(target_os = "macos")]
+    let net_inner = format!(
+        "        deny host=\"*\"\n        allow host=\"127.0.0.1:{0}\"\n",
+        http.port
+    );
+    #[cfg(target_os = "windows")]
+    let net_inner = "        allow host=\"*\"\n".to_string();
+    // The tool-level block is the RPC-layer destination list — the allowed
+    // host on any port, so stage 5's ungranted port reaches the OS. The
+    // empty fs block keeps the inherited grants from demanding a path the
+    // url-only tool does not carry.
+    let server_extra = format!(
+        "server \"fetch\" {{\n    tool \"fetch\" {{\n        filesystem {{\n            allow none=#true\n            require-path #false\n        }}\n        network {{\n            allow host=\"{host}\"\n        }}\n    }}\n}}\n"
+    );
+    let mut host_kdl = draft_host_policy(&reviewed, &argv[0], &server_extra);
+    let fetch_grants: &[(&Path, &str)] = &[(&scratch, "read")];
+    inject_fs_grants(&mut host_kdl, fetch_grants);
+    inject_network(&mut host_kdl, &net_inner);
+    let policy_path = write_policy(&root, "host-fetch.kdl", &host_kdl);
+
+    // stage 2: dry-run — the required `url` only; every optional argument
+    // (max_length, start_index, raw) is omitted.
+    let page_args = format!("{{\"url\":{}}}", json_str(&page_url));
+    stage2_dry_run(
+        spec,
+        &policy_path,
+        &argv,
+        &[],
+        Some(&scratch),
+        PositiveCall {
+            tool: "fetch",
+            args: &page_args,
+            marker: "MARKER-FSERVE-OK",
+        },
+    )
+    .await;
+
+    // stage 3 + 4: session calls — the same allowed call, the optional
+    // arguments, then an Auditor-layer destination denial. Windows runs
+    // them unsandboxed: the AppContainer grants no loopback exemption for
+    // stdio launches (HTTP transport only), so a same-host fixture is
+    // unreachable from inside the sandbox whatever the posture — the
+    // Auditor still enforces args_schema and the allow list, and stage 5
+    // keeps the sandboxed OS-layer evidence.
+    #[cfg(windows)]
+    let s3_env: &[(&str, &str)] = &[("MCP_WRIT_SKIP_SANDBOX", "1")];
+    #[cfg(not(windows))]
+    let s3_env: &[(&str, &str)] = &[];
+    let (mut s3, audit3) = stage3_spawn(spec, &policy_path, &argv, s3_env, Some(&scratch)).await;
+    let resp = s3.call("fetch", &page_args).await;
+    let resp = resp.expect("stage3 fetch: allowed call must answer");
+    assert!(
+        !json_has_error(&resp) && !is_error_result(&resp),
+        "stage3 fetch: sandboxed fetch must succeed: {resp}"
+    );
+    assert!(
+        resp.contains("MARKER-FSERVE-OK"),
+        "stage3 fetch: page body must reach the client: {resp}"
+    );
+
+    // `max_length` truncates the ~200KB body and the server names the
+    // continuation index — the large-response path exercises both.
+    let trunc_args = format!("{{\"url\":{},\"max_length\":100}}", json_str(&big_url));
+    let trunc = s3.call("fetch", &trunc_args).await;
+    let trunc = trunc.expect("stage3 fetch: truncated call must answer");
+    assert!(
+        !json_has_error(&trunc) && !is_error_result(&trunc),
+        "stage3 fetch: max_length call must succeed: {trunc}"
+    );
+    assert!(
+        trunc.contains("MARKER-BIG-HEAD") && trunc.contains("start_index of 100"),
+        "stage3 fetch: truncation must carry the continuation index: {trunc}"
+    );
+
+    // `start_index` slices deep into the same page.
+    let tail_args = format!("{{\"url\":{},\"start_index\":199900}}", json_str(&big_url));
+    let tail = s3.call("fetch", &tail_args).await;
+    let tail = tail.expect("stage3 fetch: start_index call must answer");
+    assert!(
+        !json_has_error(&tail) && !is_error_result(&tail),
+        "stage3 fetch: start_index call must succeed: {tail}"
+    );
+    assert!(
+        tail.contains("MARKER-BIG-TAIL"),
+        "stage3 fetch: the slice must reach the page tail: {tail}"
+    );
+
+    // The full large response: max_length=999999 returns the whole ~200KB
+    // body through the wire framing intact.
+    let full_args = format!("{{\"url\":{},\"max_length\":999999}}", json_str(&big_url));
+    let full = s3.call("fetch", &full_args).await;
+    let full = full.expect("stage3 fetch: full-page call must answer");
+    assert!(
+        !json_has_error(&full) && !is_error_result(&full),
+        "stage3 fetch: the ~200KB fetch must succeed: len={}",
+        full.len()
+    );
+    assert!(
+        full.contains("MARKER-BIG-HEAD") && full.contains("MARKER-BIG-TAIL"),
+        "stage3 fetch: head and tail must both arrive — len={}",
+        full.len()
+    );
+
+    // `raw` returns the HTML unsimplified.
+    let raw_args = format!("{{\"url\":{},\"raw\":true}}", json_str(&html_url));
+    let raw = s3.call("fetch", &raw_args).await;
+    let raw = raw.expect("stage3 fetch: raw call must answer");
+    assert!(
+        !json_has_error(&raw) && !is_error_result(&raw),
+        "stage3 fetch: raw call must succeed: {raw}"
+    );
+    assert!(
+        raw.contains("<html") && raw.contains("MARKER-HTML-PAGE"),
+        "stage3 fetch: raw=true must return the unprocessed HTML: {raw}"
+    );
+
+    // stage 4: Auditor deny — a destination the tool's allow list does not
+    // cover. On macOS a `localhost` spelling is additionally refused by the
+    // name layer (no resolution before the check): host `localhost` is not
+    // the declared `127.0.0.1`.
+    let denied_args = if cfg!(target_os = "macos") {
+        format!("{{\"url\":\"http://localhost:{}/\"}}", http.port)
+    } else {
+        "{\"url\":\"http://example.invalid/\"}".to_string()
+    };
+    let denied = s3.call("fetch", &denied_args).await;
+    let denied = denied.expect("stage4 fetch: denied call must still answer");
+    assert!(
+        json_has_error(&denied),
+        "stage4 fetch: uncovered destination must be a JSON-RPC error: {denied}"
+    );
+    let audit3_text = s3.finish_audit(&audit3).await;
+    let denied_line = audit_denied_line(&audit3_text).unwrap_or_else(|| {
+        panic!("stage4 fetch: audit log missing tool_call.denied: {audit3_text}")
+    });
+    assert!(
+        denied_line.contains("fetch"),
+        "stage4 fetch: denied event must name the tool: {denied_line}"
+    );
+
+    // stage 5: OS-layer reach — the tool scope allows the host on any port,
+    // so the Auditor passes http2's port; only the OS grant differentiates.
+    let audit5 = common::next_audit_log_path();
+    let mut s5 = GuardSession::spawn(&policy_path, &audit5, &argv, &[], false, Some(&scratch));
+    let init5 = s5.handshake().await;
+    let denied5_args = format!("{{\"url\":{}}}", json_str(&other_url));
+    let resp5 = if init5.is_some() {
+        let _ = s5.tools_list().await;
+        s5.call("fetch", &denied5_args).await
+    } else {
+        None
+    };
+    let audit5_text = s5.finish_audit(&audit5).await;
+    match resp5 {
+        Some(r) => {
+            if cfg!(target_os = "macos") {
+                // The SBPL endpoint and the Auditor's egress check draw
+                // from the same `egress_rules`, so a port the profile
+                // denies is refused at the RPC layer first — the denial
+                // is observable only as tool_call.denied.
+                assert!(
+                    json_has_error(&r) || is_error_result(&r),
+                    "stage5 fetch: the ungranted port must be refused: {r}"
+                );
+                assert!(
+                    audit_denied_line(&audit5_text).is_some(),
+                    "stage5 fetch: macOS denies at the RPC layer — tool_call.denied expected: {audit5_text}"
+                );
+            } else {
+                // Linux (netport) and Windows (AppContainer isolation)
+                // refuse the connect beneath the Auditor — an OS-layer
+                // denial must never log tool_call.denied. On Windows the
+                // denial is broader than the grant (no loopback exemption
+                // for stdio), but the evidence shape is the same — the
+                // capability matrix's windows-appcontainer layers carry
+                // `granularity: []` rather than a per-port grant.
+                assert!(
+                    audit_denied_line(&audit5_text).is_none(),
+                    "stage5 fetch: OS-layer deny must not log tool_call.denied: {audit5_text}"
+                );
+                if port_grant_unexpressible() {
+                    // A sub-V4 Landlock ABI cannot express ConnectTcp —
+                    // the ungranted-port fetch succeeds. A recorded
+                    // capability-matrix divergence.
+                    assert!(
+                        !json_has_error(&r) && !is_error_result(&r),
+                        "stage5 fetch: no per-port mechanism — the call must succeed: {r}"
+                    );
+                    eprintln!(
+                        "stage5 fetch: ungranted port allowed — recorded divergence (no per-port mechanism)"
+                    );
+                } else {
+                    // Linux netport pins http.port only; Windows blocks
+                    // the local connect outright — either way the OS
+                    // refuses what the Auditor allowed.
+                    assert!(
+                        json_has_error(&r) || is_error_result(&r),
+                        "stage5 fetch: the OS must deny the ungranted destination: {r}"
+                    );
+                }
+            }
+        }
+        None => panic!(
+            "stage5 fetch: sandboxed session produced no response (init5={init5:?}): {audit5_text}"
+        ),
+    }
+
+    // stage 6: corrupted hash pin must fail tools/list
+    stage6_bad_hash(
+        spec,
+        &reviewed,
+        2,
+        &argv[0],
+        &argv,
+        &[],
+        &root,
+        fetch_grants,
+        Some(&scratch),
     )
     .await;
 }

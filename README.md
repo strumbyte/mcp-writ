@@ -119,13 +119,13 @@ cargo install --locked --path . --bin mcp-writ
 The steps below run on a POSIX shell (Linux, macOS, or WSL) from a
 source checkout — the reviewed example policy they extend lives under
 `examples/` — with Node.js installed, using the pinned
-`@modelcontextprotocol/server-filesystem` `2026.8.31` server.
+`@modelcontextprotocol/server-filesystem` `1.0.0` server.
 Replace `/srv/mcp-data` with the directory the server may reach.
 
 **1. Draft a policy from the server itself.**
 
 ```sh
-npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
+npm install -g @modelcontextprotocol/server-filesystem@1.0.0
 mcp-writ generate-policy --live-discovery --output draft.kdl \
   -- "$(command -v mcp-server-filesystem)" /srv/mcp-data
 ```
@@ -139,7 +139,7 @@ server "auto-generated" {
     // REVIEW: workload hashes pin this host's files — recompute them on the deployment host
     binary-hash     "sha256:…" target="…/bin/node"
     entrypoint-hash "sha256:…" target="…/@modelcontextprotocol/server-filesystem/dist/index.js"
-    tools-list-hash "sha256:1ef36fd7…"  // the advertised 14-tool surface
+    tools-list-hash "sha256:356bc86b…"  // the advertised 14-tool surface
     // Matched: Capability(file:read) ∩ Intent(file:read) [Case A]
     tool "read_file" side_effect="read_only" args_schema="{…}"
     // REVIEW: Tool 'directory_tree' requires file:read but source lacks a matching sink

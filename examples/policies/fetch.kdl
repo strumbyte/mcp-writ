@@ -1,0 +1,99 @@
+// Example policy for mcp-server-fetch 2026.10.10.
+//
+// Pins the reviewed tool surface; no host paths. Extend it and add the
+// host's `defaults` (interpreter prefix + venv read access) — see
+// docs/policy-authoring.md. tests/real_servers_e2e.rs does the same.
+//
+// `fetch` performs outbound HTTP(S) only: the destination policy lives in
+// the `network` clauses. Launch the server with `--allow-private-ips` (and
+// `--ignore-robots-txt` where appropriate) to let it reach loopback or
+// RFC1918 fixtures — without the flag the server itself refuses those
+// addresses before the policy is ever consulted.
+//
+//   policy version=1
+//   extends "<repo>/examples/policies/fetch.kdl"
+//   defaults {
+//       network {
+//           deny host="*"
+//           // An OS-layer allow is mechanism-shaped — what each native
+//           // path accepts under deny-all:
+//           //   Linux   `allow host="443"` — the only grant Landlock
+//           //           netport expresses (a TCP port, any host). A
+//           //           named/addressed allow makes the native route
+//           //           unselectable: `auto` then picks the namespaced
+//           //           TUN proxy, which evaluates host/cidr/port
+//           //           destinations end to end.
+//           //   macOS   `allow host="localhost:8080"` — SBPL pins
+//           //           loopback TCP ports only; a remote `host=`
+//           //           allow under deny-all refuses the spawn.
+//           //   Windows none — AppContainer egress is all-or-none and
+//           //           an allow list under deny-all is a load error;
+//           //           `allow host="*"` opens egress, or the opt-in
+//           //           `--windows-mechanism psec` grants IPv4 /32
+//           //           literals (no names, no ports).
+//       }
+//       filesystem { ... }
+//   }
+//   server "fetch" {
+//       tool "fetch" {
+//           network {
+//               deny host="*"
+//               allow host="docs.example.com"   // RPC-layer destination allow-list
+//           }
+//       }
+//   }
+//
+// Hostname enforcement stays at the RPC layer on every native path: the
+// per-tool `network` block is the destination list the Auditor checks
+// `url` arguments against, and `defaults.network` is the OS-layer
+// posture the mechanism can express. A `host:port` spelling does not
+// narrow the RPC-layer check — the Auditor's identity is the host; the
+// port qualifier is applied only where the mechanism can express it
+// (the namespaced proxy, a macOS loopback pin) and refused where it
+// cannot (PSEC, unotify). Keep both lists aligned with the destinations
+// the deployment actually uses.
+extends "runtime/python.kdl"
+policy version=1
+
+defaults {
+    network {
+        deny host="*"
+    }
+    // Restrict the child's environment to the launch contract's base set
+    // (PATH, temp dirs, Windows system vars); without this node the server
+    // inherits the whole parent environment. An extending policy adds
+    // `allow "NAME"` entries for the variables it needs — e.g. proxy
+    // settings (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) when fetches must
+    // transit a corporate proxy.
+    environment {
+    }
+}
+
+server "fetch" {
+    // Pinned against mcp-server-fetch 2026.10.10 launched with
+    // `--allow-private-ips` (negotiated MCP 2025-11-25, 1 tool,
+    // mcp-guard-tools-list-v4). The flag does not change tools/list, but
+    // it is required for the server to reach loopback/RFC1918 endpoints.
+    tools-list-hash "sha256:ce464f2ab20921047330f580117eb0d5d9c04640021ee2c1e7d26a3acef78eaa"
+
+    tool "fetch" side_effect="network" {
+        // Pathless tool: keep the explicit empty filesystem block so the
+        // host `defaults.filesystem` grants are not inherited per-tool.
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+        // RPC-layer destination allow-list: the Auditor checks the `url`
+        // argument only. The server follows redirects internally, so a
+        // redirect target is never rechecked against this list — when
+        // the destination list is a security boundary, bound redirects
+        // at the OS layer instead: a destination-capable route (the
+        // Linux namespaced TUN proxy, the macOS CONNECT proxy, or
+        // Windows PSEC) evaluates every connect against
+        // `defaults.network`.
+        network {
+            deny host="*"
+            allow host="<FETCH_HOST>"
+        }
+    }
+}

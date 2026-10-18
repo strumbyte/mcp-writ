@@ -936,14 +936,24 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] `generate-policy --live-discovery` で作ったドラフトに、ホスト側の許可を足して `run` する（dry-run と本実行の両方）。レビュー工程は、指定したツールの deny を外す操作で模擬する。
-- [ ] 省略可能な引数を含めて呼び出す。
+- [x] `generate-policy --live-discovery` で作ったドラフトに、ホスト側の許可を足して `run` する（dry-run と本実行の両方）。レビュー工程は、指定したツールの deny を外す操作で模擬する。
+- [x] 省略可能な引数を含めて呼び出す。
   - git: `git_log` に `max_count` とタイムスタンプを渡し、他の git ツールも呼ぶ。
   - filesystem: `read_multiple_files` と、PR-20 の上限付近の大きなファイルを試す。
-- [ ] fetch を試験対象に加える。fetch は外部へ通信するので、ローカルの HTTP サーバー宛てにする。
-- [ ] 固定版を更新し、npm で非推奨になっていないか確認する。
+- [x] fetch を試験対象に加える。fetch は外部へ通信するので、ローカルの HTTP サーバー宛てにする。
+- [x] 固定版を更新し、npm で非推奨になっていないか確認する。
 
-**検証:** `MCP_WRIT_REQUIRE_SERVER_TESTS=1` を付け、`mcp-servers.yml` の 3 OS で実行する。
+**検証:** `MCP_WRIT_REQUIRE_SERVER_TESTS=1` 付き `cargo test --test real_servers_e2e` — Windows で 7 件すべて通過（filesystem/memory/time/git/fetch の生成→レビュー→run、省略可能引数、Auditor/OS 両層の deny、破損 pin）。`mcp-servers.yml` の 3 OS 実行は CI 側の確認が残る。
+
+**記録:**
+
+- Node ドラフトの `entrypoint-hash` は全 OS で run 不能と判明 — ピンしたペイロードを memfd/一時コピーから実行するため、ESM の `node_modules` 解決がそのパス起点で祖先を辿れない（Linux の `/proc/self/fd`→memfd、macOS/Windows の staged copy とも同じ）。レビュー工程でピンを外す対応（`binary-hash`＋`tools-list-hash` は残る）。製品側の根本対応は別論点。
+- `server-memory@1.0.0` の `.lock` 再試行は Windows の EPERM を「他者が保持」とみなし、ENOENT 分岐がデッドラインを迂回して無限化する（非サンドボックスでも再現）。Windows の OS 層 deny は「応答なし＋denied イベントなし＋ファイル未作成」で検出する形に分岐記録。
+- Windows AppContainer は stdio 起動に loopback exemption を付けない（HTTP transport 限定）ため、同一ホストの fixture へは姿勢を問わず到達不能。fetch の呼び出し系は `MCP_WRIT_SKIP_SANDBOX` セッションで、OS 層の遮断証拠は stage5 のサンドボックス起動で取得する構成。
+- `server-filesystem` は応答に本文を 2 重（content+structuredContent）に含めるため、PR-20 の 10MiB フレーム上限の両側を ~4MiB（成功）/~9MiB（`frame-too-large` 拒否）で挟んで検証。
+- N-13: `@modelcontextprotocol/server-memory` の `2026.8.31` ピンは旧日付版で、npm は `1.0.0`（2026-10-11 公開・非推奨なし）で semantic versioning を再開 — filesystem/memory を `1.0.0` へ更新。Python 側は `mcp-server-{git,time,fetch}` を `2026.10.10` に更新（requirements.txt は全依存をハッシュ固定で再生成）。
+- fetch は `--allow-private-ips --ignore-robots-txt` 付きで起動しないとローカル宛を自身で拒否するため、launch argv に両フラグを含める（宛先の絞り込みはポリシー側で実施）。
+- レビュー対応: diff の約89%を占めた `.codacy/`（Codacy CLI のローカル解析用生成 JSON — config と baseline が同一）は除去コミットで除外し `.gitignore` に追加。`defaults`/`filesystem` 内への KDL 挿入は「列0の `}`」「先頭の `    }`」への形状依存検索だったため、`common` の `kdl_block_open`/`kdl_matching_brace`/`kdl_insert_pos`（行頭ノード限定＋文字列・コメント内のブレースを数えない対応関係スキャン）へ置き換え — `inject_fs_grants`/`inject_environment`/`inject_network` と `environment_e2e` の同パターンに適用。`LocalHttp` fixture は `0.0.0.0` ではなく URL が指す単一アドレス（macOS は `127.0.0.1`、他は LAN IPv4）のみ bind する形に縮小し、未使用インターフェースへの公開を除去。
 
 **完了条件:** 生成→レビュー→`run` の流れが、公式 4 サーバーと fetch で通る。
 

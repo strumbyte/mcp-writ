@@ -1,4 +1,4 @@
-// Example policy for mcp-server-time 2026.8.18.
+// Example policy for mcp-server-time 2026.10.10.
 //
 // Pins the reviewed tool surface; no host paths. Extend it and add the
 // host's `defaults` (interpreter prefix + venv read access) — see
@@ -15,7 +15,7 @@ defaults {
 }
 
 server "time" {
-    // Pinned against mcp-server-time 2026.8.18 launched with
+    // Pinned against mcp-server-time 2026.10.10 launched with
     // `--local-timezone UTC` (negotiated MCP 2025-11-25, 2 tools,
     // mcp-guard-tools-list-v4). The flag is required: the server embeds
     // the detected local timezone in its tool schemas, so without it the

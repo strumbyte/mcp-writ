@@ -516,7 +516,8 @@ async fn environment_applies_under_sandbox() {
     // Filesystem grants: the fixture script's directory (plus the file
     // itself on Windows, where ACEs are per-object) and the scratch cwd.
     {
-        let at = defaults.find("    }\n").expect("filesystem block");
+        let at =
+            common::kdl_named_insert_pos(&defaults, "filesystem", 0).expect("filesystem block");
         let mut inject = String::new();
         if let Some(parent) = script.parent() {
             inject.push_str(&format!("        allow \"{}\" mode=\"read\"\n", f(parent)));
@@ -530,9 +531,9 @@ async fn environment_applies_under_sandbox() {
         ));
         defaults.insert_str(at, &inject);
     }
-    // The environment allowlist inside `defaults` (closes at column 0).
+    // The environment allowlist inside `defaults`.
     {
-        let at = defaults.rfind("\n}").expect("defaults close") + 1;
+        let at = common::kdl_named_insert_pos(&defaults, "defaults", 0).expect("defaults block");
         defaults.insert_str(
             at,
             "    environment {\n        allow \"MCP_WRIT_TEST_KEEP\" \"MCP_WRIT_TEST_MISSING\"\n    }\n",

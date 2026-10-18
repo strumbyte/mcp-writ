@@ -1,4 +1,4 @@
-// Example policy for mcp-server-git 2026.8.18.
+// Example policy for mcp-server-git 2026.10.10.
 //
 // Pins the reviewed tool surface; no host paths. Extend it and add the
 // host's `defaults` (interpreter prefix + venv read access, and the
@@ -38,9 +38,9 @@ defaults {
 }
 
 server "git" {
-    // Pinned against mcp-server-git 2026.8.18
+    // Pinned against mcp-server-git 2026.10.10
     // (negotiated MCP 2025-11-25, 12 tools, mcp-guard-tools-list-v4).
-    tools-list-hash "sha256:6d33f714008a03d44fcb8458e95fa8b5374240837f04e6bd5db86e49ac7e6410"
+    tools-list-hash "sha256:185000d12e4a14677cc13bda254c6f2b54c4d583e908c7896751bd13913506fc"
 
     tool "git_status" side_effect="read_only" {
         filesystem {
