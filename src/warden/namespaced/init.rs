@@ -57,7 +57,7 @@
 //!    an `execvp` failure still has the fd to send `ERR exec`.
 
 use std::ffi::CString;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
 
 const STAGE_UNSHARE: &str = "unshare";
 const STAGE_IDMAP: &str = "idmap";
@@ -276,17 +276,28 @@ pub(crate) fn enable_ipv6() -> std::io::Result<()> {
 /// is v4-only *by environment*, not by a setup failure — a
 /// v6-needing policy is still refused at selection via the host-side
 /// reachability check, while a v4-only policy must keep launching.
-/// Any other socket error means the family is registered (the v6
-/// setup stage then reports its own failure instead of being
-/// mistaken for an absent stack). `pub(crate)`: the capability probe
-/// gates its v6 stage on the same predicate.
+/// Only `EAFNOSUPPORT` proves the family unregistered — every other
+/// socket error (`EMFILE`/`ENFILE` fd exhaustion, a seccomp `EPERM`,
+/// …) means the stack is present and this probe fd merely failed, so
+/// the v6 setup stage reports its own failure instead of the launch
+/// misreading it as an absent stack. `pub(crate)`: the capability
+/// probe gates its v6 stage on the same predicate.
 pub(crate) fn ipv6_stack_present() -> bool {
+    // No std API probes an address family without side effects —
+    // `UdpSocket::bind` would fold a bind failure into the verdict —
+    // so the raw `socket()` stays. `SOCK_DGRAM` protocol 0 exercises
+    // family registration alone (no transport module needed) and
+    // `SOCK_CLOEXEC` keeps the probe fd out of any exec'd image for
+    // its brief lifetime.
     let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if fd >= 0 {
-        unsafe { libc::close(fd) };
-        return true;
+    if fd < 0 {
+        return errno() != libc::EAFNOSUPPORT;
     }
-    errno() != libc::EAFNOSUPPORT
+    // Ownership passes to File the moment the descriptor exists —
+    // drop runs close(2) on every exit path, so no success path can
+    // leak it.
+    let _probe = unsafe { std::fs::File::from_raw_fd(fd) };
+    true
 }
 
 /// Hide host daemon IPC. The mountns shares the host filesystem, and
