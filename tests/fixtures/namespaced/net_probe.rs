@@ -277,7 +277,21 @@ fn tcp_echo(dest: &str) -> ! {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    // argv is this fixture's contract with the harness, not a security
+    // boundary: the fixed mode table and `SocketAddr`-literal parsing
+    // are the only sinks arguments can reach, and the egress verdict is
+    // enforced by the proxy/evaluator — never decided here. `args_os` +
+    // a hard UTF-8 check puts even non-Unicode input on the usage exit
+    // instead of the `args()` panic.
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| match a.into_string() {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("net_probe: argument is not valid UTF-8");
+                exit(2);
+            }
+        })
+        .collect();
     let usage = |args: &[String]| -> ! {
         eprintln!(
             "usage: {} <udp-echo|tcp-echo> <ip:port> | \
