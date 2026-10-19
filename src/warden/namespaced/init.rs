@@ -361,15 +361,26 @@ fn hide_host_ipc_sockets() -> std::io::Result<()> {
     Ok(())
 }
 
+/// The fd numbers `MCP_WRIT_NS_KEEPFDS` names — the fd-exec pin
+/// descriptors init must hold open through the workload exec. Read
+/// before the env scrub removes the variable.
+fn keep_fds_from_env() -> Vec<i32> {
+    parse_keep_fds(&std::env::var(super::init_env::KEEPFDS).unwrap_or_default())
+}
+
+/// Comma-separated fd numbers in `raw`; non-numeric entries and the
+/// stdio descriptors (`<=2`) never qualify as pins.
+fn parse_keep_fds(raw: &str) -> Vec<i32> {
+    raw.split(',')
+        .filter_map(|s| s.parse::<i32>().ok())
+        .filter(|fd| *fd > 2)
+        .collect()
+}
+
 fn scrub_env_and_fds(extra_keep: &[i32]) {
     // Read the keep list before the env scrub removes it — the fd-exec
     // pin descriptors init must hold open through the workload exec.
-    let mut keep: Vec<i32> = std::env::var(super::init_env::KEEPFDS)
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|s| s.parse::<i32>().ok())
-        .filter(|fd| *fd > 2)
-        .collect();
+    let mut keep = keep_fds_from_env();
     keep.extend_from_slice(extra_keep);
     for var in super::init_env::ALL {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -440,6 +451,13 @@ fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
         };
         match super::super::linux_spawn::prepare_linux_child_sandbox_namespaced(&policy) {
             Ok(mut bits) => {
+                // The pin fds KEEPFDS names were uncloaked across
+                // init's own re-exec, and the workload's argv names
+                // them as `/proc/self/fd/N` — they must survive *its*
+                // exec too. `seal_ambient_fds` CLOEXECs every ambient
+                // descriptor but its keep list, so the list has to be
+                // handed over before the bits apply.
+                bits.exec_uncloak_fds = keep_fds_from_env();
                 if let Err(e) = bits.apply_in_child() {
                     send_err(sock, STAGE_SANDBOX, e.raw_os_error().unwrap_or(-1));
                     std::process::exit(97);
@@ -795,4 +813,20 @@ pub(crate) fn init_main() -> i32 {
         return 128 + sig;
     }
     libc::WEXITSTATUS(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_keep_fds;
+
+    #[test]
+    fn keep_fds_parses_only_inheritable_pins() {
+        assert_eq!(parse_keep_fds("3,4,10"), vec![3, 4, 10]);
+        // Stdio descriptors are never pins — a forged entry must not
+        // rescue fd 0-2 from the scrub's expectations.
+        assert_eq!(parse_keep_fds("0,1,2,5"), vec![5]);
+        // Malformed entries drop instead of failing the whole list.
+        assert_eq!(parse_keep_fds("7,junk,,8x,9"), vec![7, 9]);
+        assert!(parse_keep_fds("").is_empty());
+    }
 }

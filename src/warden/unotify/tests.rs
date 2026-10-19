@@ -10,7 +10,7 @@ use super::filter::{
 };
 use super::grants::{Grants, parse_snapshot, unix_secs_now};
 use super::handoff::{UnotifyParent, install_listener, send_listener};
-use super::inspect::{SockTarget, inspect_sockaddr, parse_sockaddr};
+use super::inspect::{SockTarget, inspect_sockaddr, parse_sockaddr, unix_sockaddr_is_pathname};
 use super::notif::{
     emulate_connect, notif_resp_continue, notif_resp_error, notif_resp_result, notify_recv,
     notify_send,
@@ -289,18 +289,44 @@ fn sockaddr_decode_v4_v6_mapped_and_other() {
         }
         other => panic!("expected inet, got {other:?}"),
     }
-    // AF_UNIX → OtherFamily.
+    // AF_UNIX → OtherFamily, and the sockaddr bytes stay pinned: the
+    // non-INET connect is emulated on the dup'd object with exactly
+    // these bytes, never `CONTINUE`d into a re-read of child memory.
     let mut su = [0u8; 8];
     su[0..2].copy_from_slice(&(libc::AF_UNIX as u16).to_ne_bytes());
-    assert!(matches!(
-        parse_sockaddr(&su, 8),
-        SockTarget::OtherFamily { .. }
-    ));
+    su[2..8].copy_from_slice(b"/s/ock");
+    match parse_sockaddr(&su, 8) {
+        SockTarget::OtherFamily { raw, .. } => assert_eq!(&raw[..], &su[..]),
+        other => panic!("expected other-family, got {other:?}"),
+    }
     // Truncated sockaddr_in → fail-closed unreadable.
     assert!(matches!(
         parse_sockaddr(&sa[..8], 8),
         SockTarget::Unreadable { .. }
     ));
+}
+
+#[test]
+fn unix_pathname_sockaddr_is_flagged() {
+    // Pathname AF_UNIX — `sun_path[0] != 0` — must be denied rather
+    // than supervisor-emulated (the path resolves in the caller's
+    // mount namespace, not the supervisor's).
+    let mut su = [0u8; 8];
+    su[0..2].copy_from_slice(&(libc::AF_UNIX as u16).to_ne_bytes());
+    su[2..8].copy_from_slice(b"/s/ock");
+    assert!(unix_sockaddr_is_pathname(libc::AF_UNIX as u16, &su));
+
+    // Abstract (`\0`-prefixed) and unnamed (`addrlen == 2`) unix
+    // addresses resolve in the socket's netns — emulation-safe.
+    su[2] = 0;
+    assert!(!unix_sockaddr_is_pathname(libc::AF_UNIX as u16, &su));
+    assert!(!unix_sockaddr_is_pathname(libc::AF_UNIX as u16, &su[..2]));
+
+    // Other families never resolve a filesystem path.
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+    sa[2] = b'/';
+    assert!(!unix_sockaddr_is_pathname(libc::AF_INET as u16, &sa));
 }
 
 #[test]

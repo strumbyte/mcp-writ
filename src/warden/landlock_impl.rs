@@ -337,7 +337,14 @@ fn create_landlock_ruleset_inner(
         )
     })?;
 
-    // Check for parent allow + child deny in global fs rules
+    // Check for parent allow + child deny in global fs rules — on the
+    // spelling *and* on the resolved base the rule builder opens. An
+    // allow spelled through a symlink alias resolves to the real parent
+    // object, and Landlock grants that object wholesale: the deny's real
+    // child underneath it is silently covered unless resolved
+    // containment is checked in this direction too (the opposite
+    // direction already exists — `deny_covers_grant` suppresses a
+    // covered allow per grant below).
     for denied in &policy.fs.denied_paths {
         for allowed in policy
             .fs
@@ -346,7 +353,9 @@ fn create_landlock_ruleset_inner(
             .chain(policy.fs.read_write.iter())
             .chain(policy.fs.executable.iter())
         {
-            if crate::policy::validator::covers_or_same(allowed, denied) {
+            if crate::policy::validator::covers_or_same(allowed, denied)
+                || resolved_covers(allowed, denied)
+            {
                 return Err(WardenError::sandbox_setup(
                     SandboxStage::Policy,
                     format!(

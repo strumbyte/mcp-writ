@@ -801,7 +801,12 @@ impl IsolationBackend for AppleContainerBackend {
             Ok(Box::new(
                 EngineRunHandle::attach(
                     child,
-                    self.engine.name(),
+                    // `program()` is the resolved CLI path the engine
+                    // itself spawns — `name()` would re-resolve
+                    // `container` through PATH on every lifecycle
+                    // command (`kill`/`rm`/`inspect`), and a PATH entry
+                    // swapped in after launch would answer teardown.
+                    self.engine.program(),
                     spec.unit_id_file.clone(),
                     spec.unit_name.clone(),
                 )

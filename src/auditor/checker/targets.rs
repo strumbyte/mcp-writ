@@ -38,9 +38,14 @@ pub(super) struct ExtractedTargets {
     /// Scalars inspected so far — shared across `arguments` and
     /// `inputResponses` so one frame has a single work budget.
     leaves: usize,
-    /// Normalized spellings already retained — deduplication so repeated
-    /// arguments cost one authorization each, not one per occurrence.
-    seen: std::collections::HashSet<String>,
+    /// Normalized spellings already retained *per slot* — deduplication
+    /// so repeated arguments cost one authorization each, not one per
+    /// occurrence. Keyed by slot because the same spelling is a distinct
+    /// check in each: a value path-classified under `path` and
+    /// host-classified under `host` must reach *both* authorization
+    /// passes — dropping the host copy on a value-only key would let a
+    /// destination skip the network verdict entirely.
+    seen: std::collections::HashSet<(TargetSlot, String)>,
 }
 
 impl ExtractedTargets {
@@ -74,7 +79,7 @@ impl ExtractedTargets {
             self.truncated = true;
             return;
         }
-        if !self.seen.insert(value.clone()) {
+        if !self.seen.insert((slot, value.clone())) {
             return;
         }
         match slot {
@@ -97,6 +102,7 @@ impl ExtractedTargets {
 }
 
 /// Which target vector a classified string lands in.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum TargetSlot {
     Path,
     Url,

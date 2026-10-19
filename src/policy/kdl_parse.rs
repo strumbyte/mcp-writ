@@ -23,7 +23,9 @@ pub(crate) use leaves::{
     parse_tool_fs, parse_tool_network, parse_tool_syscalls,
 };
 pub(crate) use mcp_rules::parse_server_mcp_rules;
-pub(crate) use servers::{parse_server_hashes, parse_servers, parse_tools_list_hashes};
+pub(crate) use servers::{
+    parse_server_hashes, parse_servers, parse_tools_list_hashes, resolve_tool_profile_name,
+};
 
 /// Parse KDL content string into a Policy struct.
 pub fn parse_kdl_policy(content: &str) -> Result<Policy, PolicyError> {

@@ -136,48 +136,7 @@ pub(crate) fn parse_servers(
                     (InputResponsesMode::Auto, false)
                 };
 
-            // Profile reference: either property `profile="name"` or child `profile "name"` / `profiles "name"`
-            let profile_name = if let Some(val) = child.get("profile") {
-                match val.as_string() {
-                    Some(s) => {
-                        // The property and a child node together are
-                        // ambiguous about which profile applies.
-                        if let Some(tc) = tool_children {
-                            let prof = unique_child(tc, "profile", &tool_ctx)?;
-                            let profs = unique_child(tc, "profiles", &tool_ctx)?;
-                            if prof.is_some() || profs.is_some() {
-                                return Err(PolicyError::KdlParse(format!(
-                                    "tool '{tool_name}' sets 'profile' both as a property \
-                                     and as a profile/profiles child node"
-                                )));
-                            }
-                        }
-                        Some(s.to_string())
-                    }
-                    None => {
-                        return Err(PolicyError::KdlParse(format!(
-                            "'profile' property on tool '{}' must be a string",
-                            tool_name
-                        )));
-                    }
-                }
-            } else if let Some(tc) = tool_children {
-                let prof = unique_child(tc, "profile", &tool_ctx)?;
-                let profs = unique_child(tc, "profiles", &tool_ctx)?;
-                if prof.is_some() && profs.is_some() {
-                    // `profile "a"` and `profiles "b"` siblings pick one
-                    // silently otherwise — either could be meant.
-                    return Err(PolicyError::KdlParse(format!(
-                        "tool '{tool_name}' declares both 'profile' and 'profiles' child nodes"
-                    )));
-                }
-                prof.or(profs)
-                    .and_then(|n| n.get(0))
-                    .and_then(|v| v.as_string())
-                    .map(|s| s.to_string())
-            } else {
-                None
-            };
+            let profile_name = resolve_tool_profile_name(child, tool_children, &tool_ctx)?;
 
             let profile_layer = if let Some(ref pname) = profile_name {
                 profiles
@@ -363,6 +322,65 @@ pub(crate) fn parse_servers(
     }
 
     Ok(tools)
+}
+
+/// The profile a `tool` node names, in either spelling: the
+/// `profile="name"` property or a `profile "name"` / `profiles "name"`
+/// child node. The property and a child node together are ambiguous
+/// about which applies — as are both child nodes — so either pairing is
+/// a parse error rather than a silent pick. Shared by the inline parse
+/// and the `when`-override application on an existing tool so the two
+/// resolve (and reject) identically.
+pub(crate) fn resolve_tool_profile_name(
+    child: &kdl::KdlNode,
+    tool_children: Option<&KdlDocument>,
+    tool_ctx: &str,
+) -> Result<Option<String>, PolicyError> {
+    if let Some(val) = child.get("profile") {
+        let Some(s) = val.as_string() else {
+            return Err(PolicyError::KdlParse(format!(
+                "'profile' property on {tool_ctx} must be a string"
+            )));
+        };
+        // The property and a child node together are ambiguous about
+        // which profile applies.
+        if let Some(tc) = tool_children {
+            let prof = unique_child(tc, "profile", tool_ctx)?;
+            let profs = unique_child(tc, "profiles", tool_ctx)?;
+            if prof.is_some() || profs.is_some() {
+                return Err(PolicyError::KdlParse(format!(
+                    "{tool_ctx} sets 'profile' both as a property \
+                     and as a profile/profiles child node"
+                )));
+            }
+        }
+        return Ok(Some(s.to_string()));
+    }
+    let Some(tc) = tool_children else {
+        return Ok(None);
+    };
+    let prof = unique_child(tc, "profile", tool_ctx)?;
+    let profs = unique_child(tc, "profiles", tool_ctx)?;
+    if prof.is_some() && profs.is_some() {
+        // `profile "a"` and `profiles "b"` siblings pick one silently
+        // otherwise — either could be meant.
+        return Err(PolicyError::KdlParse(format!(
+            "{tool_ctx} declares both 'profile' and 'profiles' child nodes"
+        )));
+    }
+    let Some(node) = prof.or(profs) else {
+        return Ok(None);
+    };
+    // A *present* `profile`/`profiles` child whose first argument is
+    // missing or not a string must not collapse to `None` — the tool
+    // would load without the profile restrictions the document declares.
+    let name = node.get(0).and_then(|v| v.as_string()).ok_or_else(|| {
+        PolicyError::KdlParse(format!(
+            "'{}' child node on {tool_ctx} requires a string profile-name argument",
+            node.name().value(),
+        ))
+    })?;
+    Ok(Some(name.to_string()))
 }
 
 /// Parse hash entries (binary-hash, lockfile-hash, entrypoint-hash,

@@ -825,3 +825,128 @@ fn test_when_multiple_blocks_only_matching_applied() {
     let policy = load_kdl_policy_with_env(&dir.join("policy.kdl"), "staging").unwrap();
     assert_eq!(policy.logging.level, "debug");
 }
+
+#[test]
+fn test_when_tool_profile_applies_to_existing_tool() {
+    // Regression: a  override naming  on an *existing*
+    // tool must apply the profile layer — the reference was previously
+    // dropped silently, so conditional restrictions never landed.
+    let dir = make_test_dir("when_tool_profile");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        r#"
+            policy version=1
+            profile "restricted" {
+                filesystem {
+                    deny "/srv/secrets"
+                }
+                network {
+                    deny host="exfil.example.com"
+                }
+            }
+            server "s1" {
+                tool "fetch"
+            }
+            when environment="production" {
+                server "s1" {
+                    tool "fetch" profile="restricted"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap();
+    let fetch = policy.tools.iter().find(|t| t.name == "fetch").unwrap();
+    assert!(fetch.fs_explicit);
+    let fs = fetch.fs.as_ref().unwrap();
+    assert!(
+        fs.denied_paths.contains(&"/srv/secrets".to_string()),
+        "profile deny must reach the existing tool: {fs:?}"
+    );
+    assert!(fetch.network_explicit);
+    let net = fetch.network.as_ref().unwrap();
+    assert!(
+        net.denied_hosts.contains(&"exfil.example.com".to_string()),
+        "profile deny must reach the existing tool: {net:?}"
+    );
+
+    // A non-matching environment never applies the block — the tool
+    // keeps its un-profiled state.
+    let dev = load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
+    let fetch = dev.tools.iter().find(|t| t.name == "fetch").unwrap();
+    assert!(!fetch.fs_explicit);
+    assert!(
+        fetch
+            .fs
+            .as_ref()
+            .is_none_or(|fs| fs.denied_paths.is_empty())
+    );
+}
+
+#[test]
+fn test_when_tool_profile_deny_sticks_against_own_allow() {
+    // Deny entries from the profile accumulate under the override's own
+    // field blocks and re-prune their allow side — the tool's inline
+    // allow cannot carve the profile's deny back out.
+    let dir = make_test_dir("when_tool_profile_deny");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        r#"
+            policy version=1
+            profile "restricted" {
+                filesystem {
+                    deny "/srv/secrets"
+                }
+            }
+            server "s1" {
+                tool "fetch"
+            }
+            when environment="production" {
+                server "s1" {
+                    tool "fetch" profile="restricted" {
+                        filesystem {
+                            allow "/srv/secrets"
+                            allow "/work"
+                        }
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap();
+    let fetch = policy.tools.iter().find(|t| t.name == "fetch").unwrap();
+    let fs = fetch.fs.as_ref().unwrap();
+    assert_eq!(fs.denied_paths, vec!["/srv/secrets".to_string()]);
+    assert_eq!(fs.read_only_paths, vec!["/work".to_string()]);
+}
+
+#[test]
+fn test_when_tool_unknown_profile_fails_closed() {
+    // An unresolvable profile name on an existing tool is a load error,
+    // the same as the inline parse — never a silently ignored reference.
+    let dir = make_test_dir("when_tool_bad_profile");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        r#"
+            policy version=1
+            server "s1" {
+                tool "fetch"
+            }
+            when environment="production" {
+                server "s1" {
+                    tool "fetch" profile="missing"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let err = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap_err();
+    assert!(
+        err.to_string().contains("unknown profile 'missing'"),
+        "expected fail-closed unknown-profile error, got: {err}"
+    );
+}

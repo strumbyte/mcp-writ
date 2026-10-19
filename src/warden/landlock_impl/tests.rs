@@ -455,6 +455,41 @@ fn test_deny_of_target_suppresses_symlinked_allow() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+#[cfg(unix)]
+fn test_symlinked_allow_covers_denied_real_child() {
+    // The launch-gate direction of F85: the allow is spelled through
+    // the symlink and the deny names the real child. Landlock grants
+    // the resolved parent wholesale — the spelled deny is silently
+    // covered unless containment is compared on resolved spellings.
+    // The deny's tail need not exist yet for the check to fire.
+    // `tempdir()` is unique per call and removes itself on drop —
+    // including the panic path — so no cleanup is needed after asserts.
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // `resolved_covers(allow, deny)` — allow's resolved object covers
+    // the deny's resolved spelling.
+    assert!(resolved_covers(
+        &link.to_string_lossy(),
+        &format!("{}/not-created-yet", real.display())
+    ));
+    // Spelling-equality direction still holds as well.
+    assert!(resolved_covers(
+        &real.to_string_lossy(),
+        &format!("{}/inside", real.display())
+    ));
+    // A disjoint resolved tree is not covered.
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    assert!(!resolved_covers(
+        &other.to_string_lossy(),
+        &format!("{}/inside", real.display())
+    ));
+}
+
 // -- PR-18 (D-2): `allow unix=` opt-ins ---------------------------------
 
 /// `unix="*"` supersedes a path-bound opt-in declared beside it: the

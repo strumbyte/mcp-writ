@@ -28,9 +28,14 @@ pub(super) enum SockTarget {
         port: u16,
         raw: Box<[u8]>,
     },
-    /// A non-INET family (`AF_UNIX`, …) — out of this layer's scope;
-    /// continued unsupervised, counted, documented.
-    OtherFamily { family: u16 },
+    /// A non-INET family (`AF_UNIX`, …) — out of this layer's
+    /// destination-gating scope. `raw` still carries the pinned
+    /// sockaddr bytes: a `CONTINUE` answer would re-resolve the child's
+    /// *fd number* at resume time, and a sibling could `dup2` an INET
+    /// socket into the slot between the `SO_DOMAIN` check and the
+    /// resumed connect — so the connect is emulated on the dup'd
+    /// object exactly like an allowed INET one, never continued.
+    OtherFamily { family: u16, raw: Box<[u8]> },
     /// The `sockaddr` could not be read or decoded — fail closed.
     Unreadable { detail: &'static str },
 }
@@ -90,7 +95,10 @@ pub(super) fn parse_sockaddr(bytes: &[u8], addrlen: u64) -> SockTarget {
                 raw: bytes.into(),
             }
         }
-        _ => SockTarget::OtherFamily { family },
+        _ => SockTarget::OtherFamily {
+            family,
+            raw: bytes.into(),
+        },
     }
 }
 
@@ -154,6 +162,17 @@ pub(super) fn socket_domain(pid: u32, fd: u64) -> SockDomain {
         libc::AF_INET | libc::AF_INET6 => SockDomain::Inet,
         _ => SockDomain::Other,
     }
+}
+
+/// True when `raw` pins an `AF_UNIX` sockaddr carrying a filesystem
+/// pathname — `sun_path[0] != 0` (the byte after `sa_family`). A
+/// pathname resolves in the *caller's* mount namespace, so emulating
+/// the connect on a dup'd fd would bind the supervisor's view of that
+/// path, not the child's. Abstract (`sun_path[0] == 0`) and unnamed
+/// unix addresses resolve in the socket's own network namespace —
+/// carried by the dup'd object — and stay emulation-safe.
+pub(super) fn unix_sockaddr_is_pathname(family: u16, raw: &[u8]) -> bool {
+    family as i32 == libc::AF_UNIX && raw.get(2).is_some_and(|b| *b != 0)
 }
 
 /// `pidfd_open` + `pidfd_getfd` duplicate of the child's fd — the dup

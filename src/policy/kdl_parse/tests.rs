@@ -82,3 +82,23 @@ fn tool_accepts_single_profile_declaration_forms() {
         assert!(parse_kdl_policy(&src).is_ok(), "{decl}");
     }
 }
+
+#[test]
+fn tool_profile_child_with_bad_argument_is_an_error() {
+    // A *present* `profile`/`profiles` child that names nothing — or
+    // names a non-string — must fail the load: collapsing it to `None`
+    // would load the tool without the restrictions the document
+    // declares.
+    for decl in ["profile", "profiles"] {
+        for arg in ["", " 0", " #true"] {
+            let src = format!(
+                "policy version=1\nprofile \"p\" {{}}\nserver \"s\" {{\ntool \"t\" {{\n    {decl}{arg}\n}}\n}}"
+            );
+            let err = parse_err(&src);
+            assert!(
+                matches!(&err, PolicyError::KdlParse(m) if m.contains("profile-name")),
+                "{decl}{arg}: {err:?}"
+            );
+        }
+    }
+}

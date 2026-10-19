@@ -19,6 +19,7 @@ use super::filter::CONNECT_NR;
 use super::grants::{GrantSource, Grants};
 use super::inspect::{
     SockDomain, SockProto, SockTarget, inspect_sockaddr, socket_domain, socket_proto,
+    unix_sockaddr_is_pathname,
 };
 use super::notif::{
     emulate_connect, notif_resp_continue, notif_resp_error, notif_resp_result, notify_id_valid,
@@ -56,8 +57,11 @@ pub struct SupervisorStats {
     pub continued: u64,
     /// `connect` denied → `EACCES` sent after the audit record.
     pub denied: u64,
-    /// Non-INET-family connects passed through unsupervised after the
-    /// socket's immutable `SO_DOMAIN` proved it is not INET.
+    /// Non-INET-family connects passed through after the socket's
+    /// immutable `SO_DOMAIN` proved it is not INET — emulated on the
+    /// dup'd object like an allowed INET connect, never `CONTINUE`d:
+    /// a resume would re-resolve the child's fd number, which a
+    /// sibling could have swapped for an INET socket.
     pub noninet_skipped: u64,
     /// Non-INET-sockaddr connects refused because the fd's real domain
     /// was INET/INET6 or unverifiable — a `CONTINUE` would re-read a
@@ -370,7 +374,7 @@ impl Loop {
             return;
         }
         match target {
-            SockTarget::OtherFamily { family } => {
+            SockTarget::OtherFamily { family, raw } => {
                 // The sockaddr bytes are child-mutable: a sibling could
                 // show a non-INET family here and rewrite the buffer to
                 // an INET destination before the kernel re-reads it on
@@ -381,14 +385,48 @@ impl Loop {
                     SockDomain::Other => {
                         // A genuinely non-INET socket cannot form an
                         // INET connection no matter what the buffer is
-                        // rewritten to — continuing is race-free.
+                        // rewritten to — but `CONTINUE` would also
+                        // re-resolve the child's fd *number* at resume
+                        // time, and a sibling could `dup2` an INET
+                        // socket into the slot between this SO_DOMAIN
+                        // check and the resumed connect. Emulate on the
+                        // dup'd object instead: the verdict (pass) was
+                        // made on the socket itself, and the response
+                        // never resumes the child's mutable arguments.
+                        //
+                        // A pathname AF_UNIX connect is the exception:
+                        // `sun_path` resolves in the *caller's* mount
+                        // namespace, and the supervisor's view of that
+                        // path is not the child's — emulating here would
+                        // connect a filesystem location under the wrong
+                        // namespace. No child-context helper exists and
+                        // CONTINUE would reopen the fd-swap hole above,
+                        // so pathname unix connects are denied; abstract
+                        // and unnamed unix sockets stay emulated below.
+                        if unix_sockaddr_is_pathname(family, &raw) {
+                            self.stats.noninet_denied += 1;
+                            self.deny(
+                                notif.id,
+                                pid,
+                                "unix-pathname-connect",
+                                &format!("proto=? dest=? port=? family={family}"),
+                                None,
+                            );
+                            return;
+                        }
                         self.stats.noninet_skipped += 1;
                         tracing::debug!(
                             pid,
                             family,
-                            "connect: non-INET family — continued unsupervised"
+                            "connect: non-INET family — emulated unsupervised"
                         );
-                        self.continue_notif(notif.id);
+                        self.queue_emulation(
+                            notif,
+                            raw,
+                            "non-inet-family",
+                            &format!("proto=? dest=? port=? family={family}"),
+                            None,
+                        );
                     }
                     SockDomain::Inet | SockDomain::Unknown => {
                         // INET socket claiming a non-INET sockaddr, or

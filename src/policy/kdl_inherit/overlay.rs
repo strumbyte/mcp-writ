@@ -13,8 +13,8 @@ use crate::policy::kdl_parse::{
     parse_logging_fail_closed, parse_network_rules, parse_process_exec_allowed,
     parse_server_hashes, parse_server_mcp_rules, parse_servers, parse_syscall_allows,
     parse_tool_fs, parse_tool_network, parse_tool_syscalls, parse_tools_list_hashes,
-    parse_trajectory, resolve_tool_args_schema, unique_child, validate_logging_level,
-    validate_tool_shape_v2,
+    parse_trajectory, resolve_tool_args_schema, resolve_tool_profile_name, unique_child,
+    validate_logging_level, validate_tool_shape_v2,
 };
 use crate::policy::merge::PolicyLayer;
 use crate::policy::provenance::{DeclOrigin, LoadWarning, LoadWarningKind, Provenance};
@@ -1637,6 +1637,64 @@ fn apply_overrides_from_doc(
                         InputResponsesMode::parse_kdl(raw).map_err(PolicyError::KdlParse)?;
                     existing.input_responses_specified = true;
                     prov.set(format!("{tkey}.input_responses"), path, tline);
+                }
+                // A `when` override that names a profile must apply it
+                // to an existing tool too — the inline parse resolves
+                // the same spellings, so an unresolvable name is a
+                // load error, not a silently dropped restriction. The
+                // layer merges onto the tool's effective state in the
+                // same position it holds inline — below this override's
+                // own field blocks — so those still replace it.
+                if let Some(pname) = resolve_tool_profile_name(child, child.children(), &tool_ctx)?
+                {
+                    let profile_layer = profiles.get(&pname).ok_or_else(|| {
+                        PolicyError::Validation(format!(
+                            "unknown profile '{pname}' referenced by tool '{tool_name}'"
+                        ))
+                    })?;
+                    prov.set(format!("{tkey}.profile"), path, tline);
+                    if profile_layer.fs.is_some() {
+                        if !existing.fs_explicit {
+                            existing.fs = Some(tool_fs_base(&policy.fs, existing.fs.as_ref()));
+                        }
+                        existing.fs_explicit = true;
+                        merge_tool_fs(
+                            &mut existing.fs,
+                            profile_layer.fs.as_ref(),
+                            prov,
+                            &tkey,
+                            path,
+                            tline,
+                        );
+                    }
+                    if profile_layer.syscalls.is_some() {
+                        existing.syscalls_explicit = true;
+                        merge_tool_syscalls(
+                            &mut existing.syscalls,
+                            profile_layer.syscalls.as_ref(),
+                            prov,
+                            &tkey,
+                            path,
+                            tline,
+                        );
+                    }
+                    if profile_layer.network.is_some() {
+                        if !existing.network_explicit {
+                            existing.network = Some(tool_network_base(
+                                &policy.network,
+                                existing.network.as_ref(),
+                            ));
+                        }
+                        existing.network_explicit = true;
+                        merge_tool_network(
+                            &mut existing.network,
+                            profile_layer.network.as_ref(),
+                            prov,
+                            &tkey,
+                            path,
+                            tline,
+                        );
+                    }
                 }
                 if let Some(tc) = child.children() {
                     if let Some(fs_node) = unique_child(tc, "filesystem", &tool_ctx)?

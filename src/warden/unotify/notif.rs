@@ -180,7 +180,16 @@ pub(super) fn emulate_connect(pid: u32, fd: u64, sockaddr: &[u8]) -> io::Result<
         0
     } else {
         match io::Error::last_os_error().raw_os_error() {
-            Some(libc::EINPROGRESS) | Some(libc::EAGAIN) => connect_wait(dup),
+            Some(libc::EINPROGRESS) | Some(libc::EALREADY) => connect_wait(dup),
+            // A non-INET socket (AF_UNIX full backlog) reports EAGAIN
+            // *without initiating* the connect — `SO_ERROR` stays 0
+            // and cannot witness completion, so only a fresh attempt
+            // can finish it. Only when the child's socket was *blocking*:
+            // on an originally-nonblocking socket EAGAIN is the verdict
+            // the program must see — retrying here would block a socket
+            // the child believes is nonblocking.
+            Some(libc::EAGAIN) if saved & libc::O_NONBLOCK != 0 => libc::EAGAIN,
+            Some(libc::EAGAIN) => connect_retry(dup, sockaddr),
             Some(e) => e,
             None => libc::EIO,
         }
@@ -243,6 +252,69 @@ fn connect_wait(dup: RawFd) -> i32 {
         } else {
             err
         };
+    }
+}
+
+/// Retry `connect(2)` after `EAGAIN` — the non-INET emulation path.
+/// The kernel did not start the connect on the first attempt, so no
+/// in-progress state exists for `SO_ERROR` to observe; only another
+/// attempt can complete it. `POLLOUT` paces each retry inside the same
+/// [`EMU_CONNECT_TIMEOUT_MS`] budget, and a short sleep keeps a
+/// stalled-listener socket from spinning the worker CPU-hot. `EISCONN`
+/// means an earlier attempt connected under us; `EINPROGRESS`/
+/// `EALREADY` means a connect really is in flight — `connect_wait`'s
+/// `SO_ERROR` read finishes those.
+fn connect_retry(dup: RawFd, sockaddr: &[u8]) -> i32 {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(EMU_CONNECT_TIMEOUT_MS as u64);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return libc::ETIMEDOUT;
+        }
+        let mut pfd = libc::pollfd {
+            fd: dup,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let ms = left.as_millis().min(i32::MAX as u128) as i32;
+        // Safety: `pfd` is live for the call; `dup` is owned by the
+        // caller and outlives this wait.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms.max(1)) };
+        if rc < 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+        }
+        if rc == 0 {
+            return libc::ETIMEDOUT;
+        }
+        // Safety: `sockaddr`/`len` name the pinned bytes; `dup` is the
+        // caller's owned fd.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let rc = unsafe {
+            libc::connect(
+                dup,
+                sockaddr.as_ptr().cast::<libc::sockaddr>(),
+                sockaddr.len() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            return 0;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EAGAIN) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Some(libc::EISCONN) => return 0,
+            Some(libc::EINPROGRESS) | Some(libc::EALREADY) => return connect_wait(dup),
+            Some(e) => return e,
+            None => return libc::EIO,
+        }
     }
 }
 
