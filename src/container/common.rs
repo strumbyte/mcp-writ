@@ -941,9 +941,12 @@ pub fn refuse_wslc_non_linux_guest(
     Ok(())
 }
 
-/// Write a Dockerfile to disk (for --output-dockerfile mode).
+/// Write a Dockerfile to disk (for --output-dockerfile mode). The
+/// atomic writer replaces a planted link at the destination rather
+/// than following it — operator-selected output paths get the same
+/// hardening as policy/report publication.
 pub fn write_dockerfile_to_path(output_path: &Path, content: &str) -> Result<(), ContainerError> {
-    std::fs::write(output_path, content).map_err(|e| {
+    crate::fspriv::write_file_atomic(output_path, content.as_bytes()).map_err(|e| {
         ContainerError::DockerfileGeneration(format!(
             "failed to write Dockerfile to '{}': {e}",
             output_path.display()

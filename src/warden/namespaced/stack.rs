@@ -98,6 +98,12 @@ const UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 /// anything beyond it is counted in `udp_audit_suppressed`, never
 /// queued, so a datagram flood cannot become a sink flood.
 const UDP_AUDIT_BURST: usize = 32;
+/// Sub-cap on denied-datagram records *within* the same per-second
+/// aggregate: a flood of fresh denied destinations is telemetry and
+/// must never starve the allow path's required `authorize` records —
+/// at least `UDP_AUDIT_BURST - UDP_DENY_AUDIT_BURST` slots per window
+/// remain available to them.
+const UDP_DENY_AUDIT_BURST: usize = 8;
 const UDP_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 /// A denied datagram with no flow repeats one audit subject — collapse
 /// repeats per destination inside this window; the map is bounded and
@@ -1041,13 +1047,15 @@ enum FlowAudit {
 struct AuditBudget {
     window_start: std::time::Instant,
     used: usize,
+    limit: usize,
 }
 
 impl AuditBudget {
-    fn new() -> Self {
+    fn new(limit: usize) -> Self {
         Self {
             window_start: std::time::Instant::now(),
             used: 0,
+            limit,
         }
     }
 
@@ -1057,11 +1065,18 @@ impl AuditBudget {
             self.window_start = std::time::Instant::now();
             self.used = 0;
         }
-        if self.used >= UDP_AUDIT_BURST {
+        if self.used >= self.limit {
             return false;
         }
         self.used += 1;
         true
+    }
+
+    /// `true` when a slot is free this window — consumes nothing; the
+    /// caller charges with `take` only once every budget is known to
+    /// admit the event.
+    fn available(&self) -> bool {
+        self.window_start.elapsed() >= UDP_AUDIT_WINDOW || self.used < self.limit
     }
 }
 
@@ -1083,7 +1098,8 @@ async fn udp_task(
     // the dedup the flow's `audit` field does for allowed traffic —
     // without it a single-target flood would spend the whole budget.
     let mut deny_audit: HashMap<(IpAddr, u16), std::time::Instant> = HashMap::new();
-    let mut budget = AuditBudget::new();
+    let mut budget = AuditBudget::new(UDP_AUDIT_BURST);
+    let mut deny_budget = AuditBudget::new(UDP_DENY_AUDIT_BURST);
     let mut reaper = tokio::time::interval(UDP_IDLE / 2);
     reaper.tick().await; // immediate first tick is free
     loop {
@@ -1101,8 +1117,16 @@ async fn udp_task(
                         );
                         if fresh {
                             if !budget.take() {
+                                // The budget throttles telemetry, never
+                                // authorization: a fresh tuple whose
+                                // `authorize` record cannot be emitted
+                                // must not relay unaudited. Drop the
+                                // datagram — the workload's retransmit
+                                // lands in a replenished window.
                                 stats.udp_audit_suppressed.fetch_add(1, Ordering::Relaxed);
-                            } else if gate
+                                continue;
+                            }
+                            if gate
                                 .authorize(
                                     EgressProto::Udp,
                                     d.dst,
@@ -1145,7 +1169,13 @@ async fn udp_task(
                             due
                         };
                         if fresh {
-                            if budget.take() {
+                            // Charge neither budget until both admit
+                            // the record — a shared-cap rejection must
+                            // not spend the deny sub-budget on an event
+                            // that was never emitted.
+                            if deny_budget.available() && budget.available() {
+                                deny_budget.take();
+                                budget.take();
                                 gate.denied(
                                     EgressProto::Udp,
                                     d.dst,

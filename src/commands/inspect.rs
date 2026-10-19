@@ -57,10 +57,12 @@ pub fn run_inspect(args: InspectArgs) {
     };
 
     match args.output {
-        Some(path) => std::fs::write(&path, &output).unwrap_or_else(|e| {
-            eprintln!("Error writing output: {e}");
-            std::process::exit(1);
-        }),
+        Some(path) => {
+            crate::fspriv::write_file_atomic(&path, output.as_bytes()).unwrap_or_else(|e| {
+                eprintln!("Error writing output: {e}");
+                std::process::exit(1);
+            })
+        }
         None => print!("{output}"),
     }
 }
@@ -150,10 +152,12 @@ fn run_inspect_source(
     };
 
     match args.output {
-        Some(ref path) => std::fs::write(path, &output).unwrap_or_else(|e| {
-            eprintln!("Error writing output: {e}");
-            std::process::exit(1);
-        }),
+        Some(ref path) => {
+            crate::fspriv::write_file_atomic(path, output.as_bytes()).unwrap_or_else(|e| {
+                eprintln!("Error writing output: {e}");
+                std::process::exit(1);
+            })
+        }
         None => print!("{output}"),
     }
 }

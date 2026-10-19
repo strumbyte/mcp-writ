@@ -51,7 +51,7 @@ impl PageAccumulator {
         let mut tools_iter = page_tools.into_iter();
         for tool in tools_iter.by_ref() {
             if self.tools.iter().any(|existing| existing.name == tool.name) {
-                tracing::warn!(tool = %tool.name, "duplicate tool name in tools/list; skipping");
+                tracing::warn!(tool = %crate::termutil::sanitize_for_terminal(&tool.name), "duplicate tool name in tools/list; skipping");
             } else {
                 self.tools.push(tool);
             }

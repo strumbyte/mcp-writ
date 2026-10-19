@@ -61,6 +61,10 @@ const MAX_TCP_CONNECTIONS: usize = 64;
 /// Idle timeout on a client TCP connection — keeps a parked connection
 /// from holding its slot forever.
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bound on draining in-flight per-datagram tasks at shutdown — each
+/// is already bounded by `UPSTREAM_TIMEOUT`, so this only covers a
+/// stalled task that must not hold shutdown open forever.
+const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default ceiling on live name→address grants.
 pub(crate) const DEFAULT_MAX_GRANTS: usize = 16_384;
 /// Largest TCP message frame accepted from a client (RFC 7766 framing
@@ -383,9 +387,45 @@ pub async fn serve(
     tokio::pin!(shutdown);
     let tcp_conns = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
     let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
+    // Fail-closed audit continuity: once `writer_failed` latches, the
+    // gate can still *deny* safely but can no longer record that it
+    // did — rather than serve unaudited refusals indefinitely, exit
+    // like every other network supervisor (namespaced/unotify/macos
+    // proxy/ebpf all terminate on `is_failed`). A best-effort logger
+    // never trips `is_failed`, so this arm stays dormant there.
+    let audit_watch = core.logger.clone();
+    let mut fail_watch = audit_watch.failure_watch();
+    // Spawned work is tracked so a stopped gate actually *stops*: TCP
+    // sessions are unbounded per-connection loops that outlive `serve`
+    // if detached (an audit-dead sink would keep being answered
+    // around), and single-datagram UDP tasks are drained on exit so
+    // "stopped" is only reported once in-flight work has finished.
+    let mut tcp_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let mut udp_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let mut result = Ok(());
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            // Reap completed tasks as they finish — a JoinSet retains
+            // every completed entry until joined, so a long-lived gate
+            // would otherwise accumulate one entry per answered query.
+            _ = tcp_tasks.join_next(), if !tcp_tasks.is_empty() => {}
+            _ = udp_tasks.join_next(), if !udp_tasks.is_empty() => {}
+            _ = async {
+                loop {
+                    if audit_watch.is_failed() {
+                        break;
+                    }
+                    if fail_watch.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            } => {
+                result = Err(std::io::Error::other(
+                    "audit sink failed under fail-closed logging; refusing to serve unaudited",
+                ));
+                break;
+            }
             accepted = tcp.accept() => {
                 let (stream, peer) = match accepted {
                     Ok(v) => v,
@@ -400,7 +440,7 @@ pub async fn serve(
                     continue;
                 };
                 let core = core.clone();
-                tokio::spawn(async move {
+                tcp_tasks.spawn(async move {
                     let _conn_permit = conn_permit;
                     serve_tcp_connection(stream, peer, core).await;
                 });
@@ -432,7 +472,7 @@ pub async fn serve(
                 };
                 let core = core.clone();
                 let udp = udp.clone();
-                tokio::spawn(async move {
+                udp_tasks.spawn(async move {
                     let _permit = permit;
                     if let Some(resp) = process_query(&pkt, peer, Transport::Udp, &core).await {
                         let _ = udp.send_to(&resp, peer).await;
@@ -441,7 +481,17 @@ pub async fn serve(
             }
         }
     }
-    Ok(())
+    // Teardown: abort the TCP sessions (unbounded loops — cancellation
+    // is the only bound) and drain the per-datagram UDP tasks, each
+    // bounded by `UPSTREAM_TIMEOUT`. The drain itself is capped so a
+    // stalled task cannot hold shutdown forever.
+    tcp_tasks.abort_all();
+    while tcp_tasks.join_next().await.is_some() {}
+    let _ = tokio::time::timeout(TASK_DRAIN_TIMEOUT, async {
+        while udp_tasks.join_next().await.is_some() {}
+    })
+    .await;
+    result
 }
 
 enum Transport {

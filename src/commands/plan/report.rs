@@ -42,7 +42,7 @@ pub(super) fn emit_and_exit(report: &PlanReport, report_path: Option<&Path>) -> 
         std::process::exit(report.status.exit_code());
     };
 
-    match std::fs::write(path, report.to_json()) {
+    match crate::fspriv::write_file_atomic(path, report.to_json().as_bytes()) {
         Ok(()) => {
             eprintln!("plan report written to {}", path.display());
             print_summary(report);
