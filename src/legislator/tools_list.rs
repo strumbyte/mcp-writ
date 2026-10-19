@@ -536,9 +536,8 @@ fn relay_discovery_stderr(stderr: Option<tokio::process::ChildStderr>) {
                 while let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
                     pending.extend_from_slice(&chunk[..nl]);
                     let line = std::mem::take(&mut pending);
-                    let clean = crate::termutil::sanitize_for_terminal(
-                        &String::from_utf8_lossy(&line),
-                    );
+                    let clean =
+                        crate::termutil::sanitize_for_terminal(&String::from_utf8_lossy(&line));
                     let _ = writeln!(std::io::stderr().lock(), "{clean}");
                     chunk = &chunk[nl + 1..];
                 }
@@ -548,8 +547,7 @@ fn relay_discovery_stderr(stderr: Option<tokio::process::ChildStderr>) {
             reader.consume(consumed);
         }
         if !pending.is_empty() {
-            let clean =
-                crate::termutil::sanitize_for_terminal(&String::from_utf8_lossy(&pending));
+            let clean = crate::termutil::sanitize_for_terminal(&String::from_utf8_lossy(&pending));
             let _ = writeln!(std::io::stderr().lock(), "{clean}");
         }
     });

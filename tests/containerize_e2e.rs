@@ -263,9 +263,17 @@ fn test_containerize_output_dockerfile() {
         content.contains("WORKDIR /app"),
         "Dockerfile should set WORKDIR: {content}"
     );
+    // The runner lands executable through COPY --chmod — a shell-form
+    // `RUN chmod` would be answerable to the base image's Config.Shell.
     assert!(
-        content.contains(r#"COPY ["mcp-secure-runner", "/usr/local/bin/mcp-secure-runner"]"#),
-        "Dockerfile should COPY runner: {content}"
+        content.contains(
+            r#"COPY --chmod=755 ["mcp-secure-runner", "/usr/local/bin/mcp-secure-runner"]"#
+        ),
+        "Dockerfile should COPY runner with --chmod: {content}"
+    );
+    assert!(
+        !content.contains("\nRUN "),
+        "Dockerfile must not emit shell RUN instructions: {content}"
     );
     assert!(
         content.contains(r#"COPY ["policy.kdl", "/etc/mcp-secure/policy.kdl"]"#),

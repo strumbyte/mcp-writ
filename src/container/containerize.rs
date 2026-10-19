@@ -11,7 +11,7 @@ use crate::container::options::ContainerizeOptions;
 use crate::container::presenter::{BuildOutcome, format_project_hints_stderr};
 use crate::container::runtime_detect::RuntimeType;
 use crate::error::ContainerError;
-use crate::execution::{EngineName, TargetArch, TargetOs};
+use crate::execution::{EngineName, TargetOs};
 
 /// Execute the containerize flow: detect runtime → Dockerfile → build → tag.
 ///
@@ -81,7 +81,9 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
             detect_runtime_from_source(&options.source_dir, options.base_image.as_deref(), layout)?;
         // The emit-only path runs no engine inspect — whatever spelling
         // lands in FROM is verbatim, so a mutable base must be flagged
-        // rather than implied pinned.
+        // rather than implied pinned, and inherited ONBUILD triggers go
+        // unverified (the build path inspects the base and refuses it
+        // when it carries any).
         if !crate::container::runner::image_ref_is_digest_pinned(&runtime_info.base_image) {
             eprintln!(
                 "[containerize] note: base image '{}' is a mutable tag — the \
@@ -89,6 +91,11 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
                 runtime_info.base_image
             );
         }
+        eprintln!(
+            "[containerize] note: the emit-only path does not inspect the base image — \
+             a base carrying ONBUILD triggers executes them when the emitted Dockerfile \
+             is built; the build path refuses such bases"
+        );
         let extra_copies = collect_source_copies(&options.source_dir, layout)?;
         let dockerfile_content =
             containerize_dockerfile(&runtime_info, extra_copies, "", layout, &[])?;
@@ -113,16 +120,15 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
     )?;
     let probe_base = preliminary.base_image.clone();
 
-    // The base may not be pulled locally (the build resolves it): an
-    // uninspectable *pinned* base keeps the Linux default with the
-    // unverified note — the emitted FROM is already immutable. A
-    // tag-only base has no such fallback: the immutable binding cannot
-    // be formed without a digest, so it needs the explicit mutable
-    // downgrade — the same contract `run-image` applies, for the
-    // curated auto-detected bases as much as for `--base-image`.
+    // The base must be inspectable locally: inherited `Config.OnBuild`
+    // triggers execute inside our build context — where the source tree,
+    // runner, and bound policy are all staged readable — so an image we
+    // cannot inspect is refused rather than given a default contract.
+    // A tag-only base has the additional mutable-binding check below.
     let (layout, guest_arch, bound_base) =
         match crate::container::inspect::inspect_image(engine.as_ref(), &probe_base).await {
             Ok(meta) => {
+                crate::container::inspect::refuse_inherited_onbuild(&meta, &probe_base)?;
                 let layout = guest_layout::for_image_os(meta.os.as_deref())
                     .map_err(ContainerError::BuildFailed)?;
                 let arch =
@@ -144,22 +150,16 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
                 (layout, arch, bound)
             }
             Err(e) => {
-                if !crate::container::runner::image_ref_is_digest_pinned(&probe_base)
-                    && !options.allow_mutable_tag
-                {
-                    return Err(ContainerError::BuildFailed(format!(
-                        "cannot inspect base image '{probe_base}' to resolve its \
-                         digest: {e}; pull it locally, pin with @sha256:<digest>, or \
-                         pass --allow-mutable-tag"
-                    )));
-                }
-                eprintln!(
-                    "[containerize] note: base image '{}' is not available for local inspect; \
-                 its guest OS is unverified — assuming the Linux contract (the build \
-                 resolves the real base)",
-                    probe_base
-                );
-                (&guest_layout::LINUX, TargetArch::host(), probe_base.clone())
+                // Fail closed: an uninspected base could carry ONBUILD
+                // triggers that run with the whole private source tree
+                // in their build context, and its guest OS/immutable
+                // binding are unknown too.
+                return Err(ContainerError::BuildFailed(format!(
+                    "cannot inspect base image '{probe_base}': {e}; pull it locally \
+                     first — an uninspected base could carry inherited ONBUILD \
+                     triggers that execute during the build with access to the \
+                     staged source"
+                )));
             }
         };
     // A Windows base re-runs detection under its own layout so native

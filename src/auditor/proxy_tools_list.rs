@@ -152,7 +152,7 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if let Some((_id, raw_id)) = shared.held_client_list.lock().await.take() {
-        let response = build_tools_list_error_response(&raw_id, "tools/list did not complete");
+        let response = build_tools_list_error_response(&raw_id);
         write_client_frame(&shared.client_out, &response).await?;
     }
     Ok(())
@@ -287,7 +287,7 @@ where
         )
         .await
         {
-            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            let error_response = build_tools_list_error_response(&id_str);
             write_client_frame(&shared.client_out, &error_response).await?;
         }
         shared.abort_tx.send(true).ok();
@@ -350,7 +350,7 @@ where
         )
         .await
         {
-            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            let error_response = build_tools_list_error_response(&id_str);
             write_client_frame(&shared.client_out, &error_response).await?;
         }
         shared.abort_tx.send(true).ok();
@@ -383,7 +383,7 @@ where
             )
             .await
             {
-                let error_response = build_tools_list_error_response(&id_str, &block_reason);
+                let error_response = build_tools_list_error_response(&id_str);
                 write_client_frame(&shared.client_out, &error_response).await?;
             }
             shared.abort_tx.send(true).ok();
@@ -408,7 +408,7 @@ where
         )
         .await
         {
-            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            let error_response = build_tools_list_error_response(&id_str);
             write_client_frame(&shared.client_out, &error_response).await?;
         }
         shared.abort_tx.send(true).ok();
@@ -466,8 +466,7 @@ where
         // owner just failed, so answer it with the same error shape.
         answer_held_client_list_with_error(shared).await?;
         if let Some(client_id) = st.take_client_id() {
-            let error_response =
-                build_tools_list_error_response(&client_id, "tools/list returned an error");
+            let error_response = build_tools_list_error_response(&client_id);
             write_client_frame(&shared.client_out, &error_response).await?;
         } else if !answered_internal {
             write_client_frame(&shared.client_out, line).await?;
@@ -501,7 +500,7 @@ where
             )
             .await
             {
-                let error_response = build_tools_list_error_response(&id_str, &block_reason);
+                let error_response = build_tools_list_error_response(&id_str);
                 write_client_frame(&shared.client_out, &error_response).await?;
             }
             shared.abort_tx.send(true).ok();
@@ -525,7 +524,7 @@ where
         )
         .await
         {
-            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            let error_response = build_tools_list_error_response(&id_str);
             write_client_frame(&shared.client_out, &error_response).await?;
         }
         shared.abort_tx.send(true).ok();
@@ -564,7 +563,7 @@ where
             )
             .await
             {
-                let error_response = build_tools_list_error_response(&id_str, &block_reason);
+                let error_response = build_tools_list_error_response(&id_str);
                 write_client_frame(&shared.client_out, &error_response).await?;
             }
             shared.abort_tx.send(true).ok();
@@ -721,7 +720,7 @@ where
         )
         .await
         {
-            let error_response = build_tools_list_error_response(&emit_id, &block_reason);
+            let error_response = build_tools_list_error_response(&emit_id);
             write_client_frame(&shared.client_out, &error_response).await?;
         }
         shared.abort_tx.send(true).ok();
@@ -756,7 +755,7 @@ where
             )
             .await
             {
-                let error_response = build_tools_list_error_response(&emit_id, &block_reason);
+                let error_response = build_tools_list_error_response(&emit_id);
                 write_client_frame(&shared.client_out, &error_response).await?;
             }
             shared.abort_tx.send(true).ok();

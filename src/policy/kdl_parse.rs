@@ -33,14 +33,20 @@ pub fn parse_kdl_policy(content: &str) -> Result<Policy, PolicyError> {
         .parse()
         .map_err(|e: kdl::KdlError| PolicyError::KdlParse(e.to_string()))?;
     let profiles = parse_profiles(&doc)?;
-    parse_kdl_policy_with_profiles(content, &profiles, None)
+    // No `base_dir` means `@file` references stay unresolved — nothing
+    // is read, nothing to record.
+    let mut schema_sources = Vec::new();
+    parse_kdl_policy_with_profiles(content, &profiles, None, &mut schema_sources)
 }
 
 /// Parse KDL content string with existing profiles and base directory.
+/// `schema_sources` collects every `@file` document the parse read —
+/// the caller records them as protected policy sources.
 pub fn parse_kdl_policy_with_profiles(
     content: &str,
     profiles: &HashMap<String, PolicyLayer>,
     base_dir: Option<&Path>,
+    schema_sources: &mut Vec<std::path::PathBuf>,
 ) -> Result<Policy, PolicyError> {
     let doc: KdlDocument = content
         .parse()
@@ -52,7 +58,14 @@ pub fn parse_kdl_policy_with_profiles(
     let logging = parse_logging(&doc)?;
     let sandbox = parse_sandbox(&doc)?;
     let defaults_layer = defaults_to_layer(&defaults);
-    let tools = parse_servers(&doc, &defaults_layer, profiles, base_dir, version)?;
+    let tools = parse_servers(
+        &doc,
+        &defaults_layer,
+        profiles,
+        base_dir,
+        version,
+        schema_sources,
+    )?;
     let mcp_rules = parse_server_mcp_rules(&doc, version, false)?;
     reject_misplaced_deputy(&doc, false)?;
     let hash_entries = parse_server_hashes(&doc)?;
@@ -620,10 +633,17 @@ pub(crate) fn parse_profiles(
     Ok(profiles)
 }
 
+/// Resolve an `args_schema` spelling: `@file` reads the document
+/// relative to `base_dir` (or absolutely); anything else is returned
+/// verbatim. The second tuple element is the file actually read, when
+/// one was, as `(spelled, canonical)`: the absolute path exactly as
+/// spelled — symlinks left unresolved — plus its canonical target.
+/// Callers record both as policy sources so a workload write grant
+/// covering either refuses the launch.
 pub(crate) fn resolve_tool_args_schema(
     schema_ref: &str,
     base_dir: Option<&Path>,
-) -> Result<String, PolicyError> {
+) -> Result<(String, Option<(PathBuf, PathBuf)>), PolicyError> {
     if let Some(file_path) = schema_ref.strip_prefix('@') {
         let file_path = file_path.trim();
         if let Some(base) = base_dir {
@@ -646,12 +666,14 @@ pub(crate) fn resolve_tool_args_schema(
                     resolved.display()
                 )));
             }
-            Ok(content)
+            let spelled = crate::fsoverlap::absolutize_lexical(&resolved);
+            let canonical = resolved.canonicalize().unwrap_or(resolved);
+            Ok((content, Some((spelled, canonical))))
         } else {
-            Ok(schema_ref.to_string())
+            Ok((schema_ref.to_string(), None))
         }
     } else {
-        Ok(schema_ref.to_string())
+        Ok((schema_ref.to_string(), None))
     }
 }
 

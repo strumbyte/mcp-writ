@@ -601,6 +601,7 @@ impl IsolationBackend for HypervBackend {
                     "the hyperv backend requires an image-defined workload".to_string(),
                 )
             })?;
+            super::verify_share_pins(spec)?;
             let options = run_options(spec);
             let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
             let child = self.engine.run(image, &option_refs, true).await?;

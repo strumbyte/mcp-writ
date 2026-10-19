@@ -459,10 +459,13 @@ async fn run_info(engine_cmd: &str, format: Option<&str>) -> Result<String, Engi
     Ok(text)
 }
 
-/// The `<engine> <subcmd> -f <dockerfile> -t <tag> [--no-cache] <ctx>`
+/// The `<engine> <subcmd> -f <dockerfile> -t <tag> --network=none [--no-cache] <ctx>`
 /// argv — the OCI build dialect docker/podman/wslc share; buildah
-/// passes `bud` for `subcmd`. `--no-cache` sits after the tag, before
-/// the context dir, matching the production build line.
+/// passes `bud` for `subcmd`. `--network=none` denies build-time
+/// networking outright: generated Dockerfiles carry no `RUN`, but the
+/// flag stays as the invariant's enforcement if one ever is added —
+/// build steps must never reach the network. `--no-cache` sits after
+/// the tag, before the context dir, matching the production build line.
 fn image_build_args(
     subcmd: &str,
     dockerfile_path: &str,
@@ -476,6 +479,7 @@ fn image_build_args(
         dockerfile_path.to_string(),
         "-t".to_string(),
         tag.to_string(),
+        "--network=none".to_string(),
     ];
     if no_cache {
         args.push("--no-cache".to_string());
@@ -505,8 +509,8 @@ async fn run_cli_args<S: AsRef<str>>(cli: &str, name: &str, args: &[S]) -> Resul
     Ok(())
 }
 
-/// `<cli> <subcmd> -f <dockerfile> -t <tag> [--no-cache] <ctx>` shared
-/// by the engine `build` implementations.
+/// `<cli> <subcmd> -f <dockerfile> -t <tag> --network=none [--no-cache] <ctx>`
+/// shared by the engine `build` implementations.
 async fn run_image_build(
     cli: &str,
     name: &str,

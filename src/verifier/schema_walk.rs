@@ -145,10 +145,20 @@ fn schema_property_names(schema: &str) -> Vec<String> {
     names
 }
 
+/// Fold-insensitive property-name membership: the schema-side key is
+/// run through the same NFKC + confusable fold as collision checks, so
+/// a compatibility-equivalent spelling (`ｕｒｌ`, `redirect_urі`, …)
+/// lands in the same detector bucket as its ASCII form. `wanted`
+/// entries are the detectors' ASCII lowercase constants.
+pub(crate) fn schema_name_in(name: &str, wanted: &[&str]) -> bool {
+    let folded = crate::verifier::unicode::fold_name_for_collision(name);
+    wanted.iter().any(|w| folded == *w)
+}
+
 pub(crate) fn schema_has_named_property(schema: &str, names: &[&str]) -> bool {
     schema_property_names(schema)
         .iter()
-        .any(|n| names.iter().any(|want| n.eq_ignore_ascii_case(want)))
+        .any(|n| schema_name_in(n, names))
 }
 
 pub(crate) fn schema_property_keys(schema: &str) -> Vec<String> {
@@ -205,8 +215,7 @@ fn collect_property_keys(val: nojson::RawJsonValue<'_, '_>, out: &mut Vec<String
 }
 
 pub(crate) fn property_key_match(keys: &[String], wanted: &[&str]) -> bool {
-    keys.iter()
-        .any(|k| wanted.iter().any(|w| k.eq_ignore_ascii_case(w)))
+    keys.iter().any(|k| schema_name_in(k, wanted))
 }
 
 pub(crate) fn property_schema_has_uri_hint(

@@ -439,6 +439,283 @@ pub fn resolve_backend(
     }
 }
 
+/// Re-verify every share that carries a caller-pinned identity: the
+/// pinned object is re-opened without following reparse and compared
+/// against the identity recorded at staging, so a path renamed away
+/// between staging and launch cannot mount a replacement into the
+/// guest. Engine-backed backends (`oci`/`kata`/`hyperv`) and the apple
+/// driver run this at the top of `launch`, before the share spelling
+/// reaches the substrate CLI; `windows_sandbox` performs the same check
+/// inside its own launch body. A share with no pin (read-only mounts)
+/// needs no verification — only identities the caller asserted are
+/// checked.
+///
+/// Engine CLIs accept only path spellings — no fd/handle mount
+/// mechanism exists (a `/proc/<pid>/fd/<n>` source is refused by the
+/// runtime's bind-mount call), so the verified object cannot be bound
+/// by identity through engine resolution. The OCI and Kata launches
+/// therefore verify twice — once here, just before the engine is
+/// spawned, and again after `attach` — and keep a [`SharePinWatch`]
+/// armed across the whole window so a repoint-and-restore the path
+/// checks would miss is still detected before the session proceeds.
+/// VM-mediated backends (`apple`, `hyperv`) verify at the top of
+/// `launch` only; the mount resolves inside their guest/remote
+/// substrate, where a post-create check of the local path proves
+/// nothing about the object actually bound.
+pub(crate) fn verify_share_pins(spec: &LaunchSpec) -> Result<(), BackendError> {
+    for share in &spec.shares {
+        let Some(expected) = share.pin else { continue };
+        let (_handle, identity) = crate::fspriv::open_dir_pinned(&share.host).map_err(|e| {
+            BackendError::LaunchFailed(format!(
+                "share '{}' could not be re-verified: {e}",
+                share.host.display()
+            ))
+        })?;
+        if identity != expected {
+            return Err(BackendError::LaunchFailed(format!(
+                "share '{}' was replaced since staging",
+                share.host.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A window-wide repoint detector for pinned shares.
+///
+/// A path check — before `engine.run` or after `attach` — compares the
+/// object `share.host` names at that instant. An attacker who renames
+/// the verified directory away and restores it inside the
+/// verify→mount-resolve window leaves no trace a path check can see.
+/// The parent directory's event stream records every move/create/
+/// delete on the leaf regardless of the final state, so watching it
+/// from before verification until the session takes stdio covers the
+/// entire window — including the gap where `attach` returns before
+/// the substrate has finished creating the unit.
+///
+/// Linux implements this over inotify. Every directory on the spelled
+/// path is watched — each ancestor up to `/` for events on the next
+/// component's name, plus the self-events that fire when a watched
+/// directory itself moves, is deleted, or unmounts — so a repoint of
+/// any component, not just the leaf, is detected (a watch on the leaf's
+/// parent alone follows the renamed object and misses an ancestor
+/// swap). Other hosts have no watch — [`begin_share_pin_watch`]
+/// returns an empty detector and the pre/post `verify_share_pins`
+/// checks remain the coverage there.
+pub(crate) struct SharePinWatch {
+    /// The first drain failure, retained so the refusal cannot be
+    /// cleared by draining again after the triggering events were
+    /// already consumed.
+    failed: Option<String>,
+    #[cfg(target_os = "linux")]
+    watches: Vec<PinWatchLinux>,
+}
+
+/// Arm a watch on every pinned share's parent directory. Call before
+/// [`verify_share_pins`] so the covered window spans the entire launch;
+/// a spec with no pins — or a host without inotify — yields an empty
+/// detector whose drains always pass.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+pub(crate) fn begin_share_pin_watch(spec: &LaunchSpec) -> Result<SharePinWatch, BackendError> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut watches = Vec::new();
+        for share in &spec.shares {
+            if share.pin.is_some() {
+                watches.push(PinWatchLinux::begin(&share.host)?);
+            }
+        }
+        Ok(SharePinWatch {
+            failed: None,
+            watches,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(SharePinWatch { failed: None })
+    }
+}
+
+impl SharePinWatch {
+    /// Fail if any component on a pinned share's spelled path saw a
+    /// repoint event — or an event-stream anomaly that could hide one —
+    /// since the watch was armed. The first failure is retained: every
+    /// later drain returns it, even after the triggering events were
+    /// consumed.
+    pub(crate) fn drain(&mut self) -> Result<(), BackendError> {
+        if let Some(msg) = &self.failed {
+            return Err(BackendError::LaunchFailed(msg.clone()));
+        }
+        #[cfg(target_os = "linux")]
+        for watch in &mut self.watches {
+            if let Err(e) = watch.drain() {
+                self.failed = Some(e.to_string());
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PinWatchLinux {
+    fd: std::os::unix::io::RawFd,
+    /// watch-descriptor → the next component name that watch's
+    /// directory must not see touched.
+    names: Vec<(i32, std::ffi::OsString)>,
+    share: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl PinWatchLinux {
+    /// Watch every directory on `share`'s spelled path: each ancestor
+    /// for events naming the component below it, and every watched
+    /// directory for self-events — rename-away, delete, unmount, or
+    /// queue overflow — that would make the stream unable to prove the
+    /// path stayed put. The spelled (lexically absolutized) path is
+    /// walked rather than the canonical one, because the spelled
+    /// spelling is what the engine resolves — including any symlink
+    /// an attacker could swap mid-window.
+    fn begin(share: &std::path::Path) -> Result<Self, BackendError> {
+        use std::os::unix::ffi::OsStrExt;
+        let share_abs = crate::fsoverlap::absolutize_lexical(share);
+        // (directory to watch, component name that must stay put)
+        let mut pairs: Vec<(std::path::PathBuf, std::ffi::OsString)> = Vec::new();
+        let mut cur = share_abs;
+        while let Some(name) = cur.file_name().map(|n| n.to_os_string()) {
+            let dir = match cur.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => std::path::PathBuf::from("/"),
+            };
+            pairs.push((dir.clone(), name));
+            cur = dir;
+        }
+        if pairs.is_empty() {
+            return Err(BackendError::LaunchFailed(format!(
+                "share '{}' has no path components to watch",
+                share.display()
+            )));
+        }
+        // Safety: inotify_init1 has no preconditions; CLOEXEC|NONBLOCK
+        // keep the fd out of spawned children and make drain reads
+        // poll-style rather than blocking.
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if fd < 0 {
+            return Err(BackendError::LaunchFailed(format!(
+                "cannot watch share '{}': {}",
+                share.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mask = libc::IN_CREATE
+            | libc::IN_DELETE
+            | libc::IN_MOVED_FROM
+            | libc::IN_MOVED_TO
+            | libc::IN_MOVE_SELF
+            | libc::IN_DELETE_SELF;
+        let mut names = Vec::with_capacity(pairs.len());
+        for (dir, component) in pairs {
+            let c_dir = match std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+                Ok(c) => c,
+                Err(_) => {
+                    unsafe { libc::close(fd) };
+                    return Err(BackendError::LaunchFailed(format!(
+                        "share ancestor '{}' is not watchable",
+                        dir.display()
+                    )));
+                }
+            };
+            // Safety: fd is a live inotify fd; c_dir outlives the call.
+            let wd = unsafe { libc::inotify_add_watch(fd, c_dir.as_ptr(), mask) };
+            if wd < 0 {
+                let e = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                return Err(BackendError::LaunchFailed(format!(
+                    "cannot watch share ancestor '{}': {e}",
+                    dir.display()
+                )));
+            }
+            names.push((wd, component));
+        }
+        Ok(Self {
+            fd,
+            names,
+            share: share.to_path_buf(),
+        })
+    }
+
+    fn drain(&mut self) -> Result<(), BackendError> {
+        use std::os::unix::ffi::OsStrExt;
+        #[repr(align(8))]
+        struct Aligned([u8; 8192]);
+        let mut buf = Aligned([0u8; 8192]);
+        loop {
+            // Safety: fd is a live NONBLOCK inotify fd and buf is a
+            // valid writable region of its size.
+            let n = unsafe { libc::read(self.fd, buf.0.as_mut_ptr().cast(), buf.0.len()) };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                return Err(BackendError::LaunchFailed(format!(
+                    "share watch on '{}' failed: {e}",
+                    self.share.display()
+                )));
+            }
+            if n == 0 {
+                return Ok(());
+            }
+            let mut off = 0usize;
+            while off + std::mem::size_of::<libc::inotify_event>() <= n as usize {
+                // Safety: buf is 8-aligned and inotify_event is
+                // 4-aligned, so this pointer is validly aligned; the
+                // bounds check above keeps the read inside the buffer.
+                let ev = unsafe { &*(buf.0.as_ptr().add(off) as *const libc::inotify_event) };
+                let hit = if ev.mask
+                    & (libc::IN_Q_OVERFLOW
+                        | libc::IN_MOVE_SELF
+                        | libc::IN_DELETE_SELF
+                        | libc::IN_UNMOUNT
+                        | libc::IN_IGNORED)
+                    != 0
+                {
+                    // Lost events — or a watched directory itself
+                    // moved, was deleted, or unmounted — mean the
+                    // stream can no longer prove the path stayed put.
+                    true
+                } else {
+                    let name = &buf.0[off + 16..off + 16 + ev.len as usize];
+                    let trimmed = match name.iter().position(|&b| b == 0) {
+                        Some(z) => &name[..z],
+                        None => name,
+                    };
+                    !trimmed.is_empty()
+                        && self.names.iter().find(|(wd, _)| *wd == ev.wd).is_some_and(
+                            |(_, expected)| {
+                                std::ffi::OsStr::from_bytes(trimmed) == expected.as_os_str()
+                            },
+                        )
+                };
+                if hit {
+                    return Err(BackendError::LaunchFailed(format!(
+                        "share '{}' was repointed while the mount resolved",
+                        self.share.display()
+                    )));
+                }
+                off += 16 + ev.len as usize;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PinWatchLinux {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}
+
 /// The request/observation gate: the backend's confirmed isolation must
 /// equal the spec's requirement. A mismatch refuses the launch — a
 /// weaker boundary is never applied in place of the requested one.

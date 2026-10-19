@@ -112,8 +112,18 @@ fn extract_host_and_port_from_url(url: &str) -> Option<(String, Option<u16>, boo
     };
 
     // WHATWG URL Standard: for special schemes (http, https, ftp, ws, wss),
-    // '\' is treated as a path delimiter like '/'. Authority ends at first '/', '\', '?', or '#'
-    let authority = after_scheme.split(['/', '\\', '?', '#']).next()?;
+    // '\' is treated as a path delimiter like '/'. RFC-style parsers
+    // (urllib, reqwest/uri, Go url.Parse) do NOT treat it as a delimiter:
+    // for `http://allowed\@evil/` they see authority `allowed\@evil` and
+    // connect to `evil` — exactly the host this layer did not authorize.
+    // The checked policy runs against the spelling we forward, so an
+    // authority span that would parse differently downstream is refused
+    // rather than reconciled.
+    let authority_span = after_scheme.split(['/', '?', '#']).next()?;
+    if authority_span.contains('\\') {
+        return None;
+    }
+    let authority = authority_span;
     if authority.is_empty() {
         return None;
     }
@@ -659,6 +669,32 @@ mod tests {
         assert_eq!(
             extract_host_from_url("https://[::1]:8443/"),
             Some("::1".to_string())
+        );
+    }
+
+    /// RFC-style parsers do not treat `\` as an authority delimiter, so
+    /// `http://allowed\@evil/` reaches `evil` there while a WHATWG split
+    /// authorizes `allowed` — the ambiguous authority is refused rather
+    /// than reconciled.
+    #[test]
+    fn test_extract_host_from_url_rejects_backslash_authority() {
+        assert_eq!(
+            extract_host_from_url("http://allowed.example\\@127.0.0.1/"),
+            None
+        );
+        assert_eq!(
+            extract_host_from_url("http://allowed.example\\@evil.test/x"),
+            None
+        );
+        assert_eq!(extract_host_from_url("http://a\\b/"), None);
+        assert_eq!(extract_host_from_url("https://\\evil.test/"), None);
+        assert_eq!(extract_host_from_url("//allowed\\@evil/"), None);
+        // A backslash *after* the authority (inside the path the RFC
+        // parser sees too) does not change the host on either grammar —
+        // it stays accepted.
+        assert_eq!(
+            extract_host_from_url("https://example.com/pa\\th"),
+            Some("example.com".to_string())
         );
     }
 

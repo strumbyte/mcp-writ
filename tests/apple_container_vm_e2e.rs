@@ -812,11 +812,10 @@ async fn apple_vm_stdio_session() {
         // Seccomp: chmod/fchmodat/fchmodat2 are outside the allowlist.
         (6, "chmod_666", "{\"path\":\"/workspace/apple-ok.txt\"}"),
         // Seccomp: `socket` is removed when network deny-all is set.
-        (
-            7,
-            "net_probe",
-            "{\"addr\":\"192.0.2.1:80\",\"path\":\"/proc/self/status\"}",
-        ),
+        // `addr` is omitted — the probe defaults to 192.0.2.1:80 —
+        // because a `read_only` tool carrying a host/URL argument is
+        // refused by the auditor before the kernel check can engage.
+        (7, "net_probe", "{\"path\":\"/proc/self/status\"}"),
         // Landlock: /etc is granted to nothing at kernel level.
         (
             8,

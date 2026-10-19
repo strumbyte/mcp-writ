@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kdl::KdlDocument;
 
@@ -12,12 +12,16 @@ use crate::error::PolicyError;
 use crate::policy::merge::{PolicyLayer, merge_policy, validate_merged};
 use crate::policy::{HashEntry, HashType, InputResponsesMode, ToolPolicy, ToolsListHashEntry};
 
+/// `schema_sources` collects every `@file` document resolved here —
+/// the load records them as policy sources a launch must protect from
+/// workload write grants.
 pub(crate) fn parse_servers(
     doc: &KdlDocument,
     defaults_layer: &PolicyLayer,
     profiles: &HashMap<String, PolicyLayer>,
     base_dir: Option<&Path>,
     version: u32,
+    schema_sources: &mut Vec<PathBuf>,
 ) -> Result<Vec<ToolPolicy>, PolicyError> {
     let mut tools = Vec::new();
 
@@ -87,7 +91,14 @@ pub(crate) fn parse_servers(
             // Parse args_schema if present (strict type check, resolve relative to base_dir)
             let args_schema = if let Some(val) = child.get("args_schema") {
                 match val.as_string() {
-                    Some(s) => Some(resolve_tool_args_schema(s, base_dir)?),
+                    Some(s) => {
+                        let (content, source) = resolve_tool_args_schema(s, base_dir)?;
+                        if let Some((spelled, canonical)) = source {
+                            schema_sources.push(spelled);
+                            schema_sources.push(canonical);
+                        }
+                        Some(content)
+                    }
                     None => {
                         return Err(PolicyError::KdlParse(format!(
                             "'args_schema' property on tool '{}' must be a string",

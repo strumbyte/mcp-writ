@@ -646,11 +646,10 @@ async fn kata_vm_stdio_session() {
         // Seccomp: chmod/fchmodat/fchmodat2 are outside the allowlist.
         (6, "chmod_666", "{\"path\":\"/workspace/kata-ok.txt\"}"),
         // Seccomp: `socket` is removed when network deny-all is set.
-        (
-            7,
-            "net_probe",
-            "{\"addr\":\"192.0.2.1:80\",\"path\":\"/proc/self/status\"}",
-        ),
+        // `addr` is omitted — the probe defaults to 192.0.2.1:80 —
+        // because a `read_only` tool carrying a host/URL argument is
+        // refused by the auditor before the kernel check can engage.
+        (7, "net_probe", "{\"path\":\"/proc/self/status\"}"),
         // Landlock: /etc is granted to nothing at kernel level.
         (
             8,
@@ -798,7 +797,49 @@ async fn kata_vm_stdio_session() {
         );
     }
 
-    let audit = std::fs::read_to_string(dirs.logs.join("audit.jsonl")).expect("audit log missing");
+    let audit_path = dirs.logs.join("audit.jsonl");
+    let audit = match std::fs::read_to_string(&audit_path) {
+        Ok(text) => text,
+        // The runner tightens the sink to 0600 and the guest's virtiofs
+        // write lands owned by the mapped (root) uid — the host test
+        // user cannot open it. Read the same directory back through a
+        // scratch runc container, where the daemon's root bypasses the
+        // mode bits.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let out = timeout(
+                Duration::from_secs(STOP_TIMEOUT_SECS),
+                Command::new("docker")
+                    .args([
+                        "run",
+                        "--rm",
+                        "--runtime",
+                        "runc",
+                        "-v",
+                        &format!("{}:/logs:ro", dirs.logs.display()),
+                        BASE_IMAGE_PINNED,
+                        "cat",
+                        "/logs/audit.jsonl",
+                    ])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    // A dropped future must kill the CLI — the same
+                    // pattern as `docker_build` — so a stalled daemon
+                    // cannot hang the test on a detached readback.
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("docker run for the audit readback timed out")
+            .expect("docker run for the audit readback failed");
+            assert!(
+                out.status.success(),
+                "audit readback container failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).expect("audit log is not utf-8")
+        }
+        Err(e) => panic!("audit log missing at {}: {e}", audit_path.display()),
+    };
     assert!(
         audit.contains("tool_call.denied") && audit.contains("mcp_message.allowed"),
         "audit log must record allows and denies"

@@ -376,12 +376,8 @@ fn callback_from_args(after_name: &str, functions: &[SourceFunction]) -> Callbac
                 // nested scope is likewise unprovable: the binding is
                 // Unbound with an empty body for review rather than
                 // borrowing a body the identifier cannot resolve to.
-                let mut top = functions
-                    .iter()
-                    .filter(|f| f.name == *name && f.top_level);
-                let mut nested = functions
-                    .iter()
-                    .filter(|f| f.name == *name && !f.top_level);
+                let mut top = functions.iter().filter(|f| f.name == *name && f.top_level);
+                let mut nested = functions.iter().filter(|f| f.name == *name && !f.top_level);
                 let (body, dup) = match top.next() {
                     Some(_) if top.next().is_some() => (
                         Rc::default(),

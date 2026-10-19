@@ -355,8 +355,10 @@ async fn list_response_with_result_and_error_is_rejected() {
     )
     .await;
     assert_eq!(json_id(&resp).as_deref(), Some("1"), "got: {resp}");
+    // The client-facing refusal is the stable visibility-safe text —
+    // the malformed-envelope detail is audit-only.
     assert!(
-        has_error(&resp) && error_message(&resp).contains("malformed"),
+        has_error(&resp) && error_message(&resp).contains("tools/list verification failed"),
         "ambiguous envelope must be rejected, not emitted: {resp}"
     );
     assert!(

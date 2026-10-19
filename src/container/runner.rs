@@ -906,6 +906,11 @@ async fn run_image_inner(
                 .into());
             };
             let mut sensitive: Vec<PathBuf> = vec![temp_dir.dir.clone(), policy_canonical.clone()];
+            // Every file the policy load read — extends/include
+            // ancestors and @file schemas — is launch input a later
+            // launch re-reads; a writable share covering one would let
+            // the workload rewrite what it runs under next.
+            sensitive.extend(bound.source_files());
             if let Some(report) = &options.report {
                 sensitive.push(report.clone());
             }

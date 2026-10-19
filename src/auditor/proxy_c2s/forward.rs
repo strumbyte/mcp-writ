@@ -193,6 +193,7 @@ where
                     raw_id,
                     line,
                     "no verified tools/list has been published yet",
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -202,8 +203,14 @@ where
             None
         };
         if shared.list_busy.load(Ordering::SeqCst) {
-            deny_busy_tools_call(shared, raw_id, line, "tools/list revalidation in progress")
-                .await?;
+            deny_busy_tools_call(
+                shared,
+                raw_id,
+                line,
+                "tools/list revalidation in progress",
+                None,
+            )
+            .await?;
             return Ok(());
         }
         // Registration eligibility must be validated before any session
@@ -255,14 +262,20 @@ where
                             state.take_pending_list(id);
                             state.complete_pending_tool_call(id, false);
                         }
+                        // Wire text must not reveal that the name is
+                        // policy-allowed but unadvertised — that probes
+                        // policy membership through tools/call. The
+                        // advertised-set detail stays in the audit
+                        // record.
                         deny_busy_tools_call(
                             shared,
                             raw_id,
                             line,
-                            &format!(
+                            crate::auditor::checker::REASON_TOOL_NOT_ALLOWED,
+                            Some(&format!(
                                 "tool '{}' is not advertised by the verified tools/list",
                                 tool.as_deref().unwrap_or("<unknown>")
-                            ),
+                            )),
                         )
                         .await?;
                         return Ok(());
@@ -393,8 +406,15 @@ where
                         reason = %crate::termutil::sanitize_for_terminal(&violation.reason),
                         "Policy violation: blocking tools/call"
                     );
-                    let error_response =
-                        build_error_response(&id_str, &violation.tool_name, &violation.reason);
+                    // The wire reason must not reveal whether the name
+                    // exists in the policy — `client_reason` collapses
+                    // the hidden/unknown distinction; `violation.reason`
+                    // keeps the detail for the audit record above.
+                    let error_response = build_error_response(
+                        &id_str,
+                        &violation.tool_name,
+                        violation.client_reason(),
+                    );
                     write_client_frame(&shared.client_out, &error_response).await?;
                 }
                 Ok(())
@@ -845,12 +865,16 @@ where
 
 /// The tools/call denial while the verified-list gate is closed — a
 /// revalidation in flight or (when verification is enforced) no
-/// verified listing published yet.
+/// verified listing published yet. `reason` is the client-facing text;
+/// `audit_reason` carries the detail for the audit record when the wire
+/// text must stay membership-blind (an allowed-but-unadvertised name
+/// must read exactly like a denied or unknown one).
 pub(super) async fn deny_busy_tools_call<W>(
     shared: &ProxyShared<W>,
     raw_id: &str,
     line: &str,
     reason: &str,
+    audit_reason: Option<&str>,
 ) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -868,7 +892,7 @@ where
     );
     event.target_tool = Some(tool);
     event.request_id = Some(proxy_rpc::truncate_for_audit(raw_id));
-    event.details = Some(reason.to_string());
+    event.details = Some(audit_reason.unwrap_or(reason).to_string());
     shared.audit.log(event);
     Ok(())
 }

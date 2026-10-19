@@ -111,9 +111,9 @@ pub struct ManifestFinding {
 /// `tool_has_blocking` match against — truncating it would orphan the
 /// finding from the tool it names.
 const MAX_FINDING_NAME_CHARS: usize = 160;
-const MAX_FINDING_DETAIL_CHARS: usize = 512;
+pub(crate) const MAX_FINDING_DETAIL_CHARS: usize = 512;
 
-fn bound_finding_text(text: String, cap: usize) -> String {
+pub(crate) fn bound_finding_text(text: String, cap: usize) -> String {
     if text.chars().count() <= cap {
         return text;
     }

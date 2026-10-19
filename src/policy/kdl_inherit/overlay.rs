@@ -1622,8 +1622,12 @@ fn apply_overrides_from_doc(
                             tool_name
                         ))
                     })?;
-                    let resolved = resolve_tool_args_schema(s, base_dir)?;
+                    let (resolved, source) = resolve_tool_args_schema(s, base_dir)?;
                     existing.args_schema = Some(resolved);
+                    if let Some((spelled, canonical)) = source {
+                        prov.record_source(canonical);
+                        prov.record_source_spelling(spelled);
+                    }
                     prov.set(format!("{tkey}.args_schema"), path, tline);
                 }
                 if let Some(val) = child.get("input_responses") {
@@ -1793,13 +1797,18 @@ fn apply_overrides_from_doc(
                 s_children.nodes_mut().push(child.clone());
                 s_node.set_children(s_children);
                 dummy_doc.nodes_mut().push(s_node);
+                let mut schema_sources = Vec::new();
                 let new_tools = parse_servers(
                     &dummy_doc,
                     &defaults_layer,
                     profiles,
                     base_dir,
                     policy.version,
+                    &mut schema_sources,
                 )?;
+                for source in schema_sources {
+                    prov.record_source(source);
+                }
                 for t in new_tools {
                     prov.set(tkey.clone(), path, tline);
                     seed_tool_fields(prov, &tkey, &t, (path, tline));

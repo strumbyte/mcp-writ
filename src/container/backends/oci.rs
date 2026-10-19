@@ -122,6 +122,15 @@ impl IsolationBackend for OciBackend {
                     "the OCI backend requires an image-defined workload".to_string(),
                 )
             })?;
+            // Arm the parent-directory watch before the identity check
+            // so the covered window spans verify→mount-resolve entirely
+            // — an event on a pinned leaf refuses the launch even when
+            // the path itself is back in place by the time a check runs.
+            let mut watch = super::begin_share_pin_watch(spec)?;
+            // Pinned writable shares (the log mount) are re-opened and
+            // identity-checked before their spelling reaches the engine
+            // — a replaced path must not be bound into the guest.
+            super::verify_share_pins(spec)?;
             let options = spec_run_options(spec);
             let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
             let child = self.engine.run(image, &option_refs, true).await?;
@@ -132,6 +141,23 @@ impl IsolationBackend for OciBackend {
                 spec.unit_name.clone(),
             )
             .await;
+            // `attach` can return before the substrate has finished
+            // creating the unit, so this drain only covers what already
+            // landed; the watch lives on in the handle and drains once
+            // more when the session takes stdio — by then the mount has
+            // resolved, and a repoint that slipped between the two
+            // checks is caught with the same refusal. The second path
+            // check here still wins cheaply when a replacement is left
+            // in place.
+            if let Err(e) = watch.drain().and_then(|()| super::verify_share_pins(spec)) {
+                return Err(match handle.cleanup().await {
+                    Ok(()) => e,
+                    Err(c) => BackendError::CleanupFailed(format!(
+                        "{e}; the refused unit could not be proven gone: {c}"
+                    )),
+                });
+            }
+            handle.share_watch = Some(watch);
             handle.graceful_signal = self.engine.interrupt_signal();
             Ok(Box::new(handle) as Box<dyn IsolationHandle>)
         })
@@ -226,6 +252,13 @@ const REMOVAL_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// until [`REMOVAL_CONFIRM_TIMEOUT`] elapses.
 const INSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long `take_stdio` waits for proof the unit exists — a published
+/// cidfile or a successful inspect — before draining the share watch.
+/// The mount resolves during unit creation, so ending the watch
+/// without that signal would leave a gap where the spelled path could
+/// still be repointed unobserved.
+const UNIT_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The launch handle for an engine-driven unit — owns the engine CLI
 /// child, the `--cidfile` path, and rm-by-id cleanup. Shared by the
 /// backends that drive `<engine> run`: the OCI container path, the
@@ -254,6 +287,10 @@ pub(crate) struct EngineRunHandle {
     /// [`SIGNAL_GRACE`] to unwind before the CLI client is killed;
     /// `None` leaves the client kill + `rm -f` as the whole stop path.
     pub(crate) graceful_signal: Option<&'static str>,
+    /// The launch-window repoint detector for pinned shares —
+    /// `take_stdio` drains it once more so a swap landing between
+    /// `attach` and actual unit creation still refuses the session.
+    pub(crate) share_watch: Option<super::SharePinWatch>,
     cleaned: bool,
 }
 
@@ -276,6 +313,7 @@ impl EngineRunHandle {
             unit_id: None,
             unit_name,
             graceful_signal: None,
+            share_watch: None,
             cleaned: false,
         };
         handle.wait_for_unit_id().await;
@@ -375,6 +413,41 @@ impl EngineRunHandle {
         }
     }
 
+    /// Synchronous existence probe for `take_stdio` — `true` only when
+    /// `<cli> inspect <id>` exits 0 within [`INSPECT_TIMEOUT`], meaning
+    /// the unit provably exists (created, running, or stopped). A
+    /// failed, absent, timed-out, or unspawnable probe answers `false`
+    /// so the caller keeps waiting instead of trusting an unanswerable
+    /// signal — the opposite polarity of `unit_resolvable_blocking`,
+    /// which must assume the unit lives on doubt.
+    fn unit_present_blocking(id: &str, engine_cli: &str) -> bool {
+        let Ok(mut inspect) = std::process::Command::new(engine_cli)
+            .args(["inspect", id])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        let deadline = std::time::Instant::now() + INSPECT_TIMEOUT;
+        loop {
+            match inspect.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = inspect.wait();
+                    return status.success();
+                }
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = inspect.kill();
+                    let _ = inspect.wait();
+                    return false;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(_) => return false,
+            }
+        }
+    }
+
     /// Synchronous single-probe variant for `Drop` — `true` when the
     /// unit still resolves. An unanswerable inspect is treated as
     /// "still present" (conservative — the dropped handle reports the
@@ -428,6 +501,44 @@ impl IsolationHandle for EngineRunHandle {
     }
 
     fn take_stdio(&mut self) -> Result<SessionStdio, BackendError> {
+        // The mount resolves while the unit is created, which races
+        // `attach`'s return — end the launch-window watch only once the
+        // unit provably exists (a published cidfile, or an inspect that
+        // resolves it), bounded by [`UNIT_READY_WAIT`]. A spec without
+        // a unit identity can never produce that signal and is refused
+        // outright. Then the final drain runs: a repoint that slipped
+        // between `attach` and create still refuses before the first
+        // byte flows — the driver's error path runs the usual cleanup.
+        // A spec with no unit identity at all can never produce the
+        // signal — refuse upfront; a cidfile-only spec still can (the
+        // daemon may publish it inside this window), so it polls on.
+        if self.cid_path.is_none() && self.unit_name.is_none() {
+            return Err(BackendError::LaunchFailed(
+                "container unit has no trackable identity — its mount cannot be proven resolved"
+                    .into(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + UNIT_READY_WAIT;
+        loop {
+            if self.recorded_unit_id().is_some() {
+                break;
+            }
+            if let Some(name) = &self.unit_name
+                && Self::unit_present_blocking(name, &self.engine_cli)
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(BackendError::LaunchFailed(format!(
+                    "container unit was not observable within {}s — the share mount cannot be proven resolved",
+                    UNIT_READY_WAIT.as_secs()
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if let Some(watch) = &mut self.share_watch {
+            watch.drain()?;
+        }
         let stdin =
             self.child.stdin.take().ok_or_else(|| {
                 BackendError::LaunchFailed("container stdin was not captured".into())
@@ -594,7 +705,9 @@ impl Drop for EngineRunHandle {
 mod tests {
     use super::*;
     use crate::container::backends::ShareMount;
-    use crate::container::engine::{BuildahEngine, WslcEngine, container_run_args};
+    use crate::container::engine::{
+        BuildahEngine, ContainerEngine, WslcEngine, container_run_args,
+    };
     use crate::execution::{TargetArch, TargetOs};
 
     fn spec(image: &str) -> LaunchSpec {
@@ -821,6 +934,358 @@ mod tests {
         assert_eq!(args[pos + 1], "mcp-writ-deadbeef");
         let without = container_run_args(&spec_run_options(&spec("img")), "img");
         assert!(!without.iter().any(|a| a == "--name"));
+    }
+
+    /// A stub engine for the share-swap tests: `run` performs the
+    /// attacker's filesystem move — the same instant the real substrate
+    /// would resolve the spelled mount source — then spawns a real
+    /// child so the launch proceeds to the post-attach checks.
+    /// `program` points at a script answering every lifecycle call with
+    /// an absent-unit marker so refused-launch teardown stays fast.
+    enum SwapMode {
+        /// Leave the path untouched — the clean control.
+        None,
+        /// Move the verified dir away and leave a replacement in place.
+        Swap,
+        /// Move away, replace, then restore — the path looks untouched
+        /// afterwards; only the launch-window watch sees the swap.
+        SwapBack,
+        /// Repoint an ancestor above the share's parent: rename the
+        /// ancestor directory away and rebuild the spelled path inside
+        /// a fresh one — a parent-only watch would follow the moved
+        /// object and never see it.
+        AncestorSwap,
+    }
+
+    struct SwapEngine {
+        dir: PathBuf,
+        backup: PathBuf,
+        cli: PathBuf,
+        mode: SwapMode,
+    }
+
+    impl SwapEngine {
+        fn new(dir: PathBuf, backup: PathBuf, stage: &std::path::Path, mode: SwapMode) -> Self {
+            let cli = stage.join("stub-engine.sh");
+            // `inspect` resolves the unit until `rm` records it gone —
+            // the take_stdio readiness probe sees an existing unit, and
+            // refused-launch teardown confirms removal fast.
+            std::fs::write(
+                &cli,
+                format!(
+                    "#!/bin/sh\n\
+                     if [ \"$1\" = \"rm\" ]; then touch \"{0}/unit-gone\"; exit 0; fi\n\
+                     if [ \"$1\" = \"inspect\" ] && [ ! -f \"{0}/unit-gone\" ]; then exit 0; fi\n\
+                     echo 'Error: No such object: fake' >&2\n\
+                     exit 1\n",
+                    stage.display()
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            Self {
+                dir,
+                backup,
+                cli,
+                mode,
+            }
+        }
+    }
+
+    impl ContainerEngine for SwapEngine {
+        fn name(&self) -> &str {
+            "docker"
+        }
+        fn program(&self) -> &str {
+            self.cli.to_str().unwrap()
+        }
+        fn build<'a>(
+            &'a self,
+            _d: &'a str,
+            _t: &'a str,
+            _c: &'a str,
+            _n: bool,
+        ) -> crate::container::engine::BoxFuture<
+            'a,
+            Result<(), crate::container::engine::EngineError>,
+        > {
+            unreachable!("the swap engine never builds")
+        }
+        fn inspect<'a>(
+            &'a self,
+            _i: &'a str,
+        ) -> crate::container::engine::BoxFuture<
+            'a,
+            Result<String, crate::container::engine::EngineError>,
+        > {
+            unreachable!("the swap engine never inspects images")
+        }
+        fn tag<'a>(
+            &'a self,
+            _s: &'a str,
+            _t: &'a str,
+        ) -> crate::container::engine::BoxFuture<
+            'a,
+            Result<(), crate::container::engine::EngineError>,
+        > {
+            unreachable!("the swap engine never tags")
+        }
+        fn remove_image<'a>(
+            &'a self,
+            _i: &'a str,
+        ) -> crate::container::engine::BoxFuture<
+            'a,
+            Result<(), crate::container::engine::EngineError>,
+        > {
+            unreachable!("the swap engine never removes images")
+        }
+        fn info<'a>(
+            &'a self,
+        ) -> crate::container::engine::BoxFuture<
+            'a,
+            Result<String, crate::container::engine::EngineError>,
+        > {
+            unreachable!("the swap engine never reports info")
+        }
+        fn run<'a>(
+            &'a self,
+            _i: &'a str,
+            _a: &'a [&'a str],
+            _s: bool,
+        ) -> crate::container::engine::BoxFuture<
+            'a,
+            Result<tokio::process::Child, crate::container::engine::EngineError>,
+        > {
+            Box::pin(async move {
+                // The filesystem move lands exactly where the real
+                // daemon would resolve the mount spelling — after the
+                // pre-launch verification, before the session proceeds.
+                match self.mode {
+                    SwapMode::None => {}
+                    SwapMode::Swap => {
+                        std::fs::rename(&self.dir, &self.backup).unwrap();
+                        std::fs::create_dir(&self.dir).unwrap();
+                    }
+                    SwapMode::SwapBack => {
+                        std::fs::rename(&self.dir, &self.backup).unwrap();
+                        std::fs::create_dir(&self.dir).unwrap();
+                        std::fs::remove_dir(&self.dir).unwrap();
+                        std::fs::rename(&self.backup, &self.dir).unwrap();
+                    }
+                    SwapMode::AncestorSwap => {
+                        // `dir` is <ancestor>/<mid>/<leaf>: move the
+                        // ancestor away, rebuild the whole spelling
+                        // inside a replacement ancestor, then restore
+                        // the original — the leaf's parent object is
+                        // never touched and the pinned ancestor is back
+                        // in place afterwards, so only the component
+                        // watch (not the identity re-check) can see it.
+                        let leaf = self.dir.file_name().unwrap().to_os_string();
+                        let mid_dir = self.dir.parent().unwrap();
+                        let mid = mid_dir.file_name().unwrap().to_os_string();
+                        let ancestor = mid_dir.parent().unwrap();
+                        let escaped = ancestor.parent().unwrap().join(format!(
+                            "{}-bak",
+                            ancestor.file_name().unwrap().to_string_lossy()
+                        ));
+                        std::fs::rename(ancestor, &escaped).unwrap();
+                        std::fs::create_dir_all(ancestor.join(&mid).join(&leaf)).unwrap();
+                        std::fs::remove_dir_all(ancestor).unwrap();
+                        std::fs::rename(&escaped, ancestor).unwrap();
+                    }
+                }
+                tokio::process::Command::new("sleep")
+                    .arg("30")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|e| crate::container::engine::EngineError::CommandFailed {
+                        engine: "docker".to_string(),
+                        message: format!("stub run spawn failed: {e}"),
+                    })
+            })
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// A share path swapped between the pre-launch verification and the
+    /// substrate's mount resolution must not be trusted: `run` performs
+    /// the replacement mid-launch, and the post-create re-check refuses
+    /// the session rather than letting the substituted directory stand
+    /// in as the mounted share.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_refuses_share_replaced_before_mount() {
+        let stage = tempfile::tempdir().unwrap();
+        let dir = stage.path().join("logs");
+        let backup = stage.path().join("logs-backup");
+        std::fs::create_dir(&dir).unwrap();
+        let (_check, identity) = crate::fspriv::open_dir_pinned(&dir).unwrap();
+
+        let mut s = spec("img");
+        s.shares.push(ShareMount {
+            host: dir.clone(),
+            guest: "/var/log/mcp-secure".to_string(),
+            writable: true,
+            pin: Some(identity),
+        });
+        s.unit_name = Some("mcp-writ-test-share-swap".to_string());
+
+        let backend = OciBackend::new(Box::new(SwapEngine::new(
+            dir,
+            backup,
+            stage.path(),
+            SwapMode::Swap,
+        )));
+        let outcome = backend.launch(&s).await;
+        assert!(
+            outcome.is_err(),
+            "a share replaced before the mount resolves must refuse the launch"
+        );
+    }
+
+    /// The attack the path re-check cannot see: the verified dir is
+    /// replaced and then restored inside the launch window, so the
+    /// spelled path names the right object again by the time a second
+    /// path check runs. The parent-directory watch still recorded the
+    /// move/create events — the launch must refuse.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn launch_refuses_share_swapped_back_in_window() {
+        let stage = tempfile::tempdir().unwrap();
+        let dir = stage.path().join("logs");
+        let backup = stage.path().join("logs-backup");
+        std::fs::create_dir(&dir).unwrap();
+        let (_check, identity) = crate::fspriv::open_dir_pinned(&dir).unwrap();
+
+        let mut s = spec("img");
+        s.shares.push(ShareMount {
+            host: dir.clone(),
+            guest: "/var/log/mcp-secure".to_string(),
+            writable: true,
+            pin: Some(identity),
+        });
+        s.unit_name = Some("mcp-writ-test-share-swapback".to_string());
+
+        let backend = OciBackend::new(Box::new(SwapEngine::new(
+            dir,
+            backup,
+            stage.path(),
+            SwapMode::SwapBack,
+        )));
+        let outcome = backend.launch(&s).await;
+        assert!(
+            outcome.is_err(),
+            "a repoint-and-restore inside the launch window must refuse"
+        );
+    }
+
+    /// An ancestor repoint-and-restore: the directory above the
+    /// share's parent is swapped wholesale and then put back, so both
+    /// the leaf's own parent object and the pinned ancestor are in
+    /// place afterwards — the identity re-check sees the original,
+    /// and only the component watch's event stream can catch the
+    /// repoint. The launch must refuse.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn launch_refuses_share_ancestor_repoint() {
+        let stage = tempfile::tempdir().unwrap();
+        let dir = stage.path().join("outer").join("inner").join("logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_check, identity) = crate::fspriv::open_dir_pinned(&dir).unwrap();
+
+        let mut s = spec("img");
+        s.shares.push(ShareMount {
+            host: dir.clone(),
+            guest: "/var/log/mcp-secure".to_string(),
+            writable: true,
+            pin: Some(identity),
+        });
+        s.unit_name = Some("mcp-writ-test-share-ancestor".to_string());
+
+        let backend = OciBackend::new(Box::new(SwapEngine::new(
+            dir,
+            stage.path().join("unused"),
+            stage.path(),
+            SwapMode::AncestorSwap,
+        )));
+        let outcome = backend.launch(&s).await;
+        assert!(
+            outcome.is_err(),
+            "an ancestor repoint inside the launch window must refuse"
+        );
+    }
+
+    /// A drain that already fired must stay fired: the first failure
+    /// is retained so a later drain cannot consume the events and then
+    /// report the window clean.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn share_watch_drain_retains_first_failure() {
+        let stage = tempfile::tempdir().unwrap();
+        let dir = stage.path().join("logs");
+        std::fs::create_dir(&dir).unwrap();
+        let (_check, identity) = crate::fspriv::open_dir_pinned(&dir).unwrap();
+
+        let mut s = spec("img");
+        s.shares.push(ShareMount {
+            host: dir.clone(),
+            guest: "/var/log/mcp-secure".to_string(),
+            writable: true,
+            pin: Some(identity),
+        });
+
+        let mut watch = crate::container::backends::begin_share_pin_watch(&s).unwrap();
+        assert!(watch.drain().is_ok(), "a clean window drains");
+        std::fs::rename(&dir, stage.path().join("logs-moved")).unwrap();
+        assert!(watch.drain().is_err(), "the repoint must refuse");
+        assert!(
+            watch.drain().is_err(),
+            "the consumed failure must stay refused on the next drain"
+        );
+    }
+
+    /// The control for the swap tests: with the pinned dir left alone,
+    /// the launch proceeds — the arming/verifying/draining pipeline
+    /// itself must not refuse a clean window — and the final drain
+    /// inside `take_stdio` hands the pipes over.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_with_stable_pinned_share_proceeds() {
+        let stage = tempfile::tempdir().unwrap();
+        let dir = stage.path().join("logs");
+        let backup = stage.path().join("logs-backup");
+        std::fs::create_dir(&dir).unwrap();
+        let (_check, identity) = crate::fspriv::open_dir_pinned(&dir).unwrap();
+
+        let mut s = spec("img");
+        s.shares.push(ShareMount {
+            host: dir.clone(),
+            guest: "/var/log/mcp-secure".to_string(),
+            writable: true,
+            pin: Some(identity),
+        });
+        s.unit_name = Some("mcp-writ-test-share-stable".to_string());
+
+        let backend = OciBackend::new(Box::new(SwapEngine::new(
+            dir,
+            backup,
+            stage.path(),
+            SwapMode::None,
+        )));
+        let mut handle = backend.launch(&s).await.unwrap();
+        handle
+            .take_stdio()
+            .expect("a clean launch window must hand over stdio");
+        handle.cleanup().await.unwrap();
     }
 
     #[test]

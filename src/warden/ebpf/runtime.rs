@@ -214,8 +214,10 @@ fn entry_bytes(e: &RuleEntry) -> &[u8] {
 /// sheds connect enforcement entirely. Any grant spelling covering the
 /// v2 root — or inside it, where it could still name `cgroup.procs` or
 /// `cgroup.subtree_control` of a sibling branch — refuses the launch.
-/// An unresolvable spelling refuses too: "cannot prove disjoint" stays
-/// on the refuse side.
+/// A root-glob spelling (`/*`, `/**`) reduces to an empty base every
+/// grant builder skips — it grants nothing and is skipped here too.
+/// Any other unresolvable spelling refuses: "cannot prove disjoint"
+/// stays on the refuse side.
 pub fn cgroup_write_grant_conflict(policy: &crate::policy::Policy) -> Option<String> {
     let root = match crate::fsoverlap::resolve_grant_spelling(CGROUP_ROOT) {
         Some(r) => r,
@@ -239,6 +241,9 @@ pub fn cgroup_write_grant_conflict(policy: &crate::policy::Policy) -> Option<Str
                 }
             }
             None => {
+                if crate::fsoverlap::reduces_to_empty_base(&grant) {
+                    continue;
+                }
                 return Some(format!(
                     "fs write grant '{grant}' cannot be resolved against the cgroup v2 \
                      hierarchy — refusing rather than assuming disjoint"

@@ -141,18 +141,28 @@ fn resolve_engine_explicit_buildah() {
 
 // -- WslcEngine -------------------------------------------------------
 
-/// The `<subcmd> -f df -t tag [--no-cache] ctx` argument order the
-/// engine build impls share — `--no-cache` sits between the tag
-/// and the context dir, and `bud` swaps the subcommand.
+/// The `<subcmd> -f df -t tag --network=none [--no-cache] ctx` argument
+/// order the engine build impls share — build networking is always
+/// denied, `--no-cache` sits between the flags and the context dir, and
+/// `bud` swaps the subcommand.
 #[test]
 fn image_build_args_place_no_cache_before_context() {
     assert_eq!(
         image_build_args("build", "df", "img:tag", "ctx", true),
-        ["build", "-f", "df", "-t", "img:tag", "--no-cache", "ctx"]
+        [
+            "build",
+            "-f",
+            "df",
+            "-t",
+            "img:tag",
+            "--network=none",
+            "--no-cache",
+            "ctx"
+        ]
     );
     assert_eq!(
         image_build_args("bud", "df", "img:tag", "ctx", false),
-        ["bud", "-f", "df", "-t", "img:tag", "ctx"]
+        ["bud", "-f", "df", "-t", "img:tag", "--network=none", "ctx"]
     );
 }
 

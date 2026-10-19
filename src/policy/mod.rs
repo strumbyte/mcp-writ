@@ -667,6 +667,22 @@ impl Policy {
         Ok(policy)
     }
 
+    /// Every file the policy load read — the root document, each
+    /// `extends`/`include` ancestor, and each resolved `@file`
+    /// `args_schema` — canonicalized and deduplicated, plus each file's
+    /// spelled absolute path alongside its canonical target. A workload
+    /// write grant covering any of them — or a directory whose symlink
+    /// a spelled path resolves through — would let it rewrite what a
+    /// *later* launch loads, so launchers refuse that overlap before
+    /// spawning. Empty for policies built without a load (no provenance
+    /// attached).
+    pub fn source_files(&self) -> Vec<std::path::PathBuf> {
+        self.provenance
+            .as_ref()
+            .map(|p| p.sources.clone())
+            .unwrap_or_default()
+    }
+
     /// Every path spelling that hands the workload filesystem write
     /// access: `defaults.filesystem` `read_write` entries plus each
     /// *allowed* tool's `fs.read_write_paths`, minus `denied_paths`
