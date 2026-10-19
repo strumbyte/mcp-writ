@@ -819,8 +819,28 @@ where
         digest_changed = changed;
         // Publish a new verified generation before the busy gate drops:
         // a tools/call admitted under the prior generation sees the
-        // mismatch at its pre-write recheck and unwinds.
-        shared.list_generation.fetch_add(1, Ordering::SeqCst);
+        // mismatch at its pre-write recheck and unwinds. The advertised
+        // name set moves with the counter under one lock — the pair is
+        // the object `tools/call` authorization binds to, so a tool the
+        // verified listing omitted loses its channel on this bump even
+        // when the static policy names it.
+        let next = {
+            // A poisoned mutex still holds the generation/name pair —
+            // recovering the guard keeps the S2C task alive instead of
+            // panicking the forwarding path on a sibling task's panic.
+            let mut vt = shared
+                .verified_tools
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            vt.generation += 1;
+            vt.names = if shared.dry_run {
+                tools_to_verify.iter().map(|t| t.name.clone()).collect()
+            } else {
+                visible.iter().map(|t| t.name.clone()).collect()
+            };
+            vt.generation
+        };
+        shared.list_generation.store(next, Ordering::SeqCst);
         if changed {
             tracing::debug!(hash = verified_digest, "tools/list last_verified updated");
         }
@@ -993,6 +1013,12 @@ mod tests {
             held_client_list: Arc::new(Mutex::new(None)),
             internal_list_failure: Arc::new(tokio::sync::Mutex::new(None)),
             list_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            verified_tools: Arc::new(std::sync::Mutex::new(
+                crate::auditor::proxy_state::VerifiedToolSet {
+                    generation: 0,
+                    names: std::collections::HashSet::new(),
+                },
+            )),
             last_list_template: Arc::new(Mutex::new(String::new())),
             next_internal_id: Arc::new(std::sync::atomic::AtomicU64::new(910_001)),
             abort_tx,

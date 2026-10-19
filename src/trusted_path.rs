@@ -18,10 +18,12 @@ use std::path::{Path, PathBuf};
 ///   the caller or by root — and a root-owned entry must not be
 ///   world-writable (a group-writable admin dir like Homebrew's
 ///   `/usr/local` is accepted; an `o+w` shared dir never is).
-/// - **Windows**: absolute + canonical + regular file — ACL ownership
-///   is expressed by the resolution site instead: OS-owned helpers
-///   resolve inside [`system32_exe`]'s directory or the admin-writable
-///   Program Files tree, never PATH.
+/// - **Windows**: absolute + canonical + regular file, and the leaf
+///   plus every ancestor must be owned by a trusted principal
+///   (the caller, SYSTEM, Administrators, TrustedInstaller) with no
+///   DACL grant that hands a broad trustee write/delete/ACL control —
+///   the same "no different user can replace it" contract the Unix
+///   walk enforces, expressed through SIDs instead of modes.
 ///
 /// Errors name the rejected candidate class — callers must refuse,
 /// never fall through to a later PATH entry (the same-name shadow is
@@ -38,10 +40,10 @@ pub(crate) fn validate_driver_path(path: &Path) -> Result<PathBuf, String> {
     if !md.is_file() {
         return Err(format!("'{}' is not a regular file", canon.display()));
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if let Some(bad) = driver_replacement_gap(&canon) {
         return Err(format!(
-            "'{}' (or ancestor '{}') is writable by a different user — a \
+            "'{}' (or ancestor '{}') is replaceable by a different user — a \
              substituted driver runs before sandbox setup",
             canon.display(),
             bad.display()
@@ -95,6 +97,47 @@ fn driver_replacement_gap(path: &Path) -> Option<PathBuf> {
         let sticky = md.mode() & 0o1000 != 0;
         if world_writable && (leaf || !sticky) {
             return Some(p.to_path_buf());
+        }
+        leaf = false;
+        cur = p.parent();
+    }
+    None
+}
+
+/// Windows gap check mirroring the Unix walk: the first component —
+/// from the resolved leaf up through its ancestors — a *different*
+/// principal could replace. A component is a gap when:
+///
+/// - its owner is not a trusted principal (`path_owner_is_trusted`
+///   fails or errors — an unanswerable owner question counts as a
+///   gap rather than a pass);
+/// - the leaf file's DACL grants a broad trustee content-write,
+///   delete, or ACL control (`dacl_grants_file_write`);
+/// - an ancestor directory's DACL grants a broad trustee
+///   delete/delete-child/ACL control (`dir_dacl_grants_replace_rights`)
+///   — the rights to rename a component out and plant a same-name
+///   substitute.
+///
+/// Grants to Administrators or SYSTEM are not broad: they name the
+/// very authority being validated, matching the Unix "owned by root"
+/// class.
+#[cfg(windows)]
+fn driver_replacement_gap(path: &Path) -> Option<PathBuf> {
+    let mut leaf = true;
+    let mut cur: Option<&Path> = Some(path);
+    while let Some(p) = cur {
+        match crate::fspriv::path_owner_is_trusted(p) {
+            Ok(true) => {}
+            _ => return Some(p.to_path_buf()),
+        }
+        let broad = if leaf {
+            crate::fspriv::dacl_grants_file_write(p)
+        } else {
+            crate::fspriv::dir_dacl_grants_replace_rights(p)
+        };
+        match broad {
+            Ok(false) => {}
+            _ => return Some(p.to_path_buf()),
         }
         leaf = false;
         cur = p.parent();

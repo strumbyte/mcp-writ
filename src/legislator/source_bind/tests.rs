@@ -201,7 +201,7 @@ fn env_launcher_marks_workload_not_fully_bound() {
         "server.py".into(),
     ];
     let discovery = discover_from_argv(&argv);
-    let w = workload_hashes(&argv, &discovery);
+    let w = workload_hashes(&argv, &discovery, None);
     assert!(
         w.unbound_reasons.iter().any(|r| r.contains("env")),
         "env launch must carry a reason: {:?}",
@@ -242,7 +242,7 @@ fn shebang_script_binds_interpreter_and_payload() {
     // Direct exec: argv[0] is the script — the launch expands through
     // the shebang to the resolved interpreter, so the draft binds both.
     let argv = vec![script.to_string_lossy().into_owned()];
-    let w = workload_hashes(&argv, &discover_from_argv(&argv));
+    let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
     let binary = w.binary.as_ref().expect("binary pin on the interpreter");
     assert!(
         !crate::workload::same_file(Path::new(&binary.target), &script),
@@ -261,7 +261,7 @@ fn shebang_script_binds_interpreter_and_payload() {
     // Indirect exec (`python3 server.py`) binds the same way — the
     // shebang is inert there and must not draw a caveat.
     let argv = vec!["python3".into(), script.to_string_lossy().into_owned()];
-    let w = workload_hashes(&argv, &discover_from_argv(&argv));
+    let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
     assert!(
         !w.unbound_reasons.iter().any(|r| r.contains("shebang")),
         "{:?}",
@@ -272,7 +272,7 @@ fn shebang_script_binds_interpreter_and_payload() {
     // fully bound.
     std::fs::write(&script, "#!/usr/bin/python3\nprint(1)\n").unwrap();
     let argv = vec![script.to_string_lossy().into_owned()];
-    let w = workload_hashes(&argv, &discover_from_argv(&argv));
+    let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
     assert!(
         w.binary.is_some() && w.entrypoint.is_some(),
         "fixed shebang binds interpreter and script: {w:?}"
@@ -311,7 +311,7 @@ fn unmodeled_shebang_marks_payload_unbound() {
         let script = dir.join("entrypoint");
         std::fs::write(&script, format!("#!/usr/bin/env {interp}\necho hi\n")).unwrap();
         let argv = vec![script.to_string_lossy().into_owned()];
-        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
         let binary = w.binary.as_ref().expect("binary pin on the interpreter");
         assert!(
             !crate::workload::same_file(Path::new(&binary.target), &script),
@@ -340,7 +340,7 @@ fn unmodeled_shebang_marks_payload_unbound() {
     let script = dir.join("entrypoint");
     std::fs::write(&script, "echo hi\n").unwrap();
     let argv = vec![script.to_string_lossy().into_owned()];
-    let w = workload_hashes(&argv, &discover_from_argv(&argv));
+    let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
     assert!(
         !w.unbound_reasons.iter().any(|r| r.contains("shebang")),
         "{:?}",
@@ -497,7 +497,7 @@ fn extensionless_shebang_script_is_a_source_payload() {
     // Direct exec: the launch expands through the env shebang to the
     // PATH-resolved interpreter — binary-hash pins it and
     // entrypoint-hash pins the script, so the launch is fully bound.
-    let w = workload_hashes(&argv, &d);
+    let w = workload_hashes(&argv, &d, None);
     if crate::workload::resolve_command_path("python3").is_ok() {
         assert!(
             w.binary.is_some() && w.entrypoint.is_some(),
@@ -569,7 +569,7 @@ fn inline_eval_reason_without_known_interpreter() {
         vec!["perl".into(), "-e".into(), "1".into()],
         vec!["ruby".into(), "-e".into(), "puts 1".into()],
     ] {
-        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
         assert!(
             w.unbound_reasons
                 .iter()
@@ -588,7 +588,7 @@ fn unresolvable_payload_args_get_unbound_reason() {
     // the draft still carries an unbound-entrypoint reason that names
     // the blocking option.
     let argv = vec!["perl".into(), "--unknown-option".into(), "script.pl".into()];
-    let w = workload_hashes(&argv, &discover_from_argv(&argv));
+    let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
     assert!(
         w.unbound_reasons
             .iter()
@@ -598,7 +598,7 @@ fn unresolvable_payload_args_get_unbound_reason() {
     );
     // Bare interpreter: no arguments, nothing to bind, no reason.
     let argv = vec!["perl".into()];
-    let w = workload_hashes(&argv, &discover_from_argv(&argv));
+    let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
     assert!(
         !w.unbound_reasons
             .iter()
@@ -709,7 +709,7 @@ fn node_preload_flags_get_unbound_reason() {
             "stub.cjs".into(),
             script.to_string_lossy().into_owned(),
         ];
-        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
         assert!(
             w.unbound_reasons.iter().any(|r| r.contains("preload")),
             "{flag}: {:?}",
@@ -717,7 +717,7 @@ fn node_preload_flags_get_unbound_reason() {
         );
     }
     let argv = vec!["node".into(), script.to_string_lossy().into_owned()];
-    let w = workload_hashes(&argv, &discover_from_argv(&argv));
+    let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
     assert!(
         !w.unbound_reasons.iter().any(|r| r.contains("preload")),
         "{:?}",
@@ -791,4 +791,146 @@ fn direct_script_argv0() {
             ..
         }
     ));
+}
+
+/// F1 (TOCTOU): the `entrypoint-hash` line must pin the digest of the
+/// bytes the analysis actually consumed — never a second pathname read
+/// taken after live discovery executed the payload. A payload that
+/// rewrites itself during discovery still gets the analysis-time pin
+/// (and fails closed at `run` when its current bytes differ).
+#[test]
+fn analyzed_digest_pins_analyzed_bytes_not_a_second_read() {
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp_writ_toctou_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("server.py");
+    let analyzed_bytes = b"# analyzed version\n";
+    std::fs::write(&script, analyzed_bytes).unwrap();
+
+    let analyzed = AnalyzedDigest {
+        path: std::fs::canonicalize(&script).unwrap(),
+        digest: crate::verifier::hash::hash_bytes(analyzed_bytes),
+        binds_launch_image: false,
+    };
+
+    // The payload swapped its own bytes — what a hostile server does
+    // while tools/list discovery runs it — before hashing runs.
+    std::fs::write(&script, b"# rewritten during discovery\n").unwrap();
+
+    let discovery = PayloadDiscovery {
+        kind: PayloadKind::Source {
+            interpreter: InterpreterKind::Python,
+            path: script.clone(),
+        },
+    };
+    let w = workload_hashes(
+        &["python3".into(), script.to_string_lossy().into_owned()],
+        &discovery,
+        Some(&analyzed),
+    );
+    let entry = w
+        .entrypoint
+        .as_ref()
+        .expect("the analyzed payload must still pin");
+    assert_eq!(
+        entry.hash_value, analyzed.digest,
+        "the pin covers the analyzed bytes"
+    );
+    assert_ne!(
+        entry.hash_value,
+        crate::verifier::hash::hash_file(&script).unwrap(),
+        "a second read would have certified the swapped content"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same binding refuses to pin when the analyzed path and the
+/// hash-time resolution name different objects — a PATH or filesystem
+/// swap that moved the launch target.
+#[test]
+fn analyzed_digest_refused_when_payload_resolution_drifted() {
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp_writ_toctou_drift_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("server.py");
+    let other = dir.join("other.py");
+    std::fs::write(&script, b"# current\n").unwrap();
+    std::fs::write(&other, b"# analyzed\n").unwrap();
+
+    let analyzed = AnalyzedDigest {
+        path: std::fs::canonicalize(&other).unwrap(),
+        digest: crate::verifier::hash::hash_bytes(b"# analyzed\n"),
+        binds_launch_image: false,
+    };
+    let discovery = PayloadDiscovery {
+        kind: PayloadKind::Source {
+            interpreter: InterpreterKind::Python,
+            path: script.clone(),
+        },
+    };
+    let w = workload_hashes(
+        &["python3".into(), script.to_string_lossy().into_owned()],
+        &discovery,
+        Some(&analyzed),
+    );
+    assert!(
+        w.entrypoint.is_none(),
+        "drifted analysis must not pin: {w:?}"
+    );
+    assert!(
+        w.unbound_reasons
+            .iter()
+            .any(|r| r.contains("cannot be bound")),
+        "the drift is recorded as an unbound reason: {:?}",
+        w.unbound_reasons
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The argv[0] image the analysis already read is pinned from its digest
+/// when it still resolves to the same object — `binds_launch_image`
+/// marks that identity.
+#[test]
+fn analyzed_launch_image_binds_the_binary_pin() {
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp_writ_toctou_bin_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("server.bin");
+    std::fs::write(&exe, b"analyzed image").unwrap();
+
+    let analyzed = AnalyzedDigest {
+        path: std::fs::canonicalize(&exe).unwrap(),
+        digest: crate::verifier::hash::hash_bytes(b"analyzed image"),
+        binds_launch_image: true,
+    };
+    // Mutate after analysis: the pin still names the analyzed bytes.
+    std::fs::write(&exe, b"post-discovery image").unwrap();
+
+    let argv = vec![exe.to_string_lossy().into_owned()];
+    let discovery = discover_from_argv(&argv);
+    let w = workload_hashes(&argv, &discovery, Some(&analyzed));
+    let binary = w.binary.as_ref().expect("the launch image must pin");
+    assert_eq!(binary.hash_value, analyzed.digest);
+    let _ = std::fs::remove_dir_all(&dir);
 }

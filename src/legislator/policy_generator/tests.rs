@@ -1147,6 +1147,7 @@ fn workload_hashes_end_to_end_from_argv() {
         &PayloadDiscovery {
             kind: PayloadKind::Native,
         },
+        None,
     );
     if let Some(resolution) = &interp_resolution {
         let binary = wh
@@ -1190,6 +1191,7 @@ fn workload_hashes_end_to_end_from_argv() {
                 path: fixture.clone(),
             },
         },
+        None,
     );
     let entrypoint = wh
         .entrypoint
@@ -1213,6 +1215,7 @@ fn workload_hashes_end_to_end_from_argv() {
                 flag: "-e".to_string(),
             },
         },
+        None,
     );
     assert!(wh.binary.is_some());
     assert!(wh.entrypoint.is_none());

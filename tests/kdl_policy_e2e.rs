@@ -55,6 +55,13 @@ fn write_policy(dir: &Path, name: &str, content: &str) -> PathBuf {
     path
 }
 
+/// Every tool name the policies in this file may legitimately call —
+/// advertised by the fixture so the verified tools/list gate admits
+/// them. Unknown-tool tests use names outside this set.
+const KDL_FIXTURE_TOOLS: &str = "allowed_tool,another_safe,blocked_tool,dangerous_tool,\
+debug_tool,exec,fetch_url,fail_write,my_read,only_this_tool,read_file,safe_tool,search,\
+search_repos,tool_a,tool_b,write_file";
+
 /// Spawn mcp-writ with a custom policy file and optional dry-run flag.
 fn spawn_guard_with_policy(policy_path: &Path, dry_run: bool) -> tokio::process::Child {
     spawn_guard_with_options(policy_path, dry_run, None, &[])
@@ -104,7 +111,13 @@ fn spawn_guard_with_options(
     }
 
     cmd.arg("--");
-    cmd.args(common::scripted_stdio_argv("tools_call_ok"))
+    // The Auditor admits tools/call only for names the verified
+    // tools/list advertised — the fixture must actually advertise the
+    // arbitrary names these policies declare, so the union of every
+    // tool name exercised here is added to the fixture's set.
+    let mut argv = common::scripted_stdio_argv("tools_call_ok");
+    argv.push(format!("--advertise-tools={KDL_FIXTURE_TOOLS}"));
+    cmd.args(argv)
         .env("MCP_WRIT_SKIP_SANDBOX", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

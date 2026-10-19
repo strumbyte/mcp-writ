@@ -322,10 +322,52 @@ def tools_for_mode(mode: str, list_count: int) -> list:
                 },
             ]
         )
+        # The deputy test policies also declare tools outside the role
+        # exercise (legacy discovery/use names and an unregistered pass-
+        # through) — a real server advertises every tool it serves, and
+        # the Auditor admits calls only against the verified advertised
+        # set.
+        for extra in ("list_files", "list_directory", "write_file"):
+            tools.append(
+                {
+                    "name": extra,
+                    "description": "Deputy scenario tool.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            )
         return tools
+    if mode == "denied_result":
+        # Advertise every name the pending-release scenarios call — the
+        # Auditor binds tools/call admission to the verified advertised
+        # set, so the fixture must list the tools it serves.
+        return [
+            {
+                "name": name,
+                "description": "Denied-result scenario tool.",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+            for name in ("read_file", "deny_me", "list_files", "list_directory")
+        ]
     if mode in ("tools_call_ok", "s2c_id_collision"):
         return call_tools()
     return clean_tools()
+
+
+def advertised_tools(mode: str, list_count: int, extra: list) -> list:
+    """The mode's listing plus any `--advertise-tools` extras, appended
+    once each with a generic schema."""
+    tools = tools_for_mode(mode, list_count)
+    seen = {t.get("name") for t in tools if isinstance(t, dict)}
+    for name in extra:
+        if name not in seen:
+            tools.append(
+                {
+                    "name": name,
+                    "description": "Scripted extra advertised tool.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            )
+    return tools
 
 
 def handle_tools_call(mode: str, msg: dict, v26_mode: bool, pending_s2c: dict) -> None:
@@ -699,6 +741,20 @@ def main() -> None:
         (a.split("=", 1)[1] for a in extra_args if a.startswith("--protocol-version=")),
         None,
     )
+    # `--advertise-tools=a,b,c` unions extra names into every tools/list
+    # answer: the Auditor binds tools/call admission to the verified
+    # advertised set, so a policy exercising arbitrary tool names needs
+    # the fixture to actually advertise them. Mode fixtures stay intact —
+    # extras are generic one-property-schema entries appended to the
+    # mode's own set.
+    advertise_extra = next(
+        (
+            [n for n in a.split("=", 1)[1].split(",") if n]
+            for a in extra_args
+            if a.startswith("--advertise-tools=")
+        ),
+        [],
+    )
     list_count = 0
     pending_s2c: dict = {}
     held_list: list = []
@@ -819,7 +875,11 @@ def main() -> None:
                 list_count += 1
                 continue
             reply(
-                result_for(msg, {"tools": tools_for_mode(mode, list_count)}, v26_mode)
+                result_for(
+                    msg,
+                    {"tools": advertised_tools(mode, list_count, advertise_extra)},
+                    v26_mode,
+                )
             )
             if list_count == 0 and mode.startswith("list_changed"):
                 reply({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})

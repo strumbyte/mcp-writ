@@ -48,11 +48,40 @@ impl WorkloadHashes {
     }
 }
 
+/// Bytes the capability analysis already materialized, with the digest
+/// computed over exactly them. A generated draft's hash pin must certify
+/// *these* bytes: re-reading the pathname after live discovery ran the
+/// workload would let a self-rewriting server pin content the analysis
+/// never saw (the TOCTOU this type exists to close).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyzedDigest {
+    /// Path the analyzed bytes came from.
+    pub path: PathBuf,
+    /// `sha256:` digest over the analyzed buffer.
+    pub digest: String,
+    /// True when `path` was derived by resolving `argv[0]` — i.e. it IS
+    /// the launch image the `binary-hash` line pins. False for an
+    /// explicit `--binary-path` or a source payload: those never stand in
+    /// for the spawned `argv[0]` object.
+    pub binds_launch_image: bool,
+}
+
 /// Compute the draft's launch-target hashes from argv and its payload
 /// discovery. Hash values are this host's digests; the REVIEW comments the
 /// generator emits with them tell the operator to recompute on the
 /// deployment host.
-pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> WorkloadHashes {
+///
+/// `analyzed` carries the digest of the bytes capability analysis already
+/// consumed. When it names the same object the launch binds (the resolved
+/// `argv[0]` image, or the source payload), the pin is taken from it
+/// verbatim — no second read. If the object resolves differently between
+/// analysis and hashing the pin is refused with an unbound reason rather
+/// than certifying unanalyzed bytes.
+pub fn workload_hashes(
+    argv: &[String],
+    discovery: &PayloadDiscovery,
+    analyzed: Option<&AnalyzedDigest>,
+) -> WorkloadHashes {
     let mut out = WorkloadHashes::default();
     let mut reasons: Vec<String> = Vec::new();
 
@@ -67,17 +96,34 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
             Ok(resolution) => {
                 let launch_argv = resolution.into_argv(argv);
                 let exe = resolution.exe;
-                match crate::verifier::hash::hash_file(&exe) {
-                    Ok(hash_value) => {
+                match analyzed.filter(|a| a.binds_launch_image) {
+                    Some(a) if crate::workload::same_file(&a.path, &exe) => {
+                        // The analysis read IS this launch image — pin
+                        // its digest without a second pathname read.
                         out.binary = Some(HashLine {
                             target: draft_target(&exe),
-                            hash_value,
+                            hash_value: a.digest.clone(),
                         });
                     }
-                    Err(e) => reasons.push(format!(
-                        "binary-hash not emitted: cannot hash '{}': {e}",
+                    Some(a) => reasons.push(format!(
+                        "binary-hash not emitted: '{argv0}' resolved to '{}' during \
+                         analysis but '{}' at hash time — the analyzed bytes cannot \
+                         be bound to this launch",
+                        a.path.display(),
                         exe.display()
                     )),
+                    None => match crate::verifier::hash::hash_file(&exe) {
+                        Ok(hash_value) => {
+                            out.binary = Some(HashLine {
+                                target: draft_target(&exe),
+                                hash_value,
+                            });
+                        }
+                        Err(e) => reasons.push(format!(
+                            "binary-hash not emitted: cannot hash '{}': {e}",
+                            exe.display()
+                        )),
+                    },
                 }
                 (Some(exe), launch_argv)
             }
@@ -203,21 +249,49 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
         }
         PayloadKind::Source { path, .. } => {
             let resolved = resolve_payload_path(path);
-            match resolved.and_then(|p| {
-                crate::verifier::hash::hash_file(&p)
-                    .ok()
-                    .map(|hash_value| (p, hash_value))
-            }) {
-                Some((p, hash_value)) => {
+            match analyzed.filter(|a| !a.binds_launch_image) {
+                // The analysis already materialized the payload — pin the
+                // digest of exactly those bytes when the resolved object
+                // still matches; a swapped payload must not smuggle bytes
+                // the analysis never saw into the pin.
+                Some(a)
+                    if resolved
+                        .as_ref()
+                        .is_some_and(|p| crate::workload::same_file(&a.path, p)) =>
+                {
+                    let p = resolved.expect("guarded by is_some_and");
                     out.entrypoint = Some(HashLine {
                         target: draft_target(&p),
-                        hash_value,
+                        hash_value: a.digest.clone(),
                     });
                 }
-                None => reasons.push(format!(
-                    "entrypoint-hash not emitted: cannot hash payload '{}'",
-                    path.display()
+                Some(a) => reasons.push(format!(
+                    "entrypoint-hash not emitted: payload '{}' resolved to '{}' during \
+                     analysis but '{}' at hash time — the analyzed bytes cannot be \
+                     bound to this launch",
+                    path.display(),
+                    a.path.display(),
+                    resolved
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unresolvable>".to_string())
                 )),
+                None => match resolved.and_then(|p| {
+                    crate::verifier::hash::hash_file(&p)
+                        .ok()
+                        .map(|hash_value| (p, hash_value))
+                }) {
+                    Some((p, hash_value)) => {
+                        out.entrypoint = Some(HashLine {
+                            target: draft_target(&p),
+                            hash_value,
+                        });
+                    }
+                    None => reasons.push(format!(
+                        "entrypoint-hash not emitted: cannot hash payload '{}'",
+                        path.display()
+                    )),
+                },
             }
         }
         PayloadKind::InlineEval { interpreter, flag } => reasons.push(format!(

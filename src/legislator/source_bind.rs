@@ -16,7 +16,7 @@ pub use crate::workload::{InterpreterKind, interpreter_from_command};
 
 mod workload;
 
-pub use workload::{HashLine, WorkloadHashes, workload_hashes};
+pub use workload::{AnalyzedDigest, HashLine, WorkloadHashes, workload_hashes};
 
 /// How argv / an inspect path maps onto a payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +68,10 @@ pub struct ToolBinding {
 pub struct SourceFunction {
     pub name: String,
     pub body: std::rc::Rc<str>,
+    /// Declared at file top level — a same-named helper nested inside
+    /// another function or block is a different variable and never
+    /// competes for a registration-site identifier binding.
+    pub top_level: bool,
 }
 
 /// Derived-state caps for the source analyzer: the 16 MiB input bound
@@ -88,6 +92,11 @@ pub struct SourceAnalysis {
     pub tools: Vec<ToolCapability>,
     pub warnings: Vec<String>,
     pub skip_note: String,
+    /// `sha256:` digest over exactly the bytes this analysis consumed.
+    /// The draft's `entrypoint-hash` must pin these bytes — never a
+    /// second pathname read that a payload could have swapped in between
+    /// analysis and hashing.
+    pub payload_digest: String,
 }
 
 /// Human-readable summary of the resolved source payload.
@@ -339,17 +348,30 @@ fn first_inline_eval_flag<'a>(argv: &'a [String], resolved_exe: Option<&Path>) -
 const MAX_SOURCE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Parse a source file into per-tool Capability (fail-secure: I/O errors propagate).
+///
+/// The payload is analyzed under its canonical spelling — the same
+/// resolution `workload_hashes` performs before emitting the
+/// `entrypoint-hash` pin — so the analyzed bytes and the pinned object
+/// cannot drift apart through a link or a renamed spelling.
 pub fn analyze_source_path(path: &Path) -> io::Result<SourceAnalysis> {
-    let source = crate::fspriv::read_text_bounded(path, MAX_SOURCE_FILE_BYTES)?;
-    let interpreter = source_kind_from_path(path)
-        .or_else(|| shebang_interpreter(path))
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let bytes = crate::fspriv::read_file_bounded(&path, MAX_SOURCE_FILE_BYTES)?;
+    // The digest pins the payload bytes as read — hashing the decoded
+    // text instead would pin re-encoded output the file never held.
+    let payload_digest = crate::verifier::hash::hash_bytes(&bytes);
+    let source =
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let interpreter = source_kind_from_path(&path)
+        .or_else(|| shebang_interpreter(&path))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("cannot determine source language for {}", path.display()),
             )
         })?;
-    Ok(analyze_source(path, interpreter, &source))
+    let mut analysis = analyze_source(&path, interpreter, &source);
+    analysis.payload_digest = payload_digest;
+    Ok(analysis)
 }
 
 pub fn analyze_source(path: &Path, interpreter: InterpreterKind, source: &str) -> SourceAnalysis {
@@ -375,6 +397,7 @@ pub fn analyze_source(path: &Path, interpreter: InterpreterKind, source: &str) -
         tools,
         warnings,
         skip_note: native_skip_note(path),
+        payload_digest: crate::verifier::hash::hash_bytes(source.as_bytes()),
     }
 }
 

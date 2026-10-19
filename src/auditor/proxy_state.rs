@@ -32,6 +32,21 @@ pub(crate) fn list_verification_required(policy: &Policy, fail_on: FailOn) -> bo
     !policy.tools_list_hashes.is_empty() || fail_on != FailOn::None
 }
 
+/// The tool-name set the last verified `tools/list` advertised to the
+/// client — paired with the generation it published under.
+///
+/// `names` holds exactly what the client-facing response emitted: the
+/// policy-visible subset in enforce mode, the full advertised set in
+/// dry-run. `tools/call` is admitted only when the called name is a
+/// member — a statically allowed tool the verified listing omitted is
+/// refused, because the client could never have learned it was offered.
+pub(crate) struct VerifiedToolSet {
+    /// Same counter as `list_generation`: bumped once per verified
+    /// manifest, so `generation` and `names` always move together.
+    pub(crate) generation: u64,
+    pub(crate) names: std::collections::HashSet<String>,
+}
+
 pub(crate) struct PendingToolsList {
     ids: std::collections::VecDeque<RpcId>,
 }
@@ -166,7 +181,17 @@ pub(crate) struct ProxyShared<W> {
     /// captures this at admission and re-checks it (together with the
     /// busy gate, which a revalidation raises *before* it starts) right
     /// before the child write — a mismatch unwinds and denies the call.
+    /// The atomic mirrors `verified_tools`'s generation for readers that
+    /// only need the number; the mutexed pair is authoritative.
     pub(crate) list_generation: Arc<AtomicU64>,
+    /// The (generation, advertised-name-set) pair `tools/call`
+    /// authorization is bound to — updated under one lock at verified
+    /// publish so an admission captures both atomically and the
+    /// pre-write recheck observes the identical pair. A server cannot
+    /// keep an authorized channel to a tool it omitted from the
+    /// verified listing: membership in the emitted set is checked at
+    /// admission, not just the generation number.
+    pub(crate) verified_tools: Arc<std::sync::Mutex<VerifiedToolSet>>,
     pub(crate) last_list_template: Arc<Mutex<String>>,
     pub(crate) next_internal_id: Arc<AtomicU64>,
     /// Cancellation signal shared between S2C and C2S to immediately abort session.
@@ -195,6 +220,7 @@ impl<W> Clone for ProxyShared<W> {
             held_client_list: self.held_client_list.clone(),
             internal_list_failure: self.internal_list_failure.clone(),
             list_generation: self.list_generation.clone(),
+            verified_tools: self.verified_tools.clone(),
             last_list_template: self.last_list_template.clone(),
             next_internal_id: self.next_internal_id.clone(),
             abort_tx: self.abort_tx.clone(),

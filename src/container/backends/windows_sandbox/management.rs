@@ -18,14 +18,15 @@ const OUTPUT_CAP: u64 = 64 * 1024;
 pub(super) async fn cli() -> Result<PathBuf, String> {
     if let Some(raw) = std::env::var_os("MCP_WRIT_WSB_EXE") {
         let path = PathBuf::from(raw);
-        return if path.is_absolute() && path.is_file() {
-            Ok(path)
-        } else {
-            Err(format!(
-                "MCP_WRIT_WSB_EXE '{}' is not an absolute existing file",
-                path.display()
-            ))
-        };
+        // The override substitutes the trusted-path resolution — the
+        // same owner/DACL contract a driver candidate must pass, so an
+        // env-planted path in a broadly writable location refuses.
+        return crate::trusted_path::validate_driver_path(&path).map_err(|e| {
+            format!(
+                "MCP_WRIT_WSB_EXE '{}' is not a trusted executable: {e}",
+                crate::termutil::sanitize_for_terminal(&path.display().to_string())
+            )
+        });
     }
     if let Some(p) = crate::trusted_path::system32_exe("wsb.exe") {
         return Ok(p);
@@ -53,22 +54,22 @@ pub(super) async fn cli() -> Result<PathBuf, String> {
         crate::container::windows_probe::ProbeOutcome::Answered(text) => {
             let install_dir = PathBuf::from(text.trim());
             // The package record is machine data, not a trusted path —
-            // a relative or empty answer must never anchor a join.
+            // it must resolve through the same driver contract (absolute,
+            // canonical, owner/DACL-checked) rather than anchor a join
+            // on its own claim.
             if !install_dir.is_absolute() {
                 Err(format!(
                     "wsb.exe package install location '{}' is not an absolute path",
-                    install_dir.display()
+                    crate::termutil::sanitize_for_terminal(&install_dir.display().to_string())
                 ))
             } else {
                 let loc = install_dir.join("wsb.exe");
-                if loc.is_file() {
-                    Ok(loc)
-                } else {
-                    Err(format!(
-                        "wsb.exe not present at the package install location '{}'",
-                        loc.display()
-                    ))
-                }
+                crate::trusted_path::validate_driver_path(&loc).map_err(|e| {
+                    format!(
+                        "wsb.exe at package location '{}' is not a trusted executable: {e}",
+                        crate::termutil::sanitize_for_terminal(&loc.display().to_string())
+                    )
+                })
             }
         }
         crate::container::windows_probe::ProbeOutcome::Absent => {
@@ -424,11 +425,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("wsb.exe");
         std::fs::write(&exe, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            // Driver validation requires the executable bit — a fixture
+            // override still names a runnable image.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("MCP_WRIT_WSB_EXE", &exe);
         }
-        assert_eq!(cli().await.as_deref().ok(), Some(exe.as_path()));
+        // Driver validation returns the canonical spelling — tempdirs
+        // may live behind a symlinked component (macOS /var → /private/var).
+        assert_eq!(
+            cli().await.as_deref().ok(),
+            Some(exe.canonicalize().unwrap().as_path())
+        );
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var("MCP_WRIT_WSB_EXE");
