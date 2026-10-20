@@ -165,6 +165,18 @@ pub fn syscall_grant_intents(
                 );
             }
         }
+        if matches!(name.as_str(), "sendto" | "sendmsg" | "sendmmsg")
+            && !namespaced
+            && policy.network.outbound.deny_all_others
+        {
+            reason.push(
+                "MSG_FASTOPEN pinned clear — unotify sees connect(2) only, so \
+                 the flag's connect-less send would carry an unsupervised \
+                 destination; unconnected datagram sockets already cannot \
+                 exist under the socket() type pin"
+                    .to_string(),
+            );
+        }
         if name == "socketpair" {
             let unix_star = !namespaced
                 && policy
@@ -451,6 +463,42 @@ fn collect_syscall_rules(
                         ],
                     );
                 }
+            } else if matches!(name.as_str(), "sendto" | "sendmsg" | "sendmmsg")
+                && !namespaced
+                && policy.network.outbound.deny_all_others
+            {
+                // Destination-bearing sends on the restricted native
+                // route: the socket() pin already denies unconnected
+                // INET datagram sockets and unotify supervises every
+                // connect(2) — but sendto(2) on a SOCK_STREAM socket
+                // with MSG_FASTOPEN connects from the send's own
+                // sockaddr without any connect(2) call (sendmsg/sendmmsg
+                // take the same flag in their trailing scalar word).
+                // Pin the flags word so the fast-open bit must be
+                // clear; AF_UNIX self-pipe sends and connected sends
+                // pass unchanged. The namespaced route needs no pin —
+                // its TUN boundary evaluates the SYN itself — and an
+                // open posture promises unrestricted TCP already.
+                let flags_arg: u8 = if name == "sendmsg" { 2 } else { 3 };
+                let cond = SeccompCondition::new(
+                    flags_arg,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(libc::MSG_FASTOPEN as u64),
+                    0,
+                )
+                .map_err(|e| {
+                    WardenError::sandbox_setup(
+                        crate::error::SandboxStage::Prepare,
+                        format!("seccomp {name} flags condition: {e}"),
+                    )
+                })?;
+                let rule = SeccompRule::new(vec![cond]).map_err(|e| {
+                    WardenError::sandbox_setup(
+                        crate::error::SandboxStage::Prepare,
+                        format!("seccomp {name} flags rule: {e}"),
+                    )
+                })?;
+                rules.insert(nr, vec![rule]);
             } else if (name == "fork" || name == "vfork") && nr == libc::SYS_clone {
                 // fork/vfork expand to clone(2): pin clone's flag word to
                 // exactly the bits those operations need so the grant

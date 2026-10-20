@@ -100,7 +100,7 @@ fn helper_exe(env_var: &str, candidates: Vec<PathBuf>) -> Option<PathBuf> {
     }
     candidates
         .into_iter()
-        .find(|p| crate::trusted_path::validate_driver_path(p).is_ok())
+        .find_map(|p| crate::trusted_path::validate_driver_path(&p).ok())
 }
 
 /// The `wsl.exe` binary — `MCP_WRIT_WSL_EXE` overrides for fixtures;

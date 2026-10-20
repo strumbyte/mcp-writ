@@ -730,7 +730,72 @@ pub(crate) fn literal_normalized_path(path: &Path) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    crate::pathutil::lexical_normalize_path(&joined).unwrap_or(joined)
+    let spelled = crate::pathutil::lexical_normalize_path(&joined).unwrap_or(joined);
+    on_disk_component_names(&spelled)
+}
+
+/// Windows: fold each existing component of `path` to its on-disk
+/// directory-entry name — the same names a `FILE_NAME_NORMALIZED`
+/// handle path reports — so an 8.3 (`RUNNER~1`) or case-only variant
+/// of the spelled chain still compares equal to the open handle's
+/// real path. `FindFirstFileW` reads the entry in its parent without
+/// traversing it, so a junction keeps its own name here while the
+/// handle path shows the reparse target — the substitution proof is
+/// preserved. Components that do not resolve (absent leaf, remote
+/// share) keep their spelled form.
+#[cfg(windows)]
+fn on_disk_component_names(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Component;
+    use windows::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    use windows::core::HSTRING;
+
+    // FindFirstFileW pattern metacharacters — none can appear in a real
+    // on-disk name.
+    const WILDCARDS: [u16; 5] = [
+        b'*' as u16,
+        b'?' as u16,
+        b'<' as u16,
+        b'>' as u16,
+        b'"' as u16,
+    ];
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        out.push(comp.as_os_str());
+        if !matches!(comp, Component::Normal(_)) {
+            continue;
+        }
+        // A spelled component carrying wildcard characters is not an
+        // on-disk name, but FindFirstFileW would treat it as a pattern
+        // and fold to an unrelated entry — keep the spelling.
+        if comp
+            .as_os_str()
+            .encode_wide()
+            .any(|c| WILDCARDS.contains(&c))
+        {
+            continue;
+        }
+        // Query the parent dir for this entry's on-disk name; a miss
+        // keeps the spelled component.
+        let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+        let Ok(handle) = (unsafe { FindFirstFileW(&HSTRING::from(out.as_os_str()), &mut data) })
+        else {
+            continue;
+        };
+        unsafe {
+            let _ = FindClose(handle);
+        }
+        let end = data
+            .cFileName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(data.cFileName.len());
+        if end == 0 {
+            continue;
+        }
+        out.set_file_name(String::from_utf16_lossy(&data.cFileName[..end]));
+    }
+    out
 }
 
 /// Windows: true when the open `file`'s real path equals the literal

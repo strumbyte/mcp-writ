@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use crate::fsoverlap::{path_covers, resolve_grant_spelling};
+use crate::fsoverlap::{grant_spellings, path_covers, resolve_grant_spelling};
 
 /// `Some(conflict)` when `audit_path` falls under a write grant the
 /// workload will receive — the launch must refuse. `write_grants` is the
@@ -92,7 +92,7 @@ fn protected_path_write_conflict(
     // next open — so coverage is refused on both spellings.
     let spelled = crate::fsoverlap::absolutize_lexical(protected_path);
     for grant in write_grants {
-        let Some(g) = resolve_grant_spelling(&grant) else {
+        let Some((g, g_spelled)) = grant_spellings(&grant) else {
             // A root-glob spelling (`/*`, `/**`) reduces to an empty
             // base — every grant builder skips it, so it contributes
             // nothing to the workload's effective write surface and
@@ -107,7 +107,15 @@ fn protected_path_write_conflict(
                 protected.display()
             ));
         };
-        if path_covers(&g, &protected) || path_covers(&g, &spelled) {
+        // Compare like with like: resolved grant against the resolved
+        // target, lexical grant against the lexical spelling — a
+        // system-symlinked ancestor (macOS `/var` → `/private/var`)
+        // makes the resolved and lexical prefixes differ, and mixing
+        // the bases misses the spelled location under the grant.
+        if path_covers(&g, &protected)
+            || path_covers(&g, &spelled)
+            || path_covers(&g_spelled, &spelled)
+        {
             return Some(format!(
                 "grant '{grant}' (resolves to '{}') covers {label} '{}'",
                 g.display(),

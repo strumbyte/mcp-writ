@@ -257,7 +257,11 @@ fn resolve_engine_wslc_resolves_the_validated_line() {
         std::env::remove_var(crate::container::windows_probe::WSLC_EXE_ENV);
     }
     assert_eq!(engine.name(), "wslc");
-    assert_eq!(engine.program(), stub.to_string_lossy().as_ref());
+    // Driver-path validation returns the canonical spelling — tempdirs
+    // may sit behind a symlinked component (macOS /var → /private/var)
+    // or an 8.3 short name (Windows RUNNER~1 → runneradmin).
+    let canonical_stub = stub.canonicalize().unwrap();
+    assert_eq!(engine.program(), canonical_stub.to_string_lossy().as_ref());
     assert_eq!(engine.interrupt_signal(), Some("SIGINT"));
     assert!(engine.is_available());
 }

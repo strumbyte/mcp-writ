@@ -676,28 +676,47 @@ pub fn policy_path_str(p: &Path) -> String {
 
 pub fn sandbox_fs_allows(unix_dirs: &[&Path], windows_objects: &[&Path], exe: &Path) -> String {
     let f = |p: &Path| policy_path_str(p);
+    // Schema-v2 rejects an identical `allow` twice in one `filesystem`
+    // block — the probe living inside a granted dir (`exe.parent()` ∈
+    // `unix_dirs`) or a caller dir overlapping the fixed runtime list
+    // would emit the same line twice.
+    let mut seen = std::collections::HashSet::new();
+    let mut emit = |out: &mut String, line: String| {
+        if seen.insert(line.clone()) {
+            out.push_str(&line);
+        }
+    };
     let mut out = String::new();
     if cfg!(unix) {
         // Landlock PathBeneath covers the whole subtree beneath a granted
         // directory. Runtime dirs are needed for the dynamically linked exe.
         for dir in unix_dirs {
-            out.push_str(&format!("        allow \"{}\" mode=\"read\"\n", f(dir)));
+            emit(
+                &mut out,
+                format!("        allow \"{}\" mode=\"read\"\n", f(dir)),
+            );
         }
         if let Some(exe_dir) = exe.parent() {
-            out.push_str(&format!("        allow \"{}\" mode=\"read\"\n", f(exe_dir)));
+            emit(
+                &mut out,
+                format!("        allow \"{}\" mode=\"read\"\n", f(exe_dir)),
+            );
         }
         for dir in [
             "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/dev",
         ] {
             if Path::new(dir).exists() {
-                out.push_str(&format!("        allow \"{dir}\" mode=\"read\"\n"));
+                emit(&mut out, format!("        allow \"{dir}\" mode=\"read\"\n"));
             }
         }
     } else if cfg!(windows) {
         // Per-object DACL grants: the executable image, the directories for
         // traversal, and each file the child must actually open.
         for path in windows_objects {
-            out.push_str(&format!("        allow \"{}\" mode=\"read\"\n", f(path)));
+            emit(
+                &mut out,
+                format!("        allow \"{}\" mode=\"read\"\n", f(path)),
+            );
         }
     }
     out

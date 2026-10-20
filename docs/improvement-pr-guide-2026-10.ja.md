@@ -1056,7 +1056,7 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 - [x] [Cargo.toml](../Cargo.toml) の `version` を確定した版に更新し、`Cargo.lock` を再生成する — `0.5.0` を作業ツリーに反映済み・未コミット（2026-10-20）。`Cargo.lock` は `mcp-writ` の version 欄のみの 1 行差分
 - [x] 最新コミットで T-BASE・T-DOC・該当する実機記録を再確認する — HEAD（`d904a34`）＋バージョン更新の作業ツリーで実施（2026-10-20・WSL2 kernel 6.18.54.1・x86-64・rustc 1.99.0）: fmt / clippy `-D warnings` / lib+bins 2457 件 / doc / doc-test 0 件 / docs_check 12 件 / capability_matrix 6 件 全 pass。`cargo doc` は既存クラスの警告 3 件（`cli/mod.rs`・`policy_resolve.rs` の intra-doc link、`provenance.rs` の HTML タグ、いずれも未編集ファイル — PR-26 の記録と同じ状態）。実機記録: `linux_mechanism_e2e`（PR-26・実機 6 レグ）と PR-26a の v6 レグは各検証文書の記録どおり、`namespaced_ipv6_flows_allowed_on_v6_host` は外部 v6 到達性依存のため環境依存。OS 固有コードの T-BASE は platform-tests 等の当該 OS ワークフローの責務
-- [ ] タグ `vX.Y.Z` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](releasing.md) 手順 2）
+- [x] タグ `vX.Y.Z` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](releasing.md) 手順 2）
 - [ ] リリースノートに「この版で保証する制御」と「残る限界」（§1.7・§5.2 の対応状況）を明記する
 
 <a id="pr-27"></a>

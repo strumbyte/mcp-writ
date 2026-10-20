@@ -55,8 +55,23 @@ defaults {
         allow "socketpair" "getsockname" "getpeername" "getsockopt" "setsockopt"
         // Self-pipe wakeup is sendto()/recv() on the AF_UNIX pair, not
         // write()/read(): without these the reader thread wakes no one and
-        // the event loop hangs in epoll_wait forever.
+        // the event loop hangs in epoll_wait forever. These sends cannot
+        // carry an unsupervised destination on the restricted native
+        // route either: the socket() pin admits only connection-oriented
+        // types, so no unconnected INET datagram socket exists to sendto
+        // through, and the seccomp filter pins MSG_FASTOPEN clear in the
+        // flags word, closing the connect-less TCP-setup path unotify
+        // cannot see. (On the namespaced route every flow crosses the
+        // TUN gate regardless.)
         allow "sendto" "recvfrom" "sendmsg" "recvmsg" "shutdown"
+        // Outbound networking — servers that fetch (mcp-server-fetch via
+        // httpx) create sockets and connect(). The syscall pair only opens
+        // the channel: destinations stay confined by the egress rules —
+        // the namespaced TUN proxy evaluates each flow per address+port
+        // (native unotify supervises connect(2) the same way), and the
+        // socket-family pin admits AF_INET/AF_INET6 only, so AF_UNIX
+        // daemon sockets stay unreachable.
+        allow "socket" "connect"
         // Process identity + misc (`uname` — os.uname via platform/uuid;
         // ioctl/statx cover TTY probes and statx fallbacks)
         allow "getpid" "getppid" "getuid" "getgid" "geteuid" "getegid" "gettid"

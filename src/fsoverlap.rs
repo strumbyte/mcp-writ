@@ -41,6 +41,19 @@ pub fn path_covers(grant: &Path, target: &Path) -> bool {
 /// resolved on both sides. `None` when the spelling cannot be made
 /// absolute or carries an unresolvable mid-path glob.
 pub fn resolve_grant_spelling(spelling: &str) -> Option<PathBuf> {
+    grant_spellings(spelling).map(|(resolved, _lexical)| resolved)
+}
+
+/// Both comparable spellings of a grant path: `(resolved, lexical)`.
+/// The resolved form follows symlinks to the real directory; the
+/// lexical form keeps the caller's written ancestors (`.`,`..`
+/// collapsed, links unfollowed). A coverage check that also refuses a
+/// protected path spelled *through* a writable link must compare like
+/// with like on both forms — on hosts where an ancestor is a system
+/// symlink (macOS `/var` → `/private/var`, `/tmp` → `/private/tmp`)
+/// the two differ, and only the lexical-vs-lexical comparison names
+/// the directory chain the caller wrote.
+pub fn grant_spellings(spelling: &str) -> Option<(PathBuf, PathBuf)> {
     let base = glob_base(spelling)?;
     let path = Path::new(base);
     let abs = if path.is_absolute() {
@@ -48,7 +61,7 @@ pub fn resolve_grant_spelling(spelling: &str) -> Option<PathBuf> {
     } else {
         std::env::current_dir().ok()?.join(path)
     };
-    Some(canonicalize_deep(&abs))
+    Some((canonicalize_deep(&abs), lexical_normalize(&abs)))
 }
 
 /// Collapse `.`/`..` components lexically — no filesystem access, no

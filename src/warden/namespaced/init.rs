@@ -74,10 +74,16 @@ fn errno() -> i32 {
 }
 
 /// Best-effort line to the parent; the socket may already be gone.
+/// `write`, not `send`: the `SANDBOXED` verdict is sent *after* the
+/// workload's seccomp filter installs, and `write` is in every runtime
+/// allowlist while `send`/`sendto` need not be — a runtime policy must
+/// never have to admit a socket syscall just to carry init's own
+/// handshake. The socket is a connected SOCK_SEQPACKET pair, so the
+/// two calls are byte-for-byte equivalent here.
 fn send(sock: RawFd, msg: &[u8]) {
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
-        libc::send(sock, msg.as_ptr() as *const libc::c_void, msg.len(), 0);
+        libc::write(sock, msg.as_ptr() as *const libc::c_void, msg.len());
     }
 }
 

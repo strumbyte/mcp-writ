@@ -698,10 +698,8 @@ defaults {
         deny host="blocked.example"
         deny host="*"
     }
-    logging {
-        fail_closed #false
-    }
 }
+logging fail_closed=#false
 
 server "probe" {
     // No tools or grants: dns-gate evaluates `defaults.network` only,
@@ -1051,7 +1049,7 @@ fn pr18_probe_policy(dir: &Path, probe: &Path, version: u8, network_rules: &str)
         .strip_suffix('}')
         .expect("fixture syscall block ends with }");
     let mut text = format!(
-        "policy version={version}\ndefaults {{\n    filesystem {{\n        secret-overlay #true\n{fs_allows}    }}\n{baseline}        allow \"socket\" \"socketpair\" \"connect\" \"sendto\" \"sendmsg\" \"bind\" \"getsockname\" \"getpeername\" \"listen\" \"accept\" \"accept4\" \"tgkill\" \"pidfd_send_signal\" \"pidfd_open\"\n    }}\n    network {{\n        {network_rules}\n    }}\n    logging {{\n        fail_closed #false\n    }}\n}}\n\nserver \"probe\" {{\n    tool \"probe\"\n}}\n"
+        "policy version={version}\ndefaults {{\n    filesystem {{\n        secret-overlay #true\n{fs_allows}    }}\n{baseline}        allow \"socket\" \"socketpair\" \"connect\" \"sendto\" \"sendmsg\" \"bind\" \"getsockname\" \"getpeername\" \"listen\" \"accept\" \"accept4\" \"tgkill\" \"pidfd_send_signal\" \"pidfd_open\"\n    }}\n    network {{\n        {network_rules}\n    }}\n}}\nlogging fail_closed=#false\n\nserver \"probe\" {{\n    tool \"probe\"\n}}\n"
     );
     if common::linux_below_landlock_v4() {
         // Kernel < 6.7 enforces Landlock ABI V1 partially; a
