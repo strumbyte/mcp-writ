@@ -12,7 +12,7 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1); // nosemgrep: rust.lang.security.args.args
     let Some(path) = args.next() else {
         eprintln!("usage: pe-imports <file> [--require-clean]");
         return ExitCode::from(2);

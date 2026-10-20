@@ -25,6 +25,12 @@ pub struct ImageMetadata {
     /// `Config.Env` entries (`KEY=value`), e.g. the runner capability
     /// marker recorded by `wrap-image`/`containerize`.
     pub env: Vec<String>,
+    /// `Config.OnBuild` triggers the base image hands down to any
+    /// Dockerfile built `FROM` it — arbitrary instructions that would
+    /// execute inside our build context, where the staged runner,
+    /// policy, and private source are readable. `containerize` and
+    /// `wrap-image` refuse a base carrying any.
+    pub onbuild: Vec<String>,
 }
 
 /// Run image inspect via the ContainerEngine abstraction and parse the JSON output.
@@ -56,6 +62,7 @@ fn parse_inspect_json(json_str: &str, image: &str) -> Result<ImageMetadata, Cont
     let cmd = extract_config_array(&json, "Cmd")?;
     let digest = extract_image_digest(&json, image);
     let env = extract_config_array(&json, "Env")?.unwrap_or_default();
+    let onbuild = extract_config_array(&json, "OnBuild")?.unwrap_or_default();
     let (os, architecture, os_version) = extract_image_os_arch(&json);
     let image_id = extract_image_id(&json);
 
@@ -68,6 +75,7 @@ fn parse_inspect_json(json_str: &str, image: &str) -> Result<ImageMetadata, Cont
         architecture,
         os_version,
         env,
+        onbuild,
     })
 }
 
@@ -253,6 +261,9 @@ fn parse_apple_inspect(
     let entrypoint = str_array("Entrypoint")?;
     let cmd = str_array("Cmd")?;
     let env = str_array("Env")?.unwrap_or_default();
+    // OCI image config has no `onbuild` member; an engine that reports
+    // one still lands it here.
+    let onbuild = str_array("OnBuild")?.unwrap_or_default();
     let digest = root
         .to_member("configuration")
         .ok()
@@ -272,7 +283,31 @@ fn parse_apple_inspect(
         // Windows-image field the apple path never carries.
         os_version: None,
         env,
+        onbuild,
     }))
+}
+
+/// Fail-closed gate on the base-image inspect both `containerize` and
+/// `wrap-image` run: a base carrying `Config.OnBuild` triggers would
+/// execute them inside *our* generated Dockerfile's build — where the
+/// staged runner, bound policy, and (for `containerize`) the user's
+/// private source tree are all readable context. There is no safe
+/// `ONBUILD` instruction for these builds, so any entry refuses.
+pub(crate) fn refuse_inherited_onbuild(
+    meta: &ImageMetadata,
+    image: &str,
+) -> Result<(), ContainerError> {
+    if meta.onbuild.is_empty() {
+        return Ok(());
+    }
+    Err(ContainerError::BuildFailed(format!(
+        "base image '{image}' declares {} inherited ONBUILD trigger{} \
+         ({}) — they would execute inside the build with access to the \
+         staged context; use a base image without ONBUILD",
+        meta.onbuild.len(),
+        if meta.onbuild.len() == 1 { "" } else { "s" },
+        meta.onbuild.join(", ")
+    )))
 }
 
 /// A variant's `config` member — the OCI image config object
@@ -523,6 +558,49 @@ mod tests {
     }
 
     #[test]
+    fn test_onbuild_extracted_and_refused() {
+        let json = r#"[{"Config":{"OnBuild":["RUN rm -rf /context","COPY . /leaked"]}}]"#;
+        let meta = parse_inspect_json(json, "evil:latest").unwrap();
+        assert_eq!(
+            meta.onbuild,
+            vec![
+                "RUN rm -rf /context".to_string(),
+                "COPY . /leaked".to_string()
+            ]
+        );
+        let err = refuse_inherited_onbuild(&meta, "evil:latest").unwrap_err();
+        match err {
+            ContainerError::BuildFailed(msg) => {
+                assert!(msg.contains("ONBUILD"), "{msg}");
+                assert!(msg.contains("evil:latest"), "{msg}");
+            }
+            other => panic!("expected BuildFailed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_onbuild_absent_or_null_passes() {
+        for json in [
+            r#"[{"Config":{}}]"#,
+            r#"[{"Config":{"OnBuild":null}}]"#,
+            r#"[{"Config":{"OnBuild":[]}}]"#,
+            r#"{"Docker":{"config":{"OnBuild":[]}}}"#,
+        ] {
+            let meta = parse_inspect_json(json, "base:tag").unwrap();
+            assert!(meta.onbuild.is_empty(), "{json}");
+            refuse_inherited_onbuild(&meta, "base:tag").unwrap();
+        }
+    }
+
+    #[test]
+    fn test_onbuild_buildah_docker_nested_shape() {
+        let json = r#"{"Docker":{"config":{"OnBuild":["RUN /sbin/evil"]}}}"#;
+        let meta = parse_inspect_json(json, "base:tag").unwrap();
+        assert_eq!(meta.onbuild, vec!["RUN /sbin/evil".to_string()]);
+        assert!(refuse_inherited_onbuild(&meta, "base:tag").is_err());
+    }
+
+    #[test]
     fn test_invalid_json_errors() {
         let err = parse_inspect_json("not json", "").unwrap_err();
         match err {
@@ -553,6 +631,7 @@ mod tests {
             architecture: None,
             os_version: None,
             env: Vec::new(),
+            onbuild: Vec::new(),
         };
         let (ep, cmd) = metadata_to_env_vars(&meta);
         assert_eq!(ep, r#"["/docker-entrypoint.sh"]"#);
@@ -570,6 +649,7 @@ mod tests {
             architecture: None,
             os_version: None,
             env: Vec::new(),
+            onbuild: Vec::new(),
         };
         let (ep, cmd) = metadata_to_env_vars(&meta);
         assert_eq!(ep, r#"["/bin/sh","-c"]"#);
@@ -587,6 +667,7 @@ mod tests {
             architecture: None,
             os_version: None,
             env: Vec::new(),
+            onbuild: Vec::new(),
         };
         let (ep, cmd) = metadata_to_env_vars(&meta);
         assert_eq!(ep, "null");
@@ -604,6 +685,7 @@ mod tests {
             architecture: None,
             os_version: None,
             env: Vec::new(),
+            onbuild: Vec::new(),
         };
         let (ep, cmd) = metadata_to_env_vars(&meta);
         assert_eq!(ep, "null");
@@ -621,6 +703,7 @@ mod tests {
             architecture: None,
             os_version: None,
             env: Vec::new(),
+            onbuild: Vec::new(),
         };
         let (ep, cmd) = metadata_to_env_vars(&meta);
         assert_eq!(ep, r#"["echo \"hello\""]"#);
@@ -638,6 +721,7 @@ mod tests {
             architecture: None,
             os_version: None,
             env: Vec::new(),
+            onbuild: Vec::new(),
         };
         let (ep, cmd) = metadata_to_env_vars(&meta);
         assert_eq!(ep, "[]");

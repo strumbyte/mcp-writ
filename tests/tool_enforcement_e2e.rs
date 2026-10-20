@@ -420,9 +420,15 @@ async fn assert_tools_list_poisoned(mode: &str, expected_cc: &str, dry_run: bool
         "client must not receive a tools/list result: {response}"
     );
     let msg = error_message(&response);
+    // The wire error is the stable visibility-safe refusal — the CC
+    // rule id and the offending tool names stay in the audit channel.
     assert!(
-        msg.contains(expected_cc),
-        "expected {expected_cc} in error, got: {msg}"
+        msg.contains("tools/list verification failed"),
+        "expected stable refusal text, got: {msg}"
+    );
+    assert!(
+        !response.contains(expected_cc),
+        "verification detail must not reach the client: {response}"
     );
     assert!(
         !response.contains("\"tools\""),
@@ -818,7 +824,14 @@ async fn list_changed_poisoned_relist_aborts_without_forwarding_notification() {
     );
     assert!(json_has_error(&next), "got: {next}");
     let msg = error_message(&next);
-    assert!(msg.contains("CC-001"), "expected CC-001 abort, got: {msg}");
+    assert!(
+        msg.contains("tools/list verification failed"),
+        "expected stable refusal text, got: {msg}"
+    );
+    assert!(
+        !next.contains("CC-001"),
+        "verification detail must not reach the client: {next}"
+    );
 
     drop(stdin);
 }
@@ -977,8 +990,12 @@ async fn fail_on_default_high_still_aborts_cc005() {
     assert!(json_has_error(&response), "got: {response}");
     assert!(!json_has_result(&response), "got: {response}");
     assert!(
-        error_message(&response).contains("CC-005"),
+        error_message(&response).contains("tools/list verification failed"),
         "got: {response}"
+    );
+    assert!(
+        !response.contains("CC-005"),
+        "verification detail must not reach the client: {response}"
     );
 }
 

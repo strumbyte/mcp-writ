@@ -607,6 +607,7 @@ pub fn apply_seccomp(policy: &Policy) -> Result<(), WardenError> {
 pub(crate) fn set_no_new_privs() -> std::io::Result<()> {
     // SAFETY: prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) is a well-defined
     // Linux syscall with no pointer arguments.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret != 0 {
         return Err(std::io::Error::last_os_error());

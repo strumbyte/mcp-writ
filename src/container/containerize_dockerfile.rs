@@ -87,15 +87,15 @@ impl ContainerizeDockerfileTemplate {
         out.push_str(self.guest.app_dir);
         out.push('\n');
 
-        // COPY runner binary + chmod (JSON array form for safe paths)
-        out.push_str("COPY [\"");
+        // COPY runner binary with the exec bit set by the instruction
+        // itself — a `RUN chmod` would execute under the base image's
+        // `Config.Shell`, the one build-time surface an inherited shell
+        // definition could steer; `COPY --chmod` is shell-independent.
+        out.push_str("COPY --chmod=755 [\"");
         out.push_str(&escape_json_string(&self.runner_path));
         out.push_str("\", \"");
         out.push_str(&escape_json_string(self.guest.runner_path));
         out.push_str("\"]\n");
-        out.push_str("RUN chmod +x ");
-        out.push_str(self.guest.runner_path);
-        out.push('\n');
 
         // COPY policy (JSON array form)
         out.push_str("COPY [\"");
@@ -241,8 +241,11 @@ mod tests {
 
         assert!(df.starts_with("FROM node:20-slim\n"));
         assert!(df.contains("WORKDIR /app\n"));
-        assert!(df.contains(r#"COPY ["mcp-secure-runner", "/usr/local/bin/mcp-secure-runner"]"#));
-        assert!(df.contains("RUN chmod +x /usr/local/bin/mcp-secure-runner\n"));
+        assert!(df.contains(
+            r#"COPY --chmod=755 ["mcp-secure-runner", "/usr/local/bin/mcp-secure-runner"]"#
+        ));
+        // No RUN line — generated builds never invoke the base image's shell.
+        assert!(!df.contains("RUN "));
         assert!(df.contains(r#"COPY ["policy.kdl", "/etc/mcp-secure/policy.kdl"]"#));
         assert!(df.contains("MCP_ORIG_CMD="));
         assert!(df.contains("MCP_WRIT_FAIL_ON=\"\""));
@@ -276,7 +279,12 @@ mod tests {
 
         assert!(df.starts_with("FROM python:3.12-slim\n"));
         assert!(df.contains("WORKDIR /app\n"));
-        assert!(df.contains(r#"COPY ["mcp-secure-runner", "/usr/local/bin/mcp-secure-runner"]"#));
+        // The runner lands executable via COPY --chmod — no shell-dependent
+        // RUN, so the image's Config.Shell cannot redirect it.
+        assert!(df.contains(
+            r#"COPY --chmod=755 ["mcp-secure-runner", "/usr/local/bin/mcp-secure-runner"]"#
+        ));
+        assert!(!df.contains("\nRUN "), "no shell RUN instructions: {df}");
         assert!(df.contains(r#"COPY ["policy.kdl", "/etc/mcp-secure/policy.kdl"]"#));
         assert!(df.contains("python"));
         assert!(df.contains("my_mcp_server"));
@@ -296,7 +304,10 @@ mod tests {
 
         assert!(df.starts_with("FROM debian:bookworm-slim\n"));
         assert!(df.contains("WORKDIR /app\n"));
-        assert!(df.contains(r#"COPY ["mcp-secure-runner", "/usr/local/bin/mcp-secure-runner"]"#));
+        assert!(df.contains(
+            r#"COPY --chmod=755 ["mcp-secure-runner", "/usr/local/bin/mcp-secure-runner"]"#
+        ));
+        assert!(!df.contains("\nRUN "), "no shell RUN instructions: {df}");
         assert!(df.contains(r#"COPY ["policy.kdl", "/etc/mcp-secure/policy.kdl"]"#));
         assert!(df.contains("my-server"));
         assert!(df.contains("8080"));
@@ -368,16 +379,15 @@ mod tests {
         let df = t.generate().unwrap();
         let lines: Vec<&str> = df.lines().collect();
 
-        // FROM, WORKDIR, COPY runner, RUN chmod, COPY policy, ENV, HEALTHCHECK, ENTRYPOINT = 8 lines
-        assert_eq!(lines.len(), 8, "unexpected line count: {df}");
+        // FROM, WORKDIR, COPY --chmod runner, COPY policy, ENV, HEALTHCHECK, ENTRYPOINT = 7 lines
+        assert_eq!(lines.len(), 7, "unexpected line count: {df}");
         assert!(lines[0].starts_with("FROM "));
         assert!(lines[1].starts_with("WORKDIR "));
-        assert!(lines[2].starts_with("COPY ")); // runner
-        assert!(lines[3].starts_with("RUN chmod"));
-        assert!(lines[4].starts_with("COPY ")); // policy
-        assert!(lines[5].starts_with("ENV "));
-        assert_eq!(lines[6], "HEALTHCHECK NONE");
-        assert!(lines[7].starts_with("ENTRYPOINT "));
+        assert!(lines[2].starts_with("COPY --chmod=755 ")); // runner
+        assert!(lines[3].starts_with("COPY ")); // policy
+        assert!(lines[4].starts_with("ENV "));
+        assert_eq!(lines[5], "HEALTHCHECK NONE");
+        assert!(lines[6].starts_with("ENTRYPOINT "));
     }
 
     #[test]
@@ -390,8 +400,8 @@ mod tests {
         let df = t.generate().unwrap();
         let lines: Vec<&str> = df.lines().collect();
 
-        // FROM, WORKDIR, COPY runner, RUN chmod, COPY policy, COPY extra, ENV, HEALTHCHECK, ENTRYPOINT = 9
-        assert_eq!(lines.len(), 9, "unexpected line count: {df}");
+        // FROM, WORKDIR, COPY --chmod runner, COPY policy, COPY extra, ENV, HEALTHCHECK, ENTRYPOINT = 8
+        assert_eq!(lines.len(), 8, "unexpected line count: {df}");
     }
 
     // ── Command serialization ──────────────────────────────────────────

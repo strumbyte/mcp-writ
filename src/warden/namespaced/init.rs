@@ -75,6 +75,7 @@ fn errno() -> i32 {
 
 /// Best-effort line to the parent; the socket may already be gone.
 fn send(sock: RawFd, msg: &[u8]) {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::send(sock, msg.as_ptr() as *const libc::c_void, msg.len(), 0);
     }
@@ -111,7 +112,9 @@ fn send_ready_with_fd(sock: RawFd, fd: RawFd) -> std::io::Result<()> {
         msg_controllen: std::mem::size_of_val(&cmsg_buf),
         msg_flags: 0,
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
@@ -122,7 +125,9 @@ fn send_ready_with_fd(sock: RawFd, fd: RawFd) -> std::io::Result<()> {
             std::mem::size_of::<RawFd>(),
         );
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     msg.msg_controllen = unsafe { (*cmsg).cmsg_len };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::sendmsg(sock, &msg, 0) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -149,6 +154,7 @@ fn write_id_maps_for(pid: i32, euid: u32, egid: u32) -> std::io::Result<()> {
 /// would also work; pipes keep the read/write directions obvious.
 fn pipe_pair() -> std::io::Result<(RawFd, RawFd)> {
     let mut p = [0i32; 2];
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::pipe(p.as_mut_ptr()) } < 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -157,6 +163,7 @@ fn pipe_pair() -> std::io::Result<(RawFd, RawFd)> {
 }
 
 fn pipe_write(fd: RawFd) -> std::io::Result<()> {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::write(fd, b"1".as_ptr() as *const libc::c_void, 1) } != 1 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -168,6 +175,7 @@ fn pipe_write(fd: RawFd) -> std::io::Result<()> {
 /// distinguish by context.
 fn pipe_read(fd: RawFd) -> std::io::Result<()> {
     let mut b = [0u8; 1];
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
     if n == 1 {
         Ok(())
@@ -182,17 +190,21 @@ fn pipe_read(fd: RawFd) -> std::io::Result<()> {
 }
 
 fn create_tun() -> std::io::Result<RawFd> {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     ifr.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as i16;
     for (slot, &b) in ifr.ifr_name.iter_mut().zip(IFNAME.iter()) {
         *slot = b as libc::c_char;
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::ioctl(fd, libc::TUNSETIFF, &ifr) } < 0 {
         let e = std::io::Error::last_os_error();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(fd) };
         return Err(e);
     }
@@ -241,6 +253,7 @@ fn redirect_resolv_conf(target: &std::path::Path, contents: &str) -> std::io::Re
         return std::fs::write(target, contents);
     }
     let ctmp = CString::new("/tmp").unwrap();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::mount(
             c"tmpfs".as_ptr(),
@@ -257,6 +270,7 @@ fn redirect_resolv_conf(target: &std::path::Path, contents: &str) -> std::io::Re
     std::fs::write(src, contents)?;
     let csrc = CString::new(src).unwrap();
     let cdst = CString::new("/etc/resolv.conf").unwrap();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::mount(
             csrc.as_ptr(),
@@ -303,6 +317,7 @@ pub(crate) fn ipv6_stack_present() -> bool {
     // family registration alone (no transport module needed) and
     // `SOCK_CLOEXEC` keeps the probe fd out of any exec'd image for
     // its brief lifetime.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return errno() != libc::EAFNOSUPPORT;
@@ -310,6 +325,7 @@ pub(crate) fn ipv6_stack_present() -> bool {
     // Ownership passes to File the moment the descriptor exists —
     // drop runs close(2) on every exit path, so no success path can
     // leak it.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let _probe = unsafe { std::fs::File::from_raw_fd(fd) };
     true
 }
@@ -329,6 +345,7 @@ pub(crate) fn ipv6_stack_present() -> bool {
 /// host IPC sockets still reachable — that is the channel this mount
 /// exists to sever.
 fn hide_host_ipc_sockets() -> std::io::Result<()> {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::mount(
             c"tmpfs".as_ptr(),
@@ -344,17 +361,29 @@ fn hide_host_ipc_sockets() -> std::io::Result<()> {
     Ok(())
 }
 
+/// The fd numbers `MCP_WRIT_NS_KEEPFDS` names — the fd-exec pin
+/// descriptors init must hold open through the workload exec. Read
+/// before the env scrub removes the variable.
+fn keep_fds_from_env() -> Vec<i32> {
+    parse_keep_fds(&std::env::var(super::init_env::KEEPFDS).unwrap_or_default())
+}
+
+/// Comma-separated fd numbers in `raw`; non-numeric entries and the
+/// stdio descriptors (`<=2`) never qualify as pins.
+fn parse_keep_fds(raw: &str) -> Vec<i32> {
+    raw.split(',')
+        .filter_map(|s| s.parse::<i32>().ok())
+        .filter(|fd| *fd > 2)
+        .collect()
+}
+
 fn scrub_env_and_fds(extra_keep: &[i32]) {
     // Read the keep list before the env scrub removes it — the fd-exec
     // pin descriptors init must hold open through the workload exec.
-    let mut keep: Vec<i32> = std::env::var(super::init_env::KEEPFDS)
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|s| s.parse::<i32>().ok())
-        .filter(|fd| *fd > 2)
-        .collect();
+    let mut keep = keep_fds_from_env();
     keep.extend_from_slice(extra_keep);
     for var in super::init_env::ALL {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::remove_var(var) };
     }
     // Close everything above stderr — the workload inherits only
@@ -371,6 +400,7 @@ fn scrub_env_and_fds(extra_keep: &[i32]) {
         })
         .unwrap_or_default();
     for fd in fds {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(fd) };
     }
 }
@@ -421,6 +451,13 @@ fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
         };
         match super::super::linux_spawn::prepare_linux_child_sandbox_namespaced(&policy) {
             Ok(mut bits) => {
+                // The pin fds KEEPFDS names were uncloaked across
+                // init's own re-exec, and the workload's argv names
+                // them as `/proc/self/fd/N` — they must survive *its*
+                // exec too. `seal_ambient_fds` CLOEXECs every ambient
+                // descriptor but its keep list, so the list has to be
+                // handed over before the bits apply.
+                bits.exec_uncloak_fds = keep_fds_from_env();
                 if let Err(e) = bits.apply_in_child() {
                     send_err(sock, STAGE_SANDBOX, e.raw_os_error().unwrap_or(-1));
                     std::process::exit(97);
@@ -450,6 +487,7 @@ fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
     // parent would never see EOF and would misread the launch — so a
     // failure here is reported like any other exec-stage failure.
     scrub_env_and_fds(&[sock]);
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::fcntl(sock, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         send_err(sock, STAGE_EXEC, errno());
         std::process::exit(98);
@@ -459,6 +497,7 @@ fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
         .map(|a| a.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::execvp(exe.as_ptr(), c_argv.as_ptr());
     }
@@ -470,7 +509,7 @@ fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
 }
 
 pub(crate) fn init_main() -> i32 {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().collect(); // nosemgrep: rust.lang.security.args.args
     // argv: namespaced-init -- <argv0-spelling> <args...>
     let sep = args.iter().position(|a| a == "--");
     let workload: Vec<String> = match sep {
@@ -496,7 +535,9 @@ pub(crate) fn init_main() -> i32 {
         .collect();
     // The exec'd image is `resolved`; argv[0] keeps the caller's
     // spelling (same contract as `run`).
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let euid = unsafe { libc::geteuid() };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let egid = unsafe { libc::getegid() };
 
     // Teardown cascade, link 1: this process is the forked
@@ -505,9 +546,11 @@ pub(crate) fn init_main() -> i32 {
     // pdeathsig, and so on down to the pidns init — the whole
     // namespaced subtree disappears instead of leaking an
     // unsupervised workload. `PR_SET_PDEATHSIG` survives `execve`.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::getppid() } == 1 {
         // Supervisor already gone (race between spawn and prctl).
         send_err(sock, STAGE_UNSHARE, libc::ESRCH);
@@ -534,12 +577,14 @@ pub(crate) fn init_main() -> i32 {
         Ok(p) => p,
         Err(e) => bail!("fork-pipe", e.raw_os_error().unwrap_or(-1)),
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         bail!("fork", errno());
     }
     if pid > 0 {
         // ---- init parent: map writer + exit-status forwarder ------
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::close(c2p_w);
             libc::close(p2c_r);
@@ -558,12 +603,14 @@ pub(crate) fn init_main() -> i32 {
         // Release the grandchild either way: on a map failure it must
         // wake up to die rather than hang on the pipe.
         let _ = pipe_write(p2c_w);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::close(c2p_r);
             libc::close(p2c_w);
             libc::close(sock);
         }
         if !mapped {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         // Reap + forward the grandchild's exit status. Signal death is
@@ -571,6 +618,7 @@ pub(crate) fn init_main() -> i32 {
         // plain exit code.
         let mut status = 0i32;
         loop {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let r = unsafe { libc::waitpid(pid, &mut status, 0) };
             if r == pid {
                 break;
@@ -581,6 +629,7 @@ pub(crate) fn init_main() -> i32 {
         }
         if libc::WIFSIGNALED(status) {
             let sig = libc::WTERMSIG(status);
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::signal(sig, libc::SIG_DFL);
                 libc::raise(sig);
@@ -595,9 +644,11 @@ pub(crate) fn init_main() -> i32 {
     // Teardown cascade, link 2: die with the init parent. Set before
     // unshare — the value is preserved across execve, so even the
     // final workload image keeps it pointed at its supervisor chain.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::close(c2p_r);
         libc::close(p2c_w);
@@ -606,6 +657,7 @@ pub(crate) fn init_main() -> i32 {
     // new pid namespace, hiding the supervisor from the workload —
     // without it a workload could `kill` the parent (same mapped uid)
     // and silence the audit path while still holding its stdio.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::unshare(
             libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWNS | libc::CLONE_NEWPID,
@@ -619,6 +671,7 @@ pub(crate) fn init_main() -> i32 {
         // Init parent gone — no map writer means no launch.
         return 97;
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::close(c2p_w);
         libc::close(p2c_r);
@@ -654,6 +707,7 @@ pub(crate) fn init_main() -> i32 {
     // back into the host's peer group and fail EPERM (or worse,
     // succeed and leak). Detach first: the mountns contract is a
     // private view.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::mount(
             std::ptr::null(),
@@ -685,11 +739,13 @@ pub(crate) fn init_main() -> i32 {
         send_err(sock, STAGE_TUN, e.raw_os_error().unwrap_or(-1));
         return 97;
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(tun) };
 
     // Wait for GO — the parent only sends it once the proxy task is
     // running, so a dead parent means no egress anyway (fail-closed).
     let mut go = [0u8; 1];
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let n = unsafe { libc::recv(sock, go.as_mut_ptr() as *mut _, 1, 0) };
     if n != 1 || go[0] != b'G' {
         return 97;
@@ -701,6 +757,7 @@ pub(crate) fn init_main() -> i32 {
     // init (pid 1) — every descendant stays inside the isolation and
     // dies with it — while this process stays in the ancestor pidns to
     // forward the exit status exactly like the init parent does for it.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let wpid = unsafe { libc::fork() };
     if wpid < 0 {
         send_err(sock, "pidns-fork", errno());
@@ -709,6 +766,7 @@ pub(crate) fn init_main() -> i32 {
     if wpid == 0 {
         // Teardown cascade, link 3: the pidns init dies with the
         // grandchild, taking the whole inner namespace with it.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
         }
@@ -717,6 +775,7 @@ pub(crate) fn init_main() -> i32 {
         // on the host's /proc it could enumerate the supervisor by
         // number and signal it (same mapped uid). Failure is fatal:
         // the monitor-isolation contract would be silently broken.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe {
             libc::mount(
                 c"proc".as_ptr(),
@@ -732,11 +791,13 @@ pub(crate) fn init_main() -> i32 {
         }
         finish_with_sandbox(sock, &resolved, &c_argv);
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::close(sock);
     }
     let mut status = 0i32;
     loop {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let r = unsafe { libc::waitpid(wpid, &mut status, 0) };
         if r == wpid || (r < 0 && errno() != libc::EINTR) {
             break;
@@ -744,6 +805,7 @@ pub(crate) fn init_main() -> i32 {
     }
     if libc::WIFSIGNALED(status) {
         let sig = libc::WTERMSIG(status);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
@@ -751,4 +813,20 @@ pub(crate) fn init_main() -> i32 {
         return 128 + sig;
     }
     libc::WEXITSTATUS(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_keep_fds;
+
+    #[test]
+    fn keep_fds_parses_only_inheritable_pins() {
+        assert_eq!(parse_keep_fds("3,4,10"), vec![3, 4, 10]);
+        // Stdio descriptors are never pins — a forged entry must not
+        // rescue fd 0-2 from the scrub's expectations.
+        assert_eq!(parse_keep_fds("0,1,2,5"), vec![5]);
+        // Malformed entries drop instead of failing the whole list.
+        assert_eq!(parse_keep_fds("7,junk,,8x,9"), vec![7, 9]);
+        assert!(parse_keep_fds("").is_empty());
+    }
 }

@@ -203,6 +203,7 @@ fn open_trusted_snapshot(path: &Path) -> std::io::Result<Option<std::fs::File>> 
         Err(e) => return Err(e),
     };
     let meta = file.metadata()?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let euid = unsafe { libc::geteuid() };
     let trusted = meta.is_file()
         && (meta.uid() == euid || meta.uid() == 0)

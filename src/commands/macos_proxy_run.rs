@@ -178,6 +178,53 @@ mod imp {
             }
         };
 
+        // Fail-closed write-grant conflicts: a grant covering a file
+        // this policy load read lets the workload rewrite what every
+        // later launch trusts; a grant covering --report lets it
+        // fabricate launch evidence.
+        let launch_write_grants = policy.write_grant_spellings();
+        for source in policy.source_files() {
+            if let Some(conflict) = crate::audit_log::policy_source_write_conflict(
+                launch_write_grants.iter().cloned(),
+                &source,
+            ) {
+                let detail = format!(
+                    "refusing launch: write grant reaches policy source '{}': {conflict}",
+                    source.display()
+                );
+                eprintln!("Error: {detail}");
+                write_report(
+                    "failed",
+                    Some(&detail),
+                    Some(&policy),
+                    policy_context.as_ref(),
+                );
+                lifecycle::prelaunch_abort(
+                    args.audit_log.as_deref(),
+                    &session_audit,
+                    None,
+                    &detail,
+                )
+                .await;
+                std::process::exit(1);
+            }
+        }
+        if let Some(ref report) = args.report
+            && let Some(conflict) =
+                crate::audit_log::report_write_conflict(launch_write_grants.iter().cloned(), report)
+        {
+            let detail = format!("refusing --report '{}': {conflict}", report.display());
+            eprintln!("Error: {detail}");
+            write_report(
+                "failed",
+                Some(&detail),
+                Some(&policy),
+                policy_context.as_ref(),
+            );
+            lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
+            std::process::exit(1);
+        }
+
         let trace_level = if args.verbose > 0 {
             match args.verbose {
                 1 => tracing::Level::DEBUG,
@@ -668,6 +715,7 @@ mod imp {
             }
             RunExit::Signal { signo, code } => {
                 if child_pgid > 0 {
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     unsafe { libc::kill(-child_pgid, signo) };
                 }
                 if (tokio::time::timeout(Duration::from_secs(5), &mut wait_fut).await).is_err() {
@@ -683,6 +731,7 @@ mod imp {
                 // supervisor itself exits.
                 let grace = std::time::Instant::now() + Duration::from_millis(500);
                 while child_pgid > 0
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     && unsafe { libc::kill(-child_pgid, 0) } == 0
                     && std::time::Instant::now() < grace
                 {
@@ -746,6 +795,7 @@ mod imp {
     /// must never reach `kill`: `-0` names the *launcher's* group.
     fn kill_group(pgid: i32) {
         if pgid > 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::kill(-pgid, libc::SIGKILL) };
         }
     }

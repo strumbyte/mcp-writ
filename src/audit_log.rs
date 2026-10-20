@@ -16,7 +16,10 @@ pub use event::{
     Severity,
 };
 pub use event::{MAX_AUDIT_FIELD_BYTES, bound_audit_field, encode_audit_field_value};
-pub use sink_guard::{audit_sink_write_conflict, snapshot_write_conflict};
+pub use sink_guard::{
+    audit_sink_write_conflict, policy_source_write_conflict, report_write_conflict,
+    snapshot_write_conflict,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // AuditLogger (mpsc channel + dedicated writer task)

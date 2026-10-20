@@ -15,7 +15,7 @@ use crate::tool_def::ToolDefinition;
 use crate::verifier::manifest::{ManifestFinding, ManifestRule, ManifestSeverity};
 use crate::verifier::schema_walk::{
     MAX_SCHEMA_STRING_DEPTH, collect_json_strings, for_each_schema_property, json_key_name,
-    property_key_match, property_schema_has_uri_hint, schema_has_named_property,
+    property_key_match, property_schema_has_uri_hint, schema_has_named_property, schema_name_in,
     schema_property_keys, schema_string_texts,
 };
 use crate::verifier::unicode::{
@@ -73,8 +73,11 @@ fn re_exfil() -> &'static Regex {
 }
 
 /// True when `description` matches CC-001 hidden-instruction markers.
+/// The text is folded (NFKC + confusable map) first — an attacker must
+/// not escape the phrase detectors with fullwidth/compatibility or
+/// homoglyph spellings like `ｉｇｎｏｒｅ аll previous instructions`.
 pub(crate) fn description_has_hidden_instructions(description: &str) -> bool {
-    re_hidden().is_match(description)
+    re_hidden().is_match(&fold_name_for_collision(description))
 }
 
 const HTML_COMMENT_INSTRUCTION_WORDS: &[&str] = &[
@@ -164,8 +167,16 @@ fn unknown_vendor_key_strings(raw: &str) -> Vec<String> {
     out
 }
 
+/// All attacker-controlled strings joined for the phrase detectors —
+/// folded through NFKC + the confusable map so Unicode-equivalent
+/// spellings (`ｉｇｎｏｒｅ`, Cyrillic `а` for `a`, …) match the same
+/// patterns the ASCII text would.
 fn advertised_blob(tool: &ToolDefinition) -> String {
-    tool_scan_texts(tool).join("\n")
+    tool_scan_texts(tool)
+        .iter()
+        .map(|t| fold_name_for_collision(t))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn html_comment_has_instruction_words(text: &str) -> Option<String> {
@@ -224,16 +235,10 @@ impl Cc005Seen {
     }
 
     fn observe(&mut self, name: &str) {
-        if NET_PROP_NAMES
-            .iter()
-            .any(|want| name.eq_ignore_ascii_case(want))
-        {
+        if schema_name_in(name, NET_PROP_NAMES) {
             self.net = true;
         }
-        if FS_PROP_NAMES
-            .iter()
-            .any(|want| name.eq_ignore_ascii_case(want))
-        {
+        if schema_name_in(name, FS_PROP_NAMES) {
             self.fs = true;
         }
     }
@@ -373,10 +378,7 @@ pub(crate) fn detect_cc006(tool: &ToolDefinition) -> Option<ManifestFinding> {
     let mut saw_redirect = false;
     let mut allowlisted = false;
     for_each_schema_property(json.value(), 0, &mut |name, val| {
-        if REDIRECT_PROP_NAMES
-            .iter()
-            .any(|want| name.eq_ignore_ascii_case(want))
-        {
+        if schema_name_in(name, REDIRECT_PROP_NAMES) {
             saw_redirect = true;
             if property_schema_has_uri_hint(val, 0) {
                 allowlisted = true;
@@ -400,7 +402,10 @@ pub(crate) fn detect_cc006(tool: &ToolDefinition) -> Option<ManifestFinding> {
 
 pub(crate) fn detect_cc007(tool: &ToolDefinition) -> Option<ManifestFinding> {
     let schema = tool.input_schema.as_deref()?;
-    if !is_read_like_name(&tool.name) {
+    // The read-stem test runs on the raw name (camelCase boundaries are
+    // significant there) AND its folded spelling — a `ｇｅｔ`-style
+    // compatibility spelling is read-like too.
+    if !is_read_like_name(&tool.name) && !is_read_like_name(&fold_name_for_collision(&tool.name)) {
         return None;
     }
     if schema_has_named_property(schema, WRITE_PROP_NAMES) {
@@ -416,25 +421,51 @@ pub(crate) fn detect_cc007(tool: &ToolDefinition) -> Option<ManifestFinding> {
 }
 
 pub(crate) fn detect_cc001(tool: &ToolDefinition) -> Option<ManifestFinding> {
-    for text in tool_scan_texts(tool) {
-        if let Some(m) = re_hidden().find(&text) {
+    // Scan the folded spelling: the phrase patterns are ASCII-bound, so
+    // compatibility-equivalent and homoglyph text must be normalized to
+    // the same surface before matching (NFKC + confusable fold). The
+    // finding quotes the advertised text — the folded form is a match
+    // surface only, and its offsets do not map back into the original.
+    for original in tool_scan_texts(tool) {
+        let folded = fold_name_for_collision(&original);
+        if re_hidden().is_match(&folded) {
             return Some(ManifestFinding::new(
                 ManifestRule::Cc001,
                 ManifestSeverity::Critical,
                 &tool.name,
-                format!("hidden instruction markers: {}", m.as_str()),
+                format!("hidden instruction markers: {}", finding_quote(&original)),
             ));
         }
-        if let Some(comment) = html_comment_has_instruction_words(&text) {
+        if let Some(comment) = html_comment_has_instruction_words(&folded) {
+            // Quote the advertised comment spelling when the original
+            // still carries ASCII delimiters; a fullwidth `＜!--` form
+            // has none to re-extract, so the folded match stands in.
+            let excerpt = html_comment_has_instruction_words(&original).unwrap_or(comment);
             return Some(ManifestFinding::new(
                 ManifestRule::Cc001,
                 ManifestSeverity::Critical,
                 &tool.name,
-                format!("HTML comment with instruction-like words: {comment}"),
+                format!(
+                    "HTML comment with instruction-like words: {}",
+                    finding_quote(&excerpt)
+                ),
             ));
         }
     }
     None
+}
+
+/// The advertised spelling quoted inside a finding's `detail`:
+/// bounded so one oversized input cannot inflate the diagnostic, and
+/// control/newline/bidi code points escaped so the excerpt cannot
+/// forge surrounding output wherever the detail is rendered. The
+/// comment escaper covers the strictest interpolation surface these
+/// details flow into — the full KDL newline set included.
+fn finding_quote(text: &str) -> String {
+    crate::termutil::escape_kdl_comment(&crate::verifier::manifest::bound_finding_text(
+        text.to_string(),
+        crate::verifier::manifest::MAX_FINDING_DETAIL_CHARS,
+    ))
 }
 
 pub(crate) fn detect_cc002(tool: &ToolDefinition) -> Option<ManifestFinding> {
@@ -467,7 +498,9 @@ pub(crate) fn detect_cc003(tool: &ToolDefinition) -> Option<ManifestFinding> {
 }
 
 pub(crate) fn detect_cc004(tool: &ToolDefinition) -> Option<ManifestFinding> {
-    let m = re_template().find(&tool.description)?;
+    // Folded so `｛｛…｝｝`-style compatibility delimiters match `{{…}}`.
+    let folded = fold_name_for_collision(&tool.description);
+    let m = re_template().find(&folded)?;
     Some(ManifestFinding::new(
         ManifestRule::Cc004,
         ManifestSeverity::Medium,
@@ -1125,7 +1158,7 @@ fn is_remote_raster(src_l: &str, mime_l: &str) -> bool {
 
 pub(crate) fn detect_cc015(tool: &ToolDefinition) -> Option<ManifestFinding> {
     for text in tool_scan_texts(tool) {
-        if let Some(needle) = secret_path_lure_in_text(&text) {
+        if let Some(needle) = secret_path_lure_in_text(&fold_name_for_collision(&text)) {
             return Some(ManifestFinding::new(
                 ManifestRule::Cc015,
                 ManifestSeverity::Medium,

@@ -100,7 +100,7 @@ pub fn resolve_for_authorization_with_cwd(path: &str, cwd: &Path) -> Result<Stri
 /// but it makes a POSIX-literal test machine-dependent.
 #[cfg(test)]
 pub(crate) fn temp_root_abs(posix: &str) -> String {
-    let anchor = std::env::temp_dir()
+    let anchor = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
         .ancestors()
         .last()
         .expect("temp dir has a filesystem root")

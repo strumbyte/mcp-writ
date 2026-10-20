@@ -72,6 +72,28 @@ fn test_unknown_tool_rejected() {
 }
 
 #[test]
+fn test_hidden_and_unknown_tool_client_reasons_match() {
+    // A denied (hidden) policy entry and an absent name must produce
+    // the same client-facing reason — otherwise tools/call errors are a
+    // membership oracle. The audit record keeps the distinction.
+    let policy = test_policy();
+    let hidden = check_request(
+        r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"exec_shell","arguments":{}}}"#,
+        &policy,
+    )
+    .unwrap_err();
+    let unknown = check_request(
+        r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"does_not_exist","arguments":{}}}"#,
+        &policy,
+    )
+    .unwrap_err();
+    assert_ne!(hidden.reason, unknown.reason, "audit detail diverges");
+    assert_eq!(hidden.client_reason(), unknown.client_reason());
+    assert_eq!(hidden.client_reason(), "tool is not allowed");
+    assert!(unknown.reason.contains("not found in policy"));
+}
+
+#[test]
 fn test_non_tools_call_passes_through() {
     let policy = test_policy();
     let line = r#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}"#;
@@ -346,6 +368,7 @@ mod decoy;
 mod helpers;
 mod mrtr;
 mod schema;
+mod targets;
 mod tool_sub_policy;
 mod trajectory_cidr;
 mod url_overlay;

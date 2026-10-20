@@ -86,7 +86,7 @@ struct Cfg {
     listen_port: u16,
     launch_id: String,
     token: String,
-    peer_token: String,
+    peer_token: String, // nosemgrep: codacy.yaml.security.hard-coded-tokens
     allowed_peers: Vec<String>,
     server_name: String,
     guest: bool,
@@ -727,7 +727,7 @@ pub fn main() {
         std::process::exit(1);
     }
     let mut config_path = PathBuf::from(r"C:\relay-ro\relay-config.txt");
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1); // nosemgrep: rust.lang.security.args.args
     while let Some(a) = args.next() {
         if a == "--config"
             && let Some(p) = args.next()

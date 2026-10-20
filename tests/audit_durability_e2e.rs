@@ -119,7 +119,7 @@ fn spawn_fixture(
     behavior: &str,
     log: &Path,
 ) -> (Child, BufReader<std::process::ChildStdout>) {
-    let exe = std::env::current_exe().expect("current test binary");
+    let exe = std::env::current_exe().expect("current test binary"); // nosemgrep: rust.lang.security.current-exe.current-exe
     let mut child = Command::new(exe)
         // `--nocapture` puts the child's READY print on the real stdout
         // pipe; the filter keeps the re-exec'd binary to this one test.

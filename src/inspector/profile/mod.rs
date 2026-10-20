@@ -179,16 +179,30 @@ fn resolve_syscalls_from_elf(
     };
 
     // Record executable code ranges for downstream consumers/policy drafts.
-    // Capped so a malformed ELF cannot force unbounded metadata growth.
+    // Capped so a malformed ELF cannot force unbounded metadata growth —
+    // in count *and* in name bytes: thousands of executable headers can
+    // all index one long shstrtab entry, and a per-section `to_string`
+    // would otherwise hold that entry's bytes once per region.
     const MAX_CODE_REGIONS: usize = 4096;
+    const MAX_CODE_REGION_NAME_BYTES: usize = 1 << 20;
+    let mut name_budget = MAX_CODE_REGION_NAME_BYTES;
     for sh in &elf.section_headers {
         if sh.is_executable() {
             if target.code_regions.len() >= MAX_CODE_REGIONS {
                 break;
             }
-            let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("").to_string();
+            let full_name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+            let name = if full_name.len() <= name_budget {
+                name_budget -= full_name.len();
+                full_name
+            } else {
+                // Over-budget names are dropped whole rather than
+                // sliced — metadata only, never an analyzer input.
+                name_budget = 0;
+                ""
+            };
             target.code_regions.push(CodeRegion {
-                name,
+                name: name.to_string(),
                 file_offset: sh.sh_offset,
                 slice_offset: None,
                 size: sh.sh_size,
@@ -758,5 +772,111 @@ fn macho_profile(
         strings,
         risk_score,
         risk_summary,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal ELF64 (LE, x86-64) with two executable PROGBITS sections
+    /// whose names come from one shared shstrtab, plus the null and
+    /// shstrtab headers goblin needs to parse it.
+    fn elf64_with_two_exec_sections(name1: &[u8], name2: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // e_ident: magic, ELFCLASS64, ELFDATA2LSB, EV_CURRENT, OSABI none
+        buf.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&2u16.to_le_bytes()); // e_type: ET_EXEC
+        buf.extend_from_slice(&62u16.to_le_bytes()); // e_machine: EM_X86_64
+        buf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+        buf.extend_from_slice(&0u64.to_le_bytes()); // e_entry
+        buf.extend_from_slice(&0u64.to_le_bytes()); // e_phoff
+        buf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff (patched below)
+        buf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+        buf.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        buf.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        buf.extend_from_slice(&0u16.to_le_bytes()); // e_phnum
+        buf.extend_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        buf.extend_from_slice(&4u16.to_le_bytes()); // e_shnum
+        buf.extend_from_slice(&3u16.to_le_bytes()); // e_shstrndx
+
+        let strtab_off = buf.len() as u64;
+        let mut strtab = vec![0u8];
+        let name1_off = strtab.len() as u32;
+        strtab.extend_from_slice(name1);
+        strtab.push(0);
+        let name2_off = strtab.len() as u32;
+        strtab.extend_from_slice(name2);
+        strtab.push(0);
+        let strtab_len = strtab.len() as u64;
+        buf.extend_from_slice(&strtab);
+
+        let shoff = buf.len() as u64;
+        buf[40..48].copy_from_slice(&shoff.to_le_bytes());
+
+        let mut push_sh = |name: u32, sh_type: u32, flags: u64, off: u64, size: u64| {
+            buf.extend_from_slice(&name.to_le_bytes()); // sh_name
+            buf.extend_from_slice(&sh_type.to_le_bytes()); // sh_type
+            buf.extend_from_slice(&flags.to_le_bytes()); // sh_flags
+            buf.extend_from_slice(&0u64.to_le_bytes()); // sh_addr
+            buf.extend_from_slice(&off.to_le_bytes()); // sh_offset
+            buf.extend_from_slice(&size.to_le_bytes()); // sh_size
+            buf.extend_from_slice(&0u32.to_le_bytes()); // sh_link
+            buf.extend_from_slice(&0u32.to_le_bytes()); // sh_info
+            buf.extend_from_slice(&1u64.to_le_bytes()); // sh_addralign
+            buf.extend_from_slice(&0u64.to_le_bytes()); // sh_entsize
+        };
+        const SHT_PROGBITS: u32 = 1;
+        const SHT_STRTAB: u32 = 3;
+        // goblin's `is_executable` requires SHF_ALLOC | SHF_EXECINSTR.
+        const SHF_ALLOC_EXEC: u64 = 0x6;
+        push_sh(0, 0, 0, 0, 0); // null section
+        push_sh(name1_off, SHT_PROGBITS, SHF_ALLOC_EXEC, strtab_off, 16);
+        push_sh(name2_off, SHT_PROGBITS, SHF_ALLOC_EXEC, strtab_off, 16);
+        push_sh(0, SHT_STRTAB, 0, strtab_off, strtab_len);
+        buf
+    }
+
+    fn linux_x86_target() -> AnalysisTarget {
+        AnalysisTarget {
+            format: BinaryFormat::Elf,
+            isa: Isa::X86_64,
+            abi: SyscallAbi::Linux,
+            endianness: Endianness::Little,
+            elf_class: Some(ElfClass::Elf64),
+            slice: None,
+            machine: Some(62),
+            slices: Vec::new(),
+            platform: None,
+            code_regions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn section_name_budget_drops_oversized_names_whole() {
+        // The aggregate name budget is 1 MiB: the first 700 KiB name
+        // fits, the second does not — it must be dropped whole, never
+        // sliced mid-name or duplicated per region.
+        let big1 = "A".repeat(700 * 1024);
+        let big2 = "B".repeat(700 * 1024);
+        let elf = elf64_with_two_exec_sections(big1.as_bytes(), big2.as_bytes());
+        let (target, _state, _sites) = resolve_syscalls_from_elf(&elf, linux_x86_target());
+        assert_eq!(target.code_regions.len(), 2);
+        assert_eq!(target.code_regions[0].name, big1);
+        assert!(
+            target.code_regions[1].name.is_empty(),
+            "over-budget name must be dropped, got {} bytes",
+            target.code_regions[1].name.len()
+        );
+    }
+
+    #[test]
+    fn section_name_budget_keeps_small_names() {
+        let elf = elf64_with_two_exec_sections(b".text.exec", b".init");
+        let (target, _state, _sites) = resolve_syscalls_from_elf(&elf, linux_x86_target());
+        assert_eq!(target.code_regions.len(), 2);
+        assert_eq!(target.code_regions[0].name, ".text.exec");
+        assert_eq!(target.code_regions[1].name, ".init");
     }
 }

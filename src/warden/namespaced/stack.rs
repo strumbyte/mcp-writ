@@ -98,6 +98,12 @@ const UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 /// anything beyond it is counted in `udp_audit_suppressed`, never
 /// queued, so a datagram flood cannot become a sink flood.
 const UDP_AUDIT_BURST: usize = 32;
+/// Sub-cap on denied-datagram records *within* the same per-second
+/// aggregate: a flood of fresh denied destinations is telemetry and
+/// must never starve the allow path's required `authorize` records —
+/// at least `UDP_AUDIT_BURST - UDP_DENY_AUDIT_BURST` slots per window
+/// remain available to them.
+const UDP_DENY_AUDIT_BURST: usize = 8;
 const UDP_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 /// A denied datagram with no flow repeats one audit subject — collapse
 /// repeats per destination inside this window; the map is bounded and
@@ -706,9 +712,21 @@ async fn dns_tcp_backend(
             }
             let pkt: Vec<u8> = buf.drain(..2 + len).skip(2).collect();
             if let Some(resp) = gate.answer(&pkt, peer, true).await {
-                credit.bytes.fetch_add(resp.len(), Ordering::Release);
+                // RFC 7766 on the way out too — the workload's stub
+                // resolver reads a 2-byte length prefix before each
+                // DNS message on a TCP transport.
+                let Ok(resp_len) = u16::try_from(resp.len()) else {
+                    // An unframeable answer is unanswerable — close
+                    // rather than desync the stream.
+                    let _ = events.send(ConnEvent::Fail { key }).await;
+                    return;
+                };
+                let mut framed = Vec::with_capacity(2 + resp.len());
+                framed.extend_from_slice(&resp_len.to_be_bytes());
+                framed.extend_from_slice(&resp);
+                credit.bytes.fetch_add(framed.len(), Ordering::Release);
                 if events
-                    .send(ConnEvent::Data { key, bytes: resp })
+                    .send(ConnEvent::Data { key, bytes: framed })
                     .await
                     .is_err()
                 {
@@ -818,6 +836,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                 };
                 match guard.try_io(|fd| {
                     use std::os::unix::io::AsRawFd;
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     let n = unsafe {
                         libc::read(
                             fd.as_raw_fd(),
@@ -903,6 +922,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                     };
                     match guard.try_io(|fd| {
                         use std::os::unix::io::AsRawFd;
+                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                         let n = unsafe {
                             libc::write(
                                 fd.as_raw_fd(),
@@ -947,6 +967,11 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
             let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(GATE_INFLIGHT));
             let mut queries = tokio::task::JoinSet::new();
             while let Some(req) = gate_rx.recv().await {
+                // Reap finished query tasks — a JoinSet retains every
+                // completed entry until it is joined, so a long-lived
+                // session would otherwise accumulate one handle per
+                // answered query.
+                while queries.try_join_next().is_some() {}
                 let Ok(permit) = inflight.clone().try_acquire_owned() else {
                     continue;
                 };
@@ -1022,13 +1047,15 @@ enum FlowAudit {
 struct AuditBudget {
     window_start: std::time::Instant,
     used: usize,
+    limit: usize,
 }
 
 impl AuditBudget {
-    fn new() -> Self {
+    fn new(limit: usize) -> Self {
         Self {
             window_start: std::time::Instant::now(),
             used: 0,
+            limit,
         }
     }
 
@@ -1038,11 +1065,18 @@ impl AuditBudget {
             self.window_start = std::time::Instant::now();
             self.used = 0;
         }
-        if self.used >= UDP_AUDIT_BURST {
+        if self.used >= self.limit {
             return false;
         }
         self.used += 1;
         true
+    }
+
+    /// `true` when a slot is free this window — consumes nothing; the
+    /// caller charges with `take` only once every budget is known to
+    /// admit the event.
+    fn available(&self) -> bool {
+        self.window_start.elapsed() >= UDP_AUDIT_WINDOW || self.used < self.limit
     }
 }
 
@@ -1064,7 +1098,8 @@ async fn udp_task(
     // the dedup the flow's `audit` field does for allowed traffic —
     // without it a single-target flood would spend the whole budget.
     let mut deny_audit: HashMap<(IpAddr, u16), std::time::Instant> = HashMap::new();
-    let mut budget = AuditBudget::new();
+    let mut budget = AuditBudget::new(UDP_AUDIT_BURST);
+    let mut deny_budget = AuditBudget::new(UDP_DENY_AUDIT_BURST);
     let mut reaper = tokio::time::interval(UDP_IDLE / 2);
     reaper.tick().await; // immediate first tick is free
     loop {
@@ -1082,8 +1117,16 @@ async fn udp_task(
                         );
                         if fresh {
                             if !budget.take() {
+                                // The budget throttles telemetry, never
+                                // authorization: a fresh tuple whose
+                                // `authorize` record cannot be emitted
+                                // must not relay unaudited. Drop the
+                                // datagram — the workload's retransmit
+                                // lands in a replenished window.
                                 stats.udp_audit_suppressed.fetch_add(1, Ordering::Relaxed);
-                            } else if gate
+                                continue;
+                            }
+                            if gate
                                 .authorize(
                                     EgressProto::Udp,
                                     d.dst,
@@ -1126,7 +1169,13 @@ async fn udp_task(
                             due
                         };
                         if fresh {
-                            if budget.take() {
+                            // Charge neither budget until both admit
+                            // the record — a shared-cap rejection must
+                            // not spend the deny sub-budget on an event
+                            // that was never emitted.
+                            if deny_budget.available() && budget.available() {
+                                deny_budget.take();
+                                budget.take();
                                 gate.denied(
                                     EgressProto::Udp,
                                     d.dst,
@@ -1237,6 +1286,12 @@ async fn udp_task(
                 }
             }
             _ = reaper.tick() => {
+                // Reap pump entries — abort() only *signals* the task;
+                // its JoinSet entry (with the tun_tx clone it held)
+                // stays until a join clears it, so finished and evicted
+                // pumps alike are drained here rather than retained
+                // for the session's lifetime.
+                while pumps.try_join_next().is_some() {}
                 flows.retain(|_, (f, j)| {
                     let live = f.last_seen.elapsed() < UDP_IDLE;
                     if !live { j.abort(); }
@@ -1328,6 +1383,11 @@ async fn stack_loop(
     };
 
     loop {
+        // Reap finished backend tasks — a JoinSet retains every
+        // completed entry until it is joined, so a long-lived session
+        // would otherwise accumulate one handle per closed connection.
+        while backends.try_join_next().is_some() {}
+
         // Drain inbound work before polling.
         while let Ok(frame) = to_stack_rx.try_recv() {
             // Frames arrive here NOT yet DNAT'd — reader pushed raw
@@ -1678,6 +1738,7 @@ async fn stack_loop(
 }
 
 fn set_nonblocking(fd: i32) {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags >= 0 {
@@ -1705,5 +1766,67 @@ mod tests {
             let ip: IpAddr = a.parse().unwrap();
             assert!(!unspecified_target(ip), "{a} must not be refused");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dns_tcp_response_carries_rfc7766_length_prefix() {
+        // Regression: the intercept backend used to emit the bare DNS
+        // message — a stub resolver on TCP reads a 2-byte big-endian
+        // length first, so an unframed reply desynced every answer.
+        let log_dir = std::env::temp_dir().join(format!("dnstcp-{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let logger = crate::audit_log::AuditLogger::to_file(&log_dir.join("audit.jsonl")).unwrap();
+        let gate = Arc::new(QueryCore::new(
+            crate::dnsgate::server::GateConfig::default(),
+            Arc::new(crate::policy::OutboundPolicy::default()),
+            Arc::new(DynamicAllowList::new(16)),
+            logger,
+            uuid::Uuid::new_v4(),
+            None,
+        ));
+        let key = ConnKey {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            port: 53,
+        };
+        let peer: SocketAddr = "10.0.0.2:5333".parse().unwrap();
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let (to_backend_tx, to_backend_rx) = mpsc::channel(4);
+        let credit = Arc::new(FlowCredit {
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            drained: tokio::sync::Notify::new(),
+        });
+        let backend = tokio::spawn(dns_tcp_backend(
+            key,
+            gate,
+            peer,
+            events_tx,
+            to_backend_rx,
+            credit,
+        ));
+        // A framed query that cannot parse — the gate answers REFUSED
+        // without ever consulting an upstream resolver.
+        let pkt = b"\x12\x34not-a-dns-message";
+        let mut frame = Vec::with_capacity(2 + pkt.len());
+        frame.extend_from_slice(&(pkt.len() as u16).to_be_bytes());
+        frame.extend_from_slice(pkt);
+        to_backend_tx.send(ToBackend::Data(frame)).await.unwrap();
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), events_rx.recv())
+            .await
+            .expect("backend answers within timeout")
+            .expect("event channel stays open");
+        let ConnEvent::Data { bytes, .. } = ev else {
+            panic!("expected a Data event carrying the framed answer");
+        };
+        let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+        assert_eq!(
+            len + 2,
+            bytes.len(),
+            "the response must carry its RFC 7766 length prefix"
+        );
+        drop(to_backend_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), backend)
+            .await
+            .expect("backend exits once the channel closes");
+        std::fs::remove_dir_all(&log_dir).ok();
     }
 }

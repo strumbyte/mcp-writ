@@ -32,11 +32,13 @@ pub fn check_support() -> Result<(), UnmetRequirement> {
             "seccomp user notification is implemented for x86_64/aarch64 only",
         ));
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut sizes: libc::seccomp_notif_sizes = unsafe { std::mem::zeroed() };
     // seccomp(2) is (operation, flags, args): the sizes struct goes in
     // `args` — flags must be 0 for GET_NOTIF_SIZES, so passing the
     // pointer as `flags` would always be EINVAL. Safety: `sizes` is
     // live and sized per the kernel ABI.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe {
         libc::syscall(
             libc::SYS_seccomp,
@@ -102,6 +104,7 @@ fn continue_round_trip() -> Result<(), UnmetRequirement> {
         .ok_or_else(|| probe_failure("notification program refused the static probe list"))?;
     let mut pair = [0 as RawFd; 2];
     // Safety: `pair` receives two owned fds.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::socketpair(
             libc::AF_UNIX,
@@ -117,8 +120,10 @@ fn continue_round_trip() -> Result<(), UnmetRequirement> {
         )));
     }
     // Safety: fork; the child below runs syscall-only code then _exit.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     if pid < 0 {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::close(pair[0]);
             libc::close(pair[1]);
@@ -130,6 +135,7 @@ fn continue_round_trip() -> Result<(), UnmetRequirement> {
     }
     if pid == 0 {
         // Child — plain syscalls only, never returns to Rust.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let byte = unsafe {
             // seccomp(2) refuses filter installs without no_new_privs
             // (or CAP_SYS_ADMIN) — set it first so the probe measures
@@ -166,26 +172,32 @@ fn continue_round_trip() -> Result<(), UnmetRequirement> {
                 }
             }
         };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::send(pair[0], &byte as *const u8 as *const libc::c_void, 1, 0);
             libc::_exit(0);
         }
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(pair[0]) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let sock = unsafe { File::from_raw_fd(pair[1]) };
     let result = probe_parent(pid, &sock);
     // Reap the probe child whatever happened.
     let mut status = 0;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::waitpid(pid, &mut status, 0) };
     result
 }
 
 fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), UnmetRequirement> {
     // Borrow via a dup so this helper never owns `sock`.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let dup_sock = unsafe { File::from_raw_fd(libc::dup(sock.as_raw_fd())) };
     let listener = match (UnotifyParent { sock: dup_sock }).recv_listener() {
         Ok(l) => l,
         Err(e) => {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::kill(pid, libc::SIGKILL) };
             return Err(probe_failure(format!(
                 "listener handoff failed in probe: {e}"
@@ -198,7 +210,9 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), UnmetRequirement> {
         events: libc::POLLIN,
         revents: 0,
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::poll(&mut pfd, 1, 10_000) } <= 0 {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::kill(pid, libc::SIGKILL) };
         return Err(probe_failure(
             "probe notification never arrived (no connect event)",
@@ -207,6 +221,7 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), UnmetRequirement> {
     let notif = match notify_recv(listener.as_raw_fd()) {
         Ok(n) => n,
         Err(e) => {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::kill(pid, libc::SIGKILL) };
             return Err(probe_failure(format!(
                 "SECCOMP_IOCTL_NOTIF_RECV failed: {e}"
@@ -220,6 +235,7 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), UnmetRequirement> {
         flags: libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32,
     };
     if let Err(e) = notify_send(listener.as_raw_fd(), &resp) {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::kill(pid, libc::SIGKILL) };
         // EINVAL on the response flags is the kernel naming the missing
         // requirement itself — CONTINUE needs ≥ 5.5. Any other errno is
@@ -240,11 +256,14 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), UnmetRequirement> {
         events: libc::POLLIN,
         revents: 0,
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::poll(&mut pfd2, 1, 5_000) } <= 0 {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::kill(pid, libc::SIGKILL) };
         return Err(probe_failure("probe child stopped answering"));
     }
     let mut byte = [0u8; 1];
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) } != 1 {
         return Err(probe_failure("probe child exited without a status byte"));
     }

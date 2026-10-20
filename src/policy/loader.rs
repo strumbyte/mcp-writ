@@ -126,7 +126,7 @@ mod tests {
         // `dns-gate` enforces the name layer itself and launches no
         // workload — a per-destination allowlist that a Windows
         // workload target must refuse still loads for the gate.
-        let dir = std::env::temp_dir()
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
             .join("mcp_writ_test")
             .join(format!("resolver_load_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

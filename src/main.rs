@@ -15,7 +15,7 @@ fn main() {
     // collide with real subcommands.
     #[cfg(target_os = "linux")]
     {
-        let mut argv = std::env::args();
+        let mut argv = std::env::args(); // nosemgrep: rust.lang.security.args.args
         let _exe = argv.next();
         match argv.next().as_deref() {
             Some(mcp_writ::commands::namespaced_run::INIT_SUBCOMMAND) => {
@@ -297,6 +297,39 @@ async fn real_main() {
             None
         }
     };
+
+    // Fail-closed write-grant conflicts: a grant covering a file this
+    // policy load read (root document, extends/include ancestors, or an
+    // @file schema) lets the workload rewrite what every later launch
+    // trusts; a grant covering the --report destination lets it
+    // fabricate or destroy launch evidence. Refuse before the spawn.
+    let launch_write_grants = policy.write_grant_spellings();
+    for source in policy.source_files() {
+        if let Some(conflict) = mcp_writ::audit_log::policy_source_write_conflict(
+            launch_write_grants.iter().cloned(),
+            &source,
+        ) {
+            let detail = format!(
+                "refusing launch: write grant reaches policy source '{}': {conflict}",
+                source.display()
+            );
+            eprintln!("Error: {detail}");
+            write_prelaunch_failure(detail.clone(), policy_context.clone());
+            lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail)
+                .await;
+            std::process::exit(1);
+        }
+    }
+    if let Some(ref report) = args.report
+        && let Some(conflict) =
+            mcp_writ::audit_log::report_write_conflict(launch_write_grants.iter().cloned(), report)
+    {
+        let detail = format!("refusing --report '{}': {conflict}", report.display());
+        eprintln!("Error: {detail}");
+        write_prelaunch_failure(detail.clone(), policy_context.clone());
+        lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail).await;
+        std::process::exit(1);
+    }
 
     // 4. Initialize tracing based on verbosity or policy.logging.level
     let trace_level = if args.verbose > 0 {

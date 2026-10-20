@@ -26,11 +26,9 @@ fn test_load_example_kdl_file() {
 
 /// Helper: create a temp directory with a unique name for test isolation.
 fn make_test_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("mcp_writ_test").join(format!(
-        "{}_{}",
-        label,
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join("mcp_writ_test")
+        .join(format!("{}_{}", label, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

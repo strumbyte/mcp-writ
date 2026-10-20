@@ -16,6 +16,15 @@ pub use targets::{extract_deputy_use_targets, extract_fs_targets, request_has_ho
 /// rejected fail-secure so a retry cannot DoS the proxy.
 pub const REQUEST_STATE_MAX_BYTES: usize = 65_536;
 
+/// The tools/call denial reason for a listed-but-disallowed tool —
+/// and the single wire string [`PolicyViolation::client_reason`]
+/// collapses both authorization refusals into, so the two cannot be
+/// told apart by the client.
+pub(crate) const REASON_TOOL_NOT_ALLOWED: &str = "tool is not allowed";
+/// The tools/call denial reason for a name with no policy entry at
+/// all. Distinct in the audit record; identical on the wire.
+const REASON_TOOL_NOT_FOUND: &str = "tool not found in policy (default deny)";
+
 /// Represents a policy violation when a tool call is not allowed.
 #[derive(Debug)]
 pub struct PolicyViolation {
@@ -44,6 +53,18 @@ impl PolicyViolation {
             Some(crate::audit_log::EventType::ValidationArgumentInvalid)
         } else {
             None
+        }
+    }
+
+    /// The reason text a client may see. The authorization refusal keeps
+    /// one wire string whether the name is an unallowed policy entry or
+    /// absent entirely — answering differently would turn `tools/call`
+    /// errors into an oracle for hidden tool names. The distinguishing
+    /// reason is preserved in `self.reason` for the audit record.
+    pub fn client_reason(&self) -> &str {
+        match self.reason.as_str() {
+            REASON_TOOL_NOT_ALLOWED | REASON_TOOL_NOT_FOUND => REASON_TOOL_NOT_ALLOWED,
+            other => other,
         }
     }
 }
@@ -211,9 +232,9 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
     // Step 3-6: Check against policy (including MRTR retries with a new JSON-RPC id)
     if !tool_is_allowed(policy, &tool_name) {
         let reason = if policy.tools.iter().any(|t| t.name == tool_name) {
-            "tool is not allowed"
+            REASON_TOOL_NOT_ALLOWED
         } else {
-            "tool not found in policy (default deny)"
+            REASON_TOOL_NOT_FOUND
         };
         return Err(PolicyViolation {
             tool_name,
@@ -232,7 +253,7 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
         None => {
             return Err(PolicyViolation {
                 tool_name,
-                reason: "tool not found in policy (default deny)".to_string(),
+                reason: REASON_TOOL_NOT_FOUND.to_string(),
             });
         }
     };

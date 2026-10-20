@@ -427,7 +427,7 @@ fn test_deny_covers_descendant_allow() {
 fn test_open_landlock_path_binds_resolved_object() {
     // F85: a spelling through a symlink binds the resolved object
     // the Auditor would authorize, not the mutable name.
-    let dir = std::env::temp_dir().join(format!("llbind-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("llbind-{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     let real = dir.join("real");
     std::fs::create_dir_all(&real).unwrap();
     let link = dir.join("link");
@@ -442,7 +442,7 @@ fn test_open_landlock_path_binds_resolved_object() {
 fn test_deny_of_target_suppresses_symlinked_allow() {
     // F85+F86: deny the real tree, allow the alias — the resolved
     // coverage check suppresses the grant anyway.
-    let dir = std::env::temp_dir().join(format!("llcov-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("llcov-{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     let real = dir.join("real");
     std::fs::create_dir_all(&real).unwrap();
     let link = dir.join("link");
@@ -453,6 +453,41 @@ fn test_deny_of_target_suppresses_symlinked_allow() {
         &format!("{}/inside", link.display())
     ));
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_symlinked_allow_covers_denied_real_child() {
+    // The launch-gate direction of F85: the allow is spelled through
+    // the symlink and the deny names the real child. Landlock grants
+    // the resolved parent wholesale — the spelled deny is silently
+    // covered unless containment is compared on resolved spellings.
+    // The deny's tail need not exist yet for the check to fire.
+    // `tempdir()` is unique per call and removes itself on drop —
+    // including the panic path — so no cleanup is needed after asserts.
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // `resolved_covers(allow, deny)` — allow's resolved object covers
+    // the deny's resolved spelling.
+    assert!(resolved_covers(
+        &link.to_string_lossy(),
+        &format!("{}/not-created-yet", real.display())
+    ));
+    // Spelling-equality direction still holds as well.
+    assert!(resolved_covers(
+        &real.to_string_lossy(),
+        &format!("{}/inside", real.display())
+    ));
+    // A disjoint resolved tree is not covered.
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    assert!(!resolved_covers(
+        &other.to_string_lossy(),
+        &format!("{}/inside", real.display())
+    ));
 }
 
 // -- PR-18 (D-2): `allow unix=` opt-ins ---------------------------------
@@ -537,7 +572,7 @@ fn test_unix_path_optin_abi_floor() {
 fn test_ruleset_skips_deny_covered_allow() {
     // F86 end-to-end: the grant record reports the covered allow as
     // Skipped rather than installing a PathBeneath rule.
-    let dir = std::env::temp_dir().join(format!("lldeny-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("lldeny-{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     let denied = dir.join("deny_root");
     let allow = denied.join("child");
     std::fs::create_dir_all(&allow).unwrap();

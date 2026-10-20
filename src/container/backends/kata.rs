@@ -375,18 +375,34 @@ impl IsolationBackend for KataBackend {
                     "the kata backend requires an image-defined workload".to_string(),
                 )
             })?;
+            // Arm the watch before verifying — same ordering as OCI, so
+            // the covered window spans the whole mount resolution.
+            let mut watch = super::begin_share_pin_watch(spec)?;
+            super::verify_share_pins(spec)?;
             let options = run_options(spec);
             let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
             let child = self.engine.run(image, &option_refs, true).await?;
-            Ok(Box::new(
-                EngineRunHandle::attach(
-                    child,
-                    self.engine.program(),
-                    spec.unit_id_file.clone(),
-                    spec.unit_name.clone(),
-                )
-                .await,
-            ) as Box<dyn IsolationHandle>)
+            let mut handle = EngineRunHandle::attach(
+                child,
+                self.engine.program(),
+                spec.unit_id_file.clone(),
+                spec.unit_name.clone(),
+            )
+            .await;
+            // The runtime resolves the share spelling host-side before
+            // the VM gets it, so the same two-stage coverage applies:
+            // drain what landed already, re-check the path, and leave
+            // the watch in the handle for the take_stdio drain.
+            if let Err(e) = watch.drain().and_then(|()| super::verify_share_pins(spec)) {
+                return Err(match handle.cleanup().await {
+                    Ok(()) => e,
+                    Err(c) => BackendError::CleanupFailed(format!(
+                        "{e}; the refused unit could not be proven gone: {c}"
+                    )),
+                });
+            }
+            handle.share_watch = Some(watch);
+            Ok(Box::new(handle) as Box<dyn IsolationHandle>)
         })
     }
 }

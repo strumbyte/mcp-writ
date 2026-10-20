@@ -1147,6 +1147,7 @@ fn workload_hashes_end_to_end_from_argv() {
         &PayloadDiscovery {
             kind: PayloadKind::Native,
         },
+        None,
     );
     if let Some(resolution) = &interp_resolution {
         let binary = wh
@@ -1190,6 +1191,7 @@ fn workload_hashes_end_to_end_from_argv() {
                 path: fixture.clone(),
             },
         },
+        None,
     );
     let entrypoint = wh
         .entrypoint
@@ -1213,6 +1215,7 @@ fn workload_hashes_end_to_end_from_argv() {
                 flag: "-e".to_string(),
             },
         },
+        None,
     );
     assert!(wh.binary.is_some());
     assert!(wh.entrypoint.is_none());
@@ -1398,5 +1401,48 @@ fn blocked_network_outbound_names_datagram_syscalls() {
             assert!(!t.contains("\"recvmsg\""), "{line}");
             assert!(!t.contains("\"sendmmsg\""), "{line}");
         }
+    }
+}
+
+#[test]
+fn test_project_hint_cannot_inject_kdl_nodes() {
+    // Regression: hint evidence is attacker-influenceable content from
+    // the analyzed project — a KDL newline code point inside it must
+    // not terminate the line comment and parse as real nodes.
+    let cap = make_capability(RiskFlags::default(), &["read"], vec![], vec![]);
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::FileRead,
+            Some("read_file"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+    for nl in [
+        '\n', '\r', '\u{0B}', '\u{0C}', '\u{85}', '\u{2028}', '\u{2029}',
+    ] {
+        let hint = crate::legislator::project_hints::ProjectHint {
+            project_type: crate::legislator::project_hints::ProjectType::Unknown,
+            detected_permissions: vec![crate::legislator::project_hints::PermissionHint {
+                permission: Permission::FileRead,
+                confidence: crate::legislator::heuristics::Confidence::Low,
+                source: crate::legislator::project_hints::HintSource::DependencyList,
+                evidence: format!("legit{nl}tool \"evil\""),
+            }],
+            entry_points: vec![],
+            confidence_summary: crate::legislator::heuristics::Confidence::Low,
+        };
+        let kdl_str = generate_policy(&result, &cap, Some(&hint), &[], &WorkloadHashes::default());
+        let doc: KdlDocument = kdl_str
+            .parse()
+            .unwrap_or_else(|_| panic!("generated doc must parse (newline {nl:?}):\n{kdl_str}"));
+        assert!(
+            !doc.nodes().iter().any(|n| n.name().value() == "tool"
+                && n.get(0)
+                    .and_then(|v| v.as_string())
+                    .is_some_and(|t| t == "evil")),
+            "hint evidence escaped the comment and injected a tool node (newline {nl:?}):\n{kdl_str}"
+        );
     }
 }

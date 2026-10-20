@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn looks_like_pe_mz_only() {
-        let dir = std::env::temp_dir()
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
             .join("mcp_writ_pe_test")
             .join(format!("mz_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

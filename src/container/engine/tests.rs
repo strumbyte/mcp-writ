@@ -141,18 +141,28 @@ fn resolve_engine_explicit_buildah() {
 
 // -- WslcEngine -------------------------------------------------------
 
-/// The `<subcmd> -f df -t tag [--no-cache] ctx` argument order the
-/// engine build impls share — `--no-cache` sits between the tag
-/// and the context dir, and `bud` swaps the subcommand.
+/// The `<subcmd> -f df -t tag --network=none [--no-cache] ctx` argument
+/// order the engine build impls share — build networking is always
+/// denied, `--no-cache` sits between the flags and the context dir, and
+/// `bud` swaps the subcommand.
 #[test]
 fn image_build_args_place_no_cache_before_context() {
     assert_eq!(
         image_build_args("build", "df", "img:tag", "ctx", true),
-        ["build", "-f", "df", "-t", "img:tag", "--no-cache", "ctx"]
+        [
+            "build",
+            "-f",
+            "df",
+            "-t",
+            "img:tag",
+            "--network=none",
+            "--no-cache",
+            "ctx"
+        ]
     );
     assert_eq!(
         image_build_args("bud", "df", "img:tag", "ctx", false),
-        ["bud", "-f", "df", "-t", "img:tag", "ctx"]
+        ["bud", "-f", "df", "-t", "img:tag", "--network=none", "ctx"]
     );
 }
 
@@ -160,10 +170,11 @@ fn image_build_args_place_no_cache_before_context() {
 /// (std spawns batch files through cmd.exe), a shell script
 /// elsewhere.
 fn cli_stub(body: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "mcp_writ_cli_stub_{}",
-        uuid::Uuid::now_v7().simple()
-    ));
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp_writ_cli_stub_{}",
+            uuid::Uuid::now_v7().simple()
+        ));
     std::fs::create_dir_all(&dir).unwrap();
     #[cfg(windows)]
     let (name, script) = ("stub.cmd", format!("{body}\r\n"));
@@ -236,10 +247,12 @@ fn wslc_stub(version: &str) -> std::path::PathBuf {
 fn resolve_engine_wslc_resolves_the_validated_line() {
     let _env = crate::warden::lock_process_env();
     let stub = wslc_stub("3.0.1.0");
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         std::env::set_var(crate::container::windows_probe::WSLC_EXE_ENV, &stub);
     }
     let engine = resolve_engine(Some(EngineKind::Wslc)).expect("the validated-line stub resolves");
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         std::env::remove_var(crate::container::windows_probe::WSLC_EXE_ENV);
     }
@@ -256,10 +269,12 @@ fn resolve_engine_wslc_refuses_an_unvalidated_version() {
     let _env = crate::warden::lock_process_env();
     for version in ["2.9.3.0", "3.1.0.0", "4.0.0.0", "3.0.0.0"] {
         let stub = wslc_stub(version);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(crate::container::windows_probe::WSLC_EXE_ENV, &stub);
         }
         let result = resolve_engine(Some(EngineKind::Wslc));
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var(crate::container::windows_probe::WSLC_EXE_ENV);
         }
@@ -283,6 +298,7 @@ fn resolve_engine_wslc_absent_is_not_available() {
     // The override naming a missing file reads as absent — and
     // overrides the stock install path, so the refusal is
     // deterministic on every host.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         std::env::set_var(
             crate::container::windows_probe::WSLC_EXE_ENV,
@@ -290,6 +306,7 @@ fn resolve_engine_wslc_absent_is_not_available() {
         );
     }
     let result = resolve_engine(Some(EngineKind::Wslc));
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         std::env::remove_var(crate::container::windows_probe::WSLC_EXE_ENV);
     }
@@ -436,10 +453,12 @@ fn resolve_binds_the_first_path_hit_as_an_absolute_path() {
     let old_path = std::env::var_os("PATH").unwrap_or_default();
     let mut split: Vec<std::path::PathBuf> = std::env::split_paths(&old_path).collect();
     split.insert(0, dir.path().to_path_buf());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         std::env::set_var("PATH", std::env::join_paths(&split).unwrap());
     }
     let resolved = crate::trusted_path::resolve_cli("mcpwrit-fake-docker");
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         std::env::set_var("PATH", &old_path);
     }
@@ -470,10 +489,12 @@ fn resolve_cli_refuses_a_shadow_in_a_world_writable_dir() {
     let mut split: Vec<std::path::PathBuf> = std::env::split_paths(&old_path).collect();
     split.insert(0, shadow_dir.path().to_path_buf());
     split.insert(1, good_dir.path().to_path_buf());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         std::env::set_var("PATH", std::env::join_paths(&split).unwrap());
     }
     let result = crate::trusted_path::resolve_cli("mcpwrit-shadowed-tool");
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         std::env::set_var("PATH", &old_path);
     }

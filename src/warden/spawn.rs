@@ -699,6 +699,7 @@ impl Warden {
                             // `kill(0)` would signal *this* process's own
                             // group.
                             if spawned_pid > 0 {
+                                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                                 unsafe {
                                     libc::kill(-(spawned_pid as libc::pid_t), libc::SIGKILL);
                                     libc::kill(spawned_pid as libc::pid_t, libc::SIGKILL);
@@ -917,6 +918,7 @@ impl Warden {
                                         // signal *this* process's own
                                         // group.
                                         if pid > 0 {
+                                            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                                             unsafe {
                                                 libc::kill(-pid, libc::SIGKILL);
                                                 libc::kill(pid, libc::SIGKILL);
@@ -963,6 +965,7 @@ impl Warden {
                             // syscall, so leaving it running is not an
                             // option either way.
                             if pid > 0 {
+                                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                                 unsafe {
                                     libc::kill(-pid, libc::SIGKILL);
                                     libc::kill(pid, libc::SIGKILL);
@@ -1253,6 +1256,7 @@ impl Warden {
                             // `kill(0)` would signal *this* process's
                             // own group.
                             if pid > 0 {
+                                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                                 unsafe {
                                     libc::kill(-pid, libc::SIGKILL);
                                     libc::kill(pid, libc::SIGKILL);

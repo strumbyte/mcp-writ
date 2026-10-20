@@ -34,6 +34,7 @@ impl Drop for Fd {
     fn drop(&mut self) {
         if self.0 >= 0 {
             // Safety: `self.0` is an owned open fd.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::close(self.0) };
         }
     }
@@ -158,19 +159,17 @@ fn hint_for(e: &io::Error) -> Option<String> {
 /// rely on grant TTLs.
 pub(super) fn boot_epoch_ns() -> u64 {
     let rt = || {
-        let mut t = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // Safety: `t` is a live out-param.
-        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut t) };
-        t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
     };
     let bt = || {
         let mut t = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut t) };
         t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
     };
@@ -196,6 +195,7 @@ fn create_private_cgroup() -> Result<(PrivateCgroup, File), PrepareError> {
 
 fn entry_bytes(e: &RuleEntry) -> &[u8] {
     // Safety: RuleEntry is a repr(C) POD of exactly RULE_ENTRY_SIZE.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         std::slice::from_raw_parts(
             e as *const RuleEntry as *const u8,
@@ -214,8 +214,10 @@ fn entry_bytes(e: &RuleEntry) -> &[u8] {
 /// sheds connect enforcement entirely. Any grant spelling covering the
 /// v2 root — or inside it, where it could still name `cgroup.procs` or
 /// `cgroup.subtree_control` of a sibling branch — refuses the launch.
-/// An unresolvable spelling refuses too: "cannot prove disjoint" stays
-/// on the refuse side.
+/// A root-glob spelling (`/*`, `/**`) reduces to an empty base every
+/// grant builder skips — it grants nothing and is skipped here too.
+/// Any other unresolvable spelling refuses: "cannot prove disjoint"
+/// stays on the refuse side.
 pub fn cgroup_write_grant_conflict(policy: &crate::policy::Policy) -> Option<String> {
     let root = match crate::fsoverlap::resolve_grant_spelling(CGROUP_ROOT) {
         Some(r) => r,
@@ -239,6 +241,9 @@ pub fn cgroup_write_grant_conflict(policy: &crate::policy::Policy) -> Option<Str
                 }
             }
             None => {
+                if crate::fsoverlap::reduces_to_empty_base(&grant) {
+                    continue;
+                }
                 return Some(format!(
                     "fs write grant '{grant}' cannot be resolved against the cgroup v2 \
                      hierarchy — refusing rather than assuming disjoint"

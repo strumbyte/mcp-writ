@@ -178,18 +178,22 @@ where
         // ever verified — fail closed. The captured generation is
         // re-checked immediately before the child write inside
         // `register_and_forward_impl`, closing the window where a
-        // `list_changed` revalidation begins mid-authorization.
+        // `list_changed` revalidation begins mid-authorization. The
+        // advertised-name membership check runs on the allowed arm
+        // below, after the richer policy/session denials keep their
+        // own reasons.
         let expected_list_gen = if crate::auditor::proxy_state::list_verification_required(
             &shared.policy,
             shared.fail_on,
         ) {
-            let generation = shared.list_generation.load(Ordering::SeqCst);
+            let generation = shared.verified_tools.lock().unwrap().generation;
             if generation == 0 {
                 deny_busy_tools_call(
                     shared,
                     raw_id,
                     line,
                     "no verified tools/list has been published yet",
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -199,8 +203,14 @@ where
             None
         };
         if shared.list_busy.load(Ordering::SeqCst) {
-            deny_busy_tools_call(shared, raw_id, line, "tools/list revalidation in progress")
-                .await?;
+            deny_busy_tools_call(
+                shared,
+                raw_id,
+                line,
+                "tools/list revalidation in progress",
+                None,
+            )
+            .await?;
             return Ok(());
         }
         // Registration eligibility must be validated before any session
@@ -234,6 +244,43 @@ where
         return match check_result {
             Ok(check_pass) => {
                 let tool = extract_tool_name_from_line(line);
+                // F6: among calls the policy allows, only names the
+                // verified listing actually advertised to this client
+                // may forward — a statically allowed tool the server
+                // omitted must not keep an authorized channel. Membership
+                // is bound to the captured generation under the same
+                // lock, so the pair can never straddle a publish.
+                if let Some(expected) = expected_list_gen {
+                    let advertised = {
+                        let vt = shared.verified_tools.lock().unwrap();
+                        vt.generation == expected
+                            && tool.as_deref().is_some_and(|name| vt.names.contains(name))
+                    };
+                    if !advertised {
+                        if let Some(ref session) = shared.session {
+                            let mut state = session.lock().await;
+                            state.take_pending_list(id);
+                            state.complete_pending_tool_call(id, false);
+                        }
+                        // Wire text must not reveal that the name is
+                        // policy-allowed but unadvertised — that probes
+                        // policy membership through tools/call. The
+                        // advertised-set detail stays in the audit
+                        // record.
+                        deny_busy_tools_call(
+                            shared,
+                            raw_id,
+                            line,
+                            crate::auditor::checker::REASON_TOOL_NOT_ALLOWED,
+                            Some(&format!(
+                                "tool '{}' is not advertised by the verified tools/list",
+                                tool.as_deref().unwrap_or("<unknown>")
+                            )),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
                 let correlation_id = Uuid::now_v7();
                 let mut event = AuditEvent::new(
                     correlation_id,
@@ -359,8 +406,15 @@ where
                         reason = %crate::termutil::sanitize_for_terminal(&violation.reason),
                         "Policy violation: blocking tools/call"
                     );
-                    let error_response =
-                        build_error_response(&id_str, &violation.tool_name, &violation.reason);
+                    // The wire reason must not reveal whether the name
+                    // exists in the policy — `client_reason` collapses
+                    // the hidden/unknown distinction; `violation.reason`
+                    // keeps the detail for the audit record above.
+                    let error_response = build_error_response(
+                        &id_str,
+                        &violation.tool_name,
+                        violation.client_reason(),
+                    );
                     write_client_frame(&shared.client_out, &error_response).await?;
                 }
                 Ok(())
@@ -745,15 +799,17 @@ where
         .await?;
     }
     shared.audit.ensure_available()?;
-    // Verified-generation recheck (F10): the admission-time capture is
+    // Verified-set recheck (F6/F10): the admission-time capture is
     // compared immediately before the child write. A `list_changed`
     // revalidation raises `list_busy` before it starts and bumps the
-    // generation when it verifies, so a stale admission is caught by
-    // either arm — unwind the registration and deny rather than let the
-    // call execute against a tool set that may have moved.
+    // generation (with its advertised-name set) when it verifies, so a
+    // stale admission is caught by either arm — unwind the registration
+    // and deny rather than let the call execute against a tool set that
+    // may have moved. `verified_tools` is authoritative: the names a
+    // call was admitted against cannot change without its generation.
     if let Some(expected) = expected_list_gen
         && (shared.list_busy.load(Ordering::SeqCst)
-            || shared.list_generation.load(Ordering::SeqCst) != expected)
+            || shared.verified_tools.lock().unwrap().generation != expected)
     {
         shared.wire.lock().await.rollback_forwarded_request(undo);
         if let Some(verdict) = audit_verdict {
@@ -809,12 +865,16 @@ where
 
 /// The tools/call denial while the verified-list gate is closed — a
 /// revalidation in flight or (when verification is enforced) no
-/// verified listing published yet.
+/// verified listing published yet. `reason` is the client-facing text;
+/// `audit_reason` carries the detail for the audit record when the wire
+/// text must stay membership-blind (an allowed-but-unadvertised name
+/// must read exactly like a denied or unknown one).
 pub(super) async fn deny_busy_tools_call<W>(
     shared: &ProxyShared<W>,
     raw_id: &str,
     line: &str,
     reason: &str,
+    audit_reason: Option<&str>,
 ) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -832,7 +892,7 @@ where
     );
     event.target_tool = Some(tool);
     event.request_id = Some(proxy_rpc::truncate_for_audit(raw_id));
-    event.details = Some(reason.to_string());
+    event.details = Some(audit_reason.unwrap_or(reason).to_string());
     shared.audit.log(event);
     Ok(())
 }
@@ -1002,6 +1062,12 @@ mod tests {
                 held_client_list: Arc::new(Mutex::new(None)),
                 internal_list_failure: Arc::new(tokio::sync::Mutex::new(None)),
                 list_generation: Arc::new(AtomicU64::new(0)),
+                verified_tools: Arc::new(std::sync::Mutex::new(
+                    crate::auditor::proxy_state::VerifiedToolSet {
+                        generation: 0,
+                        names: std::collections::HashSet::new(),
+                    },
+                )),
                 last_list_template: Arc::new(Mutex::new(String::new())),
                 next_internal_id: Arc::new(AtomicU64::new(910_001)),
                 abort_tx,
@@ -1014,6 +1080,22 @@ mod tests {
     const CALL_LINE: &str =
         r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"t","arguments":{}}}"#;
 
+    /// Publish a verified generation the way `verify_and_emit_list` does:
+    /// the name set and counter move together under the mutex, and the
+    /// atomic mirror follows.
+    fn set_verified(
+        shared: &ProxyShared<tokio::io::DuplexStream>,
+        generation: u64,
+        names: &[&str],
+    ) {
+        {
+            let mut vt = shared.verified_tools.lock().unwrap();
+            vt.generation = generation;
+            vt.names = names.iter().map(|s| s.to_string()).collect();
+        }
+        shared.list_generation.store(generation, Ordering::SeqCst);
+    }
+
     /// F10: a tools/call admitted under verified generation N must
     /// unwind and refuse the child write when a revalidation published
     /// a newer generation in between.
@@ -1021,7 +1103,7 @@ mod tests {
     async fn stale_list_generation_unwinds_registration_before_write() {
         let (shared, _rx, _child_read) = shared_for_test();
         // Verification of the *next* set published since admission.
-        shared.list_generation.store(2, Ordering::SeqCst);
+        set_verified(&shared, 2, &["t"]);
         let id = RpcId::from_u64(7);
         let ext = ExtractedRequest::default();
         let forwarded = register_and_forward_impl(
@@ -1051,7 +1133,7 @@ mod tests {
     #[tokio::test]
     async fn busy_gate_mid_authorization_unwinds_before_write() {
         let (shared, _rx, _child_read) = shared_for_test();
-        shared.list_generation.store(1, Ordering::SeqCst);
+        set_verified(&shared, 1, &["t"]);
         shared.list_busy.store(true, Ordering::SeqCst);
         let id = RpcId::from_u64(7);
         let ext = ExtractedRequest::default();
@@ -1078,7 +1160,7 @@ mod tests {
     #[tokio::test]
     async fn matching_list_generation_forwards() {
         let (shared, _rx, _child_read) = shared_for_test();
-        shared.list_generation.store(1, Ordering::SeqCst);
+        set_verified(&shared, 1, &["t"]);
         let id = RpcId::from_u64(7);
         let ext = ExtractedRequest::default();
         let forwarded = register_and_forward_impl(
@@ -1097,6 +1179,102 @@ mod tests {
         .unwrap();
         assert!(forwarded);
         assert!(shared.wire.lock().await.get(C2S, &id).is_some());
+    }
+
+    /// F6: a statically allowed tool the verified listing did not
+    /// advertise is refused at admission — the generation number alone
+    /// never carried the tool-name set, so an omitted `t` must not keep
+    /// its channel.
+    #[tokio::test]
+    async fn unadvertised_tool_is_denied_at_admission() {
+        let (mut shared, _rx, mut child_read) = shared_for_test();
+        shared.fail_on = crate::verifier::fail_on::FailOn::Critical;
+        shared
+            .policy
+            .tools
+            .push(crate::policy::ToolPolicy::named("t", true));
+        set_verified(&shared, 1, &["other_tool"]);
+        let id = RpcId::from_u64(7);
+        forward_allowed(
+            &shared,
+            CALL_LINE,
+            "tools/call",
+            &id,
+            "7",
+            SupportedProtocolVersion::Mcp2025November25,
+            McpVerdict::Allow(AllowReason::RuleAllow),
+            ExtractedRequest::default(),
+        )
+        .await
+        .unwrap();
+        assert!(shared.wire.lock().await.get(C2S, &id).is_none());
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::io::AsyncReadExt::read(&mut child_read, &mut buf),
+        )
+        .await;
+        assert!(read.is_err(), "the denied call must not reach the child");
+    }
+
+    /// F6: a tool the verified listing advertised — and the policy
+    /// allows — forwards under its generation.
+    #[tokio::test]
+    async fn advertised_tool_forwards_under_its_generation() {
+        let (mut shared, _rx, mut child_read) = shared_for_test();
+        shared.fail_on = crate::verifier::fail_on::FailOn::Critical;
+        shared
+            .policy
+            .tools
+            .push(crate::policy::ToolPolicy::named("t", true));
+        set_verified(&shared, 1, &["t"]);
+        let id = RpcId::from_u64(7);
+        forward_allowed(
+            &shared,
+            CALL_LINE,
+            "tools/call",
+            &id,
+            "7",
+            SupportedProtocolVersion::Mcp2025November25,
+            McpVerdict::Allow(AllowReason::RuleAllow),
+            ExtractedRequest::default(),
+        )
+        .await
+        .unwrap();
+        assert!(shared.wire.lock().await.get(C2S, &id).is_some());
+        let mut buf = [0u8; 256];
+        let n = tokio::io::AsyncReadExt::read(&mut child_read, &mut buf)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("tools/call"));
+    }
+
+    /// F6: an admission captured before a revalidation publishes is
+    /// denied at the pre-write recheck even when the *new* set also
+    /// names the tool — the generation is bound to the set, not to the
+    /// name alone.
+    #[tokio::test]
+    async fn republished_set_still_stales_an_earlier_admission() {
+        let (shared, _rx, _child_read) = shared_for_test();
+        set_verified(&shared, 2, &["t"]);
+        let id = RpcId::from_u64(7);
+        let ext = ExtractedRequest::default();
+        let forwarded = register_and_forward_impl(
+            &shared,
+            CALL_LINE,
+            "tools/call",
+            &id,
+            "7",
+            SupportedProtocolVersion::Mcp2025November25,
+            &ext,
+            true,
+            Some(McpVerdict::Allow(AllowReason::RuleAllow)),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        assert!(!forwarded);
+        assert!(shared.wire.lock().await.get(C2S, &id).is_none());
     }
 
     /// A client `tools/list` that loses the busy-gate CAS to an internal

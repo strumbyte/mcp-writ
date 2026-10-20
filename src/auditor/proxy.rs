@@ -64,6 +64,10 @@ where
         held_client_list: Arc::new(tokio::sync::Mutex::new(None)),
         internal_list_failure: Arc::new(tokio::sync::Mutex::new(None)),
         list_generation: Arc::new(AtomicU64::new(0)),
+        verified_tools: Arc::new(std::sync::Mutex::new(super::proxy_state::VerifiedToolSet {
+            generation: 0,
+            names: std::collections::HashSet::new(),
+        })),
         last_list_template: Arc::new(tokio::sync::Mutex::new(String::new())),
         next_internal_id: Arc::new(AtomicU64::new(910_001)),
         abort_tx: abort_tx.clone(),

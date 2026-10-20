@@ -28,6 +28,7 @@ pub struct FileIdentity {
 pub fn running_as_root() -> bool {
     #[cfg(unix)]
     {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::geteuid() == 0 }
     }
     #[cfg(not(unix))]
@@ -55,6 +56,7 @@ pub fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
             BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
         };
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             GetFileInformationByHandle(HANDLE(file.as_raw_handle() as _), &mut info)
                 .map_err(|e| io::Error::other(format!("GetFileInformationByHandle: {e}")))?;
@@ -222,6 +224,15 @@ pub fn require_parent_write_restricted(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// True when `dir`'s DACL hands a broad trustee the rights to replace a
+/// child entry — exposed for the driver-validation walk in
+/// `trusted_path`, which applies the same check to every ancestor of a
+/// candidate executable.
+#[cfg(windows)]
+pub(crate) fn dir_dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
+    dacl_grants_replace_rights(dir)
+}
+
 /// Windows: refuse `dir` when any existing ancestor's DACL grants
 /// write/delete access to a broad well-known principal (Everyone,
 /// Anonymous, Authenticated Users, BUILTIN\Users, INTERACTIVE, NETWORK)
@@ -286,18 +297,67 @@ pub fn dir_shared_writable(dir: &Path) -> io::Result<bool> {
     ))
 }
 
-/// Walk `dir`'s DACL for allow-ACEs that hand a broad trustee the
-/// rights needed to *replace* a child entry — delete/delete-child or
-/// ACL/ownership control. Add-only rights (FILE_ADD_FILE,
-/// FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA) are deliberately absent:
-/// they let a principal plant a sibling, not retarget an existing
-/// component, and drive roots grant them to Authenticated Users —
-/// counting them would refuse every path on the volume.
+/// `\\?\` verbatim spellings fail the object-name lookup, so the
+/// security APIs take the de-verbatized spelling (`\\?\UNC\x` → `\\x`,
+/// `\\?\C:` → `C:`).
 #[cfg(windows)]
-fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
+fn security_lookup_name(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+    }
+}
+
+/// `GetNamedSecurityInfoW` error → `io`: FILE_NOT_FOUND/PATH_NOT_FOUND
+/// must surface as `NotFound` so ancestor walks can skip not-yet-created
+/// levels. The API reports Win32 codes wrapped in HRESULTs (0x8007xxxx),
+/// so the low word is what matches ERROR_FILE_NOT_FOUND /
+/// ERROR_PATH_NOT_FOUND.
+#[cfg(windows)]
+fn named_security_err(e: windows::core::Error, path: &Path) -> io::Error {
+    let win32 = e.code().0 as u32 & 0xFFFF;
+    if win32 == 2 || win32 == 3 {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("'{}': {e}", path.display()),
+        )
+    } else {
+        io::Error::other(format!(
+            "GetNamedSecurityInfoW for '{}': {e}",
+            path.display()
+        ))
+    }
+}
+
+/// The SD heap allocation `GetNamedSecurityInfoW`/`GetSecurityInfo`
+/// returns must be `LocalFree`d whatever the walk finds.
+#[cfg(windows)]
+struct SdGuard(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for SdGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            use windows::Win32::Foundation::{HLOCAL, LocalFree};
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0)));
+            }
+        }
+    }
+}
+
+/// Walk `path`'s DACL for access-allowed ACEs that hand a broad trustee
+/// (Everyone, Anonymous, Authenticated Users, BUILTIN\Users,
+/// INTERACTIVE, NETWORK) any right in `rights`. A null DACL pointer
+/// means unrestricted access — fail toward "broad grant possible"
+/// rather than declaring the object safe.
+#[cfg(windows)]
+fn dacl_grants_broad(path: &Path, rights: u32) -> io::Result<bool> {
     use std::ffi::c_void;
 
-    use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE, HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -305,35 +365,33 @@ fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
         WinAnonymousSid, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinInteractiveSid,
         WinNetworkSid, WinWorldSid,
     };
-    use windows::Win32::Storage::FileSystem::{DELETE, FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER};
     use windows::core::HSTRING;
 
     /// ACE header type byte for an access-allowed ACE (`winnt.h`).
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    /// Conditional allow-ACE — same layout as the plain allow-ACE, but
+    /// the grant is gated on a condition evaluated against the caller's
+    /// token at access time (`winnt.h` `ACCESS_ALLOWED_CALLBACK_ACE_TYPE`).
+    const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 0x09;
+    /// Allow-ACE variants whose layout moves the trustee SID off the
+    /// plain-ACE offset (`winnt.h`): compound (0x04), object (0x05),
+    /// callback-object (0x0B).
+    const ACCESS_ALLOWED_COMPOUND_ACE_TYPE: u8 = 0x04;
+    const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 0x05;
+    const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 0x0B;
     /// `AceFlags` bit marking an ACE that never applies to the object
     /// itself (`winnt.h` `INHERIT_ONLY_ACE`) — it exists only to be
-    /// inherited by children, so it cannot grant replace rights on this
-    /// directory. `0x10` is `INHERITED_ACE` — a different flag, and one
-    /// that must NOT be skipped: a non-inherit-only ACE that arrived by
-    /// inheritance still governs access to this directory.
+    /// inherited by children, so it cannot grant rights on this object.
+    /// `0x10` is `INHERITED_ACE` — a different flag, and one that must
+    /// NOT be skipped: a non-inherit-only ACE that arrived by
+    /// inheritance still governs access to this object.
     const INHERIT_ONLY_ACE: u8 = 0x08;
-    const REPLACE_RIGHTS: u32 = DELETE.0
-        | FILE_DELETE_CHILD.0
-        | WRITE_DAC.0
-        | WRITE_OWNER.0
-        | GENERIC_WRITE.0
-        | GENERIC_ALL.0;
 
-    let text = dir.to_string_lossy();
-    // `\\?\` verbatim spellings fail the object-name lookup.
-    let name = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else {
-        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
-    };
+    let name = security_lookup_name(path);
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: windows::Win32::Security::PSECURITY_DESCRIPTOR =
         windows::Win32::Security::PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let status = unsafe {
         GetNamedSecurityInfoW(
             &HSTRING::from(name.as_str()),
@@ -346,33 +404,7 @@ fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
             &mut sd,
         )
     };
-    status.ok().map_err(|e| {
-        // FILE_NOT_FOUND / PATH_NOT_FOUND must surface as NotFound so
-        // ancestor walks can skip not-yet-created levels. The API
-        // reports Win32 codes wrapped in HRESULTs (0x8007xxxx), so the
-        // low word is what matches ERROR_FILE_NOT_FOUND /
-        // ERROR_PATH_NOT_FOUND.
-        let win32 = e.code().0 as u32 & 0xFFFF;
-        if win32 == 2 || win32 == 3 {
-            io::Error::new(io::ErrorKind::NotFound, format!("'{}': {e}", dir.display()))
-        } else {
-            io::Error::other(format!(
-                "GetNamedSecurityInfoW for '{}': {e}",
-                dir.display()
-            ))
-        }
-    })?;
-    // The SD heap allocation must be freed whatever the walk finds.
-    struct SdGuard(*mut c_void);
-    impl Drop for SdGuard {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe {
-                    let _ = LocalFree(Some(HLOCAL(self.0)));
-                }
-            }
-        }
-    }
+    status.ok().map_err(|e| named_security_err(e, path))?;
     let _sd_guard = SdGuard(sd.0);
 
     // A null DACL pointer = unrestricted access — fail toward "broad
@@ -381,6 +413,7 @@ fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
         return Ok(true);
     }
     let mut info = ACL_SIZE_INFORMATION::default();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         GetAclInformation(
             dacl,
@@ -401,41 +434,341 @@ fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
     ];
     for i in 0..info.AceCount {
         let mut ace: *mut c_void = std::ptr::null_mut();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             GetAce(dacl, i, &mut ace).map_err(|e| io::Error::other(format!("GetAce: {e}")))?;
         }
         let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
-        if unsafe { (*ace).Header.AceType } != ACCESS_ALLOWED_ACE_TYPE {
-            continue;
-        }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ace_type = unsafe { (*ace).Header.AceType };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { (*ace).Header.AceFlags } & INHERIT_ONLY_ACE != 0 {
             continue;
         }
-        let (mask, sid) = unsafe { ((*ace).Mask, PSID(&raw const (*ace).SidStart as *mut c_void)) };
-        if mask & REPLACE_RIGHTS == 0 {
+        // `Mask` sits at the same offset in every ACCESS_ALLOWED_*
+        // variant, so the rights check runs before the layout differs.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let mask = unsafe { (*ace).Mask };
+        if mask & rights == 0 {
             continue;
         }
-        for kind in broad {
-            if unsafe { IsWellKnownSid(sid, kind).as_bool() } {
-                return Ok(true);
+        match ace_type {
+            // The plain allow-ACE and the callback variant share this
+            // layout. A callback ACE's grant condition is evaluated
+            // against the caller's token at access time and cannot be
+            // proven statically, so an applicable callback grant to a
+            // broad trustee counts as broad access.
+            ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => {
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let sid = unsafe { PSID(&raw const (*ace).SidStart as *mut c_void) };
+                for kind in broad {
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                    if unsafe { IsWellKnownSid(sid, kind).as_bool() } {
+                        return Ok(true);
+                    }
+                }
             }
+            // Compound, object, and callback-object allow-ACEs move the
+            // SID off the plain-ACE offset, so the trustee cannot be
+            // inspected — a rights-bearing allow-ACE that cannot be
+            // proven narrow fails toward "broad access possible".
+            ACCESS_ALLOWED_COMPOUND_ACE_TYPE
+            | ACCESS_ALLOWED_OBJECT_ACE_TYPE
+            | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => return Ok(true),
+            _ => {}
         }
     }
     Ok(false)
+}
+
+/// Walk `dir`'s DACL for allow-ACEs that hand a broad trustee the
+/// rights needed to *replace* a child entry — delete/delete-child or
+/// ACL/ownership control. Add-only rights (FILE_ADD_FILE,
+/// FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA) are deliberately absent:
+/// they let a principal plant a sibling, not retarget an existing
+/// component, and drive roots grant them to Authenticated Users —
+/// counting them would refuse every path on the volume.
+#[cfg(windows)]
+fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
+    use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{DELETE, FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER};
+
+    const REPLACE_RIGHTS: u32 = DELETE.0
+        | FILE_DELETE_CHILD.0
+        | WRITE_DAC.0
+        | WRITE_OWNER.0
+        | GENERIC_WRITE.0
+        | GENERIC_ALL.0;
+    dacl_grants_broad(dir, REPLACE_RIGHTS)
+}
+
+/// File-leaf variant of [`dacl_grants_replace_rights`]: a broad trustee
+/// holding any of these rights on an *executable* can rewrite or replace
+/// the image itself — FILE_WRITE_DATA/APPEND cover content mutation,
+/// DELETE covers remove-and-recreate, and WRITE_DAC/WRITE_OWNER hand
+/// over the file's own protection. Used by `trusted_path`'s driver
+/// validation on the resolved leaf (ancestors take the directory mask).
+#[cfg(windows)]
+pub(crate) fn dacl_grants_file_write(path: &Path) -> io::Result<bool> {
+    use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_APPEND_DATA, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
+    };
+
+    const WRITE_RIGHTS: u32 = DELETE.0
+        | FILE_WRITE_DATA.0
+        | FILE_APPEND_DATA.0
+        | WRITE_DAC.0
+        | WRITE_OWNER.0
+        | GENERIC_WRITE.0
+        | GENERIC_ALL.0;
+    dacl_grants_broad(path, WRITE_RIGHTS)
+}
+
+/// The owner SID the process token reports for the current user —
+/// the buffer keeps the TOKEN_USER allocation alive; read the SID
+/// pointer from it at the call site.
+#[cfg(windows)]
+fn process_user_sid() -> io::Result<Vec<usize>> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenUser};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let os_err = |e: windows::core::Error| io::Error::other(e.to_string());
+    let mut token = windows::Win32::Foundation::HANDLE::default();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.map_err(os_err)?;
+    let result = (|| {
+        let mut need = 0u32;
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut need) };
+        let mut user = vec![0usize; (need as usize).div_ceil(size_of::<usize>())];
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(user.as_mut_ptr().cast()),
+                need,
+                &mut need,
+            )
+        }
+        .map_err(os_err)?;
+        Ok(user)
+    })();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    result
+}
+
+/// True when `sid` names a principal allowed to own a security-boundary
+/// object: the current user (it already controls the account's own
+/// files), SYSTEM, the Administrators group, or TrustedInstaller — the
+/// service that owns `C:\Windows`/`C:\Program Files` content on a stock
+/// install. Any *other* owner is a foreign principal that retains
+/// implicit control (WRITE_DAC) over the object.
+#[cfg(windows)]
+fn owner_sid_is_trusted(sid: windows::Win32::Security::PSID) -> io::Result<bool> {
+    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows::Win32::Security::{
+        EqualSid, IsWellKnownSid, TOKEN_USER, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    use windows::core::HSTRING;
+
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe {
+        IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
+            || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
+    } {
+        return Ok(true);
+    }
+    // NT SERVICE\TrustedInstaller — not a WELL_KNOWN_SID_TYPE, so the
+    // SID is built from its string form.
+    let mut ti = windows::Win32::Security::PSID(std::ptr::null_mut());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe {
+        ConvertStringSidToSidW(
+            &HSTRING::from("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"),
+            &mut ti,
+        )
+        .is_ok()
+    } {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let equal = unsafe { EqualSid(sid, ti).map(|_| true).unwrap_or(false) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            let _ = windows::Win32::Foundation::LocalFree(Some(
+                windows::Win32::Foundation::HLOCAL(ti.0),
+            ));
+        }
+        if equal {
+            return Ok(true);
+        }
+    }
+    let user = process_user_sid()?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    Ok(unsafe { EqualSid(sid, user_sid).map(|_| true).unwrap_or(false) })
+}
+
+/// Owner check on an *open* handle (`GetSecurityInfo` — no path
+/// re-resolution): true when the object's owner SID is a trusted
+/// principal per [`owner_sid_is_trusted`]. The audit sink applies this
+/// to refuse an existing sink a foreign user still controls.
+#[cfg(windows)]
+pub(crate) fn handle_owner_is_trusted(file: &fs::File) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSID};
+
+    let mut owner = PSID(std::ptr::null_mut());
+    let mut sd = windows::Win32::Security::PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        GetSecurityInfo(
+            HANDLE(file.as_raw_handle()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut sd),
+        )
+    }
+    .ok()
+    .map_err(|e| io::Error::other(format!("GetSecurityInfo: {e}")))?;
+    let _sd_guard = SdGuard(sd.0);
+    if owner.0.is_null() {
+        return Ok(false);
+    }
+    owner_sid_is_trusted(owner)
+}
+
+/// Path-based variant of [`handle_owner_is_trusted`] for validation-time
+/// checks where no handle exists yet (`trusted_path` driver candidates —
+/// the canonical path is fixed and race-free for this purpose).
+#[cfg(windows)]
+pub(crate) fn path_owner_is_trusted(path: &Path) -> io::Result<bool> {
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSID};
+    use windows::core::HSTRING;
+
+    let name = security_lookup_name(path);
+    let mut owner = PSID(std::ptr::null_mut());
+    let mut sd = windows::Win32::Security::PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            &HSTRING::from(name.as_str()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut sd,
+        )
+    };
+    status.ok().map_err(|e| named_security_err(e, path))?;
+    let _sd_guard = SdGuard(sd.0);
+    if owner.0.is_null() {
+        return Ok(false);
+    }
+    owner_sid_is_trusted(owner)
+}
+
+/// Windows: every existing ancestor of `path` must be a real directory
+/// — a symlink/junction/mount point in the chain would redirect opens
+/// outside the operator's tree. Missing components are skipped (a
+/// not-yet-created level cannot redirect). This is the fast pre-check;
+/// the *authoritative* proof is `opened_at_literal_path` on the final
+/// handle, which the ancestor walk alone can never provide because the
+/// path can be swapped between the two.
+#[cfg(windows)]
+pub(crate) fn require_no_reparse_ancestors(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    for anc in path.ancestors().skip(1) {
+        match fs::symlink_metadata(anc) {
+            Ok(m) if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("ancestor '{}' is a reparse point", anc.display()),
+                ));
+            }
+            Ok(m) if !m.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("ancestor '{}' is not a directory", anc.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Windows: the *literal* normalized spelling of `path` — absolute
+/// (cwd-joined), `.`/`..` resolved lexically, `\\?\` verbatim prefix
+/// stripped. Comparing [`real_path_of`]'s answer against this spelling
+/// proves the open traversed no junction/symlink: any reparse point in
+/// the chain would have redirected the handle's final path.
+#[cfg(windows)]
+pub(crate) fn literal_normalized_path(path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    crate::pathutil::lexical_normalize_path(&joined).unwrap_or(joined)
+}
+
+/// Windows: true when the open `file`'s real path equals the literal
+/// normalized spelling of `path` — i.e. opening `path` traversed no
+/// junction/reparse substitution. Compared case-insensitively with
+/// `\\?\`-prefix normalization, matching `FILE_NAME_NORMALIZED`'s
+/// on-disk casing.
+#[cfg(windows)]
+pub(crate) fn opened_at_literal_path(file: &fs::File, path: &Path) -> io::Result<bool> {
+    let real = real_path_of(file)?;
+    let expected = literal_normalized_path(path);
+    let strip = |p: &Path| -> String {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else {
+            s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+        }
+    };
+    Ok(crate::pathutil::paths_equal(
+        &strip(&real),
+        &strip(&expected),
+    ))
 }
 
 /// Create a new directory under the system temp dir with owner-only access.
 ///
 /// Fails closed if the directory already exists or permissions cannot be set.
 pub fn create_private_tempdir(label: &str) -> io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "mcp-writ-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp-writ-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -511,6 +844,7 @@ fn restrict_owner_only_windows(dir: &Path) -> io::Result<()> {
     } else {
         text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let result = unsafe {
         SetNamedSecurityInfoW(
             &HSTRING::from(name),
@@ -523,6 +857,7 @@ fn restrict_owner_only_windows(dir: &Path) -> io::Result<()> {
         )
     };
     if !dacl.is_null() {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             LocalFree(Some(HLOCAL(dacl as *mut c_void)));
         }
@@ -542,16 +877,15 @@ fn restrict_owner_only_windows(dir: &Path) -> io::Result<()> {
 /// buffers. The caller frees the DACL with `LocalFree`.
 #[cfg(windows)]
 fn protected_owner_dacl() -> io::Result<(*mut windows::Win32::Security::ACL, Vec<usize>, Vec<u8>)> {
-    use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL};
+    use windows::Win32::Foundation::GENERIC_ALL;
     use windows::Win32::Security::Authorization::{
         EXPLICIT_ACCESS_W, GRANT_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
         TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
     };
     use windows::Win32::Security::{
-        ACL, CONTAINER_INHERIT_ACE, CreateWellKnownSid, GetTokenInformation, OBJECT_INHERIT_ACE,
-        PSID, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
+        ACL, CONTAINER_INHERIT_ACE, CreateWellKnownSid, OBJECT_INHERIT_ACE, PSID, TOKEN_USER,
+        WinLocalSystemSid,
     };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::PWSTR;
 
     let os_err = |e: windows::core::Error| io::Error::other(e.to_string());
@@ -559,32 +893,18 @@ fn protected_owner_dacl() -> io::Result<(*mut windows::Win32::Security::ACL, Vec
     // The session's own user SID via the process token — the ACE must
     // name the real user (an elevated process would otherwise grant the
     // Administrators group, not the account holding the credentials).
-    let mut token = windows::Win32::Foundation::HANDLE::default();
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.map_err(os_err)?;
+    // SAFETY: the buffer holds a TOKEN_USER whose Sid member points
+    // into `user`, which must outlive the ACL application.
     let result = (|| {
-        let mut need = 0u32;
-        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut need) };
-        // TOKEN_USER contains a SID_AND_ATTRIBUTES pointer — the buffer
-        // must be pointer-aligned, not merely byte-aligned.
-        let mut user = vec![0usize; (need as usize).div_ceil(size_of::<usize>())];
-        unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                Some(user.as_mut_ptr().cast()),
-                need,
-                &mut need,
-            )
-        }
-        .map_err(os_err)?;
-        // SAFETY: the buffer holds a TOKEN_USER whose Sid member points
-        // into `user`, which must outlive the ACL application.
+        let user = process_user_sid()?;
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
 
         // SECURITY_MAX_SID_SIZE; CreateWellKnownSid fills caller memory,
         // nothing to free.
         let mut system = vec![0u8; 68];
         let mut size = system.len() as u32;
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             CreateWellKnownSid(
                 WinLocalSystemSid,
@@ -615,14 +935,12 @@ fn protected_owner_dacl() -> io::Result<(*mut windows::Win32::Security::ACL, Vec
         ];
         let mut dacl: *mut ACL = std::ptr::null_mut();
         // A null old ACL builds a fresh list containing only our entries.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { SetEntriesInAclW(Some(&entries), None, &mut dacl) }
             .ok()
             .map_err(os_err)?;
         Ok((dacl, user, system))
     })();
-    unsafe {
-        let _ = CloseHandle(token);
-    }
     result
 }
 
@@ -643,6 +961,7 @@ pub fn restrict_handle_owner_only(file: &fs::File) -> io::Result<()> {
     };
 
     let (dacl, _user, _system) = protected_owner_dacl()?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let result = unsafe {
         SetSecurityInfo(
             HANDLE(file.as_raw_handle()),
@@ -655,6 +974,7 @@ pub fn restrict_handle_owner_only(file: &fs::File) -> io::Result<()> {
         )
     };
     if !dacl.is_null() {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             LocalFree(Some(HLOCAL(dacl as *mut c_void)));
         }
@@ -893,7 +1213,19 @@ fn open_dir_handle(dir: &Path) -> io::Result<fs::File> {
 /// outright — it never writes through to the link's target, which is
 /// the difference between this and reopening `path` for `write` after
 /// a caller-side validation.
+///
+/// Windows additionally pins the destination's *ancestry*: existing
+/// ancestors must be real directories (no junction/mount substitution)
+/// whose DACLs deny replace rights to broad principals, the temp file
+/// gets an owner+SYSTEM DACL on its handle before the rename, and the
+/// renamed handle's real path must equal the literal spelling — a
+/// junction swapped into the chain after the checks fails the proof
+/// instead of landing the report at a redirected location.
 pub fn write_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        require_no_reparse_ancestors(path)?;
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -913,39 +1245,83 @@ pub fn write_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
         // mode instead of letting the process umask decide read access.
         opts.mode(0o600);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_GENERIC_WRITE, WRITE_DAC};
+        // `restrict_handle_owner_only` calls `SetSecurityInfo` on this
+        // handle — a plain write handle carries no DACL rights, so the
+        // open must request WRITE_DAC alongside the data-write rights or
+        // the rewrite fails ACCESS_DENIED.
+        opts.access_mode((FILE_GENERIC_WRITE | WRITE_DAC).0);
+    }
     let mut file = opts.open(&tmp)?;
+    #[cfg(windows)]
+    let mut renamed = false;
     let result = (|| -> io::Result<()> {
         use std::io::Write;
+        #[cfg(windows)]
+        {
+            // Owner+SYSTEM protected DACL applied to the open handle —
+            // an inherited broad DACL on the temp name is replaced
+            // before the contents land at the destination.
+            restrict_handle_owner_only(&file)?;
+        }
         file.write_all(contents)?;
         file.sync_data()?;
-        fs::rename(&tmp, path)
+        fs::rename(&tmp, path)?;
+        #[cfg(windows)]
+        {
+            renamed = true;
+            // The rename resolved the destination *parent* by name —
+            // prove the handle's final path is the literal spelling so
+            // a junction swapped into the chain between the checks and
+            // the rename cannot redirect the report.
+            if !opened_at_literal_path(&file, path)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "rename destination '{}' resolved outside its literal path",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
+        #[cfg(windows)]
+        {
+            // Only once the rename has landed is `path` ours to remove —
+            // a failure before it left any pre-existing destination
+            // intact, and deleting it would destroy a file this write
+            // never touched. After it, remove the placed file rather
+            // than leave a report where a redirect check refused it.
+            if renamed {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
     result
 }
 
 /// Read a whole file only when it fits within `limit` bytes — the read
 /// is refused rather than truncated so analysis never silently runs on
-/// a prefix. The metadata check is pre-allocated advice only: a file
-/// grown past the check is still cut at `limit` and refused.
+/// a prefix. The open is no-follow and nonblocking so a FIFO, device,
+/// or retargeted link can neither substitute bytes nor hang the read;
+/// a file grown past the limit check is still cut at `limit` and
+/// refused.
 pub fn read_file_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     use std::io::Read;
-    if fs::metadata(path)?.len() > limit {
+    let Some(file) = open_no_follow(path)? else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "file '{}' exceeds the {}-byte analysis limit",
-                path.display(),
-                limit
-            ),
+            format!("'{}' is a link or non-regular entry", path.display()),
         ));
-    }
+    };
     let mut bytes = Vec::new();
-    let n = fs::File::open(path)?
-        .take(limit + 1)
-        .read_to_end(&mut bytes)?;
+    let n = file.take(limit + 1).read_to_end(&mut bytes)?;
     if n as u64 > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -989,10 +1365,20 @@ pub fn read_no_follow_bounded(path: &Path, limit: u64) -> io::Result<Option<Vec<
 /// metadata length is checked before allocation and `take` bounds the
 /// read itself, so a file growing between the two cannot overrun the
 /// budget. Over-limit is `InvalidData`, never a silent truncation.
+/// Symlinks are followed (a policy path may legitimately be linked), but
+/// the open is nonblocking and the target must be a regular file so a
+/// FIFO or device cannot stall the read.
 pub fn read_bounded_text(path: &Path, limit: u64) -> io::Result<String> {
     use std::io::Read;
-    let file = std::fs::File::open(path)?;
-    if file.metadata().map(|m| m.len()).unwrap_or(0) > limit {
+    let file = open_text_file(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("'{}' is not a regular file", path.display()),
+        ));
+    }
+    if meta.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("file '{}' exceeds the {}-byte limit", path.display(), limit),
@@ -1059,6 +1445,31 @@ pub fn read_text_bounded(path: &Path, limit: u64) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Open `path` for [`read_bounded_text`]: links are followed, but the
+/// open never blocks on a special file. `O_NONBLOCK` makes a raced FIFO
+/// return immediately; on Windows a path-level type check skips devices
+/// and pipes before `CreateFile` could wait on them, and the caller's
+/// post-open `is_file` still confirms the opened object.
+#[cfg(unix)]
+fn open_text_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_text_file(path: &Path) -> io::Result<fs::File> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("'{}' is not a regular file", path.display()),
+        ));
+    }
+    fs::File::open(path)
+}
+
 /// Open `path` for reading without following a final-component link.
 /// `Ok(None)` when the entry is a link or other non-regular object.
 /// `O_NONBLOCK` keeps a raced FIFO from blocking the open before the
@@ -1115,6 +1526,7 @@ fn real_path_of(file: &fs::File) -> io::Result<PathBuf> {
 fn real_path_of(file: &fs::File) -> io::Result<PathBuf> {
     use std::os::unix::io::AsRawFd;
     let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
     if rc == -1 {
         return Err(io::Error::last_os_error());
@@ -1138,6 +1550,7 @@ fn real_path_of(file: &fs::File) -> io::Result<PathBuf> {
     // `starts_with` judges real locations, not open-time spellings.
     // Returns the `\\?\`-prefixed DOS path for the opened object.
     let mut buf = vec![0u16; 32 * 1024];
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let len = unsafe {
         GetFinalPathNameByHandleW(
             windows::Win32::Foundation::HANDLE(file.as_raw_handle() as _),
@@ -1200,6 +1613,7 @@ mod tests {
 
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             windows::Win32::Security::Authorization::GetNamedSecurityInfoW(
                 &HSTRING::from(dir.to_string_lossy().as_ref()),
@@ -1230,6 +1644,7 @@ mod tests {
         // The restriction inherits to files created after it was applied.
         let mut child_dacl: *mut ACL = std::ptr::null_mut();
         let mut child_sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             windows::Win32::Security::Authorization::GetNamedSecurityInfoW(
                 &HSTRING::from(child.to_string_lossy().as_ref()),

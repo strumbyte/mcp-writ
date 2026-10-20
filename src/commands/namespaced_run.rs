@@ -197,6 +197,53 @@ mod imp {
             }
         };
 
+        // Fail-closed write-grant conflicts: a grant covering a file
+        // this policy load read lets the workload rewrite what every
+        // later launch trusts; a grant covering --report lets it
+        // fabricate launch evidence.
+        let launch_write_grants = policy.write_grant_spellings();
+        for source in policy.source_files() {
+            if let Some(conflict) = crate::audit_log::policy_source_write_conflict(
+                launch_write_grants.iter().cloned(),
+                &source,
+            ) {
+                let detail = format!(
+                    "refusing launch: write grant reaches policy source '{}': {conflict}",
+                    source.display()
+                );
+                eprintln!("Error: {detail}");
+                write_report(
+                    "failed",
+                    Some(&detail),
+                    Some(&policy),
+                    policy_context.as_ref(),
+                );
+                lifecycle::prelaunch_abort(
+                    args.audit_log.as_deref(),
+                    &session_audit,
+                    None,
+                    &detail,
+                )
+                .await;
+                std::process::exit(1);
+            }
+        }
+        if let Some(ref report) = args.report
+            && let Some(conflict) =
+                crate::audit_log::report_write_conflict(launch_write_grants.iter().cloned(), report)
+        {
+            let detail = format!("refusing --report '{}': {conflict}", report.display());
+            eprintln!("Error: {detail}");
+            write_report(
+                "failed",
+                Some(&detail),
+                Some(&policy),
+                policy_context.as_ref(),
+            );
+            lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
+            std::process::exit(1);
+        }
+
         let trace_level = if args.verbose > 0 {
             match args.verbose {
                 1 => tracing::Level::DEBUG,
@@ -687,7 +734,9 @@ mod imp {
                 // subtree kill.
                 let pid = child.id() as libc::pid_t;
                 let exited = loop {
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     let ret = unsafe {
                         libc::waitid(
                             libc::P_PID,
@@ -706,6 +755,7 @@ mod imp {
                 if exited && pid > 0 {
                     // The zombie still reserves pid/pgid — the sweep is
                     // safe; a freed pgid must never be signaled.
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
                 }
                 if let Some(cg) = &cg {
@@ -771,6 +821,7 @@ mod imp {
                     // materialized must not reach `kill(0)` — that
                     // would signal *this* process's own group.
                     if child_pid > 0 {
+                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                         unsafe { libc::kill(-child_pid, signo) };
                     }
                     if (tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await).is_err()
@@ -844,6 +895,7 @@ mod imp {
         // `kill(0)` signals *this* process's own group — a pid that
         // never materialized must not reach the group call.
         if pid > 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::kill(-pid, libc::SIGKILL) };
         }
         if let Some(cg) = cg

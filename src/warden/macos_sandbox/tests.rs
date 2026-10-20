@@ -565,7 +565,7 @@ fn write_fake_macho(path: &Path, libs: &[&str], rpaths: &[&str]) {
 
 fn fresh_dir(tag: &str) -> PathBuf {
     let dir =
-        std::env::temp_dir().join(format!("mcp-writ-codemapt-{}-{}", tag, std::process::id()));
+        std::env::temp_dir().join(format!("mcp-writ-codemapt-{}-{}", tag, std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

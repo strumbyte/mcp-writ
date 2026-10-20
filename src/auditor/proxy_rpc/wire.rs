@@ -440,7 +440,7 @@ impl WireState {
     pub(crate) fn message_correlation(
         &self,
         subscription_id: Option<&RpcId>,
-        progress_token: Option<&RpcId>,
+        progress_token: Option<&RpcId>, // nosemgrep: codacy.yaml.security.hard-coded-tokens
     ) -> Option<MessageCorrelation<'_>> {
         if let Some(id) = subscription_id
             && let Some(entry) = self.requests.get(&(C2S, id.clone()))

@@ -4,7 +4,7 @@ use crate::inspector::profile::CapabilityProfile;
 use crate::legislator::cross_validator::CrossValidationResult;
 use crate::legislator::heuristics::Permission;
 use crate::legislator::source_bind::WorkloadHashes;
-use crate::termutil::{escape_kdl_string, sanitize_for_terminal};
+use crate::termutil::{escape_kdl_comment, escape_kdl_string};
 use crate::tool_def::ToolDefinition;
 use crate::verifier::manifest::{ManifestFinding, scan_manifest};
 use crate::verifier::ris::{RisScore, score_tool};
@@ -142,7 +142,7 @@ fn args_schema_parts(tools: &[ToolDefinition], tool_name: &str) -> (String, Stri
     if !findings.is_empty() {
         let comment = format!(
             "    // REVIEW: inputSchema uses unsupported schema features ({}); args_schema omitted — write a reviewed schema\n",
-            sanitize_for_terminal(&findings.join("; "))
+            escape_kdl_comment(&findings.join("; "))
         );
         return (comment, String::new());
     }
@@ -188,7 +188,7 @@ fn manifest_comment_block(
                 "    // {label}: {} ({}) — {}\n",
                 f.rule.as_str(),
                 f.severity.as_str(),
-                sanitize_for_terminal(&f.detail)
+                escape_kdl_comment(&f.detail)
             ));
         }
     }
@@ -233,10 +233,7 @@ fn build_tools_section(
         let mut s = String::new();
         if let Some(notes) = notes {
             for reason in notes {
-                s.push_str(&format!(
-                    "    // WARNING: {}\n",
-                    sanitize_for_terminal(reason)
-                ));
+                s.push_str(&format!("    // WARNING: {}\n", escape_kdl_comment(reason)));
             }
         }
         s
@@ -261,7 +258,7 @@ fn build_tools_section(
             let (schema_comment, schema_prop) = args_schema_parts(discovered, tool_name);
             tools.push(format!(
                 "{comments}{warnings}{schema_comment}    // REVIEW: {}\n    tool \"{}\" deny=#true{schema_prop}",
-                escape_kdl_string(&verdict.reason),
+                escape_kdl_comment(&verdict.reason),
                 escape_kdl_string(tool_name),
             ));
         }
@@ -334,7 +331,7 @@ fn build_tools_section(
             ungrounded += 1;
             tools.push(format!(
                 "{comments}{warnings}{schema_comment}    // REVIEW: {}\n    tool \"{}\" deny=#true{schema_prop}",
-                escape_kdl_string(&verdict.reason),
+                escape_kdl_comment(&verdict.reason),
                 escape_kdl_string(tool_name),
             ));
         }
@@ -392,7 +389,7 @@ fn build_tools_section(
                     // field and regenerate.
                     out.push_str(&format!(
                         "    // ERROR: tools-list-hash could not be computed ({})\n",
-                        sanitize_for_terminal(&e)
+                        escape_kdl_comment(&e)
                     ));
                 }
             }
@@ -444,10 +441,7 @@ fn emit_workload_hashes(out: &mut String, workload: &WorkloadHashes) {
         }
     }
     for reason in &workload.unbound_reasons {
-        out.push_str(&format!(
-            "    // REVIEW: {}\n",
-            sanitize_for_terminal(reason)
-        ));
+        out.push_str(&format!("    // REVIEW: {}\n", escape_kdl_comment(reason)));
     }
 }
 
@@ -541,7 +535,7 @@ fn build_syscalls_section(
         let detail = sc_state
             .detail
             .as_deref()
-            .map(|d| format!(" — {}", sanitize_for_terminal(d)))
+            .map(|d| format!(" — {}", escape_kdl_comment(d)))
             .unwrap_or_default();
         out.push_str(&format!(
             "        // REVIEW: syscall analysis status={} reason={}{}\n",
@@ -597,7 +591,7 @@ fn build_syscalls_section(
                         {
                             out.push_str(&format!(
                                 "        // REVIEW: {} detected in binary but blocked (excess capability)\n",
-                                name
+                                escape_kdl_comment(name)
                             ));
                         }
                     }
@@ -609,7 +603,7 @@ fn build_syscalls_section(
                         {
                             out.push_str(&format!(
                                 "        // REVIEW: {} detected in binary but blocked (excess capability)\n",
-                                name
+                                escape_kdl_comment(name)
                             ));
                         }
                     }
@@ -630,7 +624,7 @@ fn build_syscalls_section(
                 .unwrap_or_else(|| "?".to_string());
             out.push_str(&format!(
                 "        //   {} ({}) kind={}\n",
-                sanitize_for_terminal(sc.syscall_name.as_deref().unwrap_or("unknown")),
+                escape_kdl_comment(sc.syscall_name.as_deref().unwrap_or("unknown")),
                 num,
                 sc.kind.as_str(),
             ));
@@ -680,7 +674,7 @@ fn build_network_section(
             ]
             .contains(n)
         })
-        .map(sanitize_for_terminal)
+        .map(escape_kdl_comment)
         .filter(|n| seen_datagram.insert(n.clone()))
         .collect();
     if !datagram.is_empty() {
@@ -712,19 +706,19 @@ fn build_project_hints_section(
     out.push_str("\n// === Project Hints (advisory) ===\n");
     out.push_str(&format!(
         "// Project type: {}\n",
-        crate::termutil::sanitize_for_terminal(&hint.project_type.to_string())
+        escape_kdl_comment(&hint.project_type.to_string())
     ));
     out.push_str(&format!(
         "// Confidence: {}\n",
-        crate::termutil::sanitize_for_terminal(hint.confidence_summary.as_str())
+        escape_kdl_comment(hint.confidence_summary.as_str())
     ));
     for h in &hint.detected_permissions {
         out.push_str(&format!(
             "// Hint: {} ({}, {}) — {}\n",
-            crate::termutil::sanitize_for_terminal(h.permission.as_str()),
-            crate::termutil::sanitize_for_terminal(h.confidence.as_str()),
-            crate::termutil::sanitize_for_terminal(&h.source.to_string()),
-            crate::termutil::sanitize_for_terminal(&h.evidence)
+            escape_kdl_comment(h.permission.as_str()),
+            escape_kdl_comment(h.confidence.as_str()),
+            escape_kdl_comment(&h.source.to_string()),
+            escape_kdl_comment(&h.evidence)
         ));
     }
 }

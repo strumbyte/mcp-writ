@@ -156,7 +156,9 @@ async fn answer_inflight_client_list<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let Some((reason, answered)) = shared.internal_list_failure.lock().await.take() else {
+    // The recorded reason stays off the wire — the drain's error
+    // responses are the constant text from `build_tools_list_error_response`.
+    let Some((_reason, answered)) = shared.internal_list_failure.lock().await.take() else {
         return Ok(());
     };
     // An inline reply on a real request id already made the abort
@@ -164,7 +166,7 @@ where
     // that answered nothing.
     let mut emitted = answered;
     if let Some((_id, raw_id)) = shared.held_client_list.lock().await.take() {
-        let response = build_tools_list_error_response(&raw_id, &reason);
+        let response = build_tools_list_error_response(&raw_id);
         write_client_frame(&shared.client_out, &response).await?;
         emitted = true;
     }
@@ -190,13 +192,13 @@ where
         if let WireFrame::Request { method, raw_id, .. } = proxy_rpc::classify_frame(json.value())
             && method == "tools/list"
         {
-            let response = build_tools_list_error_response(&raw_id, &reason);
+            let response = build_tools_list_error_response(&raw_id);
             write_client_frame(&shared.client_out, &response).await?;
             emitted = true;
         }
     }
     if !emitted {
-        let response = build_tools_list_error_response("null", &reason);
+        let response = build_tools_list_error_response("null");
         write_client_frame(&shared.client_out, &response).await?;
     }
     Ok(())

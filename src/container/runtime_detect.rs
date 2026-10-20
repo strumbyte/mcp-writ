@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn test_detect_native_elf() {
-        let dir = std::env::temp_dir()
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
             .join("mcp_writ_rt_test")
             .join(format!("elf_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

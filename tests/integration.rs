@@ -347,10 +347,14 @@ async fn test_multiple_requests_same_session() {
     assert!(resp2.contains("error"));
     assert!(resp2.contains("exec_shell"));
 
-    // 3. Another allowed tool → result (session still works)
-    let req3 = r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"/workspace/output/out.txt"}}}"#;
+    // 3. Another allowed call → result (session still works). The call
+    // must stay within the verified advertised set: `write_file` is
+    // allowed by the policy but this fixture never advertises it, so the
+    // verified-listing gate would deny it — `read_file` exercises the
+    // same allowed path.
+    let req3 = r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/other.txt"}}}"#;
     let resp3 = send_and_recv(&mut stdin, &mut reader, req3).await;
-    assert!(result_text(&resp3), "write_file: {resp3}");
+    assert!(result_text(&resp3), "read_file again: {resp3}");
 
     // 4. ping → result
     let req4 = r#"{"jsonrpc":"2.0","id":13,"method":"ping","params":{}}"#;

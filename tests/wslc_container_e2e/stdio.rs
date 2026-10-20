@@ -254,11 +254,10 @@ async fn wslc_stdio_session() {
         (4, "read_file", "{\"path\":\"/workspace/wslc-ok.txt\"}"),
         (5, "read_file", "{\"path\":\"/etc/shadow\"}"),
         (6, "chmod_666", "{\"path\":\"/workspace/wslc-ok.txt\"}"),
-        (
-            7,
-            "net_probe",
-            "{\"addr\":\"192.0.2.1:80\",\"path\":\"/proc/self/status\"}",
-        ),
+        // `addr` is omitted — the probe defaults to 192.0.2.1:80 —
+        // because a `read_only` tool carrying a host/URL argument is
+        // refused by the auditor before the kernel check can engage.
+        (7, "net_probe", "{\"path\":\"/proc/self/status\"}"),
         (
             8,
             "create_file",

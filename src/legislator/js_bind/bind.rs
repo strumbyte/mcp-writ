@@ -362,15 +362,41 @@ fn callback_from_args(after_name: &str, functions: &[SourceFunction]) -> Callbac
         .iter()
         .map(|&(lo, hi)| classify_arg(after_name, lo, hi))
         .collect();
-    let pick = |class: &ArgClass| -> Option<(Option<String>, Rc<str>)> {
+    // The third tuple element carries a duplicate-definition reason: an
+    // identifier with more than one *applicable* definition is not a
+    // provable handler (the runtime's choice between the definitions is
+    // ambiguous), so the binding is Unbound rather than first-match
+    // attributed.
+    let pick = |class: &ArgClass| -> Option<(Option<String>, Rc<str>, Option<String>)> {
         match class {
             ArgClass::Ident(name) => {
-                let body = functions
-                    .iter()
-                    .find(|f| f.name == *name)
-                    .map(|f| Rc::clone(&f.body))
-                    .unwrap_or_default();
-                Some((Some(name.clone()), body))
+                // File-scope declarations win — a same-named helper
+                // nested in another scope is a different variable, not
+                // an alternative definition. A name defined only in a
+                // nested scope is likewise unprovable: the binding is
+                // Unbound with an empty body for review rather than
+                // borrowing a body the identifier cannot resolve to.
+                let mut top = functions.iter().filter(|f| f.name == *name && f.top_level);
+                let mut nested = functions.iter().filter(|f| f.name == *name && !f.top_level);
+                let (body, dup) = match top.next() {
+                    Some(_) if top.next().is_some() => (
+                        Rc::default(),
+                        Some(format!(
+                            "Unbound: function '{name}' is defined more than once — the \
+                             registered handler cannot be proven"
+                        )),
+                    ),
+                    Some(f) => (Rc::clone(&f.body), None),
+                    None if nested.next().is_some() => (
+                        Rc::default(),
+                        Some(format!(
+                            "Unbound: function '{name}' is defined only in a nested scope — \
+                             the registered handler cannot be proven"
+                        )),
+                    ),
+                    None => (Rc::default(), None),
+                };
+                Some((Some(name.clone()), body, dup))
             }
             ArgClass::Inline {
                 body_start,
@@ -383,7 +409,7 @@ fn callback_from_args(after_name: &str, functions: &[SourceFunction]) -> Callbac
                     .strip_prefix('{')
                     .and_then(|r| r.strip_suffix('}'))
                     .unwrap_or(raw);
-                Some((None, Rc::from(inner)))
+                Some((None, Rc::from(inner), None))
             }
             _ => None,
         }
@@ -400,11 +426,11 @@ fn callback_from_args(after_name: &str, functions: &[SourceFunction]) -> Callbac
     };
     match classes.last().unwrap() {
         last @ (ArgClass::Ident(_) | ArgClass::Inline { .. }) => {
-            let (fn_name, body) = pick(last).unwrap();
+            let (fn_name, body, dup) = pick(last).unwrap();
             CallbackBind {
                 fn_name,
                 body,
-                warning: None,
+                warning: dup,
             }
         }
         ArgClass::Compound => ambiguous(),
@@ -417,11 +443,11 @@ fn callback_from_args(after_name: &str, functions: &[SourceFunction]) -> Callbac
                 .filter(|c| matches!(c, ArgClass::Ident(_) | ArgClass::Inline { .. }))
                 .collect();
             if callbackish.len() == 1 && earlier.iter().all(|c| !matches!(c, ArgClass::Compound)) {
-                let (fn_name, body) = pick(callbackish[0]).unwrap();
+                let (fn_name, body, dup) = pick(callbackish[0]).unwrap();
                 CallbackBind {
                     fn_name,
                     body,
-                    warning: None,
+                    warning: dup,
                 }
             } else if callbackish.is_empty()
                 && earlier
@@ -441,6 +467,11 @@ pub fn extract_functions(source: &str) -> Vec<SourceFunction> {
     let mut body_bytes = 0usize;
     let bytes = source.as_bytes();
     let mut scan = JsScan::new();
+    // Brace depth at the scan cursor — a declaration's `top_level` flag
+    // marks helpers nested inside a callback or block: still collected
+    // for sink inlining, but not alternatives for a file-level handler
+    // binding.
+    let mut depth = 0u32;
     while scan.i < bytes.len() {
         if out.len() >= MAX_SOURCE_FUNCTIONS || body_bytes >= MAX_FUNCTION_BODY_BYTES {
             break;
@@ -457,9 +488,23 @@ pub fn extract_functions(source: &str) -> Vec<SourceFunction> {
             out.push(SourceFunction {
                 name,
                 body: Rc::from(body),
+                top_level: depth == 0,
             });
             scan.i = end;
             continue;
+        }
+        match bytes[scan.i] {
+            b'{' => depth = depth.saturating_add(1),
+            b'}' => depth = depth.saturating_sub(1),
+            // A regex literal is skipped whole: its braces never reach
+            // the depth count and `function`-lookalike text inside it
+            // cannot produce a false declaration. A `/` that is not a
+            // regex start advances one byte, same as `bump`.
+            b'/' => {
+                scan.i = skip_regex_or_slash(source, scan.i);
+                continue;
+            }
+            _ => {}
         }
         scan.bump(source);
     }

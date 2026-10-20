@@ -66,10 +66,12 @@ impl PathDenyWatcher {
     pub fn start(listener: File, denied_path: &Path) -> io::Result<Self> {
         // Safety: eventfd creates a live fd; EFD_CLOEXEC keeps it out
         // of any exec'd image.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let stop_raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
         if stop_raw < 0 {
             return Err(io::Error::last_os_error());
         }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let stop = unsafe { File::from_raw_fd(stop_raw) };
         let loop_stop = stop.try_clone()?;
         let denied = Arc::new(AtomicBool::new(false));
@@ -108,6 +110,7 @@ impl PathDenyWatcher {
     fn signal_stop(&self) {
         let byte = 1u64.to_ne_bytes();
         // Safety: `stop` is a live eventfd; 8 bytes is the eventfd write.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::write(
                 self.stop.as_raw_fd(),
@@ -153,6 +156,7 @@ impl Watch {
                 },
             ];
             // Safety: `pfds` is live for the call.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 500) };
             if rc < 0 {
                 if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {

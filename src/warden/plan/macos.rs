@@ -233,7 +233,7 @@ pub(crate) fn os_plan_grants(
     let tmp = opts
         .tmpdir
         .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("mcp-writ-sbx-<launch>"));
+        .unwrap_or_else(|| std::env::temp_dir().join("mcp-writ-sbx-<launch>")); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     match super::super::macos_sandbox::sbpl_profile(
         policy,
         &tmp.to_string_lossy(),

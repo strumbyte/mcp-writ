@@ -32,10 +32,12 @@ pub(crate) use crate::warden::linux_spawn::CredDrop;
 ///   syscalls stay governed by the policy filter regardless of uid).
 pub(crate) fn resolve_workload_cred(privileged: bool) -> Result<Option<CredDrop>, String> {
     // Safety: geteuid/getegid cannot fail.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let euid = unsafe { libc::geteuid() };
     if euid != 0 {
         return Ok(Some(CredDrop {
             uid: euid,
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             gid: unsafe { libc::getegid() },
             full: false,
         }));
@@ -92,9 +94,11 @@ pub(super) fn plan_root_demote(
 /// Runs in the parent — allocation and the nss lookup are safe here.
 fn primary_gid_for(uid: u32) -> Result<u32, String> {
     // Safety: `pwd`/`buf`/`result` are valid locals for getpwuid_r.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut result: *mut libc::passwd = std::ptr::null_mut();
     let mut buf = vec![0u8; 4096];
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe {
         libc::getpwuid_r(
             uid,

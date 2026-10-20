@@ -1478,13 +1478,20 @@ async fn fail_closed_audit_unavailable_refuses_allowed() {
         0,
         "audit failure must retain no grant"
     );
-    // Denied queries still refuse — the denial does not depend on the sink.
+    // Denied queries still refuse — the denial does not depend on the
+    // sink — but the failed commit latches `writer_failed`, and a
+    // fail-closed gate exits rather than keep serving unaudited.
     let resp = udp_query(gate.listen, &dns_query(2, "denied.example", 1))
         .await
         .expect("refusal on dead audit sink");
     assert_eq!(rcode(&resp), 5);
-    let _ = gate.shutdown.send(());
-    let _ = timeout(TEST_TIMEOUT, gate.task).await;
+    let res = timeout(TEST_TIMEOUT, gate.task)
+        .await
+        .expect("gate must exit once the fail-closed sink is dead");
+    assert!(
+        matches!(res, Ok(Err(_))),
+        "audit loss must end the gate with an error, got: {res:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

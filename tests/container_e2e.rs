@@ -267,7 +267,7 @@ async fn container_kernel_below_landlock_v4(engine: &str) -> bool {
 
 /// Create a temporary directory for test artifacts.
 fn create_temp_dir() -> std::io::Result<PathBuf> {
-    let temp_dir = std::env::temp_dir().join(format!("mcp-writ-test-{}", unique_hex_id()));
+    let temp_dir = std::env::temp_dir().join(format!("mcp-writ-test-{}", unique_hex_id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     std::fs::create_dir_all(&temp_dir)?;
     Ok(temp_dir)
 }
@@ -356,7 +356,7 @@ fn elf_with_verneed(dynstr: &[u8], verneeds: &[(u32, &[u32])]) -> Vec<u8> {
 
 #[test]
 fn required_glibc_reads_newest_version_ref() {
-    let dir = std::env::temp_dir().join(format!("mcp-writ-glibc-{}", unique_hex_id()));
+    let dir = std::env::temp_dir().join(format!("mcp-writ-glibc-{}", unique_hex_id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     std::fs::create_dir_all(&dir).unwrap();
     // .dynstr: "libc.so.6"@1, "GLIBC_2.17"@11, "GLIBC_2.38"@22,
     // "GLIBC_PRIVATE"@33, "libm.so.6"@47, "GLIBC_2.35"@57 — two

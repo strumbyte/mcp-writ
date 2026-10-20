@@ -153,6 +153,7 @@ mod tests {
             architecture: None,
             os_version: None,
             env: Vec::new(),
+            onbuild: Vec::new(),
         };
         assert_eq!(
             immutable_image_ref("ghcr.io/org/app:v1", &meta).as_deref(),
@@ -174,6 +175,7 @@ mod tests {
             architecture: None,
             os_version: None,
             env: Vec::new(),
+            onbuild: Vec::new(),
         };
         let pinned = format!("img@sha256:{}", "ef".repeat(32));
         assert_eq!(

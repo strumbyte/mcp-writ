@@ -13,7 +13,10 @@ use crate::execution::ExecutionTarget;
 use crate::policy::Policy;
 use crate::policy::loader::load_policy_or_default_for_target_scanned;
 
-/// Human summary + remediation on stderr.
+/// Human summary + remediation on stderr. `reason`/`remediation` carry
+/// text derived from the policy file, image metadata, and the host —
+/// every line is sanitized before it reaches the terminal so control
+/// characters cannot forge output.
 fn print_summary(report: &PlanReport) {
     match report.status {
         PlanStatus::Ready => {
@@ -21,11 +24,19 @@ fn print_summary(report: &PlanReport) {
         }
         status => {
             let reason = report.reason.as_deref().unwrap_or("(no detail)");
-            eprintln!("plan: {status} — {reason}", status = status.as_str());
+            eprintln!(
+                "plan: {status} — {reason}",
+                status = status.as_str(),
+                reason = crate::termutil::sanitize_for_terminal(reason)
+            );
         }
     }
     for (i, step) in report.remediation.iter().enumerate() {
-        eprintln!("  {}. {step}", i + 1);
+        eprintln!(
+            "  {}. {}",
+            i + 1,
+            crate::termutil::sanitize_for_terminal(step)
+        );
     }
 }
 
@@ -42,9 +53,12 @@ pub(super) fn emit_and_exit(report: &PlanReport, report_path: Option<&Path>) -> 
         std::process::exit(report.status.exit_code());
     };
 
-    match std::fs::write(path, report.to_json()) {
+    match crate::fspriv::write_file_atomic(path, report.to_json().as_bytes()) {
         Ok(()) => {
-            eprintln!("plan report written to {}", path.display());
+            eprintln!(
+                "plan report written to {}",
+                crate::termutil::sanitize_for_terminal(&path.display().to_string())
+            );
             print_summary(report);
             std::process::exit(report.status.exit_code());
         }
@@ -72,8 +86,9 @@ pub(super) fn emit_and_exit(report: &PlanReport, report_path: Option<&Path>) -> 
             // fallback machine channel.
             println!("{}", err.to_json());
             eprintln!(
-                "Error: failed to write plan report to '{}': {e}",
-                path.display()
+                "Error: failed to write plan report to '{}': {}",
+                crate::termutil::sanitize_for_terminal(&path.display().to_string()),
+                crate::termutil::sanitize_for_terminal(&e.to_string())
             );
             std::process::exit(PlanStatus::Error.exit_code());
         }

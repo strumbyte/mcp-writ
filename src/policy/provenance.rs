@@ -83,6 +83,15 @@ pub struct ProvRecord {
 pub struct PolicyProvenance {
     /// Write log in composition order.
     pub records: Vec<ProvRecord>,
+    /// Every file the load read: the policy root, each `extends`/
+    /// `include` ancestor, and each `@file` `args_schema` document —
+    /// canonicalized, deduplicated, sorted, with each file's spelled
+    /// absolute path kept alongside its canonical target. A workload
+    /// write grant covering any of these — or a directory whose
+    /// symlink the spelled path passes through — can rewrite what a
+    /// *later* launch loads, so launchers refuse the overlap before
+    /// spawning.
+    pub sources: Vec<PathBuf>,
 }
 
 impl PolicyProvenance {
@@ -167,11 +176,29 @@ pub struct DeclOrigin {
 pub(crate) struct Provenance {
     records: Vec<ProvRecord>,
     writers: HashMap<String, Vec<(PathBuf, String)>>,
+    /// Canonicalized source files the load read — the protected set
+    /// launchers check write grants against.
+    sources: std::collections::BTreeSet<PathBuf>,
 }
 
 impl Provenance {
     fn push(&mut self, record: ProvRecord) {
         self.records.push(record);
+    }
+
+    /// `path` contributed content to this load — a policy file or an
+    /// `@file` schema document. Recorded so a launch can refuse when
+    /// the workload's write grants reach it.
+    pub(crate) fn record_source(&mut self, path: PathBuf) {
+        self.sources.insert(path);
+    }
+
+    /// The spelled absolute form of a recorded source — kept next to
+    /// its canonical target so the launch check can also refuse a
+    /// write grant covering a directory whose symlink the spelling
+    /// resolves through.
+    pub(crate) fn record_source_spelling(&mut self, path: PathBuf) {
+        self.sources.insert(path);
     }
 
     /// `file` wrote scalar/flag `field` — no entry tracking (the write
@@ -430,6 +457,7 @@ impl Provenance {
     pub(crate) fn finish(self) -> PolicyProvenance {
         PolicyProvenance {
             records: self.records,
+            sources: self.sources.into_iter().collect(),
         }
     }
 }

@@ -129,6 +129,7 @@ impl SharedApplyRecord {
     fn map() -> Option<Self> {
         let len = size_of::<ApplyRecordPage>();
         // Safety: standard anonymous shared mapping; no fd, no file.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -160,6 +161,7 @@ impl SharedApplyRecord {
     /// error packet / died after recording `failed_stage`.
     pub(super) fn snapshot(&self) -> ApplySnapshot {
         // Safety: `ptr` refers to a live mapping owned by `self`.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let page = unsafe { &*self.ptr };
         ApplySnapshot {
             stage: page.stage.load(Ordering::Acquire),
@@ -174,6 +176,7 @@ impl SharedApplyRecord {
 impl Drop for SharedApplyRecord {
     fn drop(&mut self) {
         // Safety: `ptr`/`len` name the mapping created in `map`.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::munmap(self.ptr.cast(), self.len) };
     }
 }
@@ -365,8 +368,7 @@ pub(super) fn prepare_linux_child_sandbox(
 /// Write the child's pid to `fd` (an open `cgroup.procs`) — no
 /// allocation, `write(2)` only; `pre_exec`-safe.
 fn write_self_pid(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
-    // Safety: getpid has no failure mode.
-    let mut pid = unsafe { libc::getpid() } as u64;
+    let mut pid = std::process::id() as u64;
     let mut buf = [0u8; 20];
     let mut i = buf.len();
     loop {
@@ -379,6 +381,7 @@ fn write_self_pid(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
     }
     let s = &buf[i..];
     // Safety: `s` is live stack memory; `fd` is a live write fd.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe { libc::write(fd, s.as_ptr().cast::<libc::c_void>(), s.len()) };
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
@@ -409,6 +412,7 @@ fn apply_cred_drop(drop: &CredDrop) -> std::io::Result<()> {
         // Ambient first: EINVAL means pre-4.3 kernel — the set cannot
         // exist there, so nothing is left to clear.
         // Safety: prctl with a literal command and no pointers.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) } != 0 {
             let e = last_error();
             if e.raw_os_error() != Some(libc::EINVAL) {
@@ -418,6 +422,7 @@ fn apply_cred_drop(drop: &CredDrop) -> std::io::Result<()> {
         // Bounding set, while CAP_SETPCAP is still effective.
         for cap in 0..=CAP_MAX_BOUND {
             // Safety: prctl with a literal command and no pointers.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0 {
                 let e = last_error();
                 if e.raw_os_error() != Some(libc::EINVAL) {
@@ -447,8 +452,10 @@ fn apply_cred_drop(drop: &CredDrop) -> std::io::Result<()> {
             version: LINUX_CAPABILITY_VERSION_3,
             pid: 0,
         };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let mut data: [CapUserData; 2] = unsafe { std::mem::zeroed() };
         // Safety: valid stack pointers; SYS_capget fills `data`.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::syscall(libc::SYS_capget, &header, data.as_mut_ptr()) } != 0 {
             return Err(last_error());
         }
@@ -456,26 +463,31 @@ fn apply_cred_drop(drop: &CredDrop) -> std::io::Result<()> {
             d.inheritable = 0;
         }
         // Safety: valid stack pointers; SYS_capset semantics.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0 {
             return Err(last_error());
         }
         // Supplementary groups — needs CAP_SETGID, still held.
         // Safety: null list + 0 count is the documented clear call.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
             return Err(last_error());
         }
         // gid before uid — a root uid may still setgid without CAP_SETGID
         // only while it *is* root; drop the group first, then the uid.
         // Safety: plain setgid/setuid.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::setgid(drop.gid) } != 0 {
             return Err(last_error());
         }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::setuid(drop.uid) } != 0 {
             return Err(last_error());
         }
     } else {
         // Ambient is the only set an unprivileged launcher can hand
         // execve — strip it; everything else the kernel recomputes.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) } != 0 {
             let e = last_error();
             if e.raw_os_error() != Some(libc::EINVAL) {
@@ -487,6 +499,7 @@ fn apply_cred_drop(drop: &CredDrop) -> std::io::Result<()> {
     // Prove the final credentials — a demotion that cannot be shown is
     // a spawn failure, not a tolerated degrade.
     // Safety: the get*id/getgroups calls cannot fail.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let ok = unsafe {
         libc::getuid() == drop.uid
             && libc::geteuid() == drop.uid
@@ -612,6 +625,7 @@ impl LinuxSandboxBits {
     pub(super) fn apply_in_child(&mut self) -> std::io::Result<()> {
         // Safety: `record_ptr` is 0 or points at the parent's shared page,
         // which stays mapped until `spawn()` has returned in the parent.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rec = unsafe { (self.record_ptr as *const ApplyRecordPage).as_ref() };
 
         if let Err(e) = seccomp_impl::set_no_new_privs() {
@@ -745,6 +759,7 @@ impl LinuxSandboxBits {
 /// seal are still enumerated.
 fn open_fd_table() -> std::io::Result<libc::c_int> {
     // Safety: `open(2)` on a C-string literal; returns -1 on error.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let dirfd = unsafe {
         libc::open(
             c"/proc/self/fd".as_ptr(),
@@ -777,6 +792,7 @@ fn seal_ambient_fds(dirfd: libc::c_int, keep: &[libc::c_int]) -> std::io::Result
     let result = seal_ambient_fds_walk(dirfd, keep);
     // Safety: `dirfd` came from `open_fd_table` and is closed exactly
     // once, on whichever path the walk left.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(dirfd) };
     result
 }
@@ -787,6 +803,7 @@ fn seal_ambient_fds_walk(dirfd: libc::c_int, keep: &[libc::c_int]) -> std::io::R
         // Safety: getdents64 writes at most `buf.len()` bytes into
         // valid stack storage. linux_dirent64 layout: u64 ino,
         // i64 offset, u16 reclen, u8 d_type, then NUL-terminated name.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let n = unsafe { libc::syscall(libc::SYS_getdents64, dirfd, buf.as_mut_ptr(), buf.len()) };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
@@ -821,6 +838,7 @@ fn seal_ambient_fds_walk(dirfd: libc::c_int, keep: &[libc::c_int]) -> std::io::R
                 // Safety: F_SETFD only touches the descriptor's
                 // close-on-exec flag — the fd stays live for anything
                 // the spawn machinery still needs until execve.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
             }
             off += reclen;
@@ -849,6 +867,7 @@ pub(super) fn attach_linux_pre_exec(
     // pre-built artifacts and stores into the shared record page; no heap
     // allocation happens after fork. The page outlives the call: the
     // returned guard is dropped only after spawn() has returned.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         cmd.pre_exec(move || bits.apply_in_child());
     }
@@ -869,6 +888,7 @@ pub(super) fn attach_linux_pre_exec_tokio(
     let record = SharedApplyRecord::map();
     bits.record_ptr = record.as_ref().map_or(0, SharedApplyRecord::child_ptr);
     // Safety: same contract as `attach_linux_pre_exec`.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         cmd.pre_exec(move || bits.apply_in_child());
     }

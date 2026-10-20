@@ -401,7 +401,14 @@ pub(super) fn take_string(source: &str, start: usize) -> Option<(String, usize)>
     let mut i = start + 1;
     while i < bytes.len() {
         if bytes[i] == b'\\' {
-            i += 2;
+            // The escaped unit is a whole char, not two bytes — a
+            // multi-byte scalar after the backslash must not leave `i`
+            // mid-sequence (the `source[i..]` slices below panic on a
+            // non-boundary).
+            i += 1;
+            if i < bytes.len() {
+                i += source[i..].chars().next()?.len_utf8();
+            }
             continue;
         }
         if bytes[i] == quote {

@@ -92,6 +92,7 @@ pub fn check_support() -> Result<(), UnmetRequirement> {
     // The private cgroup is created under the hierarchy root — without
     // write access there is nowhere to attach.
     // Safety: plain access(2) on a literal path.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::access(c"/sys/fs/cgroup".as_ptr(), libc::W_OK) } != 0 {
         return Err(UnmetRequirement::one(
             "cgroup-writable",
@@ -105,6 +106,7 @@ pub fn check_support() -> Result<(), UnmetRequirement> {
 
     // 3. bpf() syscall reachable — a 1-entry ARRAY is the cheapest op.
     match sys::map_create(sys::BPF_MAP_TYPE_ARRAY, 4, 8, 1) {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         Ok(fd) => unsafe {
             libc::close(fd);
         },
@@ -135,6 +137,7 @@ pub fn check_support() -> Result<(), UnmetRequirement> {
     ];
     let mut vlog = Vec::new();
     match sys::prog_load(&insns, sys::BPF_CGROUP_INET4_CONNECT, &mut vlog) {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         Ok(fd) => unsafe {
             libc::close(fd);
         },

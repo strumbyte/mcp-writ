@@ -94,6 +94,26 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
         }
     };
 
+    // A write grant covering a file this policy load read (root,
+    // extends/include ancestors, @file schemas) lets the gated workload
+    // rewrite what every later launch trusts — refuse before start.
+    let launch_write_grants = policy.write_grant_spellings();
+    for source in policy.source_files() {
+        if let Some(conflict) = crate::audit_log::policy_source_write_conflict(
+            launch_write_grants.iter().cloned(),
+            &source,
+        ) {
+            let detail = format!(
+                "refusing launch: write grant reaches policy source '{}': {conflict}",
+                source.display()
+            );
+            eprintln!("Error: {detail}");
+            lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail)
+                .await;
+            std::process::exit(1);
+        }
+    }
+
     let trace_level = if args.verbose > 0 {
         match args.verbose {
             1 => tracing::Level::DEBUG,

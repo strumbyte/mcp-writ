@@ -317,14 +317,15 @@ pub async fn run_self_test(
 }
 
 fn create_self_test_dir() -> io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "mcp-writ-self-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp-writ-self-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {

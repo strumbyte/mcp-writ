@@ -626,10 +626,13 @@ fn root_launch_unresolvable_gid_refuses() {
 fn nonroot_launcher_self_demotes() {
     // `resolve_workload_cred` reads the real euid — under a non-root
     // test process it must return the light plan.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::geteuid() } == 0 {
         return; // root test envs exercise the demote path instead
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let euid = unsafe { libc::geteuid() };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let egid = unsafe { libc::getegid() };
     let plan = super::spawn::resolve_workload_cred(false).unwrap();
     assert_eq!(

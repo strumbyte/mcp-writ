@@ -5,7 +5,9 @@ fn main() {
         env!("CARGO_PKG_VERSION"),
         ":1\0"
     ));
-    if std::env::args().nth(1).as_deref() == Some("--version") {
+    // nosemgrep on the `let` line: rustfmt moves comments trailing `{`.
+    let version_requested = std::env::args().nth(1).as_deref() == Some("--version"); // nosemgrep: rust.lang.security.args.args
+    if version_requested {
         println!(
             "mcp-writ-wsb-relay {} protocol=1",
             env!("CARGO_PKG_VERSION")

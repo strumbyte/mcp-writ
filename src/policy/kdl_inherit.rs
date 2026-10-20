@@ -109,6 +109,14 @@ fn load_kdl_policy_recursive_with_decl(
             path.display(),
         )));
     }
+    // Every file the load reads is a policy source a later launch must
+    // protect from workload writes — record it before parsing begins.
+    // The spelled path is recorded alongside the canonical target: a
+    // symlink inside a writable directory resolves out of the grant,
+    // yet the workload can repoint it and own this spelling's reads.
+    cx.prov.record_source(canonical.clone());
+    cx.prov
+        .record_source_spelling(crate::fsoverlap::absolutize_lexical(path));
     let result = load_kdl_policy_subtree(path, visited, env, cx, budget, depth);
     visited.remove(&canonical);
     result
@@ -246,7 +254,12 @@ fn load_kdl_policy_subtree(
     }
     cx.profiles.extend(doc_profiles);
 
-    let this_policy = parse_kdl_policy_with_profiles(&content, cx.profiles, Some(base_dir))?;
+    let mut schema_sources = Vec::new();
+    let this_policy =
+        parse_kdl_policy_with_profiles(&content, cx.profiles, Some(base_dir), &mut schema_sources)?;
+    for source in schema_sources {
+        cx.prov.record_source(source);
+    }
 
     // Every file in the chain declares a supported `policy version` —
     // otherwise an ancestor's unknown version would ride the child's.

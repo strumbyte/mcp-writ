@@ -182,6 +182,7 @@ fn identity_of(path: &Path) -> Option<FileIdent> {
     let f = std::fs::File::open(path).ok()?;
     let mut info = win_ident::ByHandleInfo::default();
     // Safety: `info` is a valid out-buffer; the handle is open for the call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let ok = unsafe { win_ident::GetFileInformationByHandle(f.as_raw_handle(), &mut info) };
     if ok == 0 {
         return None;

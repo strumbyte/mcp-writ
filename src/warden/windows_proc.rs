@@ -97,6 +97,7 @@ impl SpawnCleanup {
     /// still alive.
     fn delete_attr_list(&mut self) {
         if let Some(mut buf) = self.attr_list_buf.take() {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 DeleteProcThreadAttributeList(LPPROC_THREAD_ATTRIBUTE_LIST(
                     buf.as_mut_ptr().cast(),
@@ -109,6 +110,7 @@ impl SpawnCleanup {
 impl Drop for SpawnCleanup {
     fn drop(&mut self) {
         self.delete_attr_list();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             for handle in [
                 self.stdin_read.take(),
@@ -238,10 +240,13 @@ fn spawn_inner(
     cleanup.stdout_write = Some(stdout_write);
     set_handle_inheritable(stdin_read).map_err(at(WinStage::ProcessSetup))?;
     set_handle_inheritable(stdout_write).map_err(at(WinStage::ProcessSetup))?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let stderr_dup = match unsafe { GetStdHandle(STD_ERROR_HANDLE) } {
         Ok(h) if !h.is_invalid() && h != HANDLE::default() => {
             let mut dup = HANDLE::default();
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let current = unsafe { GetCurrentProcess() };
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             match unsafe {
                 DuplicateHandle(
                     current,
@@ -296,6 +301,7 @@ fn spawn_inner(
     // First call: get required size
     // Safety: InitializeProcThreadAttributeList with null buffer returns the
     // required size in attr_list_size. Expected to fail with ERROR_INSUFFICIENT_BUFFER.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let _ = InitializeProcThreadAttributeList(None, attr_count, Some(0), &mut attr_list_size);
     }
@@ -305,6 +311,7 @@ fn spawn_inner(
 
     // Second call: initialize with our buffer
     // Safety: buffer is large enough (we got the size from the first call).
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         InitializeProcThreadAttributeList(
             Some(attr_list),
@@ -330,6 +337,7 @@ fn spawn_inner(
     // The attribute list takes a pointer; the pointed-to data must remain valid
     // until CreateProcessW returns.
     if let Some(sec_caps) = &sec_caps {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             UpdateProcThreadAttribute(
                 attr_list,
@@ -354,6 +362,7 @@ fn spawn_inner(
     let lpac_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
     if is_lpac {
         // Safety: lpac_policy is valid for the duration of this function.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             UpdateProcThreadAttribute(
                 attr_list,
@@ -378,6 +387,7 @@ fn spawn_inner(
     // handle supplies the child's security context; `env_handle` is the
     // function-scope binding the attribute list points into.
     if has_security_env {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             UpdateProcThreadAttribute(
                 attr_list,
@@ -402,6 +412,7 @@ fn spawn_inner(
     if let Some(h) = stderr_dup {
         inherit_handles.push(h);
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         UpdateProcThreadAttribute(
             attr_list,
@@ -456,6 +467,7 @@ fn spawn_inner(
 
     // Create the child process
     // Safety: all pointers and handles are valid for the duration of this call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let create_result = unsafe {
         CreateProcessW(
             app_name,
@@ -473,22 +485,26 @@ fn spawn_inner(
 
     cleanup.delete_attr_list();
     if let Some(h) = cleanup.stdin_read.take() {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let _ = CloseHandle(h);
         }
     }
     if let Some(h) = cleanup.stdout_write.take() {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let _ = CloseHandle(h);
         }
     }
     if let Some(h) = cleanup.stderr_dup.take() {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let _ = CloseHandle(h);
         }
     }
 
     create_result.map_err(|e| {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             // CreateProcessW leaves pi.hProcess/pi.hThread NULL on
             // failure; CloseHandle on such a value is an invalid-handle
@@ -512,12 +528,14 @@ fn spawn_inner(
     })?;
 
     let job = create_kill_on_close_job()
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         .inspect_err(|_e| unsafe {
             let _ = TerminateProcess(pi.hProcess, 1);
             let _ = CloseHandle(pi.hProcess);
             let _ = CloseHandle(pi.hThread);
         })
         .map_err(at(WinStage::JobSetup))?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         AssignProcessToJobObject(job, pi.hProcess).map_err(|e| {
             let _ = TerminateProcess(pi.hProcess, 1);
@@ -561,6 +579,7 @@ fn spawn_inner(
     // Construct WindowsChild with the real process handle and parent-side pipe handles.
     // Safety: pi.hProcess is a valid process handle from CreateProcessW.
     // stdin_write and stdout_read are valid pipe handles owned by the parent.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let child = unsafe {
         use std::os::windows::io::FromRawHandle;
 
@@ -624,6 +643,7 @@ impl WindowsChild {
 
         // Safety: process_handle is a valid handle from CreateProcessW.
         // INFINITE (0xFFFF_FFFF) means wait until the process exits.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let wait_result = WaitForSingleObject(self.process_handle, INFINITE);
             // WAIT_FAILED: the wait call itself failed (e.g. invalid handle).
@@ -647,6 +667,7 @@ impl WindowsChild {
 
         // Safety: process_handle is a valid handle from CreateProcessW;
         // a zero timeout makes this a pure status query.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             match WaitForSingleObject(self.process_handle, 0) {
                 r if r == WAIT_OBJECT_0 => {
@@ -665,6 +686,7 @@ impl WindowsChild {
 
     /// Forcefully terminate the process.
     pub fn kill(&self) -> std::io::Result<()> {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             if !self.job_handle.is_invalid() {
                 // The Job teardown kills every process in the job —
@@ -684,6 +706,7 @@ impl WindowsChild {
     /// Get the OS-assigned process ID, if the process is still running.
     pub fn id(&self) -> Option<u32> {
         // Safety: process_handle is a valid handle from CreateProcessW.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let pid = unsafe { GetProcessId(self.process_handle) };
         if pid == 0 { None } else { Some(pid) }
     }
@@ -693,6 +716,7 @@ impl Drop for WindowsChild {
     fn drop(&mut self) {
         self.stdin.take();
         self.stdout.take();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             if !self.job_handle.is_invalid() {
                 let _ = TerminateJobObject(self.job_handle, 1);
@@ -790,6 +814,7 @@ fn create_pipe() -> Result<(HANDLE, HANDLE), WardenError> {
     let mut write_handle = HANDLE::default();
 
     // Safety: CreatePipe creates an anonymous pipe with non-inheritable handles.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         windows::Win32::System::Pipes::CreatePipe(&mut read_handle, &mut write_handle, None, 0)
             .map_err(|e| {
@@ -804,6 +829,7 @@ fn create_pipe() -> Result<(HANDLE, HANDLE), WardenError> {
 }
 
 fn create_kill_on_close_job() -> Result<HANDLE, WardenError> {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let job = unsafe {
         CreateJobObjectW(None, None).map_err(|e| {
             WardenError::sandbox_setup(
@@ -814,6 +840,7 @@ fn create_kill_on_close_job() -> Result<HANDLE, WardenError> {
     };
     let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         SetInformationJobObject(
             job,
@@ -838,6 +865,7 @@ fn create_kill_on_close_job() -> Result<HANDLE, WardenError> {
 /// must remain non-inheritable to prevent leakage to other child processes.
 fn set_handle_inheritable(handle: HANDLE) -> Result<(), WardenError> {
     // Safety: handle is a valid handle from CreatePipe.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT).map_err(|e| {
             WardenError::sandbox_setup(

@@ -49,6 +49,7 @@ static RUNNER_CAPS_MARKER: &str = guest_report::RUNNER_CAPS_MARKER;
 #[cfg(target_os = "linux")]
 fn probe_landlock_abi() -> i32 {
     const LANDLOCK_CREATE_RULESET_VERSION: usize = 1;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let abi = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,
@@ -224,6 +225,7 @@ async fn main() {
     // SAFETY: no other threads have been spawned yet besides the tokio runtime;
     // inherited image ENV must not skip the sandbox, override the host
     // server bind, or leak the channel variables into the workload.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         std::env::remove_var("MCP_WRIT_ENV");
         std::env::remove_var("MCP_WRIT_SKIP_SANDBOX");

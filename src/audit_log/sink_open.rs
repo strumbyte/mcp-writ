@@ -59,6 +59,7 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
     fn openat_dir(dir: Option<&fs::File>, name: &OsStr) -> io::Result<fs::File> {
         let c = cname(name)?;
         let at = dir.map(|d| d.as_raw_fd()).unwrap_or(libc::AT_FDCWD);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let fd = unsafe {
             libc::openat(
                 at,
@@ -69,6 +70,7 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         Ok(unsafe { fs::File::from_raw_fd(fd) })
     }
 
@@ -116,7 +118,9 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
         .map(|d| d.as_raw_fd())
         .unwrap_or(libc::AT_FDCWD);
     let mut was_new = false;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe { libc::fstatat(at, leaf.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
     if rc == 0 {
         if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
@@ -139,6 +143,7 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
     // `O_NONBLOCK` keeps a raced FIFO from blocking the open; the
     // fstat below still gates the type, and the flag is cleared
     // before the handle is handed on.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe {
         libc::openat(
             at,
@@ -155,6 +160,7 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let file = unsafe { fs::File::from_raw_fd(fd) };
     let meta = file.metadata()?;
     if !meta.is_file() {
@@ -166,6 +172,7 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
     // A file owned by another uid can be rewritten or truncated by
     // that uid — the audit record must live in an object the logging
     // identity owns.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let euid = unsafe { libc::geteuid() };
     if meta.uid() != euid {
         return Err(io::Error::new(
@@ -180,9 +187,11 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
     // Owner-only, applied to the opened handle: a broadly readable
     // pre-created sink is tightened rather than trusted, and a sink
     // that cannot be tightened is refused.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let fl = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
         if fl >= 0 {
@@ -215,28 +224,12 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
 
     // Ancestor components must resolve without redirect — a
     // symlink/junction/mount point in the chain would land the sink
-    // outside the operator's directory. Windows has no portable
-    // no-follow component open, so each ancestor is attribute-checked;
-    // the leaf itself is verified on the opened handle below.
-    for anc in path.ancestors().skip(1) {
-        match fs::symlink_metadata(anc) {
-            Ok(m) if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("audit log ancestor '{}' is a reparse point", anc.display()),
-                ));
-            }
-            Ok(m) if !m.is_dir() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("audit log ancestor '{}' is not a directory", anc.display()),
-                ));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-    }
+    // outside the operator's directory. This path-based walk is only
+    // the fast reject: a directory swapped for a junction *between*
+    // the check and the open below is caught by the
+    // `opened_at_literal_path` proof on the handle, which the
+    // spellings can never satisfy through a redirect.
+    crate::fspriv::require_no_reparse_ancestors(path)?;
 
     // `FILE_FLAG_OPEN_REPARSE_POINT` opens a leaf link itself instead
     // of its target, so the attribute check refuses it rather than
@@ -256,6 +249,31 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
             io::ErrorKind::PermissionDenied,
             format!(
                 "audit log '{}' is a link or non-regular entry",
+                path.display()
+            ),
+        ));
+    }
+    // The open must have landed at the literal spelling — an ancestor
+    // swapped for a junction between the walk and the open shows up as
+    // a different real path on the handle.
+    if !crate::fspriv::opened_at_literal_path(&file, path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "audit log '{}' resolved outside its literal path",
+                path.display()
+            ),
+        ));
+    }
+    // A pre-existing sink whose owner is a foreign principal keeps
+    // implicit WRITE_DAC control over the audit record — only an owner
+    // the logging identity itself (or SYSTEM/Administrators) represents
+    // is trusted.
+    if !crate::fspriv::handle_owner_is_trusted(&file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "audit log '{}' is owned by an untrusted principal",
                 path.display()
             ),
         ));

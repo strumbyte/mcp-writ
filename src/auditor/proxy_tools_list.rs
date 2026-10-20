@@ -152,7 +152,7 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if let Some((_id, raw_id)) = shared.held_client_list.lock().await.take() {
-        let response = build_tools_list_error_response(&raw_id, "tools/list did not complete");
+        let response = build_tools_list_error_response(&raw_id);
         write_client_frame(&shared.client_out, &response).await?;
     }
     Ok(())
@@ -287,7 +287,7 @@ where
         )
         .await
         {
-            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            let error_response = build_tools_list_error_response(&id_str);
             write_client_frame(&shared.client_out, &error_response).await?;
         }
         shared.abort_tx.send(true).ok();
@@ -350,7 +350,7 @@ where
         )
         .await
         {
-            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            let error_response = build_tools_list_error_response(&id_str);
             write_client_frame(&shared.client_out, &error_response).await?;
         }
         shared.abort_tx.send(true).ok();
@@ -383,7 +383,7 @@ where
             )
             .await
             {
-                let error_response = build_tools_list_error_response(&id_str, &block_reason);
+                let error_response = build_tools_list_error_response(&id_str);
                 write_client_frame(&shared.client_out, &error_response).await?;
             }
             shared.abort_tx.send(true).ok();
@@ -408,7 +408,7 @@ where
         )
         .await
         {
-            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            let error_response = build_tools_list_error_response(&id_str);
             write_client_frame(&shared.client_out, &error_response).await?;
         }
         shared.abort_tx.send(true).ok();
@@ -466,8 +466,7 @@ where
         // owner just failed, so answer it with the same error shape.
         answer_held_client_list_with_error(shared).await?;
         if let Some(client_id) = st.take_client_id() {
-            let error_response =
-                build_tools_list_error_response(&client_id, "tools/list returned an error");
+            let error_response = build_tools_list_error_response(&client_id);
             write_client_frame(&shared.client_out, &error_response).await?;
         } else if !answered_internal {
             write_client_frame(&shared.client_out, line).await?;
@@ -501,7 +500,7 @@ where
             )
             .await
             {
-                let error_response = build_tools_list_error_response(&id_str, &block_reason);
+                let error_response = build_tools_list_error_response(&id_str);
                 write_client_frame(&shared.client_out, &error_response).await?;
             }
             shared.abort_tx.send(true).ok();
@@ -525,7 +524,7 @@ where
         )
         .await
         {
-            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            let error_response = build_tools_list_error_response(&id_str);
             write_client_frame(&shared.client_out, &error_response).await?;
         }
         shared.abort_tx.send(true).ok();
@@ -564,7 +563,7 @@ where
             )
             .await
             {
-                let error_response = build_tools_list_error_response(&id_str, &block_reason);
+                let error_response = build_tools_list_error_response(&id_str);
                 write_client_frame(&shared.client_out, &error_response).await?;
             }
             shared.abort_tx.send(true).ok();
@@ -721,7 +720,7 @@ where
         )
         .await
         {
-            let error_response = build_tools_list_error_response(&emit_id, &block_reason);
+            let error_response = build_tools_list_error_response(&emit_id);
             write_client_frame(&shared.client_out, &error_response).await?;
         }
         shared.abort_tx.send(true).ok();
@@ -756,7 +755,7 @@ where
             )
             .await
             {
-                let error_response = build_tools_list_error_response(&emit_id, &block_reason);
+                let error_response = build_tools_list_error_response(&emit_id);
                 write_client_frame(&shared.client_out, &error_response).await?;
             }
             shared.abort_tx.send(true).ok();
@@ -819,8 +818,28 @@ where
         digest_changed = changed;
         // Publish a new verified generation before the busy gate drops:
         // a tools/call admitted under the prior generation sees the
-        // mismatch at its pre-write recheck and unwinds.
-        shared.list_generation.fetch_add(1, Ordering::SeqCst);
+        // mismatch at its pre-write recheck and unwinds. The advertised
+        // name set moves with the counter under one lock — the pair is
+        // the object `tools/call` authorization binds to, so a tool the
+        // verified listing omitted loses its channel on this bump even
+        // when the static policy names it.
+        let next = {
+            // A poisoned mutex still holds the generation/name pair —
+            // recovering the guard keeps the S2C task alive instead of
+            // panicking the forwarding path on a sibling task's panic.
+            let mut vt = shared
+                .verified_tools
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            vt.generation += 1;
+            vt.names = if shared.dry_run {
+                tools_to_verify.iter().map(|t| t.name.clone()).collect()
+            } else {
+                visible.iter().map(|t| t.name.clone()).collect()
+            };
+            vt.generation
+        };
+        shared.list_generation.store(next, Ordering::SeqCst);
         if changed {
             tracing::debug!(hash = verified_digest, "tools/list last_verified updated");
         }
@@ -993,6 +1012,12 @@ mod tests {
             held_client_list: Arc::new(Mutex::new(None)),
             internal_list_failure: Arc::new(tokio::sync::Mutex::new(None)),
             list_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            verified_tools: Arc::new(std::sync::Mutex::new(
+                crate::auditor::proxy_state::VerifiedToolSet {
+                    generation: 0,
+                    names: std::collections::HashSet::new(),
+                },
+            )),
             last_list_template: Arc::new(Mutex::new(String::new())),
             next_internal_id: Arc::new(std::sync::atomic::AtomicU64::new(910_001)),
             abort_tx,

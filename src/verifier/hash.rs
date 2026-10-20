@@ -70,6 +70,15 @@ pub fn hash_file(path: &Path) -> io::Result<String> {
     hash_open_file(&mut std::fs::File::open(path)?)
 }
 
+/// `sha256:<hex>` of an already-materialized buffer — binds a pin to the
+/// bytes analysis actually consumed, so a workload swapped between
+/// inspection and hashing can never pin content the analysis never saw.
+pub(crate) fn hash_bytes(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format_sha256(hasher.finalize())
+}
+
 /// Format digest bytes as `sha256:<lowercase hex>`.
 /// sha2 0.11's `Output<Sha256>` no longer implements `LowerHex`.
 pub(crate) fn format_sha256(digest: impl AsRef<[u8]>) -> String {

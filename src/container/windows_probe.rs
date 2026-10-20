@@ -75,18 +75,20 @@ pub enum ProbeOutcome {
     Answered(String),
 }
 
-/// A diagnostics override resolves only to an *absolute* existing
-/// file — the fail-closed reading of a security-sensitive pin: a
-/// relative or dangling override reports absent, never a PATH or
-/// install-dir fall-through.
+/// A diagnostics override resolves only through the same contract a
+/// trusted driver resolution does — absolute, canonical, regular, and
+/// replaceable by no untrusted principal ([`validate_driver_path`]).
+/// The environment variable authenticates *intent* (someone set it),
+/// not *the target*: an arbitrary planted path is reported absent,
+/// never run.
 fn override_exe(env_var: &str) -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os(env_var)?);
-    (path.is_absolute() && path.is_file()).then_some(path)
+    crate::trusted_path::validate_driver_path(&path).ok()
 }
 
 /// Resolve an OS-owned probe helper to a trusted absolute path: the
 /// diagnostics override when set, else the first of `candidates` that
-/// exists — admin-writable install roots and `System32` spellings
+/// validates — admin-writable install roots and `System32` spellings
 /// only, never PATH or the current directory. A helper found through
 /// caller-mutable search order would run with the launcher's host
 /// authority before any sandbox exists, so a PATH shadow is worth
@@ -96,7 +98,9 @@ fn helper_exe(env_var: &str, candidates: Vec<PathBuf>) -> Option<PathBuf> {
     if std::env::var_os(env_var).is_some() {
         return override_exe(env_var);
     }
-    candidates.into_iter().find(|p| p.is_file())
+    candidates
+        .into_iter()
+        .find(|p| crate::trusted_path::validate_driver_path(p).is_ok())
 }
 
 /// The `wsl.exe` binary — `MCP_WRIT_WSL_EXE` overrides for fixtures;
@@ -707,15 +711,18 @@ mod tests {
         let _env = crate::warden::lock_process_env();
         // A set override naming a missing file reads as absent — never
         // a fall-through to a real install location.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(WSLC_EXE_ENV, r"C:\definitely-not-present\wslc.exe");
         }
         assert!(find_wslc().is_none());
         // A relative override is absent too — never a cwd/PATH lookup.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(WSLC_EXE_ENV, "wslc.exe");
         }
         assert!(find_wslc().is_none());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var(WSLC_EXE_ENV);
         }
@@ -735,11 +742,13 @@ mod tests {
         let old_pf = std::env::var_os("ProgramFiles");
         let mut split: Vec<PathBuf> = std::env::split_paths(&old_path).collect();
         split.insert(0, path_dir.path().to_path_buf());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("PATH", std::env::join_paths(&split).unwrap());
             std::env::set_var("ProgramFiles", pf.path());
         }
         assert!(find_wslc().is_none());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("PATH", &old_path);
             match old_pf {
@@ -760,11 +769,25 @@ mod tests {
         std::fs::create_dir_all(&wsl_dir).unwrap();
         let exe = wsl_dir.join("wslc.exe");
         std::fs::write(&exe, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            // Trusted resolution requires the executable bit — a
+            // resolved helper is a runnable image, not a data file.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let old_pf = std::env::var_os("ProgramFiles");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("ProgramFiles", pf.path());
         }
-        assert_eq!(find_wslc().as_deref(), Some(exe.as_path()));
+        // Validation returns the canonical spelling — tempdirs may sit
+        // behind a symlinked component (macOS /var → /private/var).
+        assert_eq!(
+            find_wslc().as_deref(),
+            Some(exe.canonicalize().unwrap().as_path())
+        );
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             match old_pf {
                 Some(v) => std::env::set_var("ProgramFiles", v),

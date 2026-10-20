@@ -51,6 +51,10 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     let (engine_name, engine) = resolve_engine_for_build(options.engine)
         .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
     let metadata = inspect_image(engine.as_ref(), &options.image).await?;
+    // Inherited ONBUILD triggers would execute inside the wrapper build —
+    // where the staged runner and bound policy are readable context — so
+    // a base carrying any is refused before anything is staged or emitted.
+    crate::container::inspect::refuse_inherited_onbuild(&metadata, &options.image)?;
     // Bind the base to the inspected object: `repo@<digest>` when the
     // registry records one, the engine's immutable image id otherwise —
     // and refuse when neither exists rather than emitting a `FROM` that
@@ -388,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_output_dockerfile_write() {
-        let dir = std::env::temp_dir().join("mcp_writ_test_output_df");
+        let dir = std::env::temp_dir().join("mcp_writ_test_output_df"); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         let _ = std::fs::create_dir_all(&dir);
         let output_path = dir.join("Dockerfile.test");
 

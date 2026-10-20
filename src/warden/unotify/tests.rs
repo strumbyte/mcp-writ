@@ -10,7 +10,7 @@ use super::filter::{
 };
 use super::grants::{Grants, parse_snapshot, unix_secs_now};
 use super::handoff::{UnotifyParent, install_listener, send_listener};
-use super::inspect::{SockTarget, inspect_sockaddr, parse_sockaddr};
+use super::inspect::{SockTarget, inspect_sockaddr, parse_sockaddr, unix_sockaddr_is_pathname};
 use super::notif::{
     emulate_connect, notif_resp_continue, notif_resp_error, notif_resp_result, notify_recv,
     notify_send,
@@ -289,18 +289,44 @@ fn sockaddr_decode_v4_v6_mapped_and_other() {
         }
         other => panic!("expected inet, got {other:?}"),
     }
-    // AF_UNIX → OtherFamily.
+    // AF_UNIX → OtherFamily, and the sockaddr bytes stay pinned: the
+    // non-INET connect is emulated on the dup'd object with exactly
+    // these bytes, never `CONTINUE`d into a re-read of child memory.
     let mut su = [0u8; 8];
     su[0..2].copy_from_slice(&(libc::AF_UNIX as u16).to_ne_bytes());
-    assert!(matches!(
-        parse_sockaddr(&su, 8),
-        SockTarget::OtherFamily { .. }
-    ));
+    su[2..8].copy_from_slice(b"/s/ock");
+    match parse_sockaddr(&su, 8) {
+        SockTarget::OtherFamily { raw, .. } => assert_eq!(&raw[..], &su[..]),
+        other => panic!("expected other-family, got {other:?}"),
+    }
     // Truncated sockaddr_in → fail-closed unreadable.
     assert!(matches!(
         parse_sockaddr(&sa[..8], 8),
         SockTarget::Unreadable { .. }
     ));
+}
+
+#[test]
+fn unix_pathname_sockaddr_is_flagged() {
+    // Pathname AF_UNIX — `sun_path[0] != 0` — must be denied rather
+    // than supervisor-emulated (the path resolves in the caller's
+    // mount namespace, not the supervisor's).
+    let mut su = [0u8; 8];
+    su[0..2].copy_from_slice(&(libc::AF_UNIX as u16).to_ne_bytes());
+    su[2..8].copy_from_slice(b"/s/ock");
+    assert!(unix_sockaddr_is_pathname(libc::AF_UNIX as u16, &su));
+
+    // Abstract (`\0`-prefixed) and unnamed (`addrlen == 2`) unix
+    // addresses resolve in the socket's netns — emulation-safe.
+    su[2] = 0;
+    assert!(!unix_sockaddr_is_pathname(libc::AF_UNIX as u16, &su));
+    assert!(!unix_sockaddr_is_pathname(libc::AF_UNIX as u16, &su[..2]));
+
+    // Other families never resolve a filesystem path.
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+    sa[2] = b'/';
+    assert!(!unix_sockaddr_is_pathname(libc::AF_INET as u16, &sa));
 }
 
 #[test]
@@ -393,6 +419,7 @@ fn live_notification_round_trip() {
     }
     let mut pair = [0 as RawFd; 2];
     assert_eq!(
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::socketpair(
                 libc::AF_UNIX,
@@ -403,13 +430,16 @@ fn live_notification_round_trip() {
         },
         0
     );
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);
     if pid == 0 {
         // Filter install needs no_new_privs (or CAP_SYS_ADMIN) —
         // report an nnp refusal identifiably rather than letting
         // install_listener fail opaquely.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::send(pair[0], &b'N' as *const u8 as *const libc::c_void, 1, 0);
                 libc::_exit(0);
@@ -418,16 +448,21 @@ fn live_notification_round_trip() {
         let program = notify_program(&[CONNECT_NR]).unwrap();
         let listener = install_listener(&program).expect("install");
         send_listener(pair[0], listener).expect("handoff");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(listener) };
         // Trigger: connect to the discard port on loopback.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(s >= 0);
         let mut sa = [0u8; 16];
         sa[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
         sa[2..4].copy_from_slice(&9u16.to_be_bytes());
         sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rc = unsafe { libc::connect(s, sa.as_ptr().cast(), 16) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let errno = unsafe { *libc::__errno_location() };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(s) };
         // connect ran (refused is expected) — ENOSYS would mean the
         // notification killed it.
@@ -436,12 +471,15 @@ fn live_notification_round_trip() {
         } else {
             b'R'
         };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::send(pair[0], &byte as *const u8 as *const libc::c_void, 1, 0);
             libc::_exit(0);
         }
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(pair[0]) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let sock = unsafe { File::from_raw_fd(pair[1]) };
     let listener = (UnotifyParent {
         sock: sock.try_clone().unwrap(),
@@ -470,11 +508,13 @@ fn live_notification_round_trip() {
     notify_send(listener.as_raw_fd(), &resp).expect("CONTINUE send");
     let mut byte = [0u8; 1];
     assert_eq!(
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
         1
     );
     assert_eq!(byte[0], b'R');
     let mut status = 0;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::waitpid(pid, &mut status, 0) };
 }
 
@@ -487,6 +527,7 @@ fn denied_connect_gets_eacces() {
     }
     let mut pair = [0 as RawFd; 2];
     assert_eq!(
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::socketpair(
                 libc::AF_UNIX,
@@ -497,12 +538,15 @@ fn denied_connect_gets_eacces() {
         },
         0
     );
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);
     if pid == 0 {
         // Same nnp precondition as the round-trip child — report a
         // refusal identifiably instead of an opaque install error.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::send(pair[0], &b'N' as *const u8 as *const libc::c_void, 1, 0);
                 libc::_exit(0);
@@ -511,27 +555,35 @@ fn denied_connect_gets_eacces() {
         let program = notify_program(&[CONNECT_NR]).unwrap();
         let listener = install_listener(&program).expect("install");
         send_listener(pair[0], listener).expect("handoff");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(listener) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(s >= 0);
         let mut sa = [0u8; 16];
         sa[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
         sa[2..4].copy_from_slice(&9u16.to_be_bytes());
         sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rc = unsafe { libc::connect(s, sa.as_ptr().cast(), 16) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let errno = unsafe { *libc::__errno_location() };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(s) };
         let byte = if rc < 0 && errno == libc::EACCES {
             b'D' // denied as designed
         } else {
             b'X'
         };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::send(pair[0], &byte as *const u8 as *const libc::c_void, 1, 0);
             libc::_exit(0);
         }
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(pair[0]) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let sock = unsafe { File::from_raw_fd(pair[1]) };
     let listener = (UnotifyParent {
         sock: sock.try_clone().unwrap(),
@@ -552,11 +604,13 @@ fn denied_connect_gets_eacces() {
     .expect("deny send");
     let mut byte = [0u8; 1];
     assert_eq!(
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
         1
     );
     assert_eq!(byte[0], b'D');
     let mut status = 0;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::waitpid(pid, &mut status, 0) };
 }
 
@@ -595,15 +649,19 @@ fn emulated_connect_uses_pinned_sockaddr() {
 /// retries identically.
 fn emulated_connect_attempt() -> bool {
     // Loopback listener: the pinned sockaddr's destination.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let srv = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
     assert!(srv >= 0);
     let mut sa = [0u8; 16];
     sa[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
     sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     assert_eq!(unsafe { libc::bind(srv, sa.as_ptr().cast(), 16) }, 0);
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     assert_eq!(unsafe { libc::listen(srv, 4) }, 0);
     let mut got_len: libc::socklen_t = 16;
     assert_eq!(
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::getsockname(srv, sa.as_mut_ptr().cast(), &mut got_len) },
         0
     );
@@ -612,6 +670,7 @@ fn emulated_connect_attempt() -> bool {
 
     // Shared page the child's connect() reads its sockaddr from; the
     // rewriter process flips it mid-notification.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let page = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -624,6 +683,7 @@ fn emulated_connect_attempt() -> bool {
     };
     assert_ne!(page, libc::MAP_FAILED);
     let page = page.cast::<u8>();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let write_sa = |port: u16| unsafe {
         std::ptr::write_bytes(page, 0, 16);
         std::ptr::copy_nonoverlapping((libc::AF_INET as u16).to_ne_bytes().as_ptr(), page, 2);
@@ -636,6 +696,7 @@ fn emulated_connect_attempt() -> bool {
     let mut trig = [0 as RawFd; 2];
     for pair in [&mut res, &mut trig] {
         assert_eq!(
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::socketpair(
                     libc::AF_UNIX,
@@ -647,12 +708,17 @@ fn emulated_connect_attempt() -> bool {
             0
         );
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);
     if pid == 0 {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(res[1]) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(trig[1]) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::send(res[0], &b'N' as *const u8 as *const libc::c_void, 1, 0);
                 libc::_exit(0);
@@ -661,35 +727,47 @@ fn emulated_connect_attempt() -> bool {
         let program = notify_program(&[CONNECT_NR]).unwrap();
         let listener = install_listener(&program).expect("install");
         send_listener(res[0], listener).expect("handoff");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(listener) };
         // Rewriter: waits for the supervisor's trigger, then flips the
         // shared sockaddr to 127.0.0.1:1 (guaranteed refused) — the
         // window a CONTINUE answer would expose.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rw = unsafe { libc::fork() };
         assert!(rw >= 0);
         if rw == 0 {
             let mut b = [0u8; 1];
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::recv(trig[0], b.as_mut_ptr().cast(), 1, 0) };
             write_sa(1);
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::_exit(0) };
         }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(trig[0]) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(s >= 0);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rc = unsafe { libc::connect(s, page.cast::<libc::sockaddr>(), 16) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let errno = unsafe { *libc::__errno_location() };
         let byte = if rc == 0 {
             b'S'
         } else {
             errno.to_le_bytes()[0]
         };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::send(res[0], &byte as *const u8 as *const libc::c_void, 1, 0);
             libc::_exit(0);
         }
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(res[0]) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(trig[0]) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let sock = unsafe { File::from_raw_fd(res[1]) };
     let listener = (UnotifyParent {
         sock: sock.try_clone().unwrap(),
@@ -711,6 +789,7 @@ fn emulated_connect_attempt() -> bool {
     // only reaches it via EOF — then kill any survivor, reap it, and
     // release this attempt's resources. The `sock` and `listener`
     // Files close on scope exit.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let reap = |pid: libc::pid_t| unsafe {
         let _ = libc::send(trig[1], &b'X' as *const u8 as *const libc::c_void, 1, 0);
         libc::kill(pid, libc::SIGKILL);
@@ -736,6 +815,7 @@ fn emulated_connect_attempt() -> bool {
     };
     // Let the rewriter clobber the child's buffer *after* inspection.
     assert_eq!(
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::send(trig[1], &b'X' as *const u8 as *const libc::c_void, 1, 0) },
         1
     );
@@ -763,6 +843,7 @@ fn emulated_connect_attempt() -> bool {
         Err(e) => panic!("result send: {e}"),
     }
     let mut byte = [0u8; 1];
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) } != 1 {
         reap(pid);
         return false;
@@ -771,9 +852,13 @@ fn emulated_connect_attempt() -> bool {
     // rewrite (CONTINUE would have returned ECONNREFUSED here).
     assert_eq!(byte[0], b'S');
     let mut status = 0;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::waitpid(pid, &mut status, 0) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(srv) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(trig[1]) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::munmap(page.cast(), 4096) };
     true
 }
@@ -787,6 +872,7 @@ fn emulated_connect_propagates_errno() {
     }
     let mut pair = [0 as RawFd; 2];
     assert_eq!(
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::socketpair(
                 libc::AF_UNIX,
@@ -797,10 +883,13 @@ fn emulated_connect_propagates_errno() {
         },
         0
     );
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);
     if pid == 0 {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::send(pair[0], &b'N' as *const u8 as *const libc::c_void, 1, 0);
                 libc::_exit(0);
@@ -809,7 +898,9 @@ fn emulated_connect_propagates_errno() {
         let program = notify_program(&[CONNECT_NR]).unwrap();
         let listener = install_listener(&program).expect("install");
         send_listener(pair[0], listener).expect("handoff");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(listener) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(s >= 0);
         // 127.0.0.1:1 — nothing listens; ECONNREFUSED.
@@ -817,19 +908,24 @@ fn emulated_connect_propagates_errno() {
         sa[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
         sa[2..4].copy_from_slice(&1u16.to_be_bytes());
         sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rc = unsafe { libc::connect(s, sa.as_ptr().cast(), 16) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let errno = unsafe { *libc::__errno_location() };
         let byte = if rc < 0 && errno == libc::ECONNREFUSED {
             b'R'
         } else {
             b'X'
         };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::send(pair[0], &byte as *const u8 as *const libc::c_void, 1, 0);
             libc::_exit(0);
         }
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(pair[0]) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let sock = unsafe { File::from_raw_fd(pair[1]) };
     let listener = (UnotifyParent {
         sock: sock.try_clone().unwrap(),
@@ -853,10 +949,12 @@ fn emulated_connect_propagates_errno() {
     notify_send(listener.as_raw_fd(), &notif_resp_error(notif.id, errno)).expect("errno send");
     let mut byte = [0u8; 1];
     assert_eq!(
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
         1
     );
     assert_eq!(byte[0], b'R');
     let mut status = 0;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::waitpid(pid, &mut status, 0) };
 }

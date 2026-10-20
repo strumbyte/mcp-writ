@@ -241,8 +241,14 @@ pub(crate) fn client_facing_id<'a>(
     }
 }
 
-pub(crate) fn build_tools_list_error_response(id_raw: &str, diff_output: &str) -> String {
-    let message = format!("tools/list verification failed: {diff_output}");
+/// The client-facing `tools/list` failure. The message is a constant:
+/// the real reason can carry server-advertised tool names — including
+/// tools the policy hides from this client — and internal verification
+/// detail neither belongs on the wire nor is needed there (the caller
+/// records it to the audit channel through `internal_list_failure` /
+/// the verification-failed error).
+pub(crate) fn build_tools_list_error_response(id_raw: &str) -> String {
+    let message = "tools/list verification failed";
     let id_literal = RawLiteral(id_raw.to_string());
     let result = nojson::object(|f| {
         f.member("jsonrpc", "2.0")?;
@@ -251,7 +257,7 @@ pub(crate) fn build_tools_list_error_response(id_raw: &str, diff_output: &str) -
             "error",
             nojson::object(|ef| {
                 ef.member("code", POLICY_VIOLATION_ERROR_CODE)?;
-                ef.member("message", message.as_str())
+                ef.member("message", message)
             }),
         )
     });
@@ -1229,10 +1235,12 @@ mod tests {
 
     #[test]
     fn test_build_tools_list_error_response() {
-        let resp = build_tools_list_error_response("42", "hash mismatch detected");
+        let resp = build_tools_list_error_response("42");
         assert!(resp.contains(r#""id":42"#));
         assert!(resp.contains(r#""code":-32001"#));
-        assert!(resp.contains("tools/list verification failed: hash mismatch detected"));
+        // The wire message is a fixed string — the real reason (which
+        // can carry hidden tool names) is audit-only.
+        assert!(resp.contains("tools/list verification failed"));
     }
 
     #[test]
@@ -1243,12 +1251,15 @@ mod tests {
             input_schema: None,
             ..Default::default()
         }];
-        let reason = crate::verifier::manifest::first_seen_blocks(&tools)
+        let _reason = crate::verifier::manifest::first_seen_blocks(&tools)
             .expect("CC-001 must block first-seen scan");
-        let resp = build_tools_list_error_response("1", &reason);
+        let resp = build_tools_list_error_response("1");
         assert!(resp.contains("\"error\""));
         assert!(!resp.contains("\"result\""));
-        assert!(resp.contains("CC-001"));
+        // The blocked tool's name and the rule detail must not reach
+        // the client-facing error.
+        assert!(!resp.contains("helper"));
+        assert!(!resp.contains("CC-001"));
     }
 
     #[test]
@@ -1262,12 +1273,13 @@ mod tests {
             ),
             ..Default::default()
         }];
-        let reason = crate::verifier::manifest::first_seen_blocks(&tools)
+        let _reason = crate::verifier::manifest::first_seen_blocks(&tools)
             .expect("CC-005 must block first-seen scan");
-        let resp = build_tools_list_error_response("7", &reason);
+        let resp = build_tools_list_error_response("7");
         assert!(resp.contains("\"error\""));
         assert!(!resp.contains("\"result\""));
-        assert!(resp.contains("CC-005"));
+        assert!(!resp.contains("send"));
+        assert!(!resp.contains("CC-005"));
     }
 
     #[test]
@@ -1282,12 +1294,13 @@ mod tests {
             ),
             ..Default::default()
         }];
-        let reason = crate::verifier::manifest::first_seen_blocks(&tools)
+        let _reason = crate::verifier::manifest::first_seen_blocks(&tools)
             .expect("CC-011 must block first-seen scan");
-        let resp = build_tools_list_error_response("11", &reason);
+        let resp = build_tools_list_error_response("11");
         assert!(resp.contains("\"error\""));
         assert!(!resp.contains("\"result\""));
-        assert!(resp.contains("CC-011"));
+        assert!(!resp.contains("helper"));
+        assert!(!resp.contains("CC-011"));
     }
 
     #[test]

@@ -347,15 +347,17 @@ fn namespaced_socketpair_denies_unix_datagram_escape() {
         .collect();
     let program = compile_seccomp_inner_namespaced(&policy, false).unwrap();
 
-    let dir = std::env::temp_dir().join(format!("mcp-writ-sp-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("mcp-writ-sp-{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     std::fs::create_dir_all(&dir).unwrap();
     let sock_path = dir.join("listener.sock");
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let listener = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
     assert!(
         listener >= 0,
         "listener socket: {}",
         std::io::Error::last_os_error()
     );
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     use std::os::unix::ffi::OsStrExt;
@@ -364,6 +366,7 @@ fn namespaced_socketpair_denies_unix_datagram_escape() {
     for (d, &b) in addr.sun_path.iter_mut().zip(path_bytes) {
         *d = b as libc::c_char;
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe {
         libc::bind(
             listener,
@@ -373,18 +376,22 @@ fn namespaced_socketpair_denies_unix_datagram_escape() {
     };
     assert_eq!(rc, 0, "bind listener: {}", std::io::Error::last_os_error());
 
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
     if pid == 0 {
         let _ = set_no_new_privs();
         if apply_seccomp_program(&program).is_err() {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::_exit(90) };
         }
         let mut sv = [-1i32; 2];
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sv.as_mut_ptr()) } == 0 {
             // The pair exists — the escape is open; prove the harm
             // by delivering a datagram to the host pathname, then
             // report failure.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::sendto(
                     sv[0],
@@ -398,18 +405,23 @@ fn namespaced_socketpair_denies_unix_datagram_escape() {
             }
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::_exit(92) };
         }
         // Connection-bound pairs stay usable — the pin is the
         // datagram type, not the family.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::_exit(93) };
         }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::_exit(0) };
     }
     let mut status = 0i32;
     let mut done = false;
     for _ in 0..50 {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if r == pid {
             done = true;
@@ -418,6 +430,7 @@ fn namespaced_socketpair_denies_unix_datagram_escape() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     if !done {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::kill(pid, libc::SIGKILL);
             libc::waitpid(pid, &mut status, 0);
@@ -441,7 +454,9 @@ fn namespaced_socketpair_denies_unix_datagram_escape() {
         events: libc::POLLIN,
         revents: 0,
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(listener) };
     assert_eq!(
         n, 0,

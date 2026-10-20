@@ -835,11 +835,10 @@ async fn hyperv_vm_stdio_session() {
             "{\"path\":\"C:/writ-deny/evil.txt\",\"content\":\"x\"}",
         ),
         // AppContainer capability: the policy grants no network caps.
-        (
-            8,
-            "net_probe",
-            "{\"addr\":\"192.0.2.1:80\",\"path\":\"C:/workspace\"}",
-        ),
+        // `addr` is omitted — the probe defaults to 192.0.2.1:80 —
+        // because a `read_only` tool carrying a host/URL argument is
+        // refused by the auditor before the capability check can engage.
+        (8, "net_probe", "{\"path\":\"C:/workspace\"}"),
         // Descendant creation under the warden's launch conditions.
         (9, "spawn_child", "{\"path\":\"C:/workspace\"}"),
         (10, "env_probe", "{\"path\":\"C:/workspace\"}"),
@@ -1716,11 +1715,10 @@ async fn run_image_hyperv_stdio_session() {
             "{\"path\":\"C:/writ-deny/evil.txt\",\"content\":\"x\"}",
         ),
         // AppContainer capability deny — no network SIDs granted.
-        (
-            6,
-            "net_probe",
-            "{\"addr\":\"192.0.2.1:80\",\"path\":\"C:/Windows/Temp\"}",
-        ),
+        // `addr` is omitted — the probe defaults to 192.0.2.1:80 —
+        // because a `read_only` tool carrying a host/URL argument is
+        // refused by the auditor before the capability check can engage.
+        (6, "net_probe", "{\"path\":\"C:/Windows/Temp\"}"),
         (7, "env_probe", "{\"path\":\"C:/Windows/Temp\"}"),
         // Auditor tool gate.
         (8, "exec_shell", "{\"cmd\":\"id\"}"),

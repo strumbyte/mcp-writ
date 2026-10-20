@@ -990,6 +990,7 @@ async fn test_audit_sink_refuses_fifo() {
     let dir = make_test_dir("audit_sink_fifo");
     let path = dir.join("audit.jsonl");
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
 
     let result = AuditLogger::to_file(&path);

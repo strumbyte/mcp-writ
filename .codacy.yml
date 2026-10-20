@@ -1,0 +1,6 @@
+---
+# tests/fixtures/ contains intentionally insecure analyzer fixtures
+# (py_mcp/js_mcp detection samples, probe servers, golden binaries) —
+# not production code, so exclude the whole tree from analysis.
+exclude_paths:
+  - "tests/fixtures/**"

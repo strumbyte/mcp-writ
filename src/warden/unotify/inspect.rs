@@ -28,9 +28,14 @@ pub(super) enum SockTarget {
         port: u16,
         raw: Box<[u8]>,
     },
-    /// A non-INET family (`AF_UNIX`, …) — out of this layer's scope;
-    /// continued unsupervised, counted, documented.
-    OtherFamily { family: u16 },
+    /// A non-INET family (`AF_UNIX`, …) — out of this layer's
+    /// destination-gating scope. `raw` still carries the pinned
+    /// sockaddr bytes: a `CONTINUE` answer would re-resolve the child's
+    /// *fd number* at resume time, and a sibling could `dup2` an INET
+    /// socket into the slot between the `SO_DOMAIN` check and the
+    /// resumed connect — so the connect is emulated on the dup'd
+    /// object exactly like an allowed INET one, never continued.
+    OtherFamily { family: u16, raw: Box<[u8]> },
     /// The `sockaddr` could not be read or decoded — fail closed.
     Unreadable { detail: &'static str },
 }
@@ -90,7 +95,10 @@ pub(super) fn parse_sockaddr(bytes: &[u8], addrlen: u64) -> SockTarget {
                 raw: bytes.into(),
             }
         }
-        _ => SockTarget::OtherFamily { family },
+        _ => SockTarget::OtherFamily {
+            family,
+            raw: bytes.into(),
+        },
     }
 }
 
@@ -135,6 +143,7 @@ pub(super) fn socket_domain(pid: u32, fd: u64) -> SockDomain {
     let mut dom = 0 as libc::c_int;
     let mut len = size_of::<libc::c_int>() as libc::socklen_t;
     // Safety: `dom`/`len` are live out-buffers for getsockopt.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe {
         libc::getsockopt(
             dup,
@@ -144,6 +153,7 @@ pub(super) fn socket_domain(pid: u32, fd: u64) -> SockDomain {
             &mut len,
         )
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(dup) };
     if rc != 0 {
         return SockDomain::Unknown;
@@ -154,16 +164,30 @@ pub(super) fn socket_domain(pid: u32, fd: u64) -> SockDomain {
     }
 }
 
+/// True when `raw` pins an `AF_UNIX` sockaddr carrying a filesystem
+/// pathname — `sun_path[0] != 0` (the byte after `sa_family`). A
+/// pathname resolves in the *caller's* mount namespace, so emulating
+/// the connect on a dup'd fd would bind the supervisor's view of that
+/// path, not the child's. Abstract (`sun_path[0] == 0`) and unnamed
+/// unix addresses resolve in the socket's own network namespace —
+/// carried by the dup'd object — and stay emulation-safe.
+pub(super) fn unix_sockaddr_is_pathname(family: u16, raw: &[u8]) -> bool {
+    family as i32 == libc::AF_UNIX && raw.get(2).is_some_and(|b| *b != 0)
+}
+
 /// `pidfd_open` + `pidfd_getfd` duplicate of the child's fd — the dup
 /// refers to the same file description, so its getsockopt answers the
 /// child's socket's real attributes.
 fn dup_child_fd(pid: u32, fd: u64) -> Option<libc::c_int> {
     // Safety: syscall args are scalars.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if pidfd < 0 {
         return None;
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd as libc::c_int, 0) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(pidfd as libc::c_int) };
     (dup >= 0).then_some(dup as libc::c_int)
 }
@@ -196,6 +220,7 @@ pub(super) fn socket_proto(pid: u32, fd: u64) -> SockProto {
     let mut ty = 0 as libc::c_int;
     let mut len = size_of::<libc::c_int>() as libc::socklen_t;
     // Safety: `ty`/`len` are live out-buffers for getsockopt.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe {
         libc::getsockopt(
             dup,
@@ -205,6 +230,7 @@ pub(super) fn socket_proto(pid: u32, fd: u64) -> SockProto {
             &mut len,
         )
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(dup) };
     if rc != 0 {
         return SockProto::Unknown;

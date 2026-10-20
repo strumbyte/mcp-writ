@@ -667,7 +667,7 @@ mod tests {
         // A destination already spelled `x.tmp` must not collide with
         // its own temp path — the temp name is a suffix on the whole
         // name (`x.tmp.tmp`), never a replacement extension.
-        let dir = std::env::temp_dir()
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
             .join("mcp_writ_test")
             .join(format!("export_tmp_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

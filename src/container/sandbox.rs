@@ -182,7 +182,7 @@ fn prepare(
     }
     let runtime = match &options.runtime_dir {
         Some(p) => local_directory(p)?,
-        None => std::env::current_exe()
+        None => std::env::current_exe() // nosemgrep: rust.lang.security.current-exe.current-exe
             .map_err(|e| e.to_string())?
             .parent()
             .ok_or("CLI directory missing")?
@@ -949,6 +949,7 @@ mod tests {
         std::fs::write(&source, synthetic_pe()).unwrap();
 
         // A pin naming some other release's bytes refuses this file.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("MCP_WRIT_WSB_RUNNER_SHA256", "f".repeat(64));
         }
@@ -963,6 +964,7 @@ mod tests {
 
         // The correct pin passes.
         let digest = crate::container::common::sha256_hex(&synthetic_pe());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("MCP_WRIT_WSB_RUNNER_SHA256", &digest);
         }
@@ -973,6 +975,7 @@ mod tests {
             "MCP_WRIT_WSB_RUNNER_SHA256",
         )
         .unwrap();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var("MCP_WRIT_WSB_RUNNER_SHA256");
         }

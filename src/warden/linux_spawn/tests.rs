@@ -88,6 +88,7 @@ fn apply_record_round_trips_through_the_shared_page() {
 
     // Simulate the child-side writers through the shared pointer —
     // the same atomic stores apply_in_child performs.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let page = unsafe { &*(record.child_ptr() as *const ApplyRecordPage) };
     page.landlock_abi.store(1, Ordering::Relaxed);
     page.landlock
@@ -239,6 +240,7 @@ fn seal_ambient_fds_flags_everything_except_keep() {
     use std::os::unix::io::AsRawFd;
     let spare = std::fs::File::open("/dev/null").expect("/dev/null");
     let spare_fd = spare.as_raw_fd();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let mut p = [0i32; 2];
         assert_eq!(libc::pipe(p.as_mut_ptr()), 0);

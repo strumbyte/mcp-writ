@@ -59,7 +59,7 @@ fn fixture() -> PathBuf {
 /// inspection (next run truncates it).
 fn workdir(tag: &str) -> PathBuf {
     let dir =
-        std::env::temp_dir().join(format!("mcp-writ-ebpf-e2e-{}-{}", std::process::id(), tag));
+        std::env::temp_dir().join(format!("mcp-writ-ebpf-e2e-{}-{}", std::process::id(), tag)); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
