@@ -222,23 +222,22 @@ mod imp {
                 std::process::exit(1);
             }
         }
-        if let Some(ref report) = args.report {
-            if let Some(conflict) =
+        if let Some(ref report) = args.report
+            && let Some(conflict) =
                 crate::audit_log::report_write_conflict(launch_write_grants.iter().cloned(), report)
-            {
-                let detail = format!("refusing --report '{}': {conflict}", report.display());
-                eprintln!("Error: {detail}");
-                write_report(
-                    "failed",
-                    Some(&detail),
-                    Some(&policy),
-                    policy_context.as_ref(),
-                    None,
-                    &[],
-                );
-                lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
-                std::process::exit(1);
-            }
+        {
+            let detail = format!("refusing --report '{}': {conflict}", report.display());
+            eprintln!("Error: {detail}");
+            write_report(
+                "failed",
+                Some(&detail),
+                Some(&policy),
+                policy_context.as_ref(),
+                None,
+                &[],
+            );
+            lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
+            std::process::exit(1);
         }
 
         let trace_level = if args.verbose > 0 {

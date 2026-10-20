@@ -320,17 +320,15 @@ async fn real_main() {
             std::process::exit(1);
         }
     }
-    if let Some(ref report) = args.report {
-        if let Some(conflict) =
+    if let Some(ref report) = args.report
+        && let Some(conflict) =
             mcp_writ::audit_log::report_write_conflict(launch_write_grants.iter().cloned(), report)
-        {
-            let detail = format!("refusing --report '{}': {conflict}", report.display());
-            eprintln!("Error: {detail}");
-            write_prelaunch_failure(detail.clone(), policy_context.clone());
-            lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail)
-                .await;
-            std::process::exit(1);
-        }
+    {
+        let detail = format!("refusing --report '{}': {conflict}", report.display());
+        eprintln!("Error: {detail}");
+        write_prelaunch_failure(detail.clone(), policy_context.clone());
+        lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail).await;
+        std::process::exit(1);
     }
 
     // 4. Initialize tracing based on verbosity or policy.logging.level
