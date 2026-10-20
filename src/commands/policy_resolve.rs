@@ -2,7 +2,7 @@
 //!
 //! Loads a KDL policy exactly the way a launch does — `extends`,
 //! `include`, and matching `when` blocks resolved — then prints the
-//! effective document via [`Policy::to_kdl`] together with the
+//! effective document via [`Policy::to_kdl`](crate::policy::Policy::to_kdl) together with the
 //! provenance the load recorded: for every field the composition
 //! wrote, which file wrote it and what the write did
 //! (`set`/`union`/`replace`/`prune`). The load's warnings (schema

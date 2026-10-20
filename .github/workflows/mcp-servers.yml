@@ -60,6 +60,19 @@ jobs:
         shell: pwsh
         run: tests/fixtures/real_servers/setup.ps1
 
+      # Same host setup linux-tests.yml applies before the namespaced
+      # mechanism e2e: real_servers_e2e's stage3 drives the real
+      # userns+netns+TUN route on Linux and MCP_WRIT_REQUIRE_SERVER_TESTS
+      # turns a capability skip into a failure. Unprivileged GA runners
+      # deny user namespaces through Ubuntu's AppArmor restriction and may
+      # lack /dev/net/tun until the module is loaded — configure both.
+      - name: Namespaced e2e prerequisites
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo modprobe tun
+          test -c /dev/net/tun
+
       - name: Six-stage real-server tests
         run: cargo test --locked --test real_servers_e2e
 

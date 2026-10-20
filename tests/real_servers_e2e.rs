@@ -527,6 +527,10 @@ fn example_policy_path(spec: &ServerSpec) -> PathBuf {
 /// Insert `allow` entries into the `filesystem` block inside `defaults`
 /// of a host policy — the match is brace-scoped to `defaults`, so a
 /// `filesystem` node in appended server KDL cannot be hit instead.
+/// Entries the policy already carries are skipped: a literal duplicate
+/// in one `filesystem` block is a schema-v2 load error, and a host
+/// grant (e.g. a git exe under `/usr/bin`) can already be covered by
+/// `host_defaults_kdl`'s platform dirs.
 fn inject_fs_grants(policy: &mut String, grants: &[(&Path, &str)]) {
     if grants.is_empty() {
         return;
@@ -535,13 +539,17 @@ fn inject_fs_grants(policy: &mut String, grants: &[(&Path, &str)]) {
     let fs_open = common::kdl_block_open(policy, "filesystem", d_open)
         .filter(|&o| o < common::kdl_matching_brace(policy, d_open))
         .expect("filesystem block inside defaults");
+    // The strict-v2 duplicate check keys on identical entries within the
+    // same block, so only this block's span decides what to skip.
+    let fs_close = common::kdl_matching_brace(policy, fs_open);
+    let existing = &policy[fs_open..fs_close];
     let at = common::kdl_insert_pos(policy, fs_open);
     let mut inject = String::new();
     for (dir, mode) in grants {
-        inject.push_str(&format!(
-            "        allow \"{}\" mode=\"{mode}\"\n",
-            kdl_path(dir)
-        ));
+        let line = format!("        allow \"{}\" mode=\"{mode}\"\n", kdl_path(dir));
+        if !existing.contains(&line) && !inject.contains(&line) {
+            inject.push_str(&line);
+        }
     }
     policy.insert_str(at, &inject);
 }
@@ -2163,10 +2171,13 @@ async fn fetch_stages() {
     // defaults.network — the OS-layer egress shape per mechanism:
     //   Linux   deny-all + `allow host="*" port=<P>` — the bare-port
     //           spelling is the only egress shape a ConnectTcp netport
-    //           rule can express (a port with no destination bound); the
-    //           flat `allow host="<ip>"` is Auditor-only, so the granted
-    //           port reaches the OS while the ungranted one passes the
-    //           RPC layer and dies in connect(2).
+    //           rule can express (a port with no destination bound).
+    //           `allow host="<ip>:<P>"` admits the host to the Auditor's
+    //           allow list — flat entries there are port-agnostic, so the
+    //           ungranted port passes the RPC layer — while the egress
+    //           rule it mints stays port-pinned, so the namespaced flow
+    //           evaluator refuses it at connect(2). A flat
+    //           `allow host="<ip>"` would mint an any-port OS grant.
     //   macOS   deny-all + `allow host="127.0.0.1:<P>"` becomes a
     //           port-pinned `remote tcp` endpoint.
     //   Windows AppContainer capabilities are all-or-none — a deny posture
@@ -2174,7 +2185,7 @@ async fn fetch_stages() {
     //           policy is the open posture.
     #[cfg(target_os = "linux")]
     let net_inner = format!(
-        "        deny host=\"*\"\n        allow host=\"*\" port={0}\n        allow host=\"{1}\"\n",
+        "        deny host=\"*\"\n        allow host=\"*\" port={0}\n        allow host=\"{1}:{0}\"\n",
         http.port, host
     );
     #[cfg(target_os = "macos")]
@@ -2184,12 +2195,21 @@ async fn fetch_stages() {
     );
     #[cfg(target_os = "windows")]
     let net_inner = "        allow host=\"*\"\n".to_string();
-    // The tool-level block is the RPC-layer destination list — the allowed
-    // host on any port, so stage 5's ungranted port reaches the OS. The
-    // empty fs block keeps the inherited grants from demanding a path the
-    // url-only tool does not carry.
+    // The tool-level block is the RPC-layer destination list. On Linux and
+    // Windows it names the allowed host on any port, so stage 5's
+    // ungranted port passes the Auditor and the OS layer owns the
+    // per-port decision. On macOS the Auditor's egress check draws from
+    // the same port-qualified rules as the SBPL endpoint — an unqualified
+    // host allow would pass the ungranted port through the RPC layer, so
+    // the tool rule must pin the port there.
+    #[cfg(target_os = "macos")]
+    let tool_allow = format!("{host}:{}", http.port);
+    #[cfg(not(target_os = "macos"))]
+    let tool_allow = host.clone();
+    // The empty fs block keeps the inherited grants from demanding a path
+    // the url-only tool does not carry.
     let server_extra = format!(
-        "server \"fetch\" {{\n    tool \"fetch\" {{\n        filesystem {{\n            allow none=#true\n            require-path #false\n        }}\n        network {{\n            allow host=\"{host}\"\n        }}\n    }}\n}}\n"
+        "server \"fetch\" {{\n    tool \"fetch\" {{\n        filesystem {{\n            allow none=#true\n            require-path #false\n        }}\n        network {{\n            allow host=\"{tool_allow}\"\n        }}\n    }}\n}}\n"
     );
     let mut host_kdl = draft_host_policy(&reviewed, &argv[0], &server_extra);
     let fetch_grants: &[(&Path, &str)] = &[(&scratch, "read")];

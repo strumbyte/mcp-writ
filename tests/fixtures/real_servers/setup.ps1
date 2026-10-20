@@ -40,7 +40,11 @@ if (Test-Path python\.venv\.install-complete) {
     } else {
         py -3 -m venv python\.venv
     }
-    python\.venv\Scripts\pip.exe install --require-hashes -r python\requirements.txt
+    # `python -m pip`, not the pip.exe shim: requirements.txt pins pip
+    # itself, and on Windows a running pip.exe cannot replace its own
+    # executable — pip refuses with "To modify pip, please run the
+    # following command: <venv>\python.exe -m pip install ...".
+    python\.venv\Scripts\python.exe -m pip install --require-hashes -r python\requirements.txt
     # $ErrorActionPreference does not apply to native exit codes; a failed
     # pip install must not leave the completion marker behind.
     if ($LASTEXITCODE -ne 0) { throw "setup: pip install failed ($LASTEXITCODE)" }

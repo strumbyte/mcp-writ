@@ -106,7 +106,7 @@ impl PolicyProvenance {
 
     /// The `replaced` warnings the load surfaces — one per
     /// `(replacing file, contributing file)` pair per replace record:
-    /// "child.kdl replaced N entries in <field> declared by
+    /// "child.kdl replaced N entries in `<field>` declared by
     /// base.kdl". Prunes are excluded — a declared deny covering an
     /// allow is the schema's own semantics, not a silent drop. Pairs
     /// where the contributor is the replacing file itself are skipped

@@ -40,6 +40,16 @@ defaults {
         allow "rename" "renameat" "renameat2" "mkdir" "mkdirat" "unlink" "unlinkat"
         allow "rmdir" "truncate" "ftruncate" "fsync" "symlink" "symlinkat" "link" "linkat"
         allow "mknod" "mknodat" "utimensat"
+        // Mode changes — servers that persist state atomically chmod the
+        // temp file before rename (e.g. the memory server's durable
+        // store). Landlock has no access right for inode attribute
+        // changes, so — unlike the write-path ops above — filesystem
+        // grants do NOT confine chmod targets. The residual control is
+        // ordinary DAC: chmod requires euid == file owner (or
+        // CAP_FOWNER, which on the namespaced route the uid_map scopes
+        // to files the launcher's euid owns). `fchmod` additionally
+        // reaches only fds the Landlock-checked `open` handed out.
+        allow "chmod" "fchmod" "fchmodat"
         // Memory + V8 JIT (mprotect is required by V8)
         allow "mmap" "mprotect" "munmap" "brk" "madvise"
         // Threads, signals, futex

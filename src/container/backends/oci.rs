@@ -942,6 +942,10 @@ mod tests {
     /// child so the launch proceeds to the post-attach checks.
     /// `program` points at a script answering every lifecycle call with
     /// an absent-unit marker so refused-launch teardown stays fast.
+    /// `#[allow(dead_code)]`: the enum is used only by the unix
+    /// share-swap tests, and `SwapBack`/`AncestorSwap` only by the
+    /// Linux launch-window ones.
+    #[allow(dead_code)]
     enum SwapMode {
         /// Leave the path untouched — the clean control.
         None,
@@ -957,6 +961,9 @@ mod tests {
         AncestorSwap,
     }
 
+    /// `#[allow(dead_code)]`: constructed only by the unix share-swap
+    /// tests — Windows compiles the fixture but never runs one.
+    #[allow(dead_code)]
     struct SwapEngine {
         dir: PathBuf,
         backup: PathBuf,
@@ -964,6 +971,8 @@ mod tests {
         mode: SwapMode,
     }
 
+    /// `#[allow(dead_code)]`: `new` is called only from the unix tests.
+    #[allow(dead_code)]
     impl SwapEngine {
         fn new(dir: PathBuf, backup: PathBuf, stage: &std::path::Path, mode: SwapMode) -> Self {
             let cli = stage.join("stub-engine.sh");

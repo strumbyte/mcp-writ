@@ -895,7 +895,7 @@ fn protected_owner_dacl() -> io::Result<(*mut windows::Win32::Security::ACL, Vec
     // Administrators group, not the account holding the credentials).
     // SAFETY: the buffer holds a TOKEN_USER whose Sid member points
     // into `user`, which must outlive the ACL application.
-    let result = (|| {
+    (|| {
         let user = process_user_sid()?;
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
@@ -940,8 +940,7 @@ fn protected_owner_dacl() -> io::Result<(*mut windows::Win32::Security::ACL, Vec
             .ok()
             .map_err(os_err)?;
         Ok((dacl, user, system))
-    })();
-    result
+    })()
 }
 
 /// [`restrict_owner_only`]'s DACL applied to an *open file handle* via

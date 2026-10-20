@@ -201,7 +201,7 @@ pub enum ResolveFormat {
 
 /// Parsed arguments for `policy resolve` — the PR-24 composed-policy
 /// inspector: `extends`/`include`/`when` resolved to the effective
-/// document (serialized with [`Policy::to_kdl`]) plus the provenance
+/// document (serialized with [`Policy::to_kdl`](crate::policy::Policy::to_kdl)) plus the provenance
 /// log that names the file each field's write came from.
 /// `invalid_input` records a parse/semantic error the command reports
 /// as status `invalid` (exit 2) instead of a usage error.
