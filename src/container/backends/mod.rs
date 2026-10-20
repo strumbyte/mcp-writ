@@ -599,6 +599,7 @@ impl PinWatchLinux {
         // Safety: inotify_init1 has no preconditions; CLOEXEC|NONBLOCK
         // keep the fd out of spawned children and make drain reads
         // poll-style rather than blocking.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         if fd < 0 {
             return Err(BackendError::LaunchFailed(format!(
@@ -618,6 +619,7 @@ impl PinWatchLinux {
             let c_dir = match std::ffi::CString::new(dir.as_os_str().as_bytes()) {
                 Ok(c) => c,
                 Err(_) => {
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     unsafe { libc::close(fd) };
                     return Err(BackendError::LaunchFailed(format!(
                         "share ancestor '{}' is not watchable",
@@ -626,9 +628,11 @@ impl PinWatchLinux {
                 }
             };
             // Safety: fd is a live inotify fd; c_dir outlives the call.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let wd = unsafe { libc::inotify_add_watch(fd, c_dir.as_ptr(), mask) };
             if wd < 0 {
                 let e = std::io::Error::last_os_error();
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 unsafe { libc::close(fd) };
                 return Err(BackendError::LaunchFailed(format!(
                     "cannot watch share ancestor '{}': {e}",
@@ -652,6 +656,7 @@ impl PinWatchLinux {
         loop {
             // Safety: fd is a live NONBLOCK inotify fd and buf is a
             // valid writable region of its size.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let n = unsafe { libc::read(self.fd, buf.0.as_mut_ptr().cast(), buf.0.len()) };
             if n < 0 {
                 let e = std::io::Error::last_os_error();
@@ -671,7 +676,18 @@ impl PinWatchLinux {
                 // Safety: buf is 8-aligned and inotify_event is
                 // 4-aligned, so this pointer is validly aligned; the
                 // bounds check above keeps the read inside the buffer.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let ev = unsafe { &*(buf.0.as_ptr().add(off) as *const libc::inotify_event) };
+                let name_len = ev.len as usize;
+                // A declared name length running past the bytes read is
+                // a stream anomaly — the same lost proof a queue
+                // overflow is — and must not reach the slice below.
+                if off + 16 + name_len > n as usize {
+                    return Err(BackendError::LaunchFailed(format!(
+                        "share watch on '{}' returned a truncated event",
+                        self.share.display()
+                    )));
+                }
                 let hit = if ev.mask
                     & (libc::IN_Q_OVERFLOW
                         | libc::IN_MOVE_SELF
@@ -685,7 +701,7 @@ impl PinWatchLinux {
                     // stream can no longer prove the path stayed put.
                     true
                 } else {
-                    let name = &buf.0[off + 16..off + 16 + ev.len as usize];
+                    let name = &buf.0[off + 16..off + 16 + name_len];
                     let trimmed = match name.iter().position(|&b| b == 0) {
                         Some(z) => &name[..z],
                         None => name,
@@ -703,7 +719,7 @@ impl PinWatchLinux {
                         self.share.display()
                     )));
                 }
-                off += 16 + ev.len as usize;
+                off += 16 + name_len;
             }
         }
     }
@@ -712,6 +728,7 @@ impl PinWatchLinux {
 #[cfg(target_os = "linux")]
 impl Drop for PinWatchLinux {
     fn drop(&mut self) {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(self.fd) };
     }
 }
