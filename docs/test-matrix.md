@@ -265,7 +265,7 @@ main-plan scope; it does not wait for the VM-extension PRs.
 - [ ] Every `tests/*.rs` target has an owner row or a documented
   exclusion above, and no `MCP_WRIT_REQUIRE_*`-gated job ended with a
   required test left unexecuted.
-- [ ] Distribution cross-check (pre-publication): the planned tag,
+- [x] Distribution cross-check (pre-publication): the planned tag,
   repository URL, release version, and the asset names defined in
   [release.yml](../.github/workflows/release.yml) match what
   [README.md](../README.md), [README.ja.md](../README.ja.md),
@@ -298,6 +298,10 @@ post-publication verification.
 | 2026-10-05 | PR-26 alignment | Asset names | six archives + `checksums-sha256.txt` + `runners-checksums-sha256.txt` ([releasing.md](releasing.md)) | [release.yml](../.github/workflows/release.yml) release step emits `mcp-writ-{darwin,linux,windows}-{amd64,arm64}.{tar.gz,zip}` plus both checksum files | match |
 | 2026-10-05 | PR-26 alignment | Archive contents | CLI + matching-arch Linux runner + LICENSE + `policy.example.kdl` + docs; `windows-amd64` additionally `runners/mcp-secure-runner-windows-amd64.exe`, `mcp-secure-runner.exe`, `mcp-writ-wsb-relay.exe` ([releasing.md](releasing.md)) | `package()` in [release.yml](../.github/workflows/release.yml) copies exactly this set (plus README.md/README.ja.md) | match |
 | 2026-10-05 | PR-26 alignment | Published release | releasing.md describes the procedure; nothing claims a published release | `github.com/strumbyte/mcp-writ` shows no releases and no tags | unpublished |
+| 2026-10-20 | v0.5.0 release prep | Repository URL | `https://github.com/strumbyte/mcp-writ` ([releasing.md](releasing.md), [README.md](../README.md), [Cargo.toml](../Cargo.toml) `repository`) | `git remote -v` origin = `https://github.com/strumbyte/mcp-writ.git`; consistent across documents | match |
+| 2026-10-20 | v0.5.0 release prep | Planned tag / version | `v<version>` tag triggers Release ([releasing.md](releasing.md) step 3); crate version `0.5.0` | working tree Cargo.toml `version = "0.5.0"` + Cargo.lock `0.5.0` → planned tag `v0.5.0` (uncommitted); [release.yml](../.github/workflows/release.yml) `version-check` job fails the pipeline when tag and manifest disagree | match |
+| 2026-10-20 | v0.5.0 release prep | Asset names | six archives + `checksums-sha256.txt` + `runners-checksums-sha256.txt` ([releasing.md](releasing.md)) | [release.yml](../.github/workflows/release.yml) release step emits `mcp-writ-{darwin,linux,windows}-{amd64,arm64}.{tar.gz,zip}` plus both checksum files | match |
+| 2026-10-20 | v0.5.0 release prep | Archive contents | CLI + matching-arch Linux runner + LICENSE + `policy.example.kdl` + docs; `windows-amd64` additionally `runners/mcp-secure-runner-windows-amd64.exe`, `mcp-secure-runner.exe`, `mcp-writ-wsb-relay.exe` ([releasing.md](releasing.md)) | `package()` in [release.yml](../.github/workflows/release.yml) copies exactly this set (plus README.md/README.ja.md) | match |
 
 ### Publication-condition status (2026-10-05)
 

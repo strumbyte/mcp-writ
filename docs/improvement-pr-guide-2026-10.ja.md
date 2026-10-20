@@ -1045,18 +1045,18 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **到達条件 — 全て満たしたらバージョンを上げる**
 
-- [ ] PR-14〜16 のうち当該リリースに含める範囲がマージ済み
-- [ ] PR-17〜22（改善計画 §8 の P0）が全てマージ済み
-- [ ] PR-23〜26（§8 の P1）のうち当該リリースに含める範囲を決め、マージ済み。PR-16 を含める場合は PR-26 のタスク 4・6 も完了している。PR-26a（namespaced の IPv6 対応）はリリース前対応として含める
-- [ ] 判断事項 D-1〜D-6（§8.9）のうち、含める PR に関わるものの結論が記録されている
-- [ ] 含める項目が確定した時点で版番号（`0.5.0` かそれ以降か）を決めた
-- [ ] PR-15 の限界開示を含める場合、その記述が実装挙動と照合済み。PR-18 の IPC 限界の開示も同様
+- [x] PR-14〜16 のうち当該リリースに含める範囲がマージ済み — 全て含める。`main` で merge #65〜#67（`c459229`〜`9203e2c`）を確認（2026-10-20）
+- [x] PR-17〜22（改善計画 §8 の P0）が全てマージ済み — `main` で merge #68〜#73（`1c02083`〜`014862b`）を確認（2026-10-20）
+- [x] PR-23〜26（§8 の P1）のうち当該リリースに含める範囲を決め、マージ済み。PR-16 を含める場合は PR-26 のタスク 4・6 も完了している。PR-26a（namespaced の IPv6 対応）はリリース前対応として含める — 全て含める判断。merge #74〜#77（`1e3f61c`〜`3de2fa5`）と #78 PR-26a（`9da98ce`）を確認、PR-26 のタスク 4・6 は本節の記録どおり完了済み（2026-10-20）。加えて security-fix #79（`d904a34`）がマージ済み
+- [x] 判断事項 D-1〜D-6（§8.9）のうち、含める PR に関わるものの結論が記録されている — [改善計画 §8.9 の決定記録](improvement-plan-2026-10.ja.md)（2026-10-20）に6件の結論を記録。D-1〜D-4 は各PR節の記録を結論として確認、D-5 は推奨案（PR-24 運用後に判断）、D-6 は代替案（実装しない — コーパス全件クリーンを根拠。ツール単位の扱いを将来導入する場合は許可モデルの再設計として検討）
+- [x] 含める項目が確定した時点で版番号（`0.5.0` かそれ以降か）を決めた — **`0.5.0`**（2026-10-20）
+- [x] PR-15 の限界開示を含める場合、その記述が実装挙動と照合済み。PR-18 の IPC 限界の開示も同様 — ガイド §8.1〜8.4 を `9203e2c` 以降の実装変更を含む HEAD（`d904a34`）と照合: §8.4 の `unix=` opt-in（ABI v9 `ResolveUnix`・下位は選択拒否・`"*"` は全 family 開放）、Scope::Signal（ABI v6 以上・下位は `os.ipc.signal` = `not_applied`）、deny-all 下の `socket()` AF_INET/AF_INET6 ピンと `socketpair(AF_UNIX, SOCK_DGRAM)` 拒否、namespaced の family 絶対ピン・`unix=` 選択拒否・CLONE_NEWPID・`/run` マスクは [landlock_impl.rs](../src/warden/landlock_impl.rs)・[seccomp_impl.rs](../src/warden/seccomp_impl.rs)・[select.rs](../src/warden/select.rs)・[namespaced/init.rs](../src/warden/namespaced/init.rs) と一致。§8.1〜8.3 の検査境界・ランチャーピン・egress 残存リスクも `udp_audit_suppressed`・PDEATHSIG・`ttl_min`/`chain` 記録・`code_identity`（`launcher_or_module`）の実在を確認
 
 **バージョン更新の手順**
 
-- [ ] [Cargo.toml](../Cargo.toml) の `version` を確定した版に更新し、`Cargo.lock` を再生成する
-- [ ] 最新コミットで T-BASE・T-DOC・該当する実機記録を再確認する
-- [ ] タグ `vX.Y.Z` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）
+- [x] [Cargo.toml](../Cargo.toml) の `version` を確定した版に更新し、`Cargo.lock` を再生成する — `0.5.0` を作業ツリーに反映済み・未コミット（2026-10-20）。`Cargo.lock` は `mcp-writ` の version 欄のみの 1 行差分
+- [x] 最新コミットで T-BASE・T-DOC・該当する実機記録を再確認する — HEAD（`d904a34`）＋バージョン更新の作業ツリーで実施（2026-10-20・WSL2 kernel 6.18.54.1・x86-64・rustc 1.99.0）: fmt / clippy `-D warnings` / lib+bins 2457 件 / doc / doc-test 0 件 / docs_check 12 件 / capability_matrix 6 件 全 pass。`cargo doc` は既存クラスの警告 3 件（`cli/mod.rs`・`policy_resolve.rs` の intra-doc link、`provenance.rs` の HTML タグ、いずれも未編集ファイル — PR-26 の記録と同じ状態）。実機記録: `linux_mechanism_e2e`（PR-26・実機 6 レグ）と PR-26a の v6 レグは各検証文書の記録どおり、`namespaced_ipv6_flows_allowed_on_v6_host` は外部 v6 到達性依存のため環境依存。OS 固有コードの T-BASE は platform-tests 等の当該 OS ワークフローの責務
+- [ ] タグ `vX.Y.Z` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](releasing.md) 手順 2）
 - [ ] リリースノートに「この版で保証する制御」と「残る限界」（§1.7・§5.2 の対応状況）を明記する
 
 <a id="pr-27"></a>
