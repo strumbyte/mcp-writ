@@ -1832,13 +1832,14 @@ async fn git_stages() {
     // so a failing assert can report git's actual fatal line. An absent
     // trace file is itself diagnostic: the write grant then never landed.
     #[cfg(windows)]
-    let (trace_dir, trace_events, trace_stderr) = {
+    let (trace_dir, trace_events, trace_stderr, trace_full) = {
         let d = cwd.join("git-trace");
         std::fs::create_dir_all(&d).expect("create git trace dir inside granted work dir");
         (
             d.clone(),
             kdl_path(&d.join("events.log")),
             kdl_path(&d.join("stderr.log")),
+            kdl_path(&d.join("trace.log")),
         )
     };
     #[cfg(windows)]
@@ -1893,6 +1894,10 @@ async fn git_stages() {
         // server never surfaces it. GIT_REDIRECT_STDERR detours every git
         // child's stderr into the same write-granted trace dir.
         ("GIT_REDIRECT_STDERR", trace_stderr.as_str()),
+        // The last `trace:` line before a silent death localizes where the
+        // child actually stopped — events.log alone only shows "vanished
+        // after def_param".
+        ("GIT_TRACE", trace_full.as_str()),
     ]);
     // The AppContainer child's token SID differs from the repo creator's,
     // so git's "dubious ownership" gate refuses the test repos unless a
