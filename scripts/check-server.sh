@@ -63,30 +63,79 @@ if [ -z "$AUDIT_LOG" ]; then
     AUDIT_LOG="check-server-audit-$$.jsonl"
 fi
 
-# feed <request lines file> <guard stdout file>
-# Emits the first request, then waits for the id=1 response to appear in
-# the guard's relayed output before emitting the rest. The auditor
-# enforces init ordering: piping the whole file at once delivers
-# notifications/initialized before the initialize response, which drops
-# it and denies every later request (init-order). A missing id=1 response
-# means the rest can never be admitted, so the stage fails explicitly
-# instead of sending doomed requests.
-feed() {
-    head -n 1 "$1"
-    i=0
-    while [ "$i" -lt 150 ]; do
-        if grep -q '"id"[[:space:]]*:[[:space:]]*1\([^0-9]\|$\)' "$2" 2>/dev/null; then
-            tail -n +2 "$1"
-            # Hold stdin open briefly after the last request so in-flight
-            # responses are relayed before the guard shuts down on EOF.
-            sleep 3
-            return 0
+# Inspect only client-bound responses, not nested IDs or server requests.
+response_state() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys
+state = "pending"
+with open(sys.argv[1], encoding="utf-8", errors="replace") as stream:
+    for line in stream:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(r, dict) or "method" in r or r.get("id") != int(sys.argv[2]):
+            continue
+        if "error" in r:
+            state = "error"
+            break
+        if "result" in r:
+            state = "ready"
+print(state)
+' "$1" "$2"
+    elif command -v jq >/dev/null 2>&1; then
+        jq -Rrs --argjson id "$2" '
+            [split("\n")[] | fromjson? | objects |
+             select(has("method") | not) | select(.id == $id)] |
+            if any(.[]; has("error")) then "error"
+            elif any(.[]; has("result")) then "ready" else "pending" end' "$1"
+    else
+        # Retain the parser-free handshake fallback. Stage 3 already
+        # requires Python or jq for structural result validation.
+        response=$(grep '"jsonrpc"' "$1" | grep -v '"method"[[:space:]]*:' |
+            grep "\"id\"[[:space:]]*:[[:space:]]*$2\([^0-9]\|$\)" || true)
+        if printf '%s\n' "$response" | grep -q '"error"[[:space:]]*:'; then
+            echo error
+        elif printf '%s\n' "$response" | grep -q '"result"[[:space:]]*:'; then
+            echo ready
+        else
+            echo pending
         fi
-        i=$((i + 1))
-        sleep 0.1
-    done
-    echo "check-server: FAIL — no response to request id=1 within 15s (init-order gate)" >&2
-    return 1
+    fi
+}
+
+# feed <request lines file> <guard stdout file>
+# Each generated request has a fixed numeric ID before its method/params.
+# Wait for its response before sending the next request; notifications do
+# not block. In particular, a call needs a listing in this same session.
+feed() {
+    while IFS= read -r request; do
+        printf '%s\n' "$request"
+        request_id=$(printf '%s\n' "$request" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9][0-9]*\),.*/\1/p')
+        [ -n "$request_id" ] || continue
+        i=0
+        while :; do
+            state=$(response_state "$2" "$request_id") || return 1
+            case "$state" in
+                ready) break ;;
+                error) return 1 ;;
+            esac
+            i=$((i + 1))
+            if [ "$i" -ge 150 ]; then
+                echo "check-server: FAIL — no response to request id=$request_id after 150 polls" >&2
+                return 1
+            fi
+            sleep 0.1
+        done
+    done <"$1"
+    sleep 3
+}
+
+# POSIX pipelines report only the last command's status. Keep the feeder's
+# failure too, so a missing response cannot be hidden by a clean guard exit.
+feed_with_status() {
+    if feed "$1" "$2"; then echo 0 >"$3"; else echo 1 >"$3"; fi
 }
 
 # run_stage <extra run flag> <request lines file> <server command...>
@@ -96,16 +145,19 @@ run_stage() {
     reqs=$2
     shift 2
     out=$(mktemp "${TMPDIR:-/tmp}/check-server-out-XXXXXX")
+    feed_status=$(mktemp "${TMPDIR:-/tmp}/check-server-feed-XXXXXX")
+    echo 1 >"$feed_status"
     rc=0
     if [ -n "$flag" ]; then
-        feed "$reqs" "$out" |
+        feed_with_status "$reqs" "$out" "$feed_status" |
             "$MCP_WRIT" run --transport stdio --policy "$POLICY" --audit-log "$AUDIT_LOG" "$flag" -- "$@" >"$out" || rc=$?
     else
-        feed "$reqs" "$out" |
+        feed_with_status "$reqs" "$out" "$feed_status" |
             "$MCP_WRIT" run --transport stdio --policy "$POLICY" --audit-log "$AUDIT_LOG" -- "$@" >"$out" || rc=$?
     fi
+    if [ "$(cat "$feed_status")" != 0 ]; then rc=1; fi
     cat "$out"
-    rm -f "$out"
+    rm -f "$out" "$feed_status"
     return "$rc"
 }
 
@@ -298,11 +350,8 @@ echo "check-server: negotiated generation: $generation"
 
 if [ "$generation" = "2026-07-28" ]; then
     printf '%s\n%s\n' "$DISCOV" "$LIST26" >"$REQFILE"
-    call_head="$DISCOV"
 else
     printf '%s\n%s\n%s\n' "$INIT" "$NOTIF" "$LIST25" >"$REQFILE"
-    call_head="$INIT
-$NOTIF"
 fi
 
 echo "== stage 1: dry-run =="
@@ -354,10 +403,10 @@ if [ -n "$CALL" ]; then
             -e 's|^[[:space:]]*{[[:space:]]*}[[:space:]]*$|{'"$META"'}|; t' \
             -e 's|}[[:space:]]*$|,'"$META"'}|')
     fi
-    printf '%s\n%s\n' "$call_head" "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":$call_params}" >"$REQFILE"
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":$call_params}" >>"$REQFILE"
     echo "== stage 3: tools/call (sandboxed) =="
     stage_out=$(run_stage "" "$REQFILE" "$@") || fail=1
-    if ! judge "stage 3 (tools/call)" "1 3" "$stage_out" call; then
+    if ! judge "stage 3 (tools/call)" "1 2 3" "$stage_out" call; then
         fail=1
     fi
 fi

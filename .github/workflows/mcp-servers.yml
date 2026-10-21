@@ -65,6 +65,10 @@ jobs:
         shell: pwsh
         run: python tests/scripts/check-server-order.tests.py
 
+      - name: check-server request ordering (unix)
+        if: runner.os != 'Windows'
+        run: python3 tests/scripts/check-server-order.tests.py
+
       # Same host setup linux-tests.yml applies before the namespaced
       # mechanism e2e: real_servers_e2e's stage3 drives the real
       # userns+netns+TUN route on Linux and MCP_WRIT_REQUIRE_SERVER_TESTS

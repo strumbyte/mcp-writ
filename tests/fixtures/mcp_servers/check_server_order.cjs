@@ -3,13 +3,14 @@
 const fs = require('node:fs');
 const readline = require('node:readline');
 const scenario = process.env.MCP_WRIT_ORDER_SCENARIO;
+if (scenario === 'nonzero-exit') process.exitCode = 17;
 let listed = false;
-const record = event => fs.appendFileSync(process.env.MCP_WRIT_ORDER_TRACE,
-  JSON.stringify({ pid: process.pid, event }) + '\n');
+const record = (event, params) => fs.appendFileSync(process.env.MCP_WRIT_ORDER_TRACE,
+  JSON.stringify({ pid: process.pid, event, params }) + '\n');
 const send = message => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const request = JSON.parse(line);
-  record(request.method);
+  record(request.method, request.params);
   const id = request.id;
   switch (request.method) {
     case 'server/discover':
