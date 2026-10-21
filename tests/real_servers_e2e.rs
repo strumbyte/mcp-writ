@@ -1772,10 +1772,6 @@ async fn git_stages() {
     // outside every grant so `~/.gitconfig` reads fail — and git treats that
     // as a fatal "unknown error ... reading the configuration files" in some
     // code paths. Point both config files at readable non-entities instead.
-    // Windows sets neither: there is no /dev/null spelling, the restricted
-    // child env carries no HOME/USERPROFILE for git to locate a user config
-    // with, and MinGit's system gitconfig sits under the granted exe prefix
-    // anyway.
     let cfg_env: &[(&str, &str)] = if cfg!(windows) {
         &[]
     } else {
@@ -1784,8 +1780,29 @@ async fn git_stages() {
             ("GIT_CONFIG_NOSYSTEM", "1"),
         ]
     };
+    // Windows: an existing-but-unreadable config file is fatal to every git
+    // invocation, not skipped — and two such files exist on hosted runners
+    // while absent locally. MinGit's `etc/gitconfig` ends with
+    // `include.path = C:/Program Files/Git/etc/gitconfig`, which resolves on
+    // machines where Git for Windows is preinstalled (the Actions image) but
+    // sits outside every grant; and `~/.gitconfig` is located through the
+    // Windows profile directory even though the restricted env carries no
+    // HOME/USERPROFILE — the runner account's profile does have one.
+    // Redirect both file scopes at a granted empty file so no real config is
+    // ever opened; GIT_CONFIG_* below still applies at command scope.
+    #[cfg(windows)]
+    let empty_cfg = {
+        let p = cwd.join("empty.gitconfig");
+        std::fs::write(&p, b"").expect("write empty gitconfig inside granted work dir");
+        kdl_path(&p)
+    };
     let mut env_vec: Vec<(&str, &str)> = vec![(git_env.0, git_env.1.as_str())];
     env_vec.extend_from_slice(cfg_env);
+    #[cfg(windows)]
+    env_vec.extend([
+        ("GIT_CONFIG_SYSTEM", empty_cfg.as_str()),
+        ("GIT_CONFIG_GLOBAL", empty_cfg.as_str()),
+    ]);
     // The AppContainer child's token SID differs from the repo creator's,
     // so git's "dubious ownership" gate refuses the test repos unless a
     // `safe.directory` entry names them. The GIT_CONFIG_* pairs inject
