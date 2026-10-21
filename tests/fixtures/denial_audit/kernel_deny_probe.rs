@@ -34,13 +34,20 @@
 //! "unobservable", never "did not happen".
 
 fn report(mode: &str, outcome: Result<i32, i32>) -> ! {
+    use std::io::Write as _;
     match outcome {
         Ok(_) => {
-            eprintln!("KDP {mode}=ok");
+            // One write(2) for the whole marker: the launcher shares this
+            // stderr pipe with its own tracing, and eprintln! emits each
+            // format piece as a separate write — an interleaved INFO line
+            // between them splits "KDP <mode>=" and the leg reads as a
+            // missing marker instead of a denied escape.
+            let _ = std::io::stderr().write_all(format!("KDP {mode}=ok\n").as_bytes());
             std::process::exit(0);
         }
         Err(errno) => {
-            eprintln!("KDP {mode}=errno={errno}");
+            let _ = std::io::stderr()
+                .write_all(format!("KDP {mode}=errno={errno}\n").as_bytes());
             match errno {
                 EACCES | EPERM => std::process::exit(10),
                 _ => std::process::exit(1),

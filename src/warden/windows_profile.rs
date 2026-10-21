@@ -50,6 +50,7 @@ const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const GENERIC_EXECUTE: u32 = 0x2000_0000;
 const FILE_TRAVERSE: u32 = 0x0000_0020;
+const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
 const FILE_WRITE_DATA: u32 = 0x0000_0002;
 const FILE_APPEND_DATA: u32 = 0x0000_0004;
 const FILE_WRITE_EA: u32 = 0x0000_0010;
@@ -216,6 +217,12 @@ struct GrantedObject {
     identity: (u64, u64),
     /// Spelling at grant time — diagnostics only.
     path: PathBuf,
+    /// Any ACE on this object was written inheritable: its copies were
+    /// propagated to descendants, so the revoke must propagate too
+    /// (`SetSecurityInfo`). Objects holding only non-inherited ACEs
+    /// revoke through `SetKernelObjectSecurity` — nothing propagated
+    /// out, so no descendant walk is needed (see `write_object_dacl`).
+    propagates: bool,
 }
 
 /// Open an ACL-grant target once so the handle pins the file object.
@@ -237,6 +244,64 @@ fn open_acl_object(path: &Path) -> Result<std::fs::File, WardenError> {
                 format!("open for ACL grant '{}': {e}", path.display()),
             )
         })
+}
+
+/// Write `new_dacl` onto the object `handle` pins without touching
+/// descendants. `SetSecurityInfo` walks the whole subtree re-applying
+/// every inheritable ACE in the written DACL — the right behavior when
+/// an inheritable grant or revoke must reach children, but pure waste
+/// (and a failure surface on huge or restricted trees) when the ACE
+/// being written is not inherited by anything. Non-inherited ACEs
+/// therefore go through `SetKernelObjectSecurity`, which mutates only
+/// the object the handle pins.
+///
+/// `dacl_protected` re-applies the object's `SE_DACL_PROTECTED` state:
+/// the descriptor built here is fresh, so the flag travels on the
+/// `SecurityInformation` parameter instead.
+fn write_object_dacl(
+    handle: HANDLE,
+    new_dacl: *mut ACL,
+    dacl_protected: bool,
+) -> Result<(), String> {
+    // A NULL DACL means unrestricted access — never write one; an
+    // empty-but-present ACL is the fail-closed spelling.
+    if new_dacl.is_null() {
+        return Err("merged DACL is null".to_string());
+    }
+    use windows::Win32::Security::{
+        InitializeSecurityDescriptor, MakeSelfRelativeSD, SECURITY_DESCRIPTOR,
+        SetKernelObjectSecurity, SetSecurityDescriptorDacl,
+    };
+    const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+    // Safety: `abs` is initialized before use; `new_dacl` is a live
+    // ACL built by SetEntriesInAclW; `buf` outlives the kernel call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        let mut abs = SECURITY_DESCRIPTOR::default();
+        let abs_ptr = PSECURITY_DESCRIPTOR(&mut abs as *mut _ as _);
+        InitializeSecurityDescriptor(abs_ptr, SECURITY_DESCRIPTOR_REVISION)
+            .map_err(|e| format!("InitializeSecurityDescriptor: {e}"))?;
+        SetSecurityDescriptorDacl(abs_ptr, true, Some(new_dacl), false)
+            .map_err(|e| format!("SetSecurityDescriptorDacl: {e}"))?;
+        let mut size = 0u32;
+        let _ = MakeSelfRelativeSD(abs_ptr, None, &mut size);
+        let mut buf = vec![0u8; size as usize];
+        MakeSelfRelativeSD(
+            abs_ptr,
+            Some(PSECURITY_DESCRIPTOR(buf.as_mut_ptr() as _)),
+            &mut size,
+        )
+        .map_err(|e| format!("MakeSelfRelativeSD: {e}"))?;
+        let mut info = DACL_SECURITY_INFORMATION;
+        info |= if dacl_protected {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
+        SetKernelObjectSecurity(handle, info, PSECURITY_DESCRIPTOR(buf.as_ptr() as _))
+            .map_err(|e| format!("SetKernelObjectSecurity: {e}"))
+    }
 }
 
 /// `(volume serial, file index)` of an open handle — the stable object
@@ -324,23 +389,34 @@ fn revoke_granted_aces(grant: &GrantedObject, sid: PSID) -> Result<(), String> {
             SetEntriesInAclW(Some(&[ea]), Some(dacl), &mut new_dacl)
                 .ok()
                 .map_err(|e| format!("SetEntriesInAclW: {e}"))?;
-            let mut info = DACL_SECURITY_INFORMATION;
-            if control & SE_DACL_PROTECTED.0 != 0 {
-                info |= PROTECTED_DACL_SECURITY_INFORMATION;
-            } else {
-                info |= UNPROTECTED_DACL_SECURITY_INFORMATION;
+            // A NULL DACL means unrestricted access — never write one;
+            // an empty-but-present ACL is the fail-closed spelling.
+            if new_dacl.is_null() {
+                return Err("merged DACL is null".to_string());
             }
-            SetSecurityInfo(
-                handle,
-                SE_FILE_OBJECT,
-                info,
-                None,
-                None,
-                Some(new_dacl),
-                None,
-            )
-            .ok()
-            .map_err(|e| format!("SetSecurityInfo: {e}"))?;
+            if grant.propagates {
+                let mut info = DACL_SECURITY_INFORMATION;
+                if control & SE_DACL_PROTECTED.0 != 0 {
+                    info |= PROTECTED_DACL_SECURITY_INFORMATION;
+                } else {
+                    info |= UNPROTECTED_DACL_SECURITY_INFORMATION;
+                }
+                // Inheritable ACEs left propagated copies on
+                // descendants — the rewrite must walk them back out.
+                SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    info,
+                    None,
+                    None,
+                    Some(new_dacl),
+                    None,
+                )
+                .ok()
+                .map_err(|e| format!("SetSecurityInfo: {e}"))?;
+            } else {
+                write_object_dacl(handle, new_dacl, control & SE_DACL_PROTECTED.0 != 0)?;
+            }
         }
         Ok(())
     })();
@@ -490,13 +566,17 @@ impl AppContainerSandbox {
     }
 
     /// Grant traverse-only access on a directory: the AppContainer can
-    /// pass through to named children but cannot list the contents.
+    /// pass through to named children and stat the directory itself, but
+    /// cannot list the contents or read file data.
     ///
-    /// Used for ancestors of the launch image so reaching a granted file
-    /// does not depend on bypass-traverse-checking. The ACE applies to the
-    /// directory itself and is not inherited by children.
+    /// `FILE_READ_ATTRIBUTES` rides along so `lstat`-style path
+    /// resolution (git's realpath, `os.path.realpath`, …) succeeds on
+    /// the ancestor — that bit exposes metadata only. Used for ancestors
+    /// of the launch image and of granted fs paths so reaching a grant
+    /// does not depend on bypass-traverse-checking. The ACE applies to
+    /// the directory itself and is not inherited by children.
     pub(super) fn grant_traverse(&mut self, path: &Path) -> Result<(), WardenError> {
-        self.grant_access(path, FILE_TRAVERSE, false)
+        self.grant_access(path, FILE_TRAVERSE | FILE_READ_ATTRIBUTES, false)
     }
 
     fn grant_access(
@@ -578,22 +658,51 @@ impl AppContainerSandbox {
         // with the existing one; `sd` is freed whether or not it errs.
         let merged =
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { SetEntriesInAclW(Some(&[ea]), Some(existing_dacl), &mut new_dacl) }.ok();
+            unsafe { SetEntriesInAclW(Some(&[ea]), Some(existing_dacl), &mut new_dacl) }
+                .ok()
+                .map_err(|e| e.to_string());
 
-        // Write the merged DACL back to the pinned object.
+        // `sd`'s protection bit is preserved on the write — the
+        // kernel-object path rebuilds it explicitly; SetSecurityInfo
+        // keeps the current state on its own.
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        // Safety: `sd` is the object's live descriptor until the free
+        // below; `control`/`revision` are live out-params.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let dacl_protected = unsafe {
+            GetSecurityDescriptorControl(sd, &mut control, &mut revision)
+                .map(|()| control & SE_DACL_PROTECTED.0 != 0)
+                .unwrap_or(false)
+        };
+
+        // Write the merged DACL back to the pinned object. Inheritable
+        // ACEs must reach children created earlier too, so they go
+        // through SetSecurityInfo's descendant propagation; a
+        // non-inherited ACE applies to this object alone, so the write
+        // skips the descendant walk entirely. A NULL merged DACL means
+        // unrestricted access and is never written.
         // Safety: `new_dacl` is valid only when the merge succeeded.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let applied = merged.and_then(|()| unsafe {
-            SetSecurityInfo(
-                handle,
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(new_dacl),
-                None,
-            )
-            .ok()
+            if new_dacl.is_null() {
+                return Err("merged DACL is null".to_string());
+            }
+            if inherit_children {
+                SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    Some(new_dacl),
+                    None,
+                )
+                .ok()
+                .map_err(|e| e.to_string())
+            } else {
+                write_object_dacl(handle, new_dacl, dacl_protected)
+            }
         });
 
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -619,12 +728,21 @@ impl AppContainerSandbox {
         // Track by stable identity — differently-spelled grants of one
         // object collapse to a single teardown entry; the revoke is
         // trustee-scoped so repeat entries would be redundant anyway.
-        if !self.granted_objects.iter().any(|g| g.identity == identity) {
-            self.granted_objects.push(GrantedObject {
+        // `propagates` is OR'd across grants of the same object: one
+        // inheritable ACE among them means the revoke has copies to
+        // walk back off descendants.
+        match self
+            .granted_objects
+            .iter_mut()
+            .find(|g| g.identity == identity)
+        {
+            Some(existing) => existing.propagates |= inherit_children,
+            None => self.granted_objects.push(GrantedObject {
                 file,
                 identity,
                 path: PathBuf::from(path_str),
-            });
+                propagates: inherit_children,
+            }),
         }
 
         Ok(())

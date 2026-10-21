@@ -524,6 +524,56 @@ pub(super) fn grant_intents(
         );
     }
 
+    // Every granted path gets traverse-only intents on its ancestors.
+    // Consumers that resolve paths — git's realpath-ing ownership check,
+    // `realpath(3)`, `Path.resolve` — stat each component on the way
+    // down, and bypass-traverse does not cover an object's own
+    // attribute read. The ACE is metadata-only (FILE_TRAVERSE +
+    // FILE_READ_ATTRIBUTES, non-inherited): the sandboxed child can
+    // pass through and stat the ancestor but can neither list it nor
+    // read its children, so no sibling or profile content is exposed.
+    let mut seen: std::collections::HashSet<PathBuf> = out
+        .iter()
+        .filter_map(|(_, apply)| match apply {
+            Some(WinApply::GrantPath { path, .. }) | Some(WinApply::Traverse(path)) => {
+                Some(path.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut ancestors: Vec<PathBuf> = Vec::new();
+    for (_, apply) in &out {
+        let Some(WinApply::GrantPath { path, .. }) = apply else {
+            continue;
+        };
+        for ancestor in path.ancestors().skip(1) {
+            if !ancestor.as_os_str().is_empty()
+                && ancestor.is_dir()
+                && seen.insert(ancestor.to_path_buf())
+            {
+                ancestors.push(ancestor.to_path_buf());
+            }
+        }
+    }
+    for ancestor in ancestors {
+        out.push((
+            ProcessGrant {
+                subject: GrantSubject::FsPath {
+                    path: ancestor.to_string_lossy().into_owned(),
+                    access: FsAccess::Traverse,
+                },
+                origin: GrantOrigin::Runtime,
+                state: ControlState::Planned,
+                reason: Some(
+                    "ancestor of a granted path — metadata-only so \
+                     realpath-style consumers can stat through"
+                        .to_string(),
+                ),
+            },
+            Some(WinApply::Traverse(ancestor)),
+        ));
+    }
+
     out
 }
 

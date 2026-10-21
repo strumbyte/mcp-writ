@@ -346,7 +346,12 @@ async fn test_tool_fs_sub_policy_allowed_path() {
         "#,
     );
 
-    let mut child = spawn_guard_with_policy(&policy, false);
+    // `/workspace/**` resolves against the current drive's root — a
+    // broadly-writable root (default ACLs on secondary data drives) is
+    // refused as replaceable, which is host-ACL dependent and not what
+    // this test exercises.
+    let mut child =
+        spawn_guard_with_policy_env(&policy, false, &[("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")]);
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
@@ -517,7 +522,10 @@ async fn test_policy_merge_tool_deny_overrides_defaults() {
         "#,
     );
 
-    let mut child = spawn_guard_with_policy(&policy, false);
+    // See test_tool_fs_sub_policy_allowed_path — `/workspace` is
+    // drive-root relative and host-ACL dependent.
+    let mut child =
+        spawn_guard_with_policy_env(&policy, false, &[("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")]);
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
@@ -1043,7 +1051,10 @@ async fn test_multiple_requests_mixed_verdicts() {
 async fn test_example_kdl_policy_e2e() {
     let policy = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policy.example.kdl");
 
-    let mut child = spawn_guard_with_policy(&policy, false);
+    // See test_tool_fs_sub_policy_allowed_path — `/workspace` is
+    // drive-root relative and host-ACL dependent.
+    let mut child =
+        spawn_guard_with_policy_env(&policy, false, &[("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")]);
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
@@ -1202,7 +1213,7 @@ fn test_policy_resolve_json_provenance() {
     let replace = replace.expect("replace record for defaults.syscalls");
     assert!(
         resolve_json_member(replace, "file")
-            .as_string_str()
+            .to_unquoted_string_str()
             .unwrap()
             .ends_with("child.kdl"),
         "replacing file recorded"
@@ -1222,7 +1233,7 @@ fn test_policy_resolve_json_provenance() {
         warnings.iter().any(|w| {
             resolve_json_member(*w, "kind").as_string_str().unwrap() == "replaced"
                 && resolve_json_member(*w, "file")
-                    .as_string_str()
+                    .to_unquoted_string_str()
                     .unwrap()
                     .ends_with("child.kdl")
         }),
@@ -1450,7 +1461,7 @@ fn test_policy_resolve_reports_review_markers() {
     let m = markers[0];
     assert!(
         resolve_json_member(m, "file")
-            .as_string_str()
+            .to_unquoted_string_str()
             .unwrap()
             .ends_with("policy.kdl"),
         "marker names the file"

@@ -1380,9 +1380,9 @@ fn pr18_native_unix_optin_legs() {
     );
 
     // Legs 3–6 — a path-bound opt-in needs Landlock ABI v9
-    // (`ResolveUnix`): below it selection refuses the launch, the probe
-    // never runs, and the missing KDP marker skips the legs rather than
-    // failing them.
+    // (`ResolveUnix`): below it selection refuses the launch and the
+    // probe never runs — on such kernels the refusal itself is the
+    // honest outcome, asserted below rather than skipped.
     let optin_sock = dir.join("optin.sock");
     let _optin_listener =
         std::os::unix::net::UnixListener::bind(&optin_sock).expect("bind opt-in socket");
@@ -1399,7 +1399,7 @@ fn pr18_native_unix_optin_legs() {
     );
 
     // Leg 3 — connect to the opted-in socket beneath its granted parent.
-    let (run, _report) = run_pr18_probe(
+    let (run, report) = run_pr18_probe(
         &probe,
         &["unix-connect", optin_sock.to_str().unwrap()],
         &dir,
@@ -1408,6 +1408,24 @@ fn pr18_native_unix_optin_legs() {
         &path_net,
     );
     if !run.stderr.contains("KDP unix-connect=") {
+        // A kernel below ABI v9 cannot express `allow unix=<path>` at
+        // all: selection must refuse the launch rather than honor the
+        // opt-in partially. That refusal — a failed os.fs control whose
+        // reason names the ABI — is the verifiable denial here, and the
+        // remaining path legs have no granted socket to exercise.
+        if run.stderr.contains("requires kernel Landlock ABI v9") {
+            assert_eq!(
+                plan_control_state(&report, "os.fs").as_deref(),
+                Some("failed"),
+                "the refused launch must record os.fs as failed: {report}"
+            );
+            eprintln!(
+                "PR-18 unix-path legs: kernel Landlock ABI < v9 — the \
+                 opt-in launch was refused (fail-closed); legs 4-6 are \
+                 unexercisable"
+            );
+            return;
+        }
         common::skip_e2e_test(&format!(
             "path opt-in legs need Landlock ABI v9 — stderr: {}",
             run.stderr

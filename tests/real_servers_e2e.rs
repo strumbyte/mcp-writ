@@ -1790,19 +1790,17 @@ async fn git_stages() {
     // so git's "dubious ownership" gate refuses the test repos unless a
     // `safe.directory` entry names them. The GIT_CONFIG_* pairs inject
     // config at command scope — the only scope git honors safe.directory
-    // from — and need no config file under a grant. The values use the
-    // same spelling the server passes as `repo_path`. `outside_repo` is
-    // listed too so stage 5's expected failure lands on the DACL deny
-    // the stage exists to prove, not on git's own ownership gate.
-    let repo_safe_dir = kdl_path(&repo);
-    let outside_safe_dir = kdl_path(&outside_repo);
+    // from — and need no config file under a grant. `*` short-circuits
+    // git's entry realpath/compare: a path-valued entry would itself be
+    // normalized before matching, and any mismatch fails closed — the
+    // wildcard relaxes git's own check for this spawned child only, so
+    // stage 5's expected failure still lands on the DACL deny the stage
+    // exists to prove.
     if cfg!(windows) {
         env_vec.extend([
-            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_COUNT", "1"),
             ("GIT_CONFIG_KEY_0", "safe.directory"),
-            ("GIT_CONFIG_VALUE_0", repo_safe_dir.as_str()),
-            ("GIT_CONFIG_KEY_1", "safe.directory"),
-            ("GIT_CONFIG_VALUE_1", outside_safe_dir.as_str()),
+            ("GIT_CONFIG_VALUE_0", "*"),
         ]);
     }
     // GitPython probes `git --version` at import. On Windows `quiet` defers
@@ -1839,6 +1837,10 @@ async fn git_stages() {
     let mut host_kdl = draft_host_policy(&reviewed, &argv[0], &server_extra);
     let mut git_grant_dirs = vec![repo.clone(), cwd.clone()];
     git_grant_dirs.extend(common::exe_read_grant_dirs(&git_exe));
+    // git validates repository ownership by realpath-ing the discovered
+    // worktree — the runtime grants metadata-only traverse on each
+    // ancestor automatically so that resolution can stat through
+    // without exposing directory contents.
     let git_grants: Vec<(&Path, &str)> = git_grant_dirs
         .iter()
         .map(|d| (d.as_path(), "read"))
@@ -1848,8 +1850,8 @@ async fn git_stages() {
     // spawn passes must be allowed through or it never reaches the
     // server: GIT_PYTHON_GIT_EXECUTABLE locates the granted git exe,
     // the GIT_CONFIG_GLOBAL/GIT_CONFIG_NOSYSTEM redirects keep git off
-    // the ungranted real config, and on Windows the GIT_CONFIG_* pairs
-    // carry the safe.directory entries and GIT_PYTHON_REFRESH=quiet
+    // the ungranted real config, and on Windows the GIT_CONFIG_* pair
+    // carries the safe.directory waiver and GIT_PYTHON_REFRESH=quiet
     // defers `import git`'s `git --version` probe (see the note above).
     let env_names: Vec<&str> = env_vec.iter().map(|(name, _)| *name).collect();
     inject_environment(&mut host_kdl, &env_names);
