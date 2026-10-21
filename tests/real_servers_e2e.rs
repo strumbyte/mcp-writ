@@ -1832,354 +1832,32 @@ async fn git_stages() {
     // so a failing assert can report git's actual fatal line. An absent
     // trace file is itself diagnostic: the write grant then never landed.
     #[cfg(windows)]
-    const CANARY_SITECUSTOMIZE: &str = r#"# Injected by tests/real_servers_e2e.rs on Windows. PYTHONPATH points
-# at this file's directory inside the sandboxed server, so it runs at
-# every python startup. Two jobs:
-#   canary - probe the subprocess shapes git object reads rely on and
-#     record the outcomes in git-trace/canary.txt, so a stage-3 failure
-#     shows which spawn pattern the hosted runner is killing.
-#   patch - swap GitPython's persistent `cat-file` odb helpers for
-#     one-shot argv calls, and reimplement Git.execute() so every child
-#     gets file-backed stdin/stdout/stderr — the runner's sandbox denies
-#     \Device\Null and intermittently hands children invalid pipe fds,
-#     which sends git's sanitize_stdfds into a fatal /dev/null open.
-import io
+    const NULL_DEVICE_PROBE: &str = r#"# Record the actual server token's NUL access without patching GitPython.
+# Git's sanitize_stdfds() unconditionally opens /dev/null (NUL on Windows),
+# even when all three standard handles are valid. File-backed stdio and
+# retries cannot fix a device DACL denial.
 import os
-import subprocess
-import sys
-import tempfile
-import threading
-import traceback
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_TRACE_DIR = os.path.join(_HERE, "git-trace")
-_REPO = os.path.join(os.path.dirname(_HERE), "repo")
-_GIT = os.environ.get("GIT_PYTHON_GIT_EXECUTABLE")
-
-
-def _note(lines):
-    try:
-        os.makedirs(_TRACE_DIR, exist_ok=True)
-        with open(os.path.join(_TRACE_DIR, "canary.txt"), "a") as fh:
-            fh.write("\n".join(lines) + "\n")
-    except Exception:
-        pass
-
-
-def _canary():
-    out = ["== pid=%d argv=%r" % (os.getpid(), sys.argv)]
-    if not _GIT or not os.path.isdir(_REPO):
-        out.append("skip: git=%r repo=%r" % (_GIT, _REPO))
-        _note(out)
-        return
-    # Record whether python itself can open the null device; if this fails,
-    # every subprocess.DEVNULL stdin raises PermissionError at Popen — which
-    # is also what Git.refresh()'s probe hits, falling back to bare 'git'.
-    try:
-        _fd = os.open(os.devnull, os.O_RDWR)
-        os.close(_fd)
-        out.append("devnull-open: ok")
-    except Exception as e:
-        out.append("devnull-open: %r" % e)
-    cf = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-    try:
-        p = subprocess.Popen(
-            [_GIT, "cat-file", "--batch-check"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, cwd=_REPO, creationflags=cf)
-        p.stdin.write(b"HEAD\n")
-        p.stdin.flush()
-        res = {}
-        t = threading.Thread(
-            target=lambda: res.setdefault("l", p.stdout.readline()),
-            daemon=True)
-        t.start()
-        t.join(10)
-        out.append("persistent-batch-check: %s" %
-                   ("READLINE-TIMEOUT" if t.is_alive() else repr(res.get("l"))))
-        try:
-            p.kill()
-        except Exception:
-            pass
-    except Exception:
-        out.append("persistent-batch-check EXC %r" % traceback.format_exc())
-    try:
-        p = subprocess.Popen(
-            [_GIT, "cat-file", "--batch-check"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, cwd=_REPO, creationflags=cf)
-        o, e = p.communicate(b"HEAD\n", timeout=10)
-        out.append("oneshot-batch-check: rc=%r out=%r err=%r" % (p.returncode, o, e))
-    except Exception:
-        out.append("oneshot-batch-check EXC %r" % traceback.format_exc())
-    try:
-        r = subprocess.run([_GIT, "cat-file", "-t", "HEAD"],
-                           capture_output=True, cwd=_REPO, timeout=10,
-                           creationflags=cf)
-        out.append("argv-cat-file-t: rc=%r out=%r err=%r" % (r.returncode, r.stdout, r.stderr))
-    except Exception:
-        out.append("argv-cat-file-t EXC %r" % traceback.format_exc())
-    # The spawn shape the odb patch relies on: a real file as stdin.
-    try:
-        os.makedirs(_TRACE_DIR, exist_ok=True)
-        fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
-        fh.write(b"HEAD\n")
-        fh.flush()
-        fh.seek(0)
-        try:
-            r = subprocess.run([_GIT, "cat-file", "--batch-check"],
-                               stdin=fh, capture_output=True, cwd=_REPO,
-                               timeout=10, creationflags=cf)
-            out.append("file-batch-check: rc=%r out=%r err=%r" % (r.returncode, r.stdout, r.stderr))
-        finally:
-            fh.close()
-    except Exception:
-        out.append("file-batch-check EXC %r" % traceback.format_exc())
-    # The patched execute()'s actual shape: all three std channels are
-    # real files, so the child can never land an invalid fd that would
-    # send sanitize_stdfds into the denied /dev/null open.
-    try:
-        os.makedirs(_TRACE_DIR, exist_ok=True)
-        i_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
-        o_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
-        e_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
-        try:
-            i_fh.write(b"HEAD\n")
-            i_fh.flush()
-            i_fh.seek(0)
-            p = subprocess.run([_GIT, "cat-file", "--batch-check"],
-                               stdin=i_fh, stdout=o_fh, stderr=e_fh,
-                               cwd=_REPO, timeout=10, creationflags=cf)
-            o_fh.seek(0)
-            e_fh.seek(0)
-            out.append("allfile-batch-check: rc=%r out=%r err=%r"
-                       % (p.returncode, o_fh.read(), e_fh.read()))
-        finally:
-            i_fh.close()
-            o_fh.close()
-            e_fh.close()
-    except Exception:
-        out.append("allfile-batch-check EXC %r" % traceback.format_exc())
-    _note(out)
-
-
-def _gp_get_object_header(self, ref):
-    # odb callers pass the ref as bytes (gitdb's bin_to_hex is b2a_hex);
-    # execute() wants the full argv including the git executable. One
-    # `cat-file --batch-check` spawn answers type and size together;
-    # "<ref> missing"/unresolvable replies map to the odb-level BadObject
-    # callers expect, not a command-level GitCommandError.
-    from gitdb.exc import BadObject
-    ref_b = ref if isinstance(ref, bytes) else str(ref).encode("ascii")
-    # istream is consumed in-process by the patched execute() below, so a
-    # plain BytesIO suffices — no fileno is ever needed.
-    out = self.execute(
-        [self.GIT_PYTHON_GIT_EXECUTABLE, "cat-file", "--batch-check"],
-        istream=io.BytesIO(ref_b.rstrip(b"\n") + b"\n"),
-    )
-    if isinstance(out, bytes):
-        out = out.decode("ascii", "replace")
-    lines = out.splitlines()
-    tokens = lines[0].split() if lines else []
-    if len(tokens) != 3 or len(tokens[0]) != 40:
-        raise BadObject(ref_b)
-    hexsha, typename, size = tokens
-    # _parse_object_header returns tokens split off the raw bytes reply
-    # line, so odb callers expect (hexsha, typename) as bytes.
-    return (hexsha.encode("ascii"), typename.encode("ascii"), int(size))
-
-
-def _gp_stream_object_data(self, ref):
-    hexsha, typename, size = _gp_get_object_header(self, ref)
-    buf = io.BytesIO()
-    self.execute([self.GIT_PYTHON_GIT_EXECUTABLE, "cat-file",
-                  typename.decode("ascii"), hexsha.decode("ascii")],
-                 output_stream=buf)
-    buf.seek(0)
-    return (hexsha, typename, size, buf)
-
-
-def _patch():
-    import git.cmd
-    import git.exc
-    _orig_execute = git.cmd.Git.execute
-
-    # The hosted runner's \Device\Null denies our AppContainer token (the
-    # canary records this in git-trace/canary.txt), and subprocess's pipe
-    # handles intermittently arrive in the child as INVALID std fds — git's
-    # sanitize_stdfds then opens /dev/null, hits the denial, and dies with
-    # exit 128 before even emitting a trace event. File handles inherit
-    # cleanly every time, so run every git child with all three std
-    # channels backed by real files under the write-granted trace dir and
-    # reassemble execute()'s result contract in-process.
-    _EXEC_ARG_NAMES = (
-        "istream", "with_extended_output", "with_exceptions", "as_process",
-        "output_stream", "stdout_as_string", "kill_after_timeout",
-        "with_stdout", "universal_newlines", "shell", "env",
-        "max_chunk_size", "strip_newline_in_stdout",
-    )
-
-    class _FinishedProc:
-        # AutoInterrupt-shaped wrapper over a synchronous run: iter_commits
-        # reads .stdout line by line and finalize_process() calls .wait().
-        def __init__(self, command, status, out, err):
-            self.args = command
-            self.status = status
-            self.returncode = status
-            self.stdout = io.BytesIO(out)
-            self.stderr = io.BytesIO(err)
-            self.stdin = None
-            self.proc = None
-
-        def wait(self, stderr=b""):
-            if self.status:
-                err = self.stderr.getvalue() or stderr
-                if isinstance(err, str):
-                    err = err.encode("utf-8", "replace")
-                raise git.exc.GitCommandError(self.args, self.status, err)
-            return self.status
-
-        def poll(self):
-            return self.returncode
-
-    def _files_execute(self, command, *a, **kw):
-        if len(a) > len(_EXEC_ARG_NAMES):
-            return _orig_execute(self, command, *a, **kw)
-        opts = dict(kw)
-        for name, val in zip(_EXEC_ARG_NAMES, a):
-            opts[name] = val
-        if opts.get("shell"):
-            return _orig_execute(self, command, *a, **kw)
-        istream = opts.get("istream")
-        if isinstance(istream, int):
-            # PIPE/raw-fd stdin (hash_object --stdin, interpret-trailers)
-            # cannot be emulated with a pre-filled file; the server does
-            # not use it, and it keeps the original semantics if reached.
-            return _orig_execute(self, command, *a, **kw)
-        if istream is None:
-            data = b""
-        else:
-            try:
-                istream.seek(0)
-            except Exception:
-                pass
-            data = istream.read() or b""
-            if isinstance(data, str):
-                data = data.encode("utf-8")
-        env = os.environ.copy()
-        env["LANGUAGE"] = "C"
-        env["LC_ALL"] = "C"
-        env.update(getattr(self, "_environment", None) or {})
-        if opts.get("env"):
-            env.update(opts["env"])
-        cwd = getattr(self, "_working_dir", None) or os.getcwd()
-        if not os.path.isdir(cwd):
-            cwd = None
-        cf = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-        out = err = b""
-        rc = -1
-        # Two flake signatures are retryable: the 0xC0000409 fastfail and
-        # a residual /dev/null denial (kept as a belt — file-backed std fds
-        # should make sanitize_stdfds unreachable). Read-only calls are
-        # idempotent; genuine exit-code failures still propagate.
-        for _ in range(4):
-            os.makedirs(_TRACE_DIR, exist_ok=True)
-            i_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
-            o_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
-            e_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
-            try:
-                i_fh.write(data)
-                i_fh.flush()
-                i_fh.seek(0)
-                try:
-                    p = subprocess.run(
-                        command, stdin=i_fh, stdout=o_fh, stderr=e_fh,
-                        cwd=cwd, env=env, creationflags=cf)
-                except FileNotFoundError as e:
-                    raise git.exc.GitCommandNotFound(command, str(e))
-                rc = p.returncode
-                o_fh.seek(0)
-                e_fh.seek(0)
-                out, err = o_fh.read(), e_fh.read()
-            finally:
-                i_fh.close()
-                o_fh.close()
-                e_fh.close()
-            if rc not in (3221225725, -1073740791) and not (
-                    rc == 128 and "could not open '/dev/null'"
-                    in err.decode("utf-8", "replace")):
-                break
-
-        if opts.get("as_process"):
-            return _FinishedProc(command, rc, out, err)
-
-        newline = b"\n"
-        output_stream = opts.get("output_stream")
-        if output_stream is None:
-            stdout_value = out
-            if stdout_value.endswith(newline) \
-                    and opts.get("strip_newline_in_stdout", True):
-                stdout_value = stdout_value[:-1]
-        else:
-            output_stream.write(out)
-            stdout_value = b""
-        if err.endswith(newline):
-            err = err[:-1]
-        if opts.get("with_exceptions", True) and rc != 0:
-            raise git.exc.GitCommandError(command, rc, err, stdout_value)
-        if not opts.get("with_stdout", True):
-            stdout_value = b""
-        if opts.get("stdout_as_string", True):
-            try:
-                stdout_value = stdout_value.decode("utf-8")
-            except UnicodeDecodeError:
-                stdout_value = stdout_value.decode("utf-8", "replace")
-        if opts.get("with_extended_output"):
-            return (rc, stdout_value, err.decode("utf-8", "replace"))
-        return stdout_value
-
-    git.cmd.Git.execute = _files_execute
-    git.cmd.Git.get_object_header = _gp_get_object_header
-    git.cmd.Git.stream_object_data = _gp_stream_object_data
-
-    # Every odb read path above is argv/file-stdin now, so the persistent
-    # `cat-file` helpers must never be spawned — their PIPE stdin is what
-    # the runner kills at sanitize_stdfds. If some path still reaches it,
-    # surface a self-describing error naming the helper instead of a
-    # silent /dev/null denial.
-    def _blocked_persistent_cmd(self, attr_name, cmd_name, *args, **kwargs):
-        raise RuntimeError(
-            "persistent git helper blocked in sandbox: %s (%s)"
-            % (attr_name, cmd_name))
-
-    git.cmd.Git._get_persistent_cmd = _blocked_persistent_cmd
-    # Import-time Git.refresh() may have fallen back to bare 'git' if its
-    # `version` probe died on the null-device denial — command argv[0]
-    # then resolves via PATH and errors report the unhelpful Cmd('git').
-    # Pin the executable the harness granted so calls always use it.
-    if _GIT and git.cmd.Git.GIT_PYTHON_GIT_EXECUTABLE != _GIT:
-        _note(["== pid=%d executable %r -> %r" %
-               (os.getpid(), git.cmd.Git.GIT_PYTHON_GIT_EXECUTABLE, _GIT)])
-        git.cmd.Git.GIT_PYTHON_GIT_EXECUTABLE = _GIT
-    _note(["== pid=%d gitpython-odb-patched exe=%r" %
-           (os.getpid(), git.cmd.Git.GIT_PYTHON_GIT_EXECUTABLE)])
-
 
 try:
-    _canary()
-except Exception:
-    pass
-try:
-    _patch()
-except Exception:
-    _note(["== pid=%d patch EXC %r" % (os.getpid(), traceback.format_exc())])
+    fd = os.open(os.devnull, os.O_RDWR)
+    try:
+        os.write(fd, b"nul-probe")
+        status = "ok" if os.read(fd, 1) == b"" else "NUL did not return EOF"
+    finally:
+        os.close(fd)
+except OSError as error:
+    status = repr(error)
+
+with open(os.path.join(os.path.dirname(__file__), "git-trace", "null-device.txt"),
+          "w", encoding="utf-8") as report:
+    report.write(status)
 "#;
     #[cfg(windows)]
     let (trace_dir, trace_events, trace_full, trace_perf, site_dir) = {
         let d = cwd.join("git-trace");
         std::fs::create_dir_all(&d).expect("create git trace dir inside granted work dir");
-        std::fs::write(cwd.join("sitecustomize.py"), CANARY_SITECUSTOMIZE)
-            .expect("write sitecustomize canary inside granted work dir");
+        std::fs::write(cwd.join("sitecustomize.py"), NULL_DEVICE_PROBE)
+            .expect("write NUL probe inside granted work dir");
         (
             d.clone(),
             kdl_path(&d.join("events.log")),
@@ -2249,9 +1927,9 @@ except Exception:
         // (e.g. last region_enter before a fastfail in cmd_status).
         ("GIT_TRACE2_PERF", trace_perf.as_str()),
         // PYTHONPATH puts sitecustomize.py on sys.path so it runs inside
-        // the sandboxed server at interpreter startup: it records which
-        // cat-file spawn patterns survive and patches GitPython's odb
-        // reads onto argv-only one-shots (see CANARY_SITECUSTOMIZE).
+        // the sandboxed server at interpreter startup. It only checks NUL
+        // access; GitPython's subprocess and persistent cat-file paths stay
+        // unmodified so these tests exercise the pinned server as shipped.
         ("PYTHONPATH", site_dir.as_str()),
     ]);
     // The AppContainer child's token SID differs from the repo creator's,
@@ -2281,11 +1959,9 @@ except Exception:
             ("GIT_CONFIG_VALUE_1", "false"),
         ]);
     }
-    // GitPython probes `git --version` at import. On Windows `quiet` defers
-    // that subprocess to the first real git command, keeping `import git` —
-    // and therefore the handshake — independent of an extra sandboxed exec;
-    // an exec regression then surfaces as the stage-3 tool-call error rather
-    // than a dead session.
+    // GitPython probes `git --version` at import. `quiet` suppresses an
+    // import-time error; it does not skip the probe. The NUL prerequisite
+    // check below reports a device denial before any tool call.
     if cfg!(windows) {
         env_vec.push(("GIT_PYTHON_REFRESH", "quiet"));
     }
@@ -2333,7 +2009,7 @@ except Exception:
     // the GIT_CONFIG_GLOBAL/GIT_CONFIG_NOSYSTEM redirects keep git off
     // the ungranted real config, and on Windows the GIT_CONFIG_* pair
     // carries the safe.directory waiver and GIT_PYTHON_REFRESH=quiet
-    // defers `import git`'s `git --version` probe (see the note above).
+    // suppresses import-time probe errors (see the note above).
     let env_names: Vec<&str> = env_vec.iter().map(|(name, _)| *name).collect();
     inject_environment(&mut host_kdl, &env_names);
     let policy_path = write_policy(&root, "host-git.kdl", &host_kdl);
@@ -2361,9 +2037,25 @@ except Exception:
     )
     .await;
 
+    // Discard the dry-run probe: only the sandboxed token is evidence.
+    #[cfg(windows)]
+    std::fs::write(trace_dir.join("null-device.txt"), b"pending sandbox probe")
+        .expect("reset NUL probe before sandboxed startup");
     // stage 3 + 4: sandboxed session (guard cwd = work/, granted so the
     // AppContainer child has a valid working directory)
     let (mut s3, audit3) = stage3_spawn(spec, &policy_path, &argv, env_refs, Some(&cwd)).await;
+    #[cfg(windows)]
+    {
+        let probe = std::fs::read_to_string(trace_dir.join("null-device.txt"))
+            .expect("sandboxed Python must report NUL access");
+        assert_eq!(
+            probe,
+            "ok",
+            "stage3 git: Windows host must allow AppContainer NUL read/write; \
+             on an isolated elevated test host use scripts/with-windows-null-device.ps1{}",
+            trace_tail()
+        );
+    }
     let resp = s3.call("git_log", &log_args).await;
     // Earlier Windows builds could not run the MinGW git subprocess under
     // AppContainer (the runtime resolved its cwd through

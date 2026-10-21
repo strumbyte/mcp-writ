@@ -256,6 +256,31 @@ returns `EPERM` for it on every path), and a pinned MinGit for
 `mcp-server-git` (a `git.exe` under `Program Files` is neither grantable by
 a non-admin nor covered by package ACEs, and its cwd resolution is denied).
 
+Some Windows CI images also deny AppContainers read/write access to the
+`NUL` device. Git opens it unconditionally in `sanitize_stdfds()`, including
+when all standard streams are valid; redirecting streams or retrying cannot
+fix this host prerequisite. The Git test checks access using the sandboxed
+Python token and reports a device denial explicitly. GitPython itself is
+not patched by the test harness.
+
+On an isolated, elevated Windows test host, run:
+
+```powershell
+$env:MCP_WRIT_REQUIRE_SERVER_TESTS = '1'
+& ./scripts/with-windows-null-device.ps1 -Command {
+    cargo test --locked --test real_servers_e2e
+    if ($LASTEXITCODE -ne 0) { throw "Real-server tests failed ($LASTEXITCODE)" }
+}
+```
+
+The MCP server verification workflow uses this helper on its disposable
+Windows runner. It adds only a non-inherited read/write ACE for
+`ALL APPLICATION PACKAGES` on the NUL device, retaining the existing DACL,
+and restores the original DACL in `finally`, including on test failure.
+It does not change directory grants or networking. Do not run concurrent
+NUL ACL editors on that host; forced process termination cannot run the
+cleanup, so the CI runner must remain disposable.
+
 `scripts/check-server.sh` and `scripts/check-server.ps1` verify one real
 server against one policy without Cargo — a dry-run handshake plus
 `tools/list`, the same exchange sandboxed, and an optional sandboxed

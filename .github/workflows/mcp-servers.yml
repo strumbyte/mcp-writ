@@ -73,8 +73,22 @@ jobs:
           sudo modprobe tun
           test -c /dev/net/tun
 
-      - name: Six-stage real-server tests
+      - name: Six-stage real-server tests (unix)
+        if: runner.os != 'Windows'
         run: cargo test --locked --test real_servers_e2e
+
+      # Git always opens NUL in sanitize_stdfds(), even with valid stdio.
+      # Hosted Windows images can deny that device to AppContainers. Scope
+      # the host prerequisite to this command and restore its DACL on failure.
+      - name: Six-stage real-server tests (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ./tests/scripts/windows-null-device.tests.ps1 -IncludeDevice
+          & ./scripts/with-windows-null-device.ps1 -Command {
+            cargo test --locked --test real_servers_e2e
+            if ($LASTEXITCODE -ne 0) { throw "Real-server tests failed ($LASTEXITCODE)" }
+          }
 
       # check-server against the filesystem server with a host-derived
       # policy: extends examples/policies/filesystem.kdl and adds this
