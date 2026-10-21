@@ -1839,9 +1839,10 @@ async fn git_stages() {
 #     record the outcomes in git-trace/canary.txt, so a stage-3 failure
 #     shows which spawn pattern the hosted runner is killing.
 #   patch - swap GitPython's persistent `cat-file` odb helpers for
-#     argv-only one-shot calls, the spawn shape observed to survive on
-#     the runner (git version / rev-list exit 0 while the persistent
-#     --batch/--batch-check helpers vanish without an exit event).
+#     one-shot argv calls, and reimplement Git.execute() so every child
+#     gets file-backed stdin/stdout/stderr — the runner's sandbox denies
+#     \Device\Null and intermittently hands children invalid pipe fds,
+#     which sends git's sanitize_stdfds into a fatal /dev/null open.
 import io
 import os
 import subprocess
@@ -1934,6 +1935,31 @@ def _canary():
             fh.close()
     except Exception:
         out.append("file-batch-check EXC %r" % traceback.format_exc())
+    # The patched execute()'s actual shape: all three std channels are
+    # real files, so the child can never land an invalid fd that would
+    # send sanitize_stdfds into the denied /dev/null open.
+    try:
+        os.makedirs(_TRACE_DIR, exist_ok=True)
+        i_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
+        o_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
+        e_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
+        try:
+            i_fh.write(b"HEAD\n")
+            i_fh.flush()
+            i_fh.seek(0)
+            p = subprocess.run([_GIT, "cat-file", "--batch-check"],
+                               stdin=i_fh, stdout=o_fh, stderr=e_fh,
+                               cwd=_REPO, timeout=10, creationflags=cf)
+            o_fh.seek(0)
+            e_fh.seek(0)
+            out.append("allfile-batch-check: rc=%r out=%r err=%r"
+                       % (p.returncode, o_fh.read(), e_fh.read()))
+        finally:
+            i_fh.close()
+            o_fh.close()
+            e_fh.close()
+    except Exception:
+        out.append("allfile-batch-check EXC %r" % traceback.format_exc())
     _note(out)
 
 
@@ -1945,22 +1971,12 @@ def _gp_get_object_header(self, ref):
     # callers expect, not a command-level GitCommandError.
     from gitdb.exc import BadObject
     ref_b = ref if isinstance(ref, bytes) else str(ref).encode("ascii")
-    # execute() hands istream straight to Popen(stdin=...), so it must own a
-    # real fileno — BytesIO raises UnsupportedOperation('fileno'). Spool the
-    # single request into the write-granted trace dir and rewind it; a
-    # file-backed stdin also sidesteps pipe-handle inheritance entirely.
-    os.makedirs(_TRACE_DIR, exist_ok=True)
-    fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
-    try:
-        fh.write(ref_b.rstrip(b"\n") + b"\n")
-        fh.flush()
-        fh.seek(0)
-        out = self.execute(
-            [self.GIT_PYTHON_GIT_EXECUTABLE, "cat-file", "--batch-check"],
-            istream=fh,
-        )
-    finally:
-        fh.close()
+    # istream is consumed in-process by the patched execute() below, so a
+    # plain BytesIO suffices — no fileno is ever needed.
+    out = self.execute(
+        [self.GIT_PYTHON_GIT_EXECUTABLE, "cat-file", "--batch-check"],
+        istream=io.BytesIO(ref_b.rstrip(b"\n") + b"\n"),
+    )
     if isinstance(out, bytes):
         out = out.decode("ascii", "replace")
     lines = out.splitlines()
@@ -1988,86 +2004,141 @@ def _patch():
     import git.exc
     _orig_execute = git.cmd.Git.execute
 
-    # GitPython hands istream=None children stdin=DEVNULL, which makes
-    # python open 'nul' — denied on the hosted runner (its \Device\Null
-    # DACL does not cover our AppContainer token; the canary records the
-    # exact failure in git-trace/canary.txt). It also makes Git.refresh()
-    # fall back to bare 'git'. PIPE stdin is denied differently: the child
-    # dies at sanitize_stdfds before handle_builtin. A real file under the
-    # write-granted trace dir is the only stdin shape seen to survive, so
-    # substitute one for every "no stdin" call. Popen duplicates the
-    # handle for the child, so the parent copy can close right after the
-    # call returns; retries must re-substitute, so the spent file is
-    # popped back out of the arguments.
-    def _sub_file_stdin(a, kw):
-        if kw.get("istream") is not None:
-            return None, a, kw
-        if len(a) > 0:
-            if a[0] is not None:
-                return None, a, kw
-            fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
-            return fh, (fh,) + a[1:], kw
-        fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
-        kw = dict(kw)
-        kw["istream"] = fh
-        return fh, a, kw
+    # The hosted runner's \Device\Null denies our AppContainer token (the
+    # canary records this in git-trace/canary.txt), and subprocess's pipe
+    # handles intermittently arrive in the child as INVALID std fds — git's
+    # sanitize_stdfds then opens /dev/null, hits the denial, and dies with
+    # exit 128 before even emitting a trace event. File handles inherit
+    # cleanly every time, so run every git child with all three std
+    # channels backed by real files under the write-granted trace dir and
+    # reassemble execute()'s result contract in-process.
+    _EXEC_ARG_NAMES = (
+        "istream", "with_extended_output", "with_exceptions", "as_process",
+        "output_stream", "stdout_as_string", "kill_after_timeout",
+        "with_stdout", "universal_newlines", "shell", "env",
+        "max_chunk_size", "strip_newline_in_stdout",
+    )
 
-    def _pop_file_stdin(fh, a, kw):
-        if kw.get("istream") is fh:
-            kw = dict(kw)
-            del kw["istream"]
-        if len(a) > 0 and a[0] is fh:
-            a = (None,) + a[1:]
-        fh.close()
-        return a, kw
+    class _FinishedProc:
+        # AutoInterrupt-shaped wrapper over a synchronous run: iter_commits
+        # reads .stdout line by line and finalize_process() calls .wait().
+        def __init__(self, command, status, out, err):
+            self.args = command
+            self.status = status
+            self.returncode = status
+            self.stdout = io.BytesIO(out)
+            self.stderr = io.BytesIO(err)
+            self.stdin = None
+            self.proc = None
 
-    def _devnull_denied(e):
-        # The runner's \Device\Null denies our AppContainer token and
-        # handle inheritance into the child is flaky: a spawned git
-        # intermittently lands an invalid std fd, so sanitize_stdfds
-        # opens /dev/null and dies with exit 128 before handle_builtin.
-        # Distinguishable from real command failures by the fatal line.
-        err = getattr(e, "stderr", "") or ""
-        if not isinstance(err, str):
-            err = err.decode("utf-8", "replace")
-        return "could not open '/dev/null'" in err
+        def wait(self, stderr=b""):
+            if self.status:
+                err = self.stderr.getvalue() or stderr
+                if isinstance(err, str):
+                    err = err.encode("utf-8", "replace")
+                raise git.exc.GitCommandError(self.args, self.status, err)
+            return self.status
 
-    def _retrying_execute(self, command, *a, **kw):
-        # Sandboxed git children intermittently die by fastfail
-        # (0xC0000409, stack-cookie violation in the MinGit/ucrt
-        # runtime under AppContainer) — a silent crash carrying no
-        # stderr — or by the /dev/null sanitize denial above. These
-        # calls are read-only, so retry either flake signature only;
-        # genuine exit-code failures still raise.
-        last = None
-        for _ in range(4):
-            # A crashed attempt may have left partial data in the
-            # caller's output_stream; rewind it so a retry cannot
-            # append after stale bytes. (positional index 4 in the
-            # execute() signature if not passed as a kwarg)
-            stream = kw.get("output_stream")
-            if stream is None and len(a) > 4:
-                stream = a[4]
-            if stream is not None:
-                try:
-                    stream.seek(0)
-                    stream.truncate(0)
-                except (AttributeError, OSError):
-                    pass
-            fh, a, kw = _sub_file_stdin(a, kw)
+        def poll(self):
+            return self.returncode
+
+    def _files_execute(self, command, *a, **kw):
+        if len(a) > len(_EXEC_ARG_NAMES):
+            return _orig_execute(self, command, *a, **kw)
+        opts = dict(kw)
+        for name, val in zip(_EXEC_ARG_NAMES, a):
+            opts[name] = val
+        if opts.get("shell"):
+            return _orig_execute(self, command, *a, **kw)
+        istream = opts.get("istream")
+        if isinstance(istream, int):
+            # PIPE/raw-fd stdin (hash_object --stdin, interpret-trailers)
+            # cannot be emulated with a pre-filled file; the server does
+            # not use it, and it keeps the original semantics if reached.
+            return _orig_execute(self, command, *a, **kw)
+        if istream is None:
+            data = b""
+        else:
             try:
-                return _orig_execute(self, command, *a, **kw)
-            except git.exc.GitCommandError as e:
-                if getattr(e, "status", None) not in (3221225725, -1073740791) \
-                        and not (getattr(e, "status", None) == 128 and _devnull_denied(e)):
-                    raise
-                last = e
+                istream.seek(0)
+            except Exception:
+                pass
+            data = istream.read() or b""
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+        env = os.environ.copy()
+        env["LANGUAGE"] = "C"
+        env["LC_ALL"] = "C"
+        env.update(getattr(self, "_environment", None) or {})
+        if opts.get("env"):
+            env.update(opts["env"])
+        cwd = getattr(self, "_working_dir", None) or os.getcwd()
+        if not os.path.isdir(cwd):
+            cwd = None
+        cf = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        out = err = b""
+        rc = -1
+        # Two flake signatures are retryable: the 0xC0000409 fastfail and
+        # a residual /dev/null denial (kept as a belt — file-backed std fds
+        # should make sanitize_stdfds unreachable). Read-only calls are
+        # idempotent; genuine exit-code failures still propagate.
+        for _ in range(4):
+            os.makedirs(_TRACE_DIR, exist_ok=True)
+            i_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
+            o_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
+            e_fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
+            try:
+                i_fh.write(data)
+                i_fh.flush()
+                i_fh.seek(0)
+                try:
+                    p = subprocess.run(
+                        command, stdin=i_fh, stdout=o_fh, stderr=e_fh,
+                        cwd=cwd, env=env, creationflags=cf)
+                except FileNotFoundError as e:
+                    raise git.exc.GitCommandNotFound(command, str(e))
+                rc = p.returncode
+                o_fh.seek(0)
+                e_fh.seek(0)
+                out, err = o_fh.read(), e_fh.read()
             finally:
-                if fh is not None:
-                    a, kw = _pop_file_stdin(fh, a, kw)
-        raise last
+                i_fh.close()
+                o_fh.close()
+                e_fh.close()
+            if rc not in (3221225725, -1073740791) and not (
+                    rc == 128 and "could not open '/dev/null'"
+                    in err.decode("utf-8", "replace")):
+                break
 
-    git.cmd.Git.execute = _retrying_execute
+        if opts.get("as_process"):
+            return _FinishedProc(command, rc, out, err)
+
+        newline = b"\n"
+        output_stream = opts.get("output_stream")
+        if output_stream is None:
+            stdout_value = out
+            if stdout_value.endswith(newline) \
+                    and opts.get("strip_newline_in_stdout", True):
+                stdout_value = stdout_value[:-1]
+        else:
+            output_stream.write(out)
+            stdout_value = b""
+        if err.endswith(newline):
+            err = err[:-1]
+        if opts.get("with_exceptions", True) and rc != 0:
+            raise git.exc.GitCommandError(command, rc, err, stdout_value)
+        if not opts.get("with_stdout", True):
+            stdout_value = b""
+        if opts.get("stdout_as_string", True):
+            try:
+                stdout_value = stdout_value.decode("utf-8")
+            except UnicodeDecodeError:
+                stdout_value = stdout_value.decode("utf-8", "replace")
+        if opts.get("with_extended_output"):
+            return (rc, stdout_value, err.decode("utf-8", "replace"))
+        return stdout_value
+
+    git.cmd.Git.execute = _files_execute
     git.cmd.Git.get_object_header = _gp_get_object_header
     git.cmd.Git.stream_object_data = _gp_stream_object_data
 
