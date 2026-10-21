@@ -2021,12 +2021,24 @@ def _patch():
         fh.close()
         return a, kw
 
+    def _devnull_denied(e):
+        # The runner's \Device\Null denies our AppContainer token and
+        # handle inheritance into the child is flaky: a spawned git
+        # intermittently lands an invalid std fd, so sanitize_stdfds
+        # opens /dev/null and dies with exit 128 before handle_builtin.
+        # Distinguishable from real command failures by the fatal line.
+        err = getattr(e, "stderr", "") or ""
+        if not isinstance(err, str):
+            err = err.decode("utf-8", "replace")
+        return "could not open '/dev/null'" in err
+
     def _retrying_execute(self, command, *a, **kw):
         # Sandboxed git children intermittently die by fastfail
         # (0xC0000409, stack-cookie violation in the MinGit/ucrt
         # runtime under AppContainer) — a silent crash carrying no
-        # stderr. These calls are read-only, so retry the crash
-        # signature only; genuine exit-code failures still raise.
+        # stderr — or by the /dev/null sanitize denial above. These
+        # calls are read-only, so retry either flake signature only;
+        # genuine exit-code failures still raise.
         last = None
         for _ in range(4):
             # A crashed attempt may have left partial data in the
@@ -2046,7 +2058,8 @@ def _patch():
             try:
                 return _orig_execute(self, command, *a, **kw)
             except git.exc.GitCommandError as e:
-                if getattr(e, "status", None) not in (3221225725, -1073740791):
+                if getattr(e, "status", None) not in (3221225725, -1073740791) \
+                        and not (getattr(e, "status", None) == 128 and _devnull_denied(e)):
                     raise
                 last = e
             finally:
