@@ -1724,8 +1724,16 @@ async fn git_stages() {
     // readable inside the sandbox. On Windows a system git under
     // `Program Files` is neither grantable nor package-readable, so the
     // pinned MinGit fixture (fetched by setup.ps1) provides the executable.
+    // Point at mingw64/bin/git.exe — the real binary — not cmd/git.exe,
+    // which is a launcher wrapper: it derives HOME from HOMEDRIVE/USERPROFILE
+    // (absent in the restricted env), rewrites std handles, and spawns the
+    // real git via CreateProcess — an extra layer under which the sandboxed
+    // child saw persistent `cat-file --batch*` processes die silently while
+    // single-shot commands succeeded. The direct binary needs no wrapper
+    // services: its exec-path and config prefixes resolve from its own
+    // location, which the grants below cover.
     let git_exe = if cfg!(windows) {
-        let exe = fixtures_dir().join("mingit/cmd/git.exe");
+        let exe = fixtures_dir().join("mingit/mingw64/bin/git.exe");
         if !exe.is_file() {
             common::skip_server_test(&format!(
                 "mingit fixture not installed: {} (run setup.ps1)",
