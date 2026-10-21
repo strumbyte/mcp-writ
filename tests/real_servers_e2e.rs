@@ -1832,14 +1832,193 @@ async fn git_stages() {
     // so a failing assert can report git's actual fatal line. An absent
     // trace file is itself diagnostic: the write grant then never landed.
     #[cfg(windows)]
-    let (trace_dir, trace_events, trace_stderr, trace_full) = {
+    const CANARY_SITECUSTOMIZE: &str = r#"# Injected by tests/real_servers_e2e.rs on Windows. PYTHONPATH points
+# at this file's directory inside the sandboxed server, so it runs at
+# every python startup. Two jobs:
+#   canary - probe the subprocess shapes git object reads rely on and
+#     record the outcomes in git-trace/canary.txt, so a stage-3 failure
+#     shows which spawn pattern the hosted runner is killing.
+#   patch - swap GitPython's persistent `cat-file` odb helpers for
+#     argv-only one-shot calls, the spawn shape observed to survive on
+#     the runner (git version / rev-list exit 0 while the persistent
+#     --batch/--batch-check helpers vanish without an exit event).
+import io
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import traceback
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_TRACE_DIR = os.path.join(_HERE, "git-trace")
+_REPO = os.path.join(os.path.dirname(_HERE), "repo")
+_GIT = os.environ.get("GIT_PYTHON_GIT_EXECUTABLE")
+
+
+def _note(lines):
+    try:
+        os.makedirs(_TRACE_DIR, exist_ok=True)
+        with open(os.path.join(_TRACE_DIR, "canary.txt"), "a") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
+def _canary():
+    out = ["== pid=%d argv=%r" % (os.getpid(), sys.argv)]
+    if not _GIT or not os.path.isdir(_REPO):
+        out.append("skip: git=%r repo=%r" % (_GIT, _REPO))
+        _note(out)
+        return
+    cf = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    try:
+        p = subprocess.Popen(
+            [_GIT, "cat-file", "--batch-check"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=_REPO, creationflags=cf)
+        p.stdin.write(b"HEAD\n")
+        p.stdin.flush()
+        res = {}
+        t = threading.Thread(
+            target=lambda: res.setdefault("l", p.stdout.readline()),
+            daemon=True)
+        t.start()
+        t.join(10)
+        out.append("persistent-batch-check: %s" %
+                   ("READLINE-TIMEOUT" if t.is_alive() else repr(res.get("l"))))
+        try:
+            p.kill()
+        except Exception:
+            pass
+    except Exception:
+        out.append("persistent-batch-check EXC %r" % traceback.format_exc())
+    try:
+        p = subprocess.Popen(
+            [_GIT, "cat-file", "--batch-check"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=_REPO, creationflags=cf)
+        o, e = p.communicate(b"HEAD\n", timeout=10)
+        out.append("oneshot-batch-check: rc=%r out=%r err=%r" % (p.returncode, o, e))
+    except Exception:
+        out.append("oneshot-batch-check EXC %r" % traceback.format_exc())
+    try:
+        r = subprocess.run([_GIT, "cat-file", "-t", "HEAD"],
+                           capture_output=True, cwd=_REPO, timeout=10,
+                           creationflags=cf)
+        out.append("argv-cat-file-t: rc=%r out=%r err=%r" % (r.returncode, r.stdout, r.stderr))
+    except Exception:
+        out.append("argv-cat-file-t EXC %r" % traceback.format_exc())
+    _note(out)
+
+
+def _gp_get_object_header(self, ref):
+    # odb callers pass the ref as bytes (gitdb's bin_to_hex is b2a_hex);
+    # execute() wants the full argv including the git executable. One
+    # `cat-file --batch-check` spawn answers type and size together;
+    # "<ref> missing"/unresolvable replies map to the odb-level BadObject
+    # callers expect, not a command-level GitCommandError.
+    from gitdb.exc import BadObject
+    ref_b = ref if isinstance(ref, bytes) else str(ref).encode("ascii")
+    # execute() hands istream straight to Popen(stdin=...), so it must own a
+    # real fileno — BytesIO raises UnsupportedOperation('fileno'). Spool the
+    # single request into the write-granted trace dir and rewind it; a
+    # file-backed stdin also sidesteps pipe-handle inheritance entirely.
+    os.makedirs(_TRACE_DIR, exist_ok=True)
+    fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
+    try:
+        fh.write(ref_b.rstrip(b"\n") + b"\n")
+        fh.flush()
+        fh.seek(0)
+        out = self.execute(
+            [self.GIT_PYTHON_GIT_EXECUTABLE, "cat-file", "--batch-check"],
+            istream=fh,
+        )
+    finally:
+        fh.close()
+    if isinstance(out, bytes):
+        out = out.decode("ascii", "replace")
+    lines = out.splitlines()
+    tokens = lines[0].split() if lines else []
+    if len(tokens) != 3 or len(tokens[0]) != 40:
+        raise BadObject(ref_b)
+    hexsha, typename, size = tokens
+    # _parse_object_header returns tokens split off the raw bytes reply
+    # line, so odb callers expect (hexsha, typename) as bytes.
+    return (hexsha.encode("ascii"), typename.encode("ascii"), int(size))
+
+
+def _gp_stream_object_data(self, ref):
+    hexsha, typename, size = _gp_get_object_header(self, ref)
+    buf = io.BytesIO()
+    self.execute([self.GIT_PYTHON_GIT_EXECUTABLE, "cat-file",
+                  typename.decode("ascii"), hexsha.decode("ascii")],
+                 output_stream=buf)
+    buf.seek(0)
+    return (hexsha, typename, size, buf)
+
+
+def _patch():
+    import git.cmd
+    import git.exc
+    _orig_execute = git.cmd.Git.execute
+
+    def _retrying_execute(self, command, *a, **kw):
+        # Sandboxed git children intermittently die by fastfail
+        # (0xC0000409, stack-cookie violation in the MinGit/ucrt
+        # runtime under AppContainer) — a silent crash carrying no
+        # stderr. These calls are read-only, so retry the crash
+        # signature only; genuine exit-code failures still raise.
+        last = None
+        for _ in range(4):
+            # A crashed attempt may have left partial data in the
+            # caller's output_stream; rewind it so a retry cannot
+            # append after stale bytes. (positional index 4 in the
+            # execute() signature if not passed as a kwarg)
+            stream = kw.get("output_stream")
+            if stream is None and len(a) > 4:
+                stream = a[4]
+            if stream is not None:
+                try:
+                    stream.seek(0)
+                    stream.truncate(0)
+                except (AttributeError, OSError):
+                    pass
+            try:
+                return _orig_execute(self, command, *a, **kw)
+            except git.exc.GitCommandError as e:
+                if getattr(e, "status", None) not in (3221225725, -1073740791):
+                    raise
+                last = e
+        raise last
+
+    git.cmd.Git.execute = _retrying_execute
+    git.cmd.Git.get_object_header = _gp_get_object_header
+    git.cmd.Git.stream_object_data = _gp_stream_object_data
+    _note(["== pid=%d gitpython-odb-patched" % os.getpid()])
+
+
+try:
+    _canary()
+except Exception:
+    pass
+try:
+    _patch()
+except Exception:
+    _note(["== pid=%d patch EXC %r" % (os.getpid(), traceback.format_exc())])
+"#;
+    #[cfg(windows)]
+    let (trace_dir, trace_events, trace_full, trace_perf, site_dir) = {
         let d = cwd.join("git-trace");
         std::fs::create_dir_all(&d).expect("create git trace dir inside granted work dir");
+        std::fs::write(cwd.join("sitecustomize.py"), CANARY_SITECUSTOMIZE)
+            .expect("write sitecustomize canary inside granted work dir");
         (
             d.clone(),
             kdl_path(&d.join("events.log")),
-            kdl_path(&d.join("stderr.log")),
             kdl_path(&d.join("trace.log")),
+            kdl_path(&d.join("perf.log")),
+            kdl_path(&cwd),
         )
     };
     #[cfg(windows)]
@@ -1889,15 +2068,24 @@ async fn git_stages() {
         ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1"),
         ("GIT_TRACE2_EVENT", trace_events.as_str()),
         ("GIT_TRACE2_CONFIG_PARAMS", "*"),
-        // Persistent cat-file helpers die without a trace2 exit event, so
-        // their stderr is the only record of the actual fatal line — the
-        // server never surfaces it. GIT_REDIRECT_STDERR detours every git
-        // child's stderr into the same write-granted trace dir.
-        ("GIT_REDIRECT_STDERR", trace_stderr.as_str()),
+        // NOTE: do NOT use GIT_REDIRECT_STDERR here. It dup2's fd 2 onto
+        // an O_APPEND file handle; under the sandbox a mingw_write on that
+        // handle returns EINVAL, and mingw's EINVAL handler calls
+        // warning() — which writes to fd 2 again — recursing until the
+        // stack cookie fires 0xC0000409 (the silent fastfail seen in CI:
+        // no stderr, no trace2 exit event).
         // The last `trace:` line before a silent death localizes where the
         // child actually stopped — events.log alone only shows "vanished
         // after def_param".
         ("GIT_TRACE", trace_full.as_str()),
+        // trace2 perf regions localize the dying stage inside a command
+        // (e.g. last region_enter before a fastfail in cmd_status).
+        ("GIT_TRACE2_PERF", trace_perf.as_str()),
+        // PYTHONPATH puts sitecustomize.py on sys.path so it runs inside
+        // the sandboxed server at interpreter startup: it records which
+        // cat-file spawn patterns survive and patches GitPython's odb
+        // reads onto argv-only one-shots (see CANARY_SITECUSTOMIZE).
+        ("PYTHONPATH", site_dir.as_str()),
     ]);
     // The AppContainer child's token SID differs from the repo creator's,
     // so git's "dubious ownership" gate refuses the test repos unless a
@@ -1909,11 +2097,21 @@ async fn git_stages() {
     // wildcard relaxes git's own check for this spawned child only, so
     // stage 5's expected failure still lands on the DACL deny the stage
     // exists to prove.
+    //
+    // windows.appendAtomically=false disables Git for Windows'
+    // append-position check in mingw_write. Under the sandbox every
+    // trace/stderr file is O_APPEND and shared across children, so any
+    // error() call re-triggers the advisory through the stderr write —
+    // recursing until the stack cookie fires 0xC0000409 (the silent
+    // fastfail with no stderr and no trace2 exit event). The check guards
+    // refs/index writes, none of which happen here.
     if cfg!(windows) {
         env_vec.extend([
-            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_COUNT", "2"),
             ("GIT_CONFIG_KEY_0", "safe.directory"),
             ("GIT_CONFIG_VALUE_0", "*"),
+            ("GIT_CONFIG_KEY_1", "windows.appendAtomically"),
+            ("GIT_CONFIG_VALUE_1", "false"),
         ]);
     }
     // GitPython probes `git --version` at import. On Windows `quiet` defers
