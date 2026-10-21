@@ -53,16 +53,23 @@ namespace McpWrit.Ci {
             return GrantObject(path, 0x1000a1, true);
         }
 
-        static void WriteDirectoryDacl(SafeFileHandle handle, RawAcl dacl, bool protect) {
+        static void WriteDirectoryDacl(SafeFileHandle handle, RawAcl dacl, ControlFlags flags) {
             // SetSecurityInfo can walk descendants even with a non-inherited
             // new ACE. Never propagate a host-prerequisite change down a drive.
             // A fresh descriptor avoids carrying auto-inheritance request
-            // flags from the original descriptor into this single-object write.
-            var sd = new RawSecurityDescriptor(ControlFlags.DiscretionaryAclPresent,
-                null, null, null, dacl);
+            // flags from the original descriptor into this single-object write,
+            // but keeps the object's own DACL state bits — dropping
+            // AutoInherited would make later parent-side propagation treat
+            // the preserved inherited ACEs as hand-written.
+            var stored = ControlFlags.DiscretionaryAclPresent
+                | (flags & (ControlFlags.DiscretionaryAclAutoInherited
+                          | ControlFlags.DiscretionaryAclProtected));
+            var sd = new RawSecurityDescriptor(stored, null, null, null, dacl);
             var bytes = new byte[sd.BinaryLength];
             sd.GetBinaryForm(bytes, 0);
-            uint info = DaclInformation | (protect ? 0x80000000u : 0x20000000u);
+            uint info = DaclInformation
+                | ((flags & ControlFlags.DiscretionaryAclProtected) != 0
+                    ? 0x80000000u : 0x20000000u);
             if (!SetKernelObjectSecurity(handle, info, bytes))
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "Write directory metadata DACL");
         }
@@ -109,7 +116,7 @@ namespace McpWrit.Ci {
                 var pinned = GCHandle.Alloc(acl, GCHandleType.Pinned);
                 try {
                     if (directory) WriteDirectoryDacl(access.handle, new RawAcl(acl, 0),
-                        (access.directoryBefore.ControlFlags & ControlFlags.DiscretionaryAclProtected) != 0);
+                        access.directoryBefore.ControlFlags);
                     else Check(SetSecurityInfo(access.handle, FileObject, DaclInformation,
                         IntPtr.Zero, IntPtr.Zero, pinned.AddrOfPinnedObject(), IntPtr.Zero),
                         "Grant AppContainer NUL read/write");
@@ -126,7 +133,7 @@ namespace McpWrit.Ci {
             try {
                 if (changed) {
                     if (directory) WriteDirectoryDacl(handle, directoryBefore.DiscretionaryAcl,
-                        (directoryBefore.ControlFlags & ControlFlags.DiscretionaryAclProtected) != 0);
+                        directoryBefore.ControlFlags);
                     else Check(SetSecurityInfo(handle, FileObject, DaclInformation,
                         IntPtr.Zero, IntPtr.Zero, originalDacl, IntPtr.Zero),
                         "Restore original NUL DACL");
