@@ -79,13 +79,16 @@ jobs:
 
       # Git always opens NUL in sanitize_stdfds(), even with valid stdio.
       # Hosted Windows images can deny that device to AppContainers. Scope
-      # the host prerequisite to this command and restore its DACL on failure.
+      # the host prerequisites to this command and restore DACLs on failure.
+      # GetLongPathNameW also needs non-inherited parent directory listing.
       - name: Six-stage real-server tests (windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          MCP_WRIT_REQUIRE_GIT_CWD_FALLBACK: "1"
         run: |
           & ./tests/scripts/windows-null-device.tests.ps1 -IncludeDevice
-          & ./scripts/with-windows-null-device.ps1 -Command {
+          & ./scripts/with-windows-null-device.ps1 -IncludeTempAncestors -Command {
             cargo test --locked --test real_servers_e2e
             if ($LASTEXITCODE -ne 0) { throw "Real-server tests failed ($LASTEXITCODE)" }
           }

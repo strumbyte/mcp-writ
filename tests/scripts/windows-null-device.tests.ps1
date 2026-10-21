@@ -12,7 +12,7 @@ function Get-DaclBytes([string]$Path) {
     $type = [McpWrit.Ci.NullDeviceAccess]
     $flags = [System.Reflection.BindingFlags]'NonPublic,Static'
     $openArgs = [object[]]@($Path, [uint32]0x20000, [uint32]3,
-        [IntPtr]::Zero, [uint32]3, [uint32]0, [IntPtr]::Zero)
+        [IntPtr]::Zero, [uint32]3, [uint32]0x02000000, [IntPtr]::Zero)
     $handle = $type.GetMethod('CreateFileW', $flags).Invoke($null, $openArgs)
     if ($handle.IsInvalid) { throw "Cannot read DACL: $Path" }
     $query = [object[]]@($handle, 1, [uint32]4, [IntPtr]::Zero,
@@ -36,8 +36,13 @@ function Get-DaclBytes([string]$Path) {
 }
 
 function Assert-Restored([string]$Path, [byte[]]$Before) {
-    if ([Convert]::ToBase64String((Get-DaclBytes $Path)) -cne [Convert]::ToBase64String($Before)) {
-        throw "DACL was not restored exactly: $Path"
+    $after = Get-DaclBytes $Path
+    if ([Convert]::ToBase64String($after) -cne [Convert]::ToBase64String($Before)) {
+        $oldAcl = [System.Security.AccessControl.RawAcl]::new($Before, 0)
+        $newAcl = [System.Security.AccessControl.RawAcl]::new($after, 0)
+        $describe = { param($acl) @($acl | ForEach-Object { "$($_.SecurityIdentifier.Value):$($_.AceFlags):$($_.AccessMask)" }) }
+        $delta = Compare-Object (& $describe $oldAcl) (& $describe $newAcl) | Out-String
+        throw "DACL was not restored exactly: $Path`n$delta"
     }
 }
 
@@ -59,20 +64,53 @@ try {
     Assert-Restored $file $before
     Write-Output 'PASS: scoped read/write grant and exact, idempotent DACL restore'
 
+    $directory = $file + '.dir'
+    $child = Join-Path $directory 'child.txt'
+    $null = New-Item -ItemType Directory -Path $directory
+    [IO.File]::WriteAllText($child, 'must not inherit the grant', [Text.UTF8Encoding]::new($false))
+    try {
+        $directoryBefore = Get-DaclBytes $directory
+        $childBefore = Get-DaclBytes $child
+        $access = [McpWrit.Ci.NullDeviceAccess]::GrantDirectoryMetadata($directory)
+        try {
+            $acl = [System.Security.AccessControl.RawAcl]::new((Get-DaclBytes $directory), 0)
+            $grants = @($acl | Where-Object { $_.SecurityIdentifier.Value -eq 'S-1-15-2-1' })
+            if ($grants.Count -ne 1 -or $grants[0].AccessMask -ne 0xa1 -or
+                $grants[0].AceFlags -ne 0 -or $grants[0].AceQualifier -ne 'AccessAllowed') {
+                throw 'Expected only non-inherited directory list/traverse/attribute access'
+            }
+            Assert-Restored $child $childBefore
+        } finally { $access.Dispose() }
+        Assert-Restored $directory $directoryBefore
+        Assert-Restored $child $childBefore
+        Write-Output 'PASS: directory metadata grant does not propagate; exact DACL restore'
+    } finally {
+        Remove-Item -LiteralPath $child -Force
+        Remove-Item -LiteralPath $directory -Force
+    }
+
     if ($IncludeDevice) {
         $before = Get-DaclBytes '\\.\NUL'
         $wrapper = Join-Path $repo 'scripts/with-windows-null-device.ps1'
-        & $wrapper -Command { Write-Output 'success path' }
+        $ancestors = @()
+        $directory = [IO.DirectoryInfo]::new([IO.Path]::GetTempPath())
+        while ($null -ne $directory) {
+            $ancestors += @{ Path = $directory.FullName; Before = (Get-DaclBytes $directory.FullName) }
+            $directory = $directory.Parent
+        }
+        & $wrapper -IncludeTempAncestors -Command { Write-Output 'success path' }
         Assert-Restored '\\.\NUL' $before
+        foreach ($ancestor in $ancestors) { Assert-Restored $ancestor.Path $ancestor.Before }
         $caught = $false
-        try { & $wrapper -Command { throw 'intentional test failure' } }
+        try { & $wrapper -IncludeTempAncestors -Command { throw 'intentional test failure' } }
         catch {
             if ($_.Exception.Message -ne 'intentional test failure') { throw }
             $caught = $true
         }
         if (-not $caught) { throw 'Wrapper swallowed command failure' }
         Assert-Restored '\\.\NUL' $before
-        Write-Output 'PASS: real NUL DACL restored on success and command failure'
+        foreach ($ancestor in $ancestors) { Assert-Restored $ancestor.Path $ancestor.Before }
+        Write-Output 'PASS: real NUL and ancestor DACLs restored on success and command failure'
     }
 } finally {
     Remove-Item -LiteralPath $file -Force

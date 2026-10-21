@@ -1851,6 +1851,25 @@ except OSError as error:
 with open(os.path.join(os.path.dirname(__file__), "git-trace", "null-device.txt"),
           "w", encoding="utf-8") as report:
     report.write(status)
+
+# Exercise Git's fallback even on newer Windows versions where
+# GetFinalPathNameByHandleW succeeds. CI must not depend on that success.
+import ctypes
+from ctypes import wintypes
+kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel.GetLongPathNameW.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+kernel.GetLongPathNameW.restype = wintypes.DWORD
+paths = (os.getcwd(), os.path.join(os.path.dirname(os.path.dirname(__file__)), "repo"))
+errors = []
+for path in paths:
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = kernel.GetLongPathNameW(path, buffer, len(buffer))
+    if not length or length >= len(buffer):
+        errors.append("%s: GetLongPathNameW length=%d error=%d" %
+                      (path, length, ctypes.get_last_error()))
+with open(os.path.join(os.path.dirname(__file__), "git-trace", "cwd-long-path.txt"),
+          "w", encoding="utf-8") as report:
+    report.write("\n".join(errors) if errors else "ok")
 "#;
     #[cfg(windows)]
     let (trace_dir, trace_events, trace_full, trace_perf, site_dir) = {
@@ -1990,6 +2009,11 @@ with open(os.path.join(os.path.dirname(__file__), "git-trace", "null-device.txt"
     );
     let mut host_kdl = draft_host_policy(&reviewed, &argv[0], &server_extra);
     let mut git_grant_dirs = vec![repo.clone(), cwd.clone()];
+    // GetLongPathNameW (Git's getcwd fallback) enumerates the parent of
+    // repo/work. This is a private fixture root; work/repo keeps its
+    // protected DACL so the stage-5 OS denial remains effective.
+    #[cfg(windows)]
+    git_grant_dirs.push(root.clone());
     git_grant_dirs.extend(common::exe_read_grant_dirs(&git_exe));
     // git validates repository ownership by realpath-ing the discovered
     // worktree — the runtime grants metadata-only traverse on each
@@ -2039,8 +2063,10 @@ with open(os.path.join(os.path.dirname(__file__), "git-trace", "null-device.txt"
 
     // Discard the dry-run probe: only the sandboxed token is evidence.
     #[cfg(windows)]
-    std::fs::write(trace_dir.join("null-device.txt"), b"pending sandbox probe")
-        .expect("reset NUL probe before sandboxed startup");
+    for report in ["null-device.txt", "cwd-long-path.txt"] {
+        std::fs::write(trace_dir.join(report), b"pending sandbox probe")
+            .expect("reset startup probe before sandboxed startup");
+    }
     // stage 3 + 4: sandboxed session (guard cwd = work/, granted so the
     // AppContainer child has a valid working directory)
     let (mut s3, audit3) = stage3_spawn(spec, &policy_path, &argv, env_refs, Some(&cwd)).await;
@@ -2055,6 +2081,17 @@ with open(os.path.join(os.path.dirname(__file__), "git-trace", "null-device.txt"
              on an isolated elevated test host use scripts/with-windows-null-device.ps1{}",
             trace_tail()
         );
+        if std::env::var("MCP_WRIT_REQUIRE_GIT_CWD_FALLBACK").as_deref() == Ok("1") {
+            let probe = std::fs::read_to_string(trace_dir.join("cwd-long-path.txt"))
+                .expect("sandboxed Python must report Git cwd fallback access");
+            assert_eq!(
+                probe,
+                "ok",
+                "stage3 git: GetLongPathNameW needs parent directory listing; \
+                 use -IncludeTempAncestors with the Windows CI helper{}",
+                trace_tail()
+            );
+        }
     }
     let resp = s3.call("git_log", &log_args).await;
     // Earlier Windows builds could not run the MinGW git subprocess under
