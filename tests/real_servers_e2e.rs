@@ -1871,6 +1871,15 @@ def _canary():
         out.append("skip: git=%r repo=%r" % (_GIT, _REPO))
         _note(out)
         return
+    # Record whether python itself can open the null device; if this fails,
+    # every subprocess.DEVNULL stdin raises PermissionError at Popen — which
+    # is also what Git.refresh()'s probe hits, falling back to bare 'git'.
+    try:
+        _fd = os.open(os.devnull, os.O_RDWR)
+        os.close(_fd)
+        out.append("devnull-open: ok")
+    except Exception as e:
+        out.append("devnull-open: %r" % e)
     cf = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         p = subprocess.Popen(
@@ -1909,6 +1918,22 @@ def _canary():
         out.append("argv-cat-file-t: rc=%r out=%r err=%r" % (r.returncode, r.stdout, r.stderr))
     except Exception:
         out.append("argv-cat-file-t EXC %r" % traceback.format_exc())
+    # The spawn shape the odb patch relies on: a real file as stdin.
+    try:
+        os.makedirs(_TRACE_DIR, exist_ok=True)
+        fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
+        fh.write(b"HEAD\n")
+        fh.flush()
+        fh.seek(0)
+        try:
+            r = subprocess.run([_GIT, "cat-file", "--batch-check"],
+                               stdin=fh, capture_output=True, cwd=_REPO,
+                               timeout=10, creationflags=cf)
+            out.append("file-batch-check: rc=%r out=%r err=%r" % (r.returncode, r.stdout, r.stderr))
+        finally:
+            fh.close()
+    except Exception:
+        out.append("file-batch-check EXC %r" % traceback.format_exc())
     _note(out)
 
 
@@ -1963,6 +1988,39 @@ def _patch():
     import git.exc
     _orig_execute = git.cmd.Git.execute
 
+    # GitPython hands istream=None children stdin=DEVNULL, which makes
+    # python open 'nul' — denied on the hosted runner (its \Device\Null
+    # DACL does not cover our AppContainer token; the canary records the
+    # exact failure in git-trace/canary.txt). It also makes Git.refresh()
+    # fall back to bare 'git'. PIPE stdin is denied differently: the child
+    # dies at sanitize_stdfds before handle_builtin. A real file under the
+    # write-granted trace dir is the only stdin shape seen to survive, so
+    # substitute one for every "no stdin" call. Popen duplicates the
+    # handle for the child, so the parent copy can close right after the
+    # call returns; retries must re-substitute, so the spent file is
+    # popped back out of the arguments.
+    def _sub_file_stdin(a, kw):
+        if kw.get("istream") is not None:
+            return None, a, kw
+        if len(a) > 0:
+            if a[0] is not None:
+                return None, a, kw
+            fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
+            return fh, (fh,) + a[1:], kw
+        fh = tempfile.TemporaryFile(dir=_TRACE_DIR)
+        kw = dict(kw)
+        kw["istream"] = fh
+        return fh, a, kw
+
+    def _pop_file_stdin(fh, a, kw):
+        if kw.get("istream") is fh:
+            kw = dict(kw)
+            del kw["istream"]
+        if len(a) > 0 and a[0] is fh:
+            a = (None,) + a[1:]
+        fh.close()
+        return a, kw
+
     def _retrying_execute(self, command, *a, **kw):
         # Sandboxed git children intermittently die by fastfail
         # (0xC0000409, stack-cookie violation in the MinGit/ucrt
@@ -1984,18 +2042,43 @@ def _patch():
                     stream.truncate(0)
                 except (AttributeError, OSError):
                     pass
+            fh, a, kw = _sub_file_stdin(a, kw)
             try:
                 return _orig_execute(self, command, *a, **kw)
             except git.exc.GitCommandError as e:
                 if getattr(e, "status", None) not in (3221225725, -1073740791):
                     raise
                 last = e
+            finally:
+                if fh is not None:
+                    a, kw = _pop_file_stdin(fh, a, kw)
         raise last
 
     git.cmd.Git.execute = _retrying_execute
     git.cmd.Git.get_object_header = _gp_get_object_header
     git.cmd.Git.stream_object_data = _gp_stream_object_data
-    _note(["== pid=%d gitpython-odb-patched" % os.getpid()])
+
+    # Every odb read path above is argv/file-stdin now, so the persistent
+    # `cat-file` helpers must never be spawned — their PIPE stdin is what
+    # the runner kills at sanitize_stdfds. If some path still reaches it,
+    # surface a self-describing error naming the helper instead of a
+    # silent /dev/null denial.
+    def _blocked_persistent_cmd(self, attr_name, cmd_name, *args, **kwargs):
+        raise RuntimeError(
+            "persistent git helper blocked in sandbox: %s (%s)"
+            % (attr_name, cmd_name))
+
+    git.cmd.Git._get_persistent_cmd = _blocked_persistent_cmd
+    # Import-time Git.refresh() may have fallen back to bare 'git' if its
+    # `version` probe died on the null-device denial — command argv[0]
+    # then resolves via PATH and errors report the unhelpful Cmd('git').
+    # Pin the executable the harness granted so calls always use it.
+    if _GIT and git.cmd.Git.GIT_PYTHON_GIT_EXECUTABLE != _GIT:
+        _note(["== pid=%d executable %r -> %r" %
+               (os.getpid(), git.cmd.Git.GIT_PYTHON_GIT_EXECUTABLE, _GIT)])
+        git.cmd.Git.GIT_PYTHON_GIT_EXECUTABLE = _GIT
+    _note(["== pid=%d gitpython-odb-patched exe=%r" %
+           (os.getpid(), git.cmd.Git.GIT_PYTHON_GIT_EXECUTABLE)])
 
 
 try:
