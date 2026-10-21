@@ -75,9 +75,9 @@ try {
         try {
             $acl = [System.Security.AccessControl.RawAcl]::new((Get-DaclBytes $directory), 0)
             $grants = @($acl | Where-Object { $_.SecurityIdentifier.Value -eq 'S-1-15-2-1' })
-            if ($grants.Count -ne 1 -or $grants[0].AccessMask -ne 0xa1 -or
+            if ($grants.Count -ne 1 -or $grants[0].AccessMask -ne 0x1000a1 -or
                 $grants[0].AceFlags -ne 0 -or $grants[0].AceQualifier -ne 'AccessAllowed') {
-                throw 'Expected only non-inherited directory list/traverse/attribute access'
+                throw 'Expected only non-inherited directory list/traverse/attribute/synchronize access'
             }
             Assert-Restored $child $childBefore
         } finally { $access.Dispose() }

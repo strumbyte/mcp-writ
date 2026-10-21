@@ -282,8 +282,10 @@ $env:MCP_WRIT_REQUIRE_GIT_CWD_FALLBACK = '1'
 The MCP server verification workflow uses this helper on its disposable
 Windows runner. It adds a non-inherited read/write ACE for
 `ALL APPLICATION PACKAGES` on the NUL device. With `-IncludeTempAncestors`,
-it also grants list/traverse/read-attribute access on the temporary
+it also grants list/traverse/read-attribute/synchronize access on the temporary
 directory and each ancestor, without propagating the grant to children.
+The synchronize right is required for synchronous directory enumeration;
+listing rights alone still cause `GetLongPathNameW` to fail with access denied.
 It retains existing ACEs and restores the original DACLs in `finally`,
 including on test failure. The private Git fixture root is separately
 readable; the protected denied repository still exercises OS enforcement.

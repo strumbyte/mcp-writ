@@ -47,9 +47,10 @@ namespace McpWrit.Ci {
 
         public static NullDeviceAccess GrantDirectoryMetadata(string path) {
             if (!Directory.Exists(path)) throw new DirectoryNotFoundException(path);
-            // LIST_DIRECTORY | TRAVERSE | READ_ATTRIBUTES, this directory only.
-            // GetLongPathNameW queries parents even when the leaf is readable.
-            return GrantObject(path, 0xa1, true);
+            // LIST_DIRECTORY | TRAVERSE | READ_ATTRIBUTES | SYNCHRONIZE,
+            // this directory only. FindFirstFileW (used by GetLongPathNameW)
+            // opens directories synchronously and needs SYNCHRONIZE too.
+            return GrantObject(path, 0x1000a1, true);
         }
 
         static void WriteDirectoryDacl(SafeFileHandle handle, RawAcl dacl, bool protect) {
