@@ -1832,10 +1832,14 @@ async fn git_stages() {
     // so a failing assert can report git's actual fatal line. An absent
     // trace file is itself diagnostic: the write grant then never landed.
     #[cfg(windows)]
-    let (trace_dir, trace_events) = {
+    let (trace_dir, trace_events, trace_stderr) = {
         let d = cwd.join("git-trace");
         std::fs::create_dir_all(&d).expect("create git trace dir inside granted work dir");
-        (d.clone(), kdl_path(&d.join("events.log")))
+        (
+            d.clone(),
+            kdl_path(&d.join("events.log")),
+            kdl_path(&d.join("stderr.log")),
+        )
     };
     #[cfg(windows)]
     let trace_tail = || -> String {
@@ -1884,6 +1888,11 @@ async fn git_stages() {
         ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1"),
         ("GIT_TRACE2_EVENT", trace_events.as_str()),
         ("GIT_TRACE2_CONFIG_PARAMS", "*"),
+        // Persistent cat-file helpers die without a trace2 exit event, so
+        // their stderr is the only record of the actual fatal line — the
+        // server never surfaces it. GIT_REDIRECT_STDERR detours every git
+        // child's stderr into the same write-granted trace dir.
+        ("GIT_REDIRECT_STDERR", trace_stderr.as_str()),
     ]);
     // The AppContainer child's token SID differs from the repo creator's,
     // so git's "dubious ownership" gate refuses the test repos unless a
