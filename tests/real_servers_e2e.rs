@@ -1763,6 +1763,28 @@ async fn git_stages() {
             "icacls /inheritance:d failed on {}",
             outside_repo.display()
         );
+        // Elevated runs create the fixture files owned by
+        // BUILTIN\Administrators while the AppContainer child's token user is
+        // the launching account — git's ownership gate then falls into the
+        // safe.directory path, the most fragile part of the Windows flow.
+        // Restoring owner to the current user makes the gate pass on the
+        // ownership check alone, independent of config delivery.
+        let owner = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").unwrap_or_else(|_| ".".to_string()),
+            std::env::var("USERNAME").unwrap_or_default()
+        );
+        for dir in [&repo, &outside_repo] {
+            let ok = std::process::Command::new("icacls")
+                .arg(dir)
+                .args(["/setowner", &owner, "/T", "/C", "/Q"])
+                .status();
+            assert!(
+                matches!(ok, Ok(s) if s.success()),
+                "icacls /setowner {owner} failed on {}",
+                dir.display()
+            );
+        }
     }
     let git_env = (
         "GIT_PYTHON_GIT_EXECUTABLE",
@@ -1796,12 +1818,64 @@ async fn git_stages() {
         std::fs::write(&p, b"").expect("write empty gitconfig inside granted work dir");
         kdl_path(&p)
     };
+    // A sandboxed git failure surfaces only as GitPython's opaque "SHA is
+    // empty" heuristic — the server discards git's stderr. trace2 writes
+    // events and config-scope reads into files under a write-granted dir,
+    // so a failing assert can report git's actual fatal line. An absent
+    // trace file is itself diagnostic: the write grant then never landed.
+    #[cfg(windows)]
+    let (trace_dir, trace_events) = {
+        let d = cwd.join("git-trace");
+        std::fs::create_dir_all(&d).expect("create git trace dir inside granted work dir");
+        (d.clone(), kdl_path(&d.join("events.log")))
+    };
+    #[cfg(windows)]
+    let trace_tail = || -> String {
+        let mut out = String::new();
+        if let Ok(rd) = std::fs::read_dir(&trace_dir) {
+            for entry in rd.flatten() {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    let tail = content
+                        .rsplit('\n')
+                        .take(60)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    out.push_str(&format!(
+                        "\n--- {} ---\n{tail}",
+                        entry.file_name().to_string_lossy()
+                    ));
+                }
+            }
+        }
+        if out.is_empty() {
+            String::from("\n--- no git trace captured ---")
+        } else {
+            out
+        }
+    };
+    #[cfg(not(windows))]
+    let trace_tail = String::new;
     let mut env_vec: Vec<(&str, &str)> = vec![(git_env.0, git_env.1.as_str())];
     env_vec.extend_from_slice(cfg_env);
+    // Default git discovery refuses to cross filesystem boundaries, so it
+    // stat()s every ancestor of the repo path to compare device ids — and
+    // get_device_or_die dies outright on a failed stat ("failed to stat
+    // 'C:/Users'"), rather than skipping it. The AppContainer token can't
+    // stat ancestors of %TEMP% that ambient ACLs don't cover, which kills
+    // every repo command with exit 128 — and GitPython then reports the
+    // empty reply as "dubious ownership". Crossing is always fine inside
+    // the sandbox: the DACL, not device boundaries, is the real boundary
+    // the tests exercise.
     #[cfg(windows)]
     env_vec.extend([
         ("GIT_CONFIG_SYSTEM", empty_cfg.as_str()),
         ("GIT_CONFIG_GLOBAL", empty_cfg.as_str()),
+        ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1"),
+        ("GIT_TRACE2_EVENT", trace_events.as_str()),
+        ("GIT_TRACE2_CONFIG_PARAMS", "*"),
     ]);
     // The AppContainer child's token SID differs from the repo creator's,
     // so git's "dubious ownership" gate refuses the test repos unless a
@@ -1858,10 +1932,13 @@ async fn git_stages() {
     // worktree — the runtime grants metadata-only traverse on each
     // ancestor automatically so that resolution can stat through
     // without exposing directory contents.
-    let git_grants: Vec<(&Path, &str)> = git_grant_dirs
+    #[allow(unused_mut)] // `mut` only needed for the Windows-only trace grant below
+    let mut git_grants: Vec<(&Path, &str)> = git_grant_dirs
         .iter()
         .map(|d| (d.as_path(), "read"))
         .collect();
+    #[cfg(windows)]
+    git_grants.push((trace_dir.as_path(), "write"));
     inject_fs_grants(&mut host_kdl, &git_grants);
     // The child environment is restricted by default — every name the
     // spawn passes must be allowed through or it never reaches the
@@ -1907,10 +1984,11 @@ async fn git_stages() {
     // current builds the granted repo/cwd/exe paths make the call succeed.
     // Either way the call must answer — and the boundary that matters is
     // asserted by stage 5's out-of-grant deny below.
-    let r = resp.expect("stage3 git: allowed call must answer");
+    let r = resp.unwrap_or_else(|| panic!("stage3 git: allowed call must answer{}", trace_tail()));
     assert!(
         !json_has_error(&r) && !is_error_result(&r),
-        "stage3 git: sandboxed git_log on granted paths must succeed: {r}"
+        "stage3 git: sandboxed git_log on granted paths must succeed: {r}{}",
+        trace_tail()
     );
 
     // The omitted-vs-explicit optional-argument matrix: a window in the
@@ -1918,44 +1996,53 @@ async fn git_stages() {
     // server and were applied, which is what distinguishes this from a
     // bare required-argument call.
     let r_opt = s3.call("git_log", &log_args_optional).await;
-    let r_opt = r_opt.expect("stage3 git: optional-args call must answer");
+    let r_opt = r_opt
+        .unwrap_or_else(|| panic!("stage3 git: optional-args call must answer{}", trace_tail()));
     assert!(
         !json_has_error(&r_opt) && !is_error_result(&r_opt) && r_opt.contains("init"),
-        "stage3 git: windowed git_log must return the commit: {r_opt}"
+        "stage3 git: windowed git_log must return the commit: {r_opt}{}",
+        trace_tail()
     );
     let filtered_args = format!(
         "{{\"repo_path\":{},\"start_timestamp\":\"2030-01-01\",\"end_timestamp\":\"2030-12-31\"}}",
         json_str(&kdl_path(&repo))
     );
     let r_f = s3.call("git_log", &filtered_args).await;
-    let r_f = r_f.expect("stage3 git: filtered call must answer");
+    let r_f =
+        r_f.unwrap_or_else(|| panic!("stage3 git: filtered call must answer{}", trace_tail()));
     assert!(
         !json_has_error(&r_f) && !is_error_result(&r_f) && !r_f.contains("init"),
-        "stage3 git: a future window must filter the commit out: {r_f}"
+        "stage3 git: a future window must filter the commit out: {r_f}{}",
+        trace_tail()
     );
 
     // Two more reviewed tools — `git_status` takes only the required
     // `repo_path`; `git_branch` adds the required `branch_type` while its
     // `contains`/`not_contains` options stay omitted.
     let status_resp = s3.call("git_status", &log_args).await;
-    let status_resp = status_resp.expect("stage3 git: git_status must answer");
+    let status_resp =
+        status_resp.unwrap_or_else(|| panic!("stage3 git: git_status must answer{}", trace_tail()));
     assert!(
         !json_has_error(&status_resp) && !is_error_result(&status_resp),
-        "stage3 git: sandboxed git_status must succeed: {status_resp}"
+        "stage3 git: sandboxed git_status must succeed: {status_resp}{}",
+        trace_tail()
     );
     let branch_args = format!(
         "{{\"repo_path\":{},\"branch_type\":\"local\"}}",
         json_str(&kdl_path(&repo))
     );
     let branch_resp = s3.call("git_branch", &branch_args).await;
-    let branch_resp = branch_resp.expect("stage3 git: git_branch must answer");
+    let branch_resp =
+        branch_resp.unwrap_or_else(|| panic!("stage3 git: git_branch must answer{}", trace_tail()));
     assert!(
         !json_has_error(&branch_resp) && !is_error_result(&branch_resp),
-        "stage3 git: sandboxed git_branch must succeed: {branch_resp}"
+        "stage3 git: sandboxed git_branch must succeed: {branch_resp}{}",
+        trace_tail()
     );
     assert!(
         branch_resp.contains("master"),
-        "stage3 git: git_branch must list the seed branch: {branch_resp}"
+        "stage3 git: git_branch must list the seed branch: {branch_resp}{}",
+        trace_tail()
     );
 
     // stage 4: Auditor deny — repo_path outside the tool's fs allow. An
