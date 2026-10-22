@@ -95,6 +95,9 @@ Go用の診断的syscall候補、4ツールの許可・拒否を含む`policy.kd
 fixtureの3ツールが許可され、`blocked_echo`が拒否される必要があります。
 実際のMCPサーバ用ポリシーにfixtureのツールがない場合、その拒否はGo互換性の失敗とは限りません。
 probeは`MCP_WRIT_SKIP_SANDBOX`を子プロセス環境から除去し、dry-runやdegraded設定を自動追加しません。
+一方で`MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1`は常に設定します。WindowsのデータボリュームなどのACLで
+ビルド出力の祖先が置換可能な場合でも、パス持ち込みの拒否がpathless契約によるものかを確認するためです。
+置換可能パスの拒否自体はこのprobeの検証対象ではありません。
 指定ポリシー自体にdegraded等が設定されていないかも確認してください。
 
 各回の結果は`target/go-runtime-results/probe-*`に保存されます。`-output`で親ディレクトリを変更できます。

@@ -85,49 +85,61 @@ function Invoke-Stage([string[]]$Requests, [switch]$DryRun) {
     $p = $null
     try {
         $p = [System.Diagnostics.Process]::Start($psi)
-        # The auditor enforces init ordering: requests after the first must
-        # wait for the id=1 response, or notifications/initialized is
-        # dropped and the rest are denied (init-order). Run a small event
-        # loop that drains stdout line-by-line (a synchronous ReadToEnd
-        # would block until the child closes the pipe, and a chatty child
-        # could fill the pipe during the stdin hold), sends request 1 up
-        # front, and releases the remainder once its response is seen.
+        # Wait for each request's response before sending the next request.
+        # In particular, tools/call must wait for tools/list verification in
+        # this guard session; a previous stage's listing cannot authorize it.
+        # Drain stdout while waiting so a chatty child cannot fill the pipe.
         $lines = [System.Collections.Generic.List[string]]::new()
-        $p.StandardInput.Write($Requests[0] + "`n")
-        $p.StandardInput.Flush()
         $readLine = $p.StandardOutput.ReadLineAsync()
-        $initSeen = $false
-        $initDeadline = [DateTime]::UtcNow.AddSeconds(15)
+        $requestIndex = 0
+        $pendingId = $null
+        $responseDeadline = $null
         $sentRestAt = $null
         $stdinClosed = $false
         $deadline = [DateTime]::UtcNow.AddSeconds(90)
         while ($true) {
+            while ($null -eq $pendingId -and $requestIndex -lt $Requests.Count) {
+                $request = $Requests[$requestIndex] | ConvertFrom-Json
+                $p.StandardInput.Write($Requests[$requestIndex] + "`n")
+                $p.StandardInput.Flush()
+                $requestIndex++
+                # Notifications have no response and do not block the queue.
+                if ($null -ne $request.PSObject.Properties['id']) {
+                    $pendingId = [string]$request.id
+                    $responseDeadline = [DateTime]::UtcNow.AddSeconds(15)
+                }
+            }
+            if ($requestIndex -eq $Requests.Count -and $null -eq $pendingId -and $null -eq $sentRestAt) {
+                $sentRestAt = [DateTime]::UtcNow
+            }
             if ($readLine.Wait(200)) {
                 $line = $readLine.Result
                 if ($null -eq $line) { break }   # EOF: the child exited
                 $lines.Add($line)
                 $readLine = $p.StandardOutput.ReadLineAsync()
-                if ($line -match '"id"\s*:\s*1([^0-9]|$)') {
-                    $initSeen = $true
+                $response = $null
+                try { $response = $line | ConvertFrom-Json -ErrorAction Stop } catch {}
+                if ($null -ne $pendingId -and $null -ne $response -and
+                    $null -eq $response.PSObject.Properties['method'] -and
+                    $null -ne $response.PSObject.Properties['id'] -and
+                    [string]$response.id -ceq $pendingId -and
+                    ($null -ne $response.PSObject.Properties['result'] -or
+                     $null -ne $response.PSObject.Properties['error'])) {
+                    $pendingId = $null
+                    if ($null -ne $response.PSObject.Properties['error']) {
+                        # Leave dependent requests unsent; Test-Responses
+                        # reports the error and missing responses as failure.
+                        $requestIndex = $Requests.Count
+                    }
                 }
             }
-            if (-not $initSeen -and [DateTime]::UtcNow -ge $initDeadline) {
-                # A missing id=1 response means the rest can never pass the
-                # init-order gate — fail the stage explicitly instead of
-                # sending doomed requests.
-                Write-Error "check-server: FAIL — no response to request id=1 within 15s (init-order gate)"
+            if ($null -ne $pendingId -and [DateTime]::UtcNow -ge $responseDeadline) {
+                Write-Error "check-server: FAIL — no response to request id=$pendingId within 15s"
                 try { $p.StandardInput.Close() } catch {}
                 if (-not $p.WaitForExit(10000)) {
                     try { $p.Kill() } catch {}
                 }
                 return $lines
-            }
-            if ($initSeen -and $null -eq $sentRestAt) {
-                for ($i = 1; $i -lt $Requests.Count; $i++) {
-                    $p.StandardInput.Write($Requests[$i] + "`n")
-                }
-                $p.StandardInput.Flush()
-                $sentRestAt = [DateTime]::UtcNow
             }
             # Hold stdin open briefly after the last request so in-flight
             # responses are relayed before the guard shuts down on EOF.
@@ -247,10 +259,8 @@ Write-Output "check-server: negotiated generation: $generation"
 
 if ($generation -eq '2026-07-28') {
     $requests = @($DISCOV, $LIST26)
-    $callPrefix = @($DISCOV)
 } else {
     $requests = @($INIT, $NOTIF, $LIST25)
-    $callPrefix = @($INIT, $NOTIF)
 }
 
 Write-Output '== stage 1: dry-run =='
@@ -289,7 +299,7 @@ if ($Call) {
     }
     $callLine = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":' + $callParams + '}'
     Write-Output '== stage 3: tools/call (sandboxed) =='
-    if (-not (Test-Responses 'stage 3 (tools/call)' @(1, 3) (Invoke-Stage ($callPrefix + $callLine)) -IsCall)) { $fail = $true }
+    if (-not (Test-Responses 'stage 3 (tools/call)' @(1, 2, 3) (Invoke-Stage ($requests + $callLine)) -IsCall)) { $fail = $true }
 }
 $ErrorActionPreference = 'Stop'
 

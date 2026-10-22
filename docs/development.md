@@ -256,6 +256,42 @@ returns `EPERM` for it on every path), and a pinned MinGit for
 `mcp-server-git` (a `git.exe` under `Program Files` is neither grantable by
 a non-admin nor covered by package ACEs, and its cwd resolution is denied).
 
+Some Windows CI images also deny AppContainers read/write access to the
+`NUL` device. Git opens it unconditionally in `sanitize_stdfds()`, including
+when all standard streams are valid; redirecting streams or retrying cannot
+fix this host prerequisite. The Git test checks access using the sandboxed
+Python token and reports a device denial explicitly. GitPython itself is
+not patched by the test harness.
+
+Git's cwd lookup can also fall back to `GetLongPathNameW`, which requires
+directory listing rights on the temporary path's ancestors. Traverse and
+attribute rights alone are insufficient. The Windows CI workflow requires
+a sandboxed probe of this fallback even when the primary lookup succeeds.
+
+On an isolated, elevated Windows test host, run:
+
+```powershell
+$env:MCP_WRIT_REQUIRE_SERVER_TESTS = '1'
+$env:MCP_WRIT_REQUIRE_GIT_CWD_FALLBACK = '1'
+& ./scripts/with-windows-null-device.ps1 -IncludeTempAncestors -Command {
+    cargo test --locked --test real_servers_e2e
+    if ($LASTEXITCODE -ne 0) { throw "Real-server tests failed ($LASTEXITCODE)" }
+}
+```
+
+The MCP server verification workflow uses this helper on its disposable
+Windows runner. It adds a non-inherited read/write ACE for
+`ALL APPLICATION PACKAGES` on the NUL device. With `-IncludeTempAncestors`,
+it also grants list/traverse/read-attribute/synchronize access on the temporary
+directory and each ancestor, without propagating the grant to children.
+The synchronize right is required for synchronous directory enumeration;
+listing rights alone still cause `GetLongPathNameW` to fail with access denied.
+It retains existing ACEs and restores the original DACLs in `finally`,
+including on test failure. The private Git fixture root is separately
+readable; the protected denied repository still exercises OS enforcement.
+Do not run concurrent ACL editors on that host; forced process termination
+cannot run the cleanup, so the CI runner must remain disposable.
+
 `scripts/check-server.sh` and `scripts/check-server.ps1` verify one real
 server against one policy without Cargo — a dry-run handshake plus
 `tools/list`, the same exchange sandboxed, and an optional sandboxed

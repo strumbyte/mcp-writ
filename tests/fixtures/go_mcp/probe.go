@@ -97,7 +97,12 @@ func probe(args []string) (probeErr error) {
 		cmd = exec.CommandContext(ctx, *guard, "run", "--policy", *policy,
 			"--audit-log", filepath.Join(dir, "audit.jsonl"), "--", exe)
 		// A user's ambient bypass must never turn this into a false sandbox pass.
-		cmd.Env = withoutSandboxBypass(os.Environ())
+		// Build outputs can sit under broad-replace ACLs (a Windows data
+		// volume such as the runner's D:\a), where the Auditor refuses every
+		// path argument before the pathless contract is consulted. This probe
+		// tests that contract, not path hardening — accept the swap race like
+		// the Rust e2e harnesses so the denial reason stays host-independent.
+		cmd.Env = append(withoutSandboxBypass(os.Environ()), "MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1")
 	}
 	cmd.Stderr = io.MultiWriter(os.Stderr, stderr)
 	client := mcp.NewClient(&mcp.Implementation{Name: "go-runtime-probe", Version: "1.0.0"}, nil)
