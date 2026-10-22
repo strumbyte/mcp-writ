@@ -63,10 +63,10 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Unit tests (incl. CLI parse)
-        run: cargo test --locked --lib --bins
+        run: cargo test --locked --lib --bins --no-fail-fast
 
       - name: Guard-rail tests
         run: >-
-          cargo test --locked
+          cargo test --locked --no-fail-fast
           --test capability_matrix --test docs_check
           --test module_layering --test manifest_fixtures

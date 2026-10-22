@@ -50,9 +50,14 @@ Windows, or macOS.
    on real AArch64 hardware — and the MCP server verification workflow, which
    exercises the pinned real MCP servers under the sandbox on all three OSes.
    Both are intentionally manual-only rather than Release workflow
-   dependencies, so they must pass before the tag is pushed. Per-test
-   ownership of these workflows is listed in the
-   [test matrix](test-matrix.md).
+   dependencies, so they must pass before the tag is pushed. The four
+   verification workflows also run on branches only when dispatched, so
+   dispatch them on this commit too rather than leaving them to the
+   Release run — a failure found there arrives after the tag is public.
+   Then run `bash scripts/release-preflight.sh` on the commit: it exits
+   non-zero unless all six workflows have a successful run on that exact
+   commit, and prints the run links to record. Per-test ownership of these
+   workflows is listed in the [test matrix](test-matrix.md).
 3. Push a matching `v<version>` tag when ready to publish. The Release workflow
    runs verification before building the platform binaries and publishing archives.
    Pushing this tag triggers publication; an ordinary branch push does not.

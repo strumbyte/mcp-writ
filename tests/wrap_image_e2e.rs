@@ -13,25 +13,9 @@ static DOCKER_LOCK: Mutex<()> = Mutex::new(());
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Prepare the image before wrap-image inspects it. Clean CI runners have
-/// no local image cache, and inspect deliberately does not pull images.
+/// Prepare the image before wrap-image inspects it.
 fn ensure_alpine_image() {
-    let inspect = Command::new("docker")
-        .args(["image", "inspect", "alpine:3.19"])
-        .output()
-        .expect("Docker image inspection should run");
-    if inspect.status.success() {
-        return;
-    }
-    let pull = Command::new("docker")
-        .args(["pull", "alpine:3.19"])
-        .output()
-        .expect("Docker image pull should run");
-    assert!(
-        pull.status.success(),
-        "failed to prepare alpine:3.19: {}",
-        String::from_utf8_lossy(&pull.stderr)
-    );
+    common::ensure_docker_image("alpine:3.19");
 }
 
 /// Create a uniquely named temp directory. Caller must clean up.

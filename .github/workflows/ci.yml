@@ -50,14 +50,14 @@ jobs:
         run: cargo doc --locked --no-deps
 
       - name: Unit tests
-        run: cargo test --locked --lib --bins
+        run: cargo test --locked --lib --bins --no-fail-fast
 
       - name: Documentation tests
         run: cargo test --locked --doc
 
       - name: Integration tests
         run: >-
-          cargo test --locked
+          cargo test --locked --no-fail-fast
           --test integration --test kdl_policy_e2e
           --test protocol_versions --test mcp_wire_e2e --test tool_enforcement_e2e
           --test self_test --test go_runtime_policy

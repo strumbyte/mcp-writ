@@ -69,11 +69,19 @@ fn create_python_source(dir: &Path) -> PathBuf {
     source
 }
 
+/// Base image `containerize` auto-detects for a Node.js source tree
+/// (`detect_runtime_from_source` in `src/container/containerize.rs`).
+const NODE_BASE_IMAGE: &str = "node:22-slim";
+
+/// Tag-only `--base-image` override used by the build tests.
+const OVERRIDE_BASE_IMAGE: &str = "alpine:3.19";
+
 /// Run `mcp-writ containerize` with `--allow-mutable-tag` appended —
 /// the suite exercises containerize mechanics against tag-only base
-/// images (`node:22-slim`, `alpine:3.19`) that a clean runner has not
-/// pulled — without the flag the digest-pinning gate refuses before the
-/// build can fetch them.
+/// images (`node:22-slim`, `alpine:3.19`); without the flag the
+/// digest-pinning gate refuses a tag-only `--base-image`. The build path
+/// binds the base it inspects locally and never pulls, so tests that
+/// build prepare it with `common::ensure_docker_image` first.
 fn run_containerize(args: &[&str]) -> (String, String, i32) {
     run_containerize_with(args, true)
 }
@@ -512,6 +520,7 @@ fn test_containerize_nodejs_basic() {
         common::skip_container_test("could not place fake runner binary");
         return;
     }
+    common::ensure_docker_image(NODE_BASE_IMAGE);
 
     let dir = make_test_dir("nodejs_basic");
     let source = create_nodejs_source(&dir);
@@ -624,6 +633,7 @@ fn test_containerize_custom_tag() {
         common::skip_container_test("could not place fake runner binary");
         return;
     }
+    common::ensure_docker_image(NODE_BASE_IMAGE);
 
     let dir = make_test_dir("custom_tag");
     let source = create_nodejs_source(&dir);
@@ -675,6 +685,7 @@ fn test_containerize_base_image_override() {
         common::skip_container_test("could not place fake runner binary");
         return;
     }
+    common::ensure_docker_image(OVERRIDE_BASE_IMAGE);
 
     let dir = make_test_dir("base_override");
     let source = create_nodejs_source(&dir);
@@ -690,7 +701,7 @@ fn test_containerize_base_image_override() {
         "--tag",
         &tag,
         "--base-image",
-        "alpine:3.19",
+        OVERRIDE_BASE_IMAGE,
     ]);
 
     assert_eq!(code, 0, "should succeed with --base-image: stderr={stderr}");
@@ -734,6 +745,7 @@ fn test_containerize_policy_injection() {
         common::skip_container_test("could not place fake runner binary");
         return;
     }
+    common::ensure_docker_image(NODE_BASE_IMAGE);
 
     let dir = make_test_dir("policy_inject");
     let source = create_nodejs_source(&dir);

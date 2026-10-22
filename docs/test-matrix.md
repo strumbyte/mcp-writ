@@ -257,10 +257,11 @@ counts as verification.
 The release owner works through this list before publishing the
 main-plan scope; it does not wait for the VM-extension PRs.
 
-- [ ] Required verification is green on the target commit: CI, Platform
-  tests, Container tests, and Go runtime (via Release or manual
-  dispatch), plus Linux tests and MCP server verification dispatched
-  manually on the same commit. Record the run links in the evidence
+- [ ] Required verification is green on the target commit before the
+  tag is pushed: CI, Platform tests, Container tests, Go runtime, Linux
+  tests, and MCP server verification, each dispatched manually on the
+  same commit — `bash scripts/release-preflight.sh <commit>` checks all
+  six and prints their run links. Record the run links in the evidence
   table above.
 - [ ] Every `tests/*.rs` target has an owner row or a documented
   exclusion above, and no `MCP_WRIT_REQUIRE_*`-gated job ended with a

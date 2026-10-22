@@ -542,6 +542,30 @@ pub fn docker_available() -> bool {
     }
 }
 
+/// Make `image` present in the local Docker image store before a command
+/// inspects it. Clean CI runners have no image cache, and the image
+/// commands under test deliberately never pull: `wrap-image` inspects the
+/// image as given, and `containerize` refuses a base it cannot inspect
+/// locally (an uninspected base could carry ONBUILD triggers).
+pub fn ensure_docker_image(image: &str) {
+    let inspect = Command::new("docker")
+        .args(["image", "inspect", image])
+        .output()
+        .expect("Docker image inspection should run");
+    if inspect.status.success() {
+        return;
+    }
+    let pull = Command::new("docker")
+        .args(["pull", image])
+        .output()
+        .expect("Docker image pull should run");
+    assert!(
+        pull.status.success(),
+        "failed to prepare {image}: {}",
+        String::from_utf8_lossy(&pull.stderr)
+    );
+}
+
 /// True when the running kernel predates Landlock ABI V4 (Linux 6.7) —
 /// the shared `sandbox allow_degraded` gate for policies that would
 /// otherwise refuse a partially enforced ruleset (e.g. WSL2's 5.15).

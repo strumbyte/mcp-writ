@@ -35,6 +35,6 @@ jobs:
         run: cargo build --locked --bins
       - name: Test container workflows without skipping prerequisites
         run: >-
-          cargo test --locked
+          cargo test --locked --no-fail-fast
           --test container_e2e --test containerize_e2e --test wrap_image_e2e
           -- --nocapture

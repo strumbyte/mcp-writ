@@ -187,6 +187,38 @@ fn scripted_argv() -> Vec<String> {
     common::python3_script_argv("tests/fixtures/mcp_servers/scripted_stdio.py")
 }
 
+/// Argv for a `list_changed_*` `mode` that emits the notification ahead of
+/// the fixture's first ping answer instead of right after the
+/// initialize-time probe's list. A list_changed written right after that
+/// list leaves a window — the probe has published and the gate is down,
+/// but the S2C loop has not read the notification yet — in which a client
+/// `tools/call` is correctly forwarded. Tests asserting the revalidation
+/// gate sync on the ping answer instead (see `trigger_list_changed`).
+fn scripted_argv_list_changed_on_ping(mode: &str) -> Vec<String> {
+    let mut argv = scripted_argv();
+    argv.extend([mode.to_string(), "--list-changed-on-ping".to_string()]);
+    argv
+}
+
+/// Make a `scripted_argv_list_changed_on_ping` fixture emit list_changed
+/// and wait for its ping answer. The S2C loop reads frames in order, so
+/// by the time the answer reaches the client the guard has raised the
+/// revalidation gate (or queued the relist behind a probe still in
+/// flight): every `tools/call` sent afterwards is denied until the relist
+/// publishes or the session aborts.
+async fn trigger_list_changed(
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    id: u32,
+) {
+    let ping = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","params":{{}}}}"#);
+    let resp = send_and_recv(stdin, reader, &ping).await;
+    assert!(
+        json_has_result(&resp) && resp.contains(&format!("\"id\":{id}")),
+        "ping must be answered before list_changed is held: {resp}"
+    );
+}
+
 /// 2025-11-25 handshake — the wire layer denies ordinary traffic before
 /// `notifications/initialized` forwards.
 async fn handshake_2025(
@@ -676,8 +708,8 @@ async fn list_changed_revalidates_then_forwards_and_denies_mid_relist_call() {
     let mut child = spawn_guard(
         &policy,
         false,
-        &scripted_argv(),
-        &[("MCP_WRIT_FIXTURE", "list_changed_ok")],
+        &scripted_argv_list_changed_on_ping("list_changed_ok"),
+        &[],
     );
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -685,12 +717,13 @@ async fn list_changed_revalidates_then_forwards_and_denies_mid_relist_call() {
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
-    // The initialize-time verification probe consumed the clean first
-    // list and the fixture emitted list_changed right after it — the
-    // guard holds the notification and resumes a revalidation relist as
-    // soon as the probe's verified emit lands. The fixture delays that
-    // relist answer by 400ms; poll calls until one lands inside the
-    // window (too early denies "no verified", too late is published).
+    // The initialize-time verification probe consumes the clean first
+    // list; the ping makes the fixture emit list_changed, which the guard
+    // holds while it relists. The fixture delays that relist answer by
+    // 400ms. After the ping answer every call is denied until the relist
+    // publishes — "no verified" while a probe the ping overtook is still
+    // in flight, then "in progress" — so poll until the mid-relist deny.
+    trigger_list_changed(&mut stdin, &mut reader, 69).await;
     let call = r#"{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
     let mut forwarded_notif = String::new();
     let mut denied_mid_relist = false;
@@ -843,8 +876,8 @@ async fn list_changed_relist_error_keeps_tools_call_denied() {
     let mut child = spawn_guard(
         &policy,
         false,
-        &scripted_argv(),
-        &[("MCP_WRIT_FIXTURE", "list_changed_error")],
+        &scripted_argv_list_changed_on_ping("list_changed_error"),
+        &[],
     );
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -852,12 +885,14 @@ async fn list_changed_relist_error_keeps_tools_call_denied() {
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
-    // The initialize-time verification probe consumed the clean first
-    // list, the fixture emitted list_changed, and the guard's internal
-    // relist is answered with a JSON-RPC error — the session must abort
-    // without forwarding the notification or ever letting a call reach
-    // the child (which would answer {"ok":true}). Race a call into the
-    // window, then drain to EOF.
+    // The initialize-time verification probe consumes the clean first
+    // list; the ping makes the fixture emit list_changed, and the guard's
+    // internal relist is answered (after 400ms) with a JSON-RPC error —
+    // the session must abort without forwarding the notification or ever
+    // letting a call reach the child (which would answer {"ok":true}).
+    // Once the ping answer is back the gate is raised, so the call lands
+    // in the relist window deterministically; then drain to EOF.
+    trigger_list_changed(&mut stdin, &mut reader, 90).await;
     let mid = r#"{"jsonrpc":"2.0","id":91,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
     let _ = stdin.write_all(format!("{mid}\n").as_bytes()).await;
     let _ = stdin.flush().await;

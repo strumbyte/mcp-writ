@@ -6,6 +6,11 @@ when the policy restricts the child environment and the variable never
 reaches the server). A second argv argument `v26` switches result shapes
 to the 2026-07-28 envelope (resultType/ttlMs/cacheScope); without it the
 per-request `_meta` protocolVersion decides per frame. An argv argument
+`--list-changed-on-ping` makes the list_changed_* modes emit their
+notification on the first client `ping`, written ahead of the ping result,
+instead of right after the first list — the guard reads the change before
+it can forward the ping answer, so a test that waits for that answer orders
+its next request after the guard has seen the change. An argv argument
 `--protocol-version=<v>` pins the initialize result's `protocolVersion`
 to `<v>` regardless of the request; the special value `echo` answers the
 client's requested version verbatim — both exercise the auditor's
@@ -755,6 +760,8 @@ def main() -> None:
         ),
         [],
     )
+    list_changed_on_ping = "--list-changed-on-ping" in extra_args
+    list_changed_sent = False
     list_count = 0
     pending_s2c: dict = {}
     held_list: list = []
@@ -812,6 +819,13 @@ def main() -> None:
         if method == "ping":
             if mode == "black_hole":
                 continue
+            if (
+                list_changed_on_ping
+                and mode.startswith("list_changed")
+                and not list_changed_sent
+            ):
+                reply({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+                list_changed_sent = True
             reply(result_for(msg, {}, v26_mode))
             continue
 
@@ -881,7 +895,11 @@ def main() -> None:
                     v26_mode,
                 )
             )
-            if list_count == 0 and mode.startswith("list_changed"):
+            if (
+                list_count == 0
+                and mode.startswith("list_changed")
+                and not list_changed_on_ping
+            ):
                 reply({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
             list_count += 1
             continue
