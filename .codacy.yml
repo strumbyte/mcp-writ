@@ -4,3 +4,6 @@
 # not production code, so exclude the whole tree from analysis.
 exclude_paths:
   - "tests/fixtures/**"
+  # tests/scripts/ holds test harnesses: asserts/subprocess with
+  # env-configured paths there are intentional, not shipped code.
+  - "tests/scripts/**"

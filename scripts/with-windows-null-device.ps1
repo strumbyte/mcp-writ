@@ -30,7 +30,9 @@ try {
             $directory = $directory.Parent
         }
     }
+    $global:LASTEXITCODE = $null
     & $Command
+    if ($LASTEXITCODE) { throw "Command failed with exit code $LASTEXITCODE" }
 } finally {
     $restoreErrors = @()
     for ($index = $grants.Count - 1; $index -ge 0; $index--) {

@@ -12,7 +12,15 @@ CHECKER = Path(os.environ.get('MCP_WRIT_CHECK_SERVER_SCRIPT',
                              ROOT / ('scripts/check-server.sh' if UNIX else 'scripts/check-server.ps1')))
 SHELL = os.environ.get('MCP_WRIT_TEST_POWERSHELL', 'pwsh')
 NODE = shutil.which('node')
-assert NODE, 'node is required'
+
+
+def check(condition, message):
+    """assert is stripped under `python -O`; a security check must not pass silently."""
+    if not condition:
+        raise AssertionError(message)
+
+
+check(NODE, 'node is required')
 
 scenarios = ('v25', 'v26', 'list-error') + (('nonzero-exit',) if UNIX else ())
 for scenario in scenarios:
@@ -34,34 +42,34 @@ for scenario in scenarios:
             cwd=work, env=env, capture_output=True, encoding='utf-8', errors='replace', timeout=60,
         )
         output = completed.stdout + completed.stderr
-        assert trace.is_file(), (
-            f'{scenario}: server produced no trace\n{output}')
+        check(trace.is_file(), (
+            f'{scenario}: server produced no trace\n{output}'))
         events = [json.loads(line) for line in trace.read_text(encoding='utf-8').splitlines()]
         calls = [event for event in events if event['event'] == 'tools/call']
         if scenario == 'nonzero-exit':
-            assert completed.returncode != 0, output
-            assert len(calls) == 1, events
-            assert 'check-server: PASS' not in output, output
+            check(completed.returncode != 0, output)
+            check(len(calls) == 1, events)
+            check('check-server: PASS' not in output, output)
             print('PASS: nonzero child exit cannot be reported as success')
             continue
         if scenario == 'list-error':
-            assert completed.returncode != 0, output
-            assert 'tools/list' in (event['event'] for event in events), events
-            assert 'carries "error"' in output, output
-            assert not calls, 'tools/call must not follow an unsuccessful tools/list'
+            check(completed.returncode != 0, output)
+            check('tools/list' in (event['event'] for event in events), events)
+            check('carries "error"' in output, output)
+            check(not calls, 'tools/call must not follow an unsuccessful tools/list')
         else:
-            assert completed.returncode == 0, output
-            assert len(calls) == 1, events
+            check(completed.returncode == 0, output)
+            check(len(calls) == 1, events)
             session = [event['event'] for event in events if event['pid'] == calls[0]['pid']]
-            assert session.index('list-response') < session.index('tools/call'), session
+            check(session.index('list-response') < session.index('tools/call'), session)
             expected_generation = '2026-07-28' if scenario == 'v26' else '2025-11-25'
-            assert f'negotiated generation: {expected_generation}' in output, output
+            check(f'negotiated generation: {expected_generation}' in output, output)
             if scenario == 'v26':
-                assert session[0] == 'server/discover' and 'initialize' not in session, session
+                check(session[0] == 'server/discover' and 'initialize' not in session, session)
                 for event in events:
                     if event['event'] in ('server/discover', 'tools/list', 'tools/call'):
-                        assert event['params']['_meta']['io.modelcontextprotocol/protocolVersion'] == expected_generation, event
+                        check(event['params']['_meta']['io.modelcontextprotocol/protocolVersion'] == expected_generation, event)
             else:
-                assert session[:2] == ['initialize', 'notifications/initialized'], session
-            assert 'check-server: PASS' in completed.stdout, completed.stdout
+                check(session[:2] == ['initialize', 'notifications/initialized'], session)
+            check('check-server: PASS' in completed.stdout, completed.stdout)
         print(f'PASS: {scenario} request ordering and verdict')
