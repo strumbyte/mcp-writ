@@ -663,6 +663,54 @@ fn tool_fs_allow_under_masked_run_is_a_violation() {
 }
 
 #[test]
+fn disabled_tool_fs_allow_under_masked_run_is_not_a_violation() {
+    // A disabled tool's fs lists never reach the ruleset — its
+    // /run-rooted grant is absent policy, not dead policy, and the
+    // masked-root scan must not flag it.
+    let mut p = Policy::default();
+    let mut tool = crate::policy::ToolPolicy::named("t", false);
+    tool.fs = Some(crate::policy::FsToolPolicy {
+        allowed_paths: vec!["/run/app.sock".to_string()],
+        ..Default::default()
+    });
+    p.tools = vec![tool];
+    let pr = probe(true);
+    let sel = decide(
+        LinuxMechanismRequest::Namespaced,
+        &input(&p, &pr, upstream(), 8),
+    );
+    assert!(
+        sel.violations.iter().all(|s| !s.contains("tool 't'")),
+        "a disabled tool's grant must not be flagged: {:?}",
+        sel.violations
+    );
+}
+
+#[test]
+fn global_fs_listed_in_both_ro_and_rw_reports_once() {
+    // The same path under `read_only` and `read_write` is one dead
+    // grant, not two — the report dedupes by path.
+    let mut p = Policy::default();
+    p.fs.read_only = vec!["/run/app.sock".to_string()];
+    p.fs.read_write = vec!["/run/app.sock".to_string()];
+    let pr = probe(true);
+    let sel = decide(
+        LinuxMechanismRequest::Namespaced,
+        &input(&p, &pr, upstream(), 8),
+    );
+    let hits = sel
+        .violations
+        .iter()
+        .filter(|s| s.contains("/run/app.sock"))
+        .count();
+    assert_eq!(
+        hits, 1,
+        "deduped report expected, got: {:?}",
+        sel.violations
+    );
+}
+
+#[test]
 fn masked_fs_root_matches_only_rooted_spellings() {
     assert!(masked_fs_root("/run/x", false).is_some());
     assert!(masked_fs_root("/run/**", false).is_some());

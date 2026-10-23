@@ -557,6 +557,8 @@ mod imp {
                 .as_ref()
                 .map(|p| p.staged_dirs().to_vec())
                 .unwrap_or_default(),
+            // The bind-mount handoff exists only on Linux.
+            exec_entry_pin: None,
         };
         // Plus the dirs dyld will load the runtime's own libraries and
         // modules from — without exec-map on them the child dies in dyld.

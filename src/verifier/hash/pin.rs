@@ -371,7 +371,11 @@ pub fn bind_launched_workload(
 /// an empty directory cannot carry the launch. The script's exec-time
 /// guarantee is `verify_spawn_path`'s same-object + stamp re-check as
 /// the last gate before spawn — the same assurance level the
-/// workload's own imports have always lived at.
+/// workload's own imports have always lived at — or, on the Linux
+/// namespaced route, the stronger anchoring the init helper gives
+/// that path inside its mount namespace (the pinned object's bytes
+/// re-hashed, staged onto the namespace's private tmpfs, and mounted
+/// over the path).
 pub struct SpawnPin {
     exe: std::fs::File,
     exe_stamp: OpenStamp,
@@ -406,9 +410,12 @@ impl SpawnPin {
         entry_path: std::path::PathBuf,
     ) -> Self {
         let mut this = Self::for_test(exe);
+        let digest = hash_open_file(&mut entry.try_clone().expect("dup test entry"))
+            .expect("hash test entry");
         this.entrypoint = Some(PinnedEntry {
             path: entry_path,
             stamp: record_stamp(&entry).expect("record entry stamp"),
+            digest,
             file: entry,
         });
         this
@@ -418,12 +425,23 @@ impl SpawnPin {
 /// A payload-matched entrypoint script, held open across the spawn.
 struct PinnedEntry {
     /// The path the interpreter's spawn opens — the argv payload
-    /// spelling resolved against the launch's working directory. The
-    /// script also launches *through this path* (a snapshot spelling
-    /// cannot carry an interpreter's module resolution), so this is the
-    /// exec spelling `entrypoint_exec_arg` rewrites argv to.
+    /// spelling resolved against the launch's working directory with
+    /// `.` components stripped (`..` is deliberately kept: a lexical
+    /// parent pop can name a different object across symlinks, while
+    /// `.` always resolves in place). The script also launches
+    /// *through this path* (a snapshot spelling cannot carry an
+    /// interpreter's module resolution), so this is the exec spelling
+    /// `entrypoint_exec_arg` rewrites argv to — and, on the Linux
+    /// namespaced route, the mount target the pin's staged copy is
+    /// mounted over.
     path: std::path::PathBuf,
     file: std::fs::File,
+    /// The `sha256:<hex>` the manifest pinned — handed to the
+    /// namespaced init so its in-namespace digest re-check mounts
+    /// bytes that match the pin exactly (the digest travels by env;
+    /// the object's bytes travel the fd).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    digest: String,
     stamp: OpenStamp,
 }
 
@@ -440,7 +458,11 @@ impl SpawnPin {
     /// path after the spawn returns, and this is the last proof that
     /// path still names the verified object (the residual — the
     /// interpreter's `open(2)` itself — is the window every import the
-    /// workload loads already lives at). For the executable image the
+    /// workload loads already lives at). The Linux namespaced route
+    /// closes even that residual: init re-hashes the pinned object and
+    /// mounts a verified copy over the path inside its mount
+    /// namespace, so the spelling resolves to the pinned content for
+    /// the whole session. For the executable image the
     /// pathname is not exec'd at all: `fd_exec_plan` names the
     /// hash-verified snapshot, so the kernel maps the held object —
     /// this check pins the *decision* (a retargeted path still fails
@@ -548,8 +570,13 @@ impl SpawnPin {
     /// + stamp re-check is the last gate before the spawn, and the
     /// residual — the interpreter's `open(2)` after process creation —
     /// is the window every import the workload loads at run time has
-    /// always lived at. On Windows the session-held share-mode pin
-    /// also makes the object at that path unswappable.
+    /// always lived at. The Linux namespaced route closes even that
+    /// residual: init re-hashes the pinned object and mounts a
+    /// verified copy over the script's path inside its mount
+    /// namespace, so the spelling resolves to the pinned content
+    /// whatever the host pathname later names. On Windows the
+    /// session-held share-mode pin also makes the object at that path
+    /// unswappable.
     ///
     /// Non-Linux Unix has no exec'able fd spelling (`/dev/fd/N` cannot
     /// be `execve`'d on macOS), so the exe plan names the staged
@@ -612,9 +639,36 @@ impl SpawnPin {
         // `verify_spawn_path` re-checked, not a relocated snapshot it
         // cannot resolve from.
         let entrypoint = self.entrypoint_exec_arg(argv, resolved_exe)?;
+        // On Linux a CLOEXEC dup of the entrypoint's pin also rides
+        // the plan: the namespaced init re-hashes the bytes it reads
+        // through this descriptor and mounts the verified copy over
+        // the payload path inside its mount namespace — the real-path
+        // spelling stays while the content behind it is anchored to
+        // the pinned object, closing the verify→exec window a
+        // pathname launch can otherwise only narrow. It is kept
+        // separate from the exe's `_held` list so a non-namespaced
+        // spawn never uncloaks it; other Unixes have no consumer.
+        let entrypoint_fd = if cfg!(target_os = "linux") {
+            match &self.entrypoint {
+                Some(e) => {
+                    Some(
+                        dup_inheritable(&e.file).map_err(|error| VerifyError::FileError {
+                            hash_type: HashType::Entrypoint,
+                            target: e.path.display().to_string(),
+                            error,
+                        })?,
+                    )
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         Ok(FdExecPlan {
             exe_path,
             entrypoint,
+            entrypoint_digest: self.entrypoint.as_ref().map(|e| e.digest.clone()),
+            entrypoint_fd,
             _held: exe_held,
             snapshot_dirs,
         })
@@ -788,6 +842,22 @@ pub struct FdExecPlan {
     /// keep working; the pin's `verify_spawn_path` re-check (run last
     /// before the spawn) is its exec-time guarantee.
     entrypoint: Option<(usize, PathBuf)>,
+    /// The pinned entrypoint's `sha256:<hex>` — init's in-namespace
+    /// re-hash of the fd's bytes must match before the staged copy is
+    /// mounted (Linux only; travels the same env handoff as the fd).
+    entrypoint_digest: Option<String>,
+    /// CLOEXEC dup of the pinned entrypoint's file for the namespaced
+    /// handoff (Linux only — `None` on other Unixes and when no
+    /// entrypoint is pinned). Init reads the pinned object through
+    /// this descriptor — the inode the parent verified, never the
+    /// path — stages the bytes under the namespace's own tmpfs, and
+    /// mounts the staged copy over the payload path (a direct
+    /// `/proc/self/fd` bind cannot cross mount namespaces: the fd's
+    /// vfsmount belongs to the parent's mount table). The descriptor
+    /// number travels by env, not `uncloak_fds`, because only the
+    /// init spawn uncloaks it — every other spawn path must leave the
+    /// flag alone.
+    entrypoint_fd: Option<std::fs::File>,
     /// The duplicated `CLOEXEC` handles keeping the fd spellings
     /// resolvable until the child uncloaks and inherits them (Linux
     /// only — a path-spelled exec holds no descriptors).
@@ -867,9 +937,28 @@ impl FdExecPlan {
     /// `FD_CLOEXEC` (see `dup_inheritable`) — the spawn must clear the
     /// flag inside the child's `pre_exec`, never in the parent, so
     /// concurrent sibling spawns cannot inherit the pinned objects.
+    /// The entrypoint's bind-mount dup is deliberately absent: only
+    /// the namespaced init spawn uncloaks it.
     pub fn uncloak_fds(&self) -> Vec<std::os::fd::RawFd> {
         use std::os::unix::io::AsRawFd;
         self._held.iter().map(|f| f.as_raw_fd()).collect()
+    }
+
+    /// `(fd, real path, sha256)` for the namespaced entrypoint
+    /// handoff — `Some` only on Linux with a payload-bound pin. Init
+    /// reads the pinned object through the descriptor (never the
+    /// path), re-hashes it against `sha256`, and mounts the verified
+    /// bytes over the path inside its mount namespace: the
+    /// interpreter's open then reaches the pinned content even if a
+    /// host-side swap retargeted the pathname — or rewrote the object
+    /// — after `verify_spawn_path`. Other routes ignore this — their
+    /// pathname exec keeps the re-check guarantee.
+    pub fn entrypoint_bind_pin(&self) -> Option<(std::os::fd::RawFd, &Path, &str)> {
+        let fd = self.entrypoint_fd.as_ref()?;
+        let (_, path) = self.entrypoint.as_ref()?;
+        let digest = self.entrypoint_digest.as_deref()?;
+        use std::os::unix::io::AsRawFd;
+        Some((fd.as_raw_fd(), path.as_path(), digest))
     }
 }
 
@@ -920,10 +1009,12 @@ fn dup_inheritable(file: &std::fs::File) -> io::Result<std::fs::File> {
 /// (`/proc/self/fd` descriptor spelling on Linux, staged owner-only
 /// copy elsewhere) so the kernel maps the held object itself, while a
 /// payload-bound entrypoint launches by its real path — the same gate
-/// every runtime import stands at — with `verify_spawn_path`'s
-/// identity re-check last so a retargeted path fails the launch rather
-/// than silently mismatching `argv`'s own resolution. Code the
-/// workload loads at run time stays unpinned.
+/// every runtime import stands at, except on the Linux namespaced
+/// route where init mounts a re-verified copy of the pinned bytes
+/// over that path — with `verify_spawn_path`'s identity re-check
+/// last so a retargeted path fails the launch rather than silently
+/// mismatching `argv`'s own resolution. Code the workload loads at
+/// run time stays unpinned.
 pub fn reverify_immediately_before_spawn(
     argv: &[String],
     resolved_exe: &Path,
@@ -990,13 +1081,20 @@ pub fn reverify_immediately_before_spawn(
         // target — resolve it the way the child's spawn does (a
         // relative path lands on the working directory the child
         // inherits) so the held handle and the re-check follow the
-        // path the launch actually opens.
+        // path the launch actually opens. `.` components are stripped
+        // so the exec spelling (and the namespaced bind-mount target)
+        // is a clean path; `..` stays — popping it lexically could
+        // name a different object across symlinks, while `.` always
+        // resolves in place.
         let payload_path = first_payload_arg_with_exe(argv, Some(resolved_exe)).map(|arg| {
             let path = Path::new(arg);
-            match std::env::current_dir() {
+            let joined = match std::env::current_dir() {
                 Ok(cwd) if path.is_relative() => cwd.join(path),
                 _ => path.to_path_buf(),
-            }
+            };
+            // `.` components normalize away (a leading one too — the
+            // path is absolute after the join); `..` stays literal.
+            joined.components().collect::<PathBuf>()
         });
         let payload_match = payload_path.as_ref().is_some_and(|p| same_file(p, target));
         if !payload_match || same_file(target, resolved_exe) {
@@ -1050,6 +1148,7 @@ pub fn reverify_immediately_before_spawn(
         entrypoint = Some(PinnedEntry {
             path: payload_path,
             file,
+            digest: entry.hash_value.clone(),
             stamp,
         });
     }

@@ -40,7 +40,12 @@
 //!    from a private `/tmp` tmpfs (a memfd path is EINVAL to mount).
 //!    The host file is never touched; if `/etc/resolv.conf` does not
 //!    exist we leave resolution broken (fail-closed — a workload that
-//!    cannot resolve cannot turn name rules into flows).
+//!    cannot resolve cannot turn name rules into flows). A pinned
+//!    entrypoint script then has its verified content staged and
+//!    mounted over its payload path (`MCP_WRIT_NS_ENTRYPIN_*`): the
+//!    real-path spelling stays while the bytes behind it are anchored
+//!    to the pinned object for the session — the verify→exec window a
+//!    pathname launch can only narrow elsewhere closes here.
 //! 7. Handshake: `READY` + the TUN fd via `SCM_RIGHTS`; wait for `GO`.
 //! 8. Linux sandbox: the effective policy is re-loaded from the
 //!    serialized KDL the parent passed (`MCP_WRIT_NS_POLICY`) and the
@@ -381,6 +386,78 @@ fn parse_keep_fds(raw: &str) -> Vec<i32> {
         .filter_map(|s| s.parse::<i32>().ok())
         .filter(|fd| *fd > 2)
         .collect()
+}
+
+/// `(pin fd, payload path, sha256)` named by the
+/// `MCP_WRIT_NS_ENTRYPIN_*` envs; `None` when the launch pins no
+/// payload-bound entrypoint. Read before the env scrub removes the
+/// variables. Stdio descriptors never qualify — a forged entry must
+/// not alias a real fd.
+fn entry_pin_from_env() -> Option<(RawFd, std::path::PathBuf, String)> {
+    let fd: RawFd = std::env::var(super::init_env::ENTRYPIN_FD)
+        .ok()?
+        .parse()
+        .ok()?;
+    if fd <= 2 {
+        return None;
+    }
+    let target = std::env::var_os(super::init_env::ENTRYPIN_TARGET)?;
+    let sha = std::env::var(super::init_env::ENTRYPIN_SHA).ok()?;
+    Some((fd, std::path::PathBuf::from(target), sha))
+}
+
+/// Anchor the pinned entrypoint's content at its payload path. The
+/// interpreter opens the script by name — the path spelling must
+/// stay — so init reads the pinned object through the inherited fd
+/// (never the path: a host-side swap after the parent's last check
+/// would re-resolve there), re-hashes the bytes against the
+/// manifest's digest, writes the verified copy under this
+/// namespace's private `/run` tmpfs, and bind-mounts it over the
+/// path. A plain `mount(MS_BIND)` of `/proc/self/fd/<n>` cannot do
+/// this — the fd's `vfsmount` belongs to the parent's mount table,
+/// and `do_loopback` rejects a source foreign to this namespace
+/// with EINVAL — while a file on the in-namespace tmpfs binds
+/// cleanly. From the mount on, the interpreter's `open(2)` and every
+/// later resolution land on the pinned content even if the host
+/// pathname — or the object's own bytes — changed after the parent's
+/// check: the verify→exec window other routes can only narrow closes
+/// here. Runs at the mount stage (after `/run`/`/tmp` are covered,
+/// so a payload under a masked tree fails the attach cleanly); a
+/// no-op when the launch pins no payload-bound entrypoint.
+fn pin_entrypoint_mount() -> std::io::Result<()> {
+    let Some((fd, target, want_sha)) = entry_pin_from_env() else {
+        return Ok(());
+    };
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(format!("/proc/self/fd/{fd}"))?.read_to_end(&mut bytes)?;
+    if crate::verifier::hash::hash_bytes(&bytes) != want_sha {
+        // An in-place rewrite after the parent's last check — the
+        // digest gate refuses what a byte copy would have carried.
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    let stage = "/run/.mcp-writ-entrypoint";
+    std::fs::create_dir_all(stage)?;
+    let staged = format!("{stage}/payload");
+    std::fs::write(&staged, &bytes)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o400))?;
+    let src = CString::new(staged).map_err(std::io::Error::other)?;
+    let dst = CString::new(target.as_os_str().as_encoded_bytes()).map_err(std::io::Error::other)?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn scrub_env_and_fds(extra_keep: &[i32]) {
@@ -739,6 +816,18 @@ pub(crate) fn init_main() -> i32 {
     }
     if let Err(e) = resolv.and_then(|(target, contents)| redirect_resolv_conf(&target, &contents)) {
         tracing::warn!("namespaced-init: resolv.conf redirect failed: {e}");
+    }
+    // The pinned entrypoint's exec-time binding: init re-hashes the
+    // object the inherited fd names, stages the verified bytes on this
+    // namespace's private `/run`, and mounts the copy over the payload
+    // path — the ordinary spelling keeps resolving to the pinned
+    // content inside this mountns, so a host-side swap or rewrite
+    // after the parent's last check can no longer reach the
+    // interpreter's open. After the tmpfs masks: a payload rooted
+    // under `/run` or a masked `/tmp` fails the mount cleanly (the
+    // parent's `masked_namespace_root` screen refuses it earlier).
+    if let Err(e) = pin_entrypoint_mount() {
+        bail!(STAGE_MOUNT, e.raw_os_error().unwrap_or(-1));
     }
 
     if let Err(e) = send_ready_with_fd(sock, tun) {

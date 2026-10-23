@@ -30,6 +30,15 @@ pub struct SpawnConfig {
     /// re-exec) and listed in `MCP_WRIT_NS_KEEPFDS` so init's fd scrub
     /// keeps them open for the workload exec.
     pub exec_uncloak_fds: Vec<std::os::fd::RawFd>,
+    /// Entrypoint pin handoff: `(dup fd, resolved payload path,
+    /// sha256)` for a payload-bound `entrypoint-hash`. The fd uncloaks
+    /// in this spawn's `pre_exec` like the exe pins but is *not*
+    /// keep-listed — init re-hashes the bytes it reads through the
+    /// descriptor and mounts the verified copy over the path inside
+    /// its mount namespace (`MCP_WRIT_NS_ENTRYPIN_*`), after which the
+    /// mount holds the pinned content and init's scrub closes the
+    /// descriptor before the workload exec.
+    pub entry_pin: Option<(std::os::fd::RawFd, std::path::PathBuf, String)>,
 }
 
 /// The launched namespaced workload. `sock` is the handshake end —
@@ -293,18 +302,26 @@ fn build_init_command(
         );
         cmd.env(super::init_env::SKIP_SANDBOX, "1");
     }
-    // fd-exec handoff: uncloak the pin's dup'd descriptors in this
-    // child's pre_exec — never in the parent — so they survive init's
-    // re-exec; `KEEPFDS` tells init's scrub to keep them for the
-    // workload exec.
-    if !cfg.exec_uncloak_fds.is_empty() {
+    // fd handoff: uncloak the pin's dup'd descriptors in this child's
+    // pre_exec — never in the parent — so they survive init's re-exec.
+    // `KEEPFDS` lists only the exe's fds (init's scrub keeps them open
+    // for the workload exec); the entrypoint pin fd rides the same
+    // uncloak list but is *not* keep-listed — the staged copy mount
+    // holds the verified content, so init's scrub closes the
+    // descriptor before the workload exec.
+    let mut uncloak = cfg.exec_uncloak_fds.clone();
+    if let Some((fd, _, _)) = &cfg.entry_pin {
+        uncloak.push(*fd);
+    }
+    if !uncloak.is_empty() {
         use std::os::unix::process::CommandExt;
-        let fds: Vec<std::os::fd::RawFd> = cfg.exec_uncloak_fds.clone();
         // Safety: the closure performs `fcntl` only — no heap, no lock.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
-            cmd.pre_exec(move || super::super::uncloak_exec_fds(&fds));
+            cmd.pre_exec(move || super::super::uncloak_exec_fds(&uncloak));
         }
+    }
+    if !cfg.exec_uncloak_fds.is_empty() {
         let keep = cfg
             .exec_uncloak_fds
             .iter()
@@ -312,6 +329,11 @@ fn build_init_command(
             .collect::<Vec<_>>()
             .join(",");
         cmd.env(super::init_env::KEEPFDS, keep);
+    }
+    if let Some((fd, target, sha)) = &cfg.entry_pin {
+        cmd.env(super::init_env::ENTRYPIN_FD, fd.to_string())
+            .env(super::init_env::ENTRYPIN_TARGET, target.as_os_str())
+            .env(super::init_env::ENTRYPIN_SHA, sha);
     }
     super::super::child::apply_unix_process_group(&mut cmd);
     cmd

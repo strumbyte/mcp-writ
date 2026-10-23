@@ -137,6 +137,25 @@ pub(crate) async fn spawn_namespaced_attempt(
         }
     };
 
+    // A payload pinned under a tree init masks with a private tmpfs
+    // (`/run` always; `/tmp` when the resolv.conf bridge needs it) can
+    // never resolve inside the namespace — refuse with the cause named
+    // rather than let init's bind-mount or the interpreter's open
+    // surface it as a bare ENOENT.
+    if let Some((_, target, _)) = &opts.exec_entry_pin
+        && let Some(why) = super::super::select::masked_namespace_root(target)
+    {
+        refuse!(
+            controls,
+            grants,
+            spawn_err_msg(&format!(
+                "pinned entrypoint '{}' is rooted under a masked tree — \
+                 {why}; the namespaced workload could never resolve it",
+                target.display()
+            ))
+        );
+    }
+
     // 4 — spawn namespaced-init; complete the READY handshake. The
     // filtered env block is built by the same `spawn_env_pairs` the
     // native arm uses — `MCP_WRIT_NS_*` control vars are stripped by
@@ -148,6 +167,7 @@ pub(crate) async fn spawn_namespaced_attempt(
         policy_kdl_fd,
         env,
         exec_uncloak_fds: opts.exec_uncloak_fds.clone(),
+        entry_pin: opts.exec_entry_pin.clone(),
     };
     // The spawn + READY handshake is blocking socket work — run it on
     // the blocking pool rather than stall the async worker.

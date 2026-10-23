@@ -379,6 +379,114 @@ fn test_spawn_pin_entrypoint_swap_fails() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The re-verifier resolves the argv payload spelling (`.`
+/// components included), then re-spells argv with the *clean*
+/// normalized path — an argv of `./server.py` must not surface in the
+/// child as `/cwd/./server.py`. `..` is deliberately not collapsed:
+/// a lexical pop could name a different object across symlinks.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_reverify_respells_normalized_entrypoint_path() {
+    let dir = make_test_dir("pin_norm");
+    let exe = dir.join("python3");
+    let script = dir.join("server.py");
+    std::fs::write(&exe, b"interp bytes").unwrap();
+    std::fs::write(&script, b"entry").unwrap();
+
+    let entries = vec![
+        HashEntry {
+            server_name: "s".to_string(),
+            hash_type: HashType::Binary,
+            hash_value: hash_file(&exe).unwrap(),
+            target: exe.to_string_lossy().into_owned(),
+            approved: None,
+        },
+        HashEntry {
+            server_name: "s".to_string(),
+            hash_type: HashType::Entrypoint,
+            hash_value: hash_file(&script).unwrap(),
+            target: script.to_string_lossy().into_owned(),
+            approved: None,
+        },
+    ];
+    let spelled = format!("{}/./server.py", dir.display());
+    let argv = vec!["python3".to_string(), spelled];
+    let logger = AuditLogger::to_tracing();
+    let pin = reverify_immediately_before_spawn(&argv, &exe, &entries, &logger).unwrap();
+    let plan = pin.fd_exec_plan(&argv, &exe).unwrap();
+    let rewritten = plan.exec_argv(&argv);
+    assert_eq!(rewritten[1], script.display().to_string());
+    drop(plan);
+    drop(pin);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Linux namespaced handoff: a payload-bound plan carries a CLOEXEC
+/// dup of the pinned entrypoint — `entrypoint_bind_pin` names the
+/// descriptor, the resolved path init mounts the verified copy over,
+/// and the digest init re-checks the bytes against, so the mount
+/// anchors the pinned content rather than whatever the path happens
+/// to name inside the namespace.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_fd_exec_plan_entrypoint_bind_pin_names_verified_object() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = make_test_dir("pin_entrybind");
+    let exe = dir.join("interp.bin");
+    let script = dir.join("server.mjs");
+    std::fs::write(&exe, b"interp bytes").unwrap();
+    std::fs::write(&script, b"entry").unwrap();
+
+    let pin = SpawnPin::for_test_with_entry(
+        open_pinned(&exe).unwrap(),
+        open_pinned(&script).unwrap(),
+        script.clone(),
+    );
+    let argv = vec!["node".to_string(), script.to_string_lossy().into_owned()];
+    let plan = pin.fd_exec_plan(&argv, &exe).unwrap();
+
+    let Some((fd, target, sha)) = plan.entrypoint_bind_pin() else {
+        panic!("a payload-bound pin must carry the namespaced bind-mount fd");
+    };
+    assert!(fd > 2);
+    assert_eq!(target, script.as_path());
+    // The digest the init re-check enforces is the script's content
+    // hash — the same gate the parent's verify applied.
+    assert_eq!(sha, hash_bytes(b"entry"));
+    // The dup names the same object as the script — the property the
+    // staged-copy mount relies on.
+    let held = std::fs::metadata(format!("/proc/self/fd/{fd}")).unwrap();
+    let named = std::fs::metadata(&script).unwrap();
+    assert_eq!(held.dev(), named.dev());
+    assert_eq!(held.ino(), named.ino());
+    // It is *not* in the exe uncloak list — other launch routes must
+    // not inherit a descriptor they never asked for.
+    assert!(!plan.uncloak_fds().contains(&fd));
+
+    drop(plan);
+    drop(pin);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An exe-only pin has no entrypoint to bind-mount — the handoff
+/// stays absent.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_fd_exec_plan_exe_only_has_no_bind_pin() {
+    let dir = make_test_dir("pin_nobind");
+    let exe = dir.join("server.bin");
+    std::fs::write(&exe, b"verified bytes").unwrap();
+
+    let pin = SpawnPin::for_test(open_pinned(&exe).unwrap());
+    let argv = vec!["server".to_string()];
+    let plan = pin.fd_exec_plan(&argv, &exe).unwrap();
+    assert!(plan.entrypoint_bind_pin().is_none());
+    drop(plan);
+    drop(pin);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The Windows entrypoint argv keeps the script's real path — the pin
 /// (session-held share mode) is the guarantee, not a staged copy.
 #[cfg(windows)]

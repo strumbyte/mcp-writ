@@ -559,9 +559,15 @@ pub async fn launch(
             // spawn clears the flag inside the child's pre_exec. The
             // staged dirs name the paths a sandboxed child must be
             // granted to exec/read the snapshots (no fd spelling on
-            // macOS); empty on Linux.
+            // macOS); empty on Linux. The entrypoint pin's fd+path ride
+            // `exec_entry_pin` so the namespaced dispatch can hand init
+            // the descriptor it bind-mounts over the payload path —
+            // inert on every other route.
             spawn_opts.exec_uncloak_fds = plan.uncloak_fds();
             spawn_opts.exec_map_dirs = plan.staged_dirs().to_vec();
+            spawn_opts.exec_entry_pin = plan
+                .entrypoint_bind_pin()
+                .map(|(fd, p, sha)| (fd, p.to_path_buf(), sha.to_string()));
             (plan.exe_path().to_path_buf(), plan.exec_argv(&argv))
         }
         None => (resolved_exe.clone(), argv.clone()),
@@ -845,10 +851,10 @@ pub async fn launch(
     }
     // The exec method a hash pin produced is part of the launch's
     // security surface: the exe image is snapshot-exec'd (`fd` on
-    // Linux, `staged` on other Unix, the share-mode-pinned path on
-    // Windows); a payload-bound entrypoint launches by `path` — an
-    // interpreter resolves its module and imports from that path,
-    // which a snapshot spelling cannot carry.
+    // Linux, `staged` on other Unix) or path-launched under the
+    // share-mode pin (`path` on Windows); a payload-bound entrypoint
+    // launches by `path` — an interpreter resolves its module and
+    // imports from that path, which a snapshot spelling cannot carry.
     #[cfg(unix)]
     if let Some(plan) = &fd_exec_plan {
         details.push_str(&format!(" exe_exec={}", plan.exe_exec_mode()));
@@ -857,11 +863,13 @@ pub async fn launch(
         }
     }
     #[cfg(windows)]
-    if spawn_pin
-        .as_ref()
-        .is_some_and(|pin| pin.has_pinned_entrypoint())
-    {
-        details.push_str(" entrypoint_exec=path");
+    if let Some(pin) = &spawn_pin {
+        // The exe launches by its real path too — the session-held
+        // share-mode pin is the object binding there.
+        details.push_str(" exe_exec=path");
+        if pin.has_pinned_entrypoint() {
+            details.push_str(" entrypoint_exec=path");
+        }
     }
     // OS controls the launch tolerated below full enforcement ride the
     // same observations the report carries — not a separate computation.

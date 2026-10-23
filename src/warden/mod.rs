@@ -56,6 +56,14 @@ pub struct SpawnOptions {
     /// grant these dirs write — a writable+executable dir is a
     /// drop-and-run channel.
     pub exec_map_dirs: Vec<PathBuf>,
+    /// Linux namespaced handoff: the pinned entrypoint's
+    /// `(CLOEXEC-dup fd, resolved real path, sha256)` — init re-reads
+    /// the pinned object through the descriptor, re-hashes it against
+    /// the digest, and mounts the verified bytes over the path inside
+    /// its mount namespace, so the interpreter's real-path open reaches
+    /// the pinned content whatever the host later does. Set from
+    /// `FdExecPlan::entrypoint_bind_pin`; unused on every other route.
+    pub exec_entry_pin: Option<(SpawnFd, PathBuf, String)>,
 }
 
 /// Unix fd-exec handoff: clear `FD_CLOEXEC` on the pin's duplicated

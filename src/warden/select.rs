@@ -37,6 +37,7 @@
 //! selection table is unit-testable without namespaces.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::Path;
 
 use crate::execution::{
     LinuxMechanismRequest, LinuxNativeMechanism, MechanismSelection, NamespacedProbeEvidence,
@@ -498,13 +499,17 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
     // always covered (host IPC socket hiding); `/tmp` whenever the
     // resolv.conf redirect needs a bind-mount source there.
     let tmp_masked = tmp_mask_planned();
-    for path in policy
+    // Deduped — a path declared under two mode lists is one dead
+    // grant, not two (same treatment the per-tool union gets below).
+    let policy_paths: std::collections::BTreeSet<&str> = policy
         .fs
         .read_only
         .iter()
         .chain(policy.fs.read_write.iter())
         .chain(policy.fs.executable.iter())
-    {
+        .map(String::as_str)
+        .collect();
+    for path in policy_paths {
         if let Some(why) = masked_fs_root(path, tmp_masked) {
             v.push(format!(
                 "fs allow '{path}' is rooted under a masked tree — {why}, so \
@@ -513,6 +518,12 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
         }
     }
     for tool in &policy.tools {
+        // A disabled tool's fs lists never reach the ruleset — the
+        // builders skip them (same as `unmediatable_fs_violations`),
+        // so they cannot be dead grants either.
+        if !tool.allowed {
+            continue;
+        }
         let Some(fs) = &tool.fs else { continue };
         // `allowed_paths` is the union spelling of the mode lists —
         // dedupe so one rule does not report twice.
@@ -676,6 +687,28 @@ fn masked_fs_root(spelling: &str, tmp_masked: bool) -> Option<&'static str> {
     None
 }
 
+/// `Some(reason)` when `path` — a concrete pinned payload path, not a
+/// grant spelling — sits under a tree init masks with a private
+/// tmpfs (`/run` always; `/tmp` when the resolv.conf redirect needs
+/// its tmpfs): the namespaced workload could never resolve it.
+/// Unlike `masked_fs_root`'s glob-aware spelling walk this resolves
+/// the path first, so a symlinked entrypoint is judged by the object
+/// it reaches — the same object the pin verified. `/var/run` needs no
+/// separate arm: a path spelled through it canonicalizes under `/run`.
+pub(crate) fn masked_namespace_root(path: &Path) -> Option<&'static str> {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if resolved.starts_with("/run") {
+        return Some("the namespaced mount setup covers /run with a private tmpfs");
+    }
+    if tmp_mask_planned() && resolved.starts_with("/tmp") {
+        return Some(
+            "init covers /tmp with a private tmpfs to host the resolv.conf \
+             bind-mount source",
+        );
+    }
+    None
+}
+
 /// `Some(<fs name>)` when `spelling`'s grant base sits on a filesystem
 /// Landlock cannot mediate. Landlock's path-beneath walk compares the
 /// kernel inode objects along the file's dentry chain against the
@@ -719,13 +752,17 @@ fn unmediatable_fs_violations(policy: &Policy, landlock_abi: u8) -> Vec<String> 
         return Vec::new();
     }
     let mut v = Vec::new();
-    for path in policy
+    // Deduped — a path declared under two mode lists is one dead
+    // grant, not two (the per-tool union below does the same).
+    let paths: std::collections::BTreeSet<&str> = policy
         .fs
         .read_only
         .iter()
         .chain(policy.fs.read_write.iter())
         .chain(policy.fs.executable.iter())
-    {
+        .map(String::as_str)
+        .collect();
+    for path in paths {
         if let Some(fs_name) = unmediatable_grant_fs(path) {
             v.push(format!(
                 "fs allow '{path}' is on a filesystem Landlock cannot \
