@@ -826,3 +826,74 @@ fn dead_udp_allows_ignores_tcp_denies_and_open_posture() {
     p.network.outbound.deny_all_others = false;
     assert!(dead_udp_allows_without_selection(&p).is_empty());
 }
+
+// --- Landlock-unmediatable filesystems ----------------------------
+
+///  is procfs — always Landlock-mediatable. Nonexistent and
+/// mid-glob spellings are indeterminate and must not verdict.
+#[test]
+fn unmediatable_grant_fs_ignores_mediated_and_unknown() {
+    assert_eq!(unmediatable_grant_fs("/proc"), None);
+    assert_eq!(unmediatable_grant_fs("/proc/**"), None);
+    assert_eq!(unmediatable_grant_fs("/definitely/not/here"), None);
+    assert_eq!(unmediatable_grant_fs("/proc/*/status"), None);
+}
+
+/// The first 9p/v9fs mount on this host, when one exists — the
+/// filesystem Landlock's inode-object walk cannot match (WSL2 mounts
+/// Windows drives this way).
+fn first_pseudo_fs_mount() -> Option<String> {
+    std::fs::read_to_string("/proc/mounts").ok().and_then(|m| {
+        m.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            let _dev = f.next()?;
+            let dir = f.next()?;
+            let fstype = f.next()?;
+            (fstype == "9p" || fstype == "v9fs").then(|| dir.replace(r"\040", " "))
+        })
+    })
+}
+
+/// On a host with a real 9p mount the probe must flag it — and the
+/// collector must report the declared grant as dead policy. Hosts
+/// without such a mount (ordinary Linux CI) skip the positive half.
+#[test]
+fn unmediatable_fs_violations_flags_pseudo_fs_grants() {
+    // With no Landlock at all the no-support violation already covers
+    // every fs grant — this check stays silent under ABI 0.
+    let mut p = Policy::default();
+    p.fs.read_only.push("/proc".to_string());
+    assert!(unmediatable_fs_violations(&p, 0).is_empty());
+    assert!(unmediatable_fs_violations(&p, 6).is_empty());
+
+    let Some(mnt) = first_pseudo_fs_mount() else {
+        return;
+    };
+    assert!(unmediatable_grant_fs(&mnt).is_some());
+    assert!(unmediatable_grant_fs(&format!("{mnt}/**")).is_some());
+    let mut p = Policy::default();
+    p.fs.read_only.push(mnt.clone());
+    let v = unmediatable_fs_violations(&p, 6);
+    assert_eq!(v.len(), 1);
+    assert!(v[0].contains("Landlock cannot mediate"), "got: {}", v[0]);
+
+    // An allowed tool's grant flags the same way; a disabled tool's
+    // never reaches the ruleset — the builders skip it, so the
+    // selection must not refuse on its behalf.
+    let mut p = Policy::default();
+    let mut tool = crate::policy::ToolPolicy::named("t", true);
+    tool.fs = Some(crate::policy::FsToolPolicy {
+        allowed_paths: vec![mnt.clone()],
+        ..Default::default()
+    });
+    p.tools = vec![tool];
+    let v = unmediatable_fs_violations(&p, 6);
+    assert_eq!(v.len(), 1);
+    let mut tool = crate::policy::ToolPolicy::named("t", false);
+    tool.fs = Some(crate::policy::FsToolPolicy {
+        allowed_paths: vec![mnt],
+        ..Default::default()
+    });
+    p.tools = vec![tool];
+    assert!(unmediatable_fs_violations(&p, 6).is_empty());
+}

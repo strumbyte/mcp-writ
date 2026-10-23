@@ -165,11 +165,14 @@ pub(crate) fn spawn_supervised(
         tmpdir: None,
         ..Default::default()
     };
-    // Exec through the pinned descriptors' `/proc/self/fd` spellings
-    // when a pin exists — the kernel maps the verified object itself,
-    // so a pathname swap after verification cannot reach the exec.
-    // The plan holds the inherited dup handles and must outlive
-    // `cmd.spawn()`.
+    // Exec the executable through the pinned descriptor's
+    // `/proc/self/fd` spelling when a pin exists — the kernel maps the
+    // verified object itself, so a pathname swap after verification
+    // cannot reach the exec. A pinned entrypoint script instead keeps
+    // its real path inside argv (`exec_argv` re-spells the payload
+    // arg): an interpreter resolves its module and imports relative to
+    // that path, which the fd spelling cannot carry. The plan holds
+    // the inherited dup handles and must outlive `cmd.spawn()`.
     let fd_exec_plan = match spawn_pin {
         Some(pin) => Some(pin.fd_exec_plan(argv, resolved_exe).map_err(|e| {
             WardenError::sandbox_setup(

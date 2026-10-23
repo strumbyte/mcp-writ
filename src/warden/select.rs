@@ -534,6 +534,11 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
         }
     }
 
+    // fs grants on a filesystem Landlock cannot mediate are dead on
+    // the in-namespace ruleset exactly as on the native one — the
+    // same kernel walk applies the rules inside.
+    v.extend(unmediatable_fs_violations(policy, input.landlock_abi));
+
     if policy.network.inbound.allow_listen {
         v.push(
             "inbound listen cannot be granted — the namespaced network \
@@ -671,6 +676,97 @@ fn masked_fs_root(spelling: &str, tmp_masked: bool) -> Option<&'static str> {
     None
 }
 
+/// `Some(<fs name>)` when `spelling`'s grant base sits on a filesystem
+/// Landlock cannot mediate. Landlock's path-beneath walk compares the
+/// kernel inode objects along the file's dentry chain against the
+/// rule's object — on filesystems that mint a fresh inode object per
+/// lookup the comparison can never succeed: the ruleset reports
+/// `FullyEnforced` while every access under the granted tree is
+/// denied. The launch must refuse — shipping the grant would be dead
+/// policy, not a weaker sandbox.
+///
+/// The table is limited to filesystems observed to fail this way.
+/// WSL2 exposes Windows drives through a 9p protocol mount (`drvfs`,
+/// `statfs` f_type `V9FS_MAGIC`); stable-inode filesystems (tmpfs,
+/// ext*, overlayfs, NFS) mediate correctly and are not listed.
+fn unmediatable_grant_fs(spelling: &str) -> Option<&'static str> {
+    // The grant builder opens the glob base — the same reduction the
+    // fs-overlap resolver applies — so that is what gets probed.
+    let base = crate::fsoverlap::glob_base(spelling)?;
+    let c = std::ffi::CString::new(base).ok()?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // A failed probe is indeterminate, not clean — but an unreadable
+    // or nonexistent base already fails the build-time PathFd open,
+    // so no verdict is needed here.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    const V9FS_MAGIC: i64 = 0x0102_1997;
+    match st.f_type as i64 {
+        V9FS_MAGIC => Some("9p/v9fs — e.g. a WSL drvfs mount"),
+        _ => None,
+    }
+}
+
+/// Violations for declared fs grants rooted on a filesystem Landlock
+/// cannot mediate — dead policy on either Landlock-backed route.
+/// `landlock_abi == 0` skips the probe: with no Landlock at all the
+/// existing no-support violation already covers every fs grant.
+fn unmediatable_fs_violations(policy: &Policy, landlock_abi: u8) -> Vec<String> {
+    if landlock_abi == 0 {
+        return Vec::new();
+    }
+    let mut v = Vec::new();
+    for path in policy
+        .fs
+        .read_only
+        .iter()
+        .chain(policy.fs.read_write.iter())
+        .chain(policy.fs.executable.iter())
+    {
+        if let Some(fs_name) = unmediatable_grant_fs(path) {
+            v.push(format!(
+                "fs allow '{path}' is on a filesystem Landlock cannot \
+                 mediate ({fs_name}) — the kernel cannot match \
+                 path-beneath rules there, so the grant can never take \
+                 effect; place the workload on a local filesystem"
+            ));
+        }
+    }
+    for tool in &policy.tools {
+        // A disabled tool's fs lists never reach the ruleset — the
+        // builders (`create_landlock_ruleset{,_namespaced}`, which both
+        // launch routes share) skip them, so they cannot be dead
+        // grants either.
+        if !tool.allowed {
+            continue;
+        }
+        let Some(fs) = &tool.fs else { continue };
+        let paths: std::collections::BTreeSet<&str> = fs
+            .allowed_paths
+            .iter()
+            .chain(fs.read_only_paths.iter())
+            .chain(fs.read_write_paths.iter())
+            .map(String::as_str)
+            .collect();
+        for path in paths {
+            if let Some(fs_name) = unmediatable_grant_fs(path) {
+                v.push(format!(
+                    "tool '{}' fs allow '{path}' is on a filesystem \
+                     Landlock cannot mediate ({fs_name}) — the kernel \
+                     cannot match path-beneath rules there, so the \
+                     grant can never take effect; place the workload \
+                     on a local filesystem",
+                    tool.name
+                ));
+            }
+        }
+    }
+    v
+}
+
 /// `true` when `rule` is an allow the native route can never honor:
 /// under deny-all its seccomp socket pin denies datagram creation
 /// outright, so a UDP-covering allow is dead policy there. Under an
@@ -678,6 +774,15 @@ fn masked_fs_root(spelling: &str, tmp_masked: bool) -> Option<&'static str> {
 /// grant is redundant rather than silently violated.
 fn udp_allow_dead_on_native(outbound: &OutboundPolicy, rule: &EgressRule) -> bool {
     outbound.deny_all_others && rule.allow && rule.proto.covers(EgressProto::Udp)
+}
+
+/// The dead-policy fs grants a dispatch with no mechanism selection
+/// would silently carry — the same check the selection verdicts run,
+/// for the legacy `linux_mechanism: None` route (`runtime::launch`,
+/// the in-guest runner's contract). `landlock_abi == 0` short-circuits
+/// inside: with no ruleset nothing is denied, so no grant is dead.
+pub(crate) fn dead_fs_grants_without_selection(policy: &Policy) -> Vec<String> {
+    unmediatable_fs_violations(policy, crate::warden::landlock_impl::kernel_abi())
 }
 
 /// The dead-policy UDP allows a dispatch with no mechanism selection
@@ -847,6 +952,11 @@ fn native_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
             ));
         }
     }
+    // fs grants on a filesystem Landlock cannot mediate — the ruleset
+    // enforces yet the grant can never match, so declaring it is dead
+    // policy the launch must not carry silently.
+    v.extend(unmediatable_fs_violations(policy, input.landlock_abi));
+
     if let Some(e) = &input.native_build_err {
         v.push(format!("native sandbox rule build failed: {e}"));
     }

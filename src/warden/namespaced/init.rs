@@ -458,11 +458,11 @@ fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
         match super::super::linux_spawn::prepare_linux_child_sandbox_namespaced(&policy) {
             Ok(mut bits) => {
                 // The pin fds KEEPFDS names were uncloaked across
-                // init's own re-exec, and the workload's argv names
-                // them as `/proc/self/fd/N` — they must survive *its*
-                // exec too. `seal_ambient_fds` CLOEXECs every ambient
-                // descriptor but its keep list, so the list has to be
-                // handed over before the bits apply.
+                // init's own re-exec, and the workload's exe spelling
+                // names them as `/proc/self/fd/N` — they must survive
+                // *its* exec too. `seal_ambient_fds` CLOEXECs every
+                // ambient descriptor but its keep list, so the list
+                // has to be handed over before the bits apply.
                 bits.exec_uncloak_fds = keep_fds_from_env();
                 if let Err(e) = bits.apply_in_child() {
                     send_err(sock, STAGE_SANDBOX, e.raw_os_error().unwrap_or(-1));

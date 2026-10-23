@@ -281,6 +281,85 @@ fn interpreter_or_skip(test: &str) -> Option<&'static str> {
     Some(name)
 }
 
+/// `node` is a prerequisite like the python interpreter — absent it the
+/// draft would simply lack pins, so skip instead of failing.
+fn node_or_skip(test: &str) -> bool {
+    if mcp_writ::workload::resolve_command_path("node").is_err() {
+        common::skip_e2e_test(&format!("{test}: node not on PATH"));
+        return false;
+    }
+    true
+}
+
+/// `initialize` + `notifications/initialized` + `tools/list` — the full
+/// prelude a real client drives. The pinned entry's relative import must
+/// resolve for the sibling's `echo_tool` to appear in the listing.
+async fn drive_handshake_and_list(child: &mut tokio::process::Child) {
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout).lines();
+
+    // Step-wise like a real client: the proxy denies `tools/list` with
+    // init-order while `initialize` is still in flight, so the listing
+    // request must wait for the init result to come back first.
+    stdin
+        .write_all(format!("{INITIALIZE}\n").as_bytes())
+        .await
+        .expect("write initialize");
+    stdin.flush().await.expect("flush initialize");
+
+    let mut saw_init = false;
+    let mut saw_tools = false;
+    timeout(Duration::from_secs(TIMEOUT_SECS), async {
+        while !saw_init {
+            let line = reader
+                .next_line()
+                .await
+                .expect("IO error reading mcp-writ stdout")
+                .expect("unexpected EOF on mcp-writ stdout - child may have exited");
+            if !line.starts_with("{\"jsonrpc\"") || !line.contains("\"id\":1") {
+                continue;
+            }
+            let json = nojson::RawJson::parse(&line).expect("response is JSON");
+            saw_init = json
+                .value()
+                .to_member("result")
+                .ok()
+                .and_then(|m| m.optional())
+                .is_some();
+        }
+
+        stdin
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n"
+                    .as_slice(),
+            )
+            .await
+            .expect("write initialized + tools/list");
+        stdin.flush().await.expect("flush tools/list");
+
+        while !saw_tools {
+            let line = reader
+                .next_line()
+                .await
+                .expect("IO error reading mcp-writ stdout")
+                .expect("unexpected EOF on mcp-writ stdout - child may have exited");
+            if !line.starts_with("{\"jsonrpc\"") || !line.contains("\"id\":2") {
+                continue;
+            }
+            saw_tools = line.contains("echo_tool");
+        }
+    })
+    .await
+    .expect("timeout waiting for initialize + tools/list");
+    assert!(
+        saw_tools,
+        "tools/list must return the sibling module's echo_tool — the relative \
+         import resolved, which only a real-path entrypoint launch can carry"
+    );
+}
+
 #[tokio::test]
 async fn interpreted_entrypoint_hash_binds_and_tamper_fails() {
     let Some(interp) = interpreter_or_skip("interpreted") else {
@@ -347,6 +426,70 @@ async fn interpreted_entrypoint_hash_binds_and_tamper_fails() {
         stderr.contains("Supply chain verification failed"),
         "tampered launch must report supply-chain refusal: {stderr}"
     );
+}
+
+/// The reported regression: a payload-bound `entrypoint-hash` must not
+/// route the script through a snapshot spelling — Node realpaths the
+/// entry point and resolves relative imports from its directory, so a
+/// `/proc/self/fd/N` or staged-copy spelling kills the server before it
+/// can answer `initialize`. The multi-file ESM fixture imports a
+/// sibling module; only a real-path entrypoint launch can answer
+/// `tools/list` with the sibling's tool. The sibling stays unpinned —
+/// imports are outside the pin scope by design.
+#[tokio::test]
+async fn interpreted_entrypoint_hash_multifile_esm() {
+    if !node_or_skip("multifile-esm") {
+        return;
+    }
+    let dir = make_test_dir("esm_multi");
+    // Per-test copies so the pinned files sit in the test's own dir —
+    // generate-policy hashes the real paths `run` will open.
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_servers/esm_pkg");
+    let index = dir.path().join("index.mjs");
+    let tools = dir.path().join("tools.mjs");
+    std::fs::copy(src.join("index.mjs"), &index).expect("copy index.mjs");
+    std::fs::copy(src.join("tools.mjs"), &tools).expect("copy tools.mjs");
+
+    let argv = vec!["node".to_string(), index.to_string_lossy().into_owned()];
+    let (draft, _stderr) = generate_policy(&argv, &["--static-only"]).await;
+    assert!(
+        draft.contains("binary-hash \"sha256:"),
+        "esm draft must pin the node binary: {draft}"
+    );
+    assert!(
+        draft.contains("entrypoint-hash \"sha256:"),
+        "esm draft must pin the entry script: {draft}"
+    );
+
+    let policy_path = write_policy(dir.path(), &draft);
+    let mut child = ChildGuard(spawn_guard(&policy_path, &argv));
+    drive_handshake_and_list(&mut child.0).await;
+    child.0.kill().await.expect("kill guard");
+}
+
+/// The same pinned launch on a single-file CJS server — the baseline
+/// that must not regress: no imports, so any exec spelling could serve
+/// it, but it still goes through the entrypoint pin's real-path launch.
+#[tokio::test]
+async fn interpreted_entrypoint_hash_single_file_cjs() {
+    if !node_or_skip("single-file-cjs") {
+        return;
+    }
+    let dir = make_test_dir("cjs_single");
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mcp_servers/single_file.cjs");
+    let script = dir.path().join("server.cjs");
+    std::fs::copy(&src, &script).expect("copy server.cjs");
+
+    let argv = vec!["node".to_string(), script.to_string_lossy().into_owned()];
+    let (draft, _stderr) = generate_policy(&argv, &["--static-only"]).await;
+    assert!(
+        draft.contains("entrypoint-hash \"sha256:"),
+        "cjs draft must pin the entry script: {draft}"
+    );
+
+    let policy_path = write_policy(dir.path(), &draft);
+    assert_handshake_ok(&policy_path, &argv).await;
 }
 
 #[tokio::test]

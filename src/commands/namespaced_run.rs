@@ -503,12 +503,19 @@ mod imp {
         // holds the verified object — init execs `resolved_exe` and
         // the pin stays open across the whole supervised lifetime.
         let _held_spawn_pin = spawn_pin;
-        // The pin's CLOEXEC dup descriptors are uncloaked in the init
-        // spawn's pre_exec (never in the parent) and kept through
-        // init's fd scrub via `MCP_WRIT_NS_KEEPFDS`, so handing it
-        // `/proc/self/fd` spellings makes the in-namespace exec map
-        // the verified objects — a pathname swap after verification
-        // cannot reach the workload exec.
+        // The pin's CLOEXEC dup descriptor for the *executable* is
+        // uncloaked in the init spawn's pre_exec (never in the parent)
+        // and kept through init's fd scrub via `MCP_WRIT_NS_KEEPFDS`,
+        // so handing init a `/proc/self/fd` exe spelling makes the
+        // in-namespace exec map the verified object — a pathname swap
+        // after verification cannot reach it. A pinned entrypoint
+        // script instead rides argv as its real path: the interpreter
+        // inside the namespace opens it by name and resolves imports
+        // relative to it, which an fd spelling cannot carry. The mount
+        // namespace shares the host tree (it covers /run and, when the
+        // resolv.conf bridge needs it, /tmp), so a payload pinned under
+        // a covered dir cannot resolve inside — an entrypoint under
+        // /run is the residual limitation of path launch.
         let fd_exec_plan = match &_held_spawn_pin {
             Some(pin) => match pin.fd_exec_plan(&command_argv, &resolved_exe) {
                 Ok(plan) => Some(plan),
@@ -571,6 +578,31 @@ mod imp {
             ..Default::default()
         };
         let env_pairs = crate::warden::spawn_env_pairs(&spawn_opts);
+
+        // The entrypoint's exec-time guarantee is this re-check — it
+        // runs last, after the plan and env are staged, immediately
+        // before the init spawn the interpreter launch goes through.
+        if let Some(pin) = &_held_spawn_pin
+            && let Err(e) = pin.verify_spawn_path(&resolved_exe)
+        {
+            let detail = format!("supply chain verification failed at spawn: {e}");
+            eprintln!("Error: {detail}");
+            write_report(
+                "failed",
+                Some(&detail),
+                Some(&policy),
+                policy_context.as_ref(),
+            );
+            lifecycle::guard_stopped(
+                &audit_logger,
+                &session_audit,
+                "failed",
+                Some(1),
+                Some(&detail),
+            );
+            let _ = audit_logger.shutdown().await;
+            std::process::exit(1);
+        }
 
         // Spawn the init helper; complete the handshake.
         let spawn_res = {

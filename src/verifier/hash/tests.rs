@@ -278,6 +278,130 @@ fn test_fd_exec_plan_snapshot_binds_verified_bytes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A payload-bound entrypoint launches by its *real path* — never an
+/// fd or staged spelling — because the interpreter opens, realpaths,
+/// and resolves imports relative to that name. The exe still gets the
+/// snapshot spelling, and the payload argv position is re-spelled to
+/// the resolved path the pin verified.
+#[cfg(unix)]
+#[test]
+fn test_fd_exec_plan_entrypoint_launches_by_real_path() {
+    let dir = make_test_dir("pin_entrypath");
+    let exe = dir.join("interp.bin");
+    let script = dir.join("server.mjs");
+    std::fs::write(&exe, b"interp bytes").unwrap();
+    std::fs::write(&script, b"import './tools.mjs'\n").unwrap();
+
+    let exe_file = open_pinned(&exe).unwrap();
+    let entry_file = open_pinned(&script).unwrap();
+    let pin = SpawnPin::for_test_with_entry(exe_file, entry_file, script.clone());
+    let argv = vec!["node".to_string(), script.to_string_lossy().into_owned()];
+    let plan = pin.fd_exec_plan(&argv, &exe).unwrap();
+
+    // The exe still rides the snapshot spelling — memfd fd on Linux,
+    // owner-only staged path elsewhere — never the workload pathname.
+    assert_ne!(
+        plan.exe_path(),
+        exe.as_path(),
+        "the exe must keep its snapshot exec spelling"
+    );
+    assert_eq!(
+        plan.exe_exec_mode(),
+        if cfg!(target_os = "linux") {
+            "fd"
+        } else {
+            "staged"
+        }
+    );
+    assert_eq!(plan.entrypoint_exec_mode(), Some("path"));
+
+    // The payload arg is re-spelled to the resolved real path — an
+    // interpreter-readable spelling with its real directory intact.
+    let rewritten = plan.exec_argv(&argv);
+    assert_eq!(rewritten[0], "node");
+    assert_eq!(rewritten[1], script.display().to_string());
+    assert!(
+        !rewritten[1].starts_with("/proc/self/fd") && !rewritten[1].starts_with("/dev/fd"),
+        "the entrypoint must not be spelled through an fd path: {:?}",
+        rewritten[1]
+    );
+
+    drop(plan);
+    drop(pin);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The real-path spelling still stands behind the pin's last check: a
+/// payload script swapped or rewritten after pin creation fails the
+/// launch the same way the exe check does.
+#[cfg(unix)]
+#[test]
+fn test_spawn_pin_entrypoint_swap_fails() {
+    let dir = make_test_dir("pin_entryswap");
+    let exe = dir.join("interp.bin");
+    let script = dir.join("server.mjs");
+    std::fs::write(&exe, b"interp bytes").unwrap();
+    std::fs::write(&script, b"entry").unwrap();
+
+    let exe_file = open_pinned(&exe).unwrap();
+    let entry_file = open_pinned(&script).unwrap();
+    let pin = SpawnPin::for_test_with_entry(exe_file, entry_file, script.clone());
+    assert!(pin.verify_spawn_path(&exe).is_ok());
+
+    // A rename retargeting the entry path — caught by the held-object
+    // identity check on the entrypoint half.
+    std::fs::rename(&script, dir.join("original.mjs")).unwrap();
+    std::fs::write(&script, b"evil").unwrap();
+    assert!(
+        pin.verify_spawn_path(&exe).is_err(),
+        "a swapped payload path must fail the last check"
+    );
+    drop(pin);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // An in-place rewrite keeps the inode — the stamp catches it.
+    let dir = make_test_dir("pin_entryrewrite");
+    let exe = dir.join("interp.bin");
+    let script = dir.join("server.mjs");
+    std::fs::write(&exe, b"interp bytes").unwrap();
+    std::fs::write(&script, b"entry").unwrap();
+    let pin = SpawnPin::for_test_with_entry(
+        open_pinned(&exe).unwrap(),
+        open_pinned(&script).unwrap(),
+        script.clone(),
+    );
+    std::fs::write(&script, b"evil").unwrap();
+    assert!(
+        pin.verify_spawn_path(&exe).is_err(),
+        "an in-place rewrite of the payload must fail the last check"
+    );
+    drop(pin);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Windows entrypoint argv keeps the script's real path — the pin
+/// (session-held share mode) is the guarantee, not a staged copy.
+#[cfg(windows)]
+#[test]
+fn test_entrypoint_exec_argv_respells_real_path() {
+    let dir = make_test_dir("pin_entrywin");
+    let exe = dir.join("interp.exe");
+    let script = dir.join("server.mjs");
+    std::fs::write(&exe, b"interp bytes").unwrap();
+    std::fs::write(&script, b"entry").unwrap();
+
+    let pin = SpawnPin::for_test_with_entry(
+        open_pinned(&exe).unwrap(),
+        open_pinned(&script).unwrap(),
+        script.clone(),
+    );
+    let argv = vec!["node".to_string(), script.to_string_lossy().into_owned()];
+    let rewritten = pin.entrypoint_exec_argv(&argv, &exe).unwrap();
+    assert_eq!(rewritten[1], script.display().to_string());
+    drop(pin);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Windows pins carry no write/delete share: while the handle is
 /// held the OS itself refuses the rename a swap needs.
 #[cfg(windows)]

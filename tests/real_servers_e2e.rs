@@ -754,11 +754,12 @@ fn stage1_workload_hashes(spec: &ServerSpec, text: &str, out: &Path) {
 /// to its real identity and lift the deny on exactly the tools the stages
 /// exercise (`deny=#false`). Every other tool stays denied, the generated
 /// `args_schema`, `tools-list-hash`, and workload hash entries are
-/// untouched — except the Node `entrypoint-hash`, which the review drops
-/// because the pinned-payload exec cannot resolve `node_modules` — and the
-/// `// REVIEW` markers ride along (warn mode) — the same state a
-/// maintainer's partial review leaves. The returned path is the file
-/// `extends` points at in `draft_host_policy`.
+/// untouched — including the Node `entrypoint-hash`, whose pinned script
+/// launches through its real path so `import` still resolves
+/// `node_modules` from the server's real directory — and the `// REVIEW`
+/// markers ride along (warn mode) — the same state a maintainer's
+/// partial review leaves. The returned path is the file `extends` points
+/// at in `draft_host_policy`.
 fn stage1_review_draft(spec: &ServerSpec, work: &Path, allow_tools: &[&str]) -> PathBuf {
     let generated = work.join(format!("genpol-{}.kdl", spec.name));
     let draft = std::fs::read_to_string(&generated).expect("stage1 draft readable");
@@ -782,35 +783,16 @@ fn stage1_review_draft(spec: &ServerSpec, work: &Path, allow_tools: &[&str]) -> 
         reviewed = reviewed.replacen(&denied, &format!("tool \"{tool}\" deny=#false"), 1);
     }
     if spec.runtime == "node" {
-        // The entrypoint pin is dropped at review: `run` binds the pinned
-        // script by exec'ing a snapshot — an inherited sealed memfd on
-        // Linux, an owner-only staged copy on macOS and Windows — and
-        // Node's ESM resolver walks ancestors of *that* path, so the
-        // server's `import` statements never reach the real node_modules
-        // and the process dies before initialize. The pin is verified
-        // emitted (and target-correct) in stage1; the launch still binds
-        // node itself via `binary-hash` and the tool surface via
-        // `tools-list-hash`.
-        let mut stripped = String::with_capacity(reviewed.len());
-        let mut found = false;
-        for line in reviewed.lines() {
-            if line.trim_start().starts_with("entrypoint-hash \"") {
-                found = true;
-                stripped.push_str(
-                    "    // REVIEW: entrypoint-hash dropped — pinned-payload exec cannot \
-                     resolve node_modules\n",
-                );
-                continue;
-            }
-            stripped.push_str(line);
-            stripped.push('\n');
-        }
+        // The entrypoint pin must survive review intact: a payload-bound
+        // script launches through its real path, so Node's ESM resolver
+        // reaches `node_modules` from the server's real directory.
+        // (Regression guard for the fix that made pinned interpreted
+        // launches keep the path spelling.)
         assert!(
-            found,
+            reviewed.contains("entrypoint-hash \""),
             "stage1 {}: node draft must carry the entrypoint-hash line",
             spec.name
         );
-        reviewed = stripped;
     }
     let path = work.join(format!("genpol-{}-reviewed.kdl", spec.name));
     std::fs::write(&path, &reviewed).expect("write reviewed draft");
@@ -2040,9 +2022,15 @@ with open(os.path.join(os.path.dirname(__file__), "git-trace", "cwd-long-path.tx
 
     let log_args = format!("{{\"repo_path\":{}}}", json_str(&kdl_path(&repo)));
     // Optional args the generated args_schema accepts: max_count and the
-    // timestamp window — the window exercises them for real.
+    // timestamp window — the window exercises them for real. The window
+    // start must not be an epoch-boundary spelling: git's `--since`
+    // treats a bare `1970-01-01` as a pathological date in non-UTC
+    // timezones (it filters out every commit — observed on git 2.43
+    // under JST — while `1969-12-31`, `1970-01-02`, and the explicit
+    // `1970-01-01T00:00:00Z` all work). `2000-01-01` is unambiguous in
+    // every timezone git parses.
     let log_args_optional = format!(
-        "{{\"repo_path\":{},\"max_count\":1,\"start_timestamp\":\"1970-01-01\",\"end_timestamp\":\"2099-12-31\"}}",
+        "{{\"repo_path\":{},\"max_count\":1,\"start_timestamp\":\"2000-01-01\",\"end_timestamp\":\"2099-12-31\"}}",
         json_str(&kdl_path(&repo))
     );
 

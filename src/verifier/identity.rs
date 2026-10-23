@@ -291,11 +291,15 @@ fn launch_notes(
         }
         mutable.push(
             "the pinned files are re-hashed at binding and again immediately before spawn; \
-             exec then binds a hash-verified snapshot of the pinned object — on Linux \
-             through an inherited /proc/self/fd descriptor, on other Unix through a copy \
-             staged in an owner-only directory, on Windows through the share-mode-held \
-             handle — so a pathname swap cannot substitute unverified bytes; files the \
-             workload opens later by name still resolve live"
+             the executable image then execs a hash-verified snapshot of the pinned \
+             object — on Linux through an inherited /proc/self/fd descriptor, on other \
+             Unix through a copy staged in an owner-only directory, on Windows through \
+             the share-mode-held handle — while a payload-bound entrypoint script \
+             launches through its real path so the interpreter's realpath and \
+             sibling/relative-import resolution still work, its guarantee being the \
+             pre-spawn identity re-check (on Windows the share-mode pin stays held for \
+             the session, blocking a swap outright); files the workload opens later by \
+             name still resolve live"
                 .to_string(),
         );
     } else {
