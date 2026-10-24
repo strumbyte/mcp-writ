@@ -433,12 +433,19 @@ mod imp {
         };
         let _held_spawn_pin = spawn_pin;
 
-        // A hash-pinned launch execs the verified object's snapshot —
-        // the spawn sees the staged copy's owner-only path (macOS has
-        // no exec'able fd spelling), never the workload pathname it
-        // could race a swap against (F75). The plan is held for the
-        // session so the staged path still resolves at the child's
-        // execve; `_held_fd_exec_plan`'s drop removes the staging dirs.
+        // A hash-pinned launch execs the verified *executable's*
+        // snapshot — the spawn sees the staged copy's owner-only path
+        // (macOS has no exec'able fd spelling), never the workload
+        // pathname it could race a swap against (F75). A pinned
+        // entrypoint script instead keeps its real path inside argv
+        // (`exec_argv` re-spells the payload arg): the interpreter
+        // realpaths its main module and resolves sibling/relative
+        // imports from its directory, which a staged copy in an empty
+        // dir cannot carry — the real path's read grant comes from the
+        // payload package dirs `code_map_dirs` derives plus the
+        // policy's own fs grants. The plan is held for the session so
+        // the staged exe path still resolves at the child's execve;
+        // `_held_fd_exec_plan`'s drop removes the staging dirs.
         let fd_exec_plan = match &_held_spawn_pin {
             Some(pin) => match pin.fd_exec_plan(&command_argv, &resolved_exe) {
                 Ok(plan) => Some(plan),
@@ -544,11 +551,26 @@ mod imp {
                 .as_ref()
                 .map(|p| p.uncloak_fds())
                 .unwrap_or_default(),
-            // macOS execs the staged copies by path — the sandbox
+            // macOS execs the staged exe copy by path — the sandbox
             // profile must grant each staging dir.
             exec_map_dirs: _held_fd_exec_plan
                 .as_ref()
                 .map(|p| p.staged_dirs().to_vec())
+                .unwrap_or_default(),
+            // The bind-mount handoff exists only on Linux.
+            exec_entry_pin: None,
+            // The staged exe's `@executable_path`-relative rpaths
+            // resolve against the staging dir — restore the real
+            // install prefix as dyld's fallback so shared builds
+            // (e.g. libnode.dylib) still link under a relocated exec.
+            exec_dyld_fallback: _held_fd_exec_plan
+                .as_ref()
+                .map(|p| {
+                    crate::warden::macos_sandbox::staged_exec_dyld_fallback_dirs(
+                        p.exe_path(),
+                        &resolved_exe,
+                    )
+                })
                 .unwrap_or_default(),
         };
         // Plus the dirs dyld will load the runtime's own libraries and

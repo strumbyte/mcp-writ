@@ -125,6 +125,24 @@ pub(crate) mod init_env {
     /// spawn's `pre_exec` so they survive init's own re-exec. Set only
     /// by the spawn path, never forwarded from ambient env.
     pub const KEEPFDS: &str = "MCP_WRIT_NS_KEEPFDS";
+    /// fd number of a `F_DUPFD_CLOEXEC` dup of a payload-pinned
+    /// entrypoint script — uncloaked by the spawn's `pre_exec` like the
+    /// exe pins but *not* a `KEEPFDS` member: init re-reads the pinned
+    /// object through it, re-hashes the bytes against `ENTRYPIN_SHA`,
+    /// and mounts the verified copy over `ENTRYPIN_TARGET` inside its
+    /// mount namespace, after which the mount holds the pinned content
+    /// and the fd scrub closes the descriptor before the workload
+    /// exec. Set only by the spawn path.
+    pub const ENTRYPIN_FD: &str = "MCP_WRIT_NS_ENTRYPIN_FD";
+    /// The payload path the verified copy is mounted over — the
+    /// resolved real path the interpreter opens (the pin's
+    /// cwd-resolved argv spelling).
+    pub const ENTRYPIN_TARGET: &str = "MCP_WRIT_NS_ENTRYPIN_TARGET";
+    /// The `sha256:<hex>` the bytes read through `ENTRYPIN_FD` must
+    /// hash to — the manifest's own entrypoint digest, so the mounted
+    /// copy is the pinned content even if the object was rewritten
+    /// in place after the parent's last check.
+    pub const ENTRYPIN_SHA: &str = "MCP_WRIT_NS_ENTRYPIN_SHA";
     /// Fault-injection hook for the e2e supervision-loss leg: a
     /// millisecond count set on the *supervisor's* environment ends the
     /// egress proxy task that long after it starts — the same teardown
@@ -141,6 +159,9 @@ pub(crate) mod init_env {
         POLICY,
         SKIP_SANDBOX,
         KEEPFDS,
+        ENTRYPIN_FD,
+        ENTRYPIN_TARGET,
+        ENTRYPIN_SHA,
         PROXY_KILL_AFTER_MS,
     ];
 }

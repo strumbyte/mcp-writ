@@ -949,7 +949,7 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **記録:**
 
-- Node ドラフトの `entrypoint-hash` は全 OS で run 不能と判明 — ピンしたペイロードを memfd/一時コピーから実行するため、ESM の `node_modules` 解決がそのパス起点で祖先を辿れない（Linux の `/proc/self/fd`→memfd、macOS/Windows の staged copy とも同じ）。レビュー工程でピンを外す対応（`binary-hash`＋`tools-list-hash` は残る）。製品側の根本対応は別論点。
+- Node ドラフトの `entrypoint-hash` は全 OS で run 不能と判明 — ピンしたペイロードを memfd/一時コピーから実行するため、ESM の `node_modules` 解決がそのパス起点で祖先を辿れない（Linux の `/proc/self/fd`→memfd、macOS/Windows の staged copy とも同じ）。レビュー工程でピンを外す対応（`binary-hash`＋`tools-list-hash` は残る）。製品側の根本対応は別論点。 → **製品側対応済み（事後）**: payload-bound entrypoint は全 OS で実パス起動へ変更（`pin.rs` の `entrypoint_exec_arg` — Linux の `/proc/self/fd` 書き換え・Unix staged copy・Windows staged copy をやめ、インタプリタが realpath・相対 import を解決できる実パスを渡す。実行ファイルの memfd/staged exec と share-mode pin は不変、pin は `verify_spawn_path` の最終ゲート + セッション保持で担保）。レビュー工程のピン外しは撤去済み。
 - `server-memory@1.0.0` の `.lock` 再試行は Windows の EPERM を「他者が保持」とみなし、ENOENT 分岐がデッドラインを迂回して無限化する（非サンドボックスでも再現）。Windows の OS 層 deny は「応答なし＋denied イベントなし＋ファイル未作成」で検出する形に分岐記録。
 - Windows AppContainer は stdio 起動に loopback exemption を付けない（HTTP transport 限定）ため、同一ホストの fixture へは姿勢を問わず到達不能。fetch の呼び出し系は `MCP_WRIT_SKIP_SANDBOX` セッションで、OS 層の遮断証拠は stage5 のサンドボックス起動で取得する構成。
 - `server-filesystem` は応答に本文を 2 重（content+structuredContent）に含めるため、PR-20 の 10MiB フレーム上限の両側を ~4MiB（成功）/~9MiB（`frame-too-large` 拒否）で挟んで検証。

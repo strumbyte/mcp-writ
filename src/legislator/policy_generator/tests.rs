@@ -1124,6 +1124,164 @@ fn workload_unbound_reason_is_emitted_as_comment_only() {
 }
 
 #[test]
+fn interpreted_workload_seeds_interpreter_syscall_baseline() {
+    use crate::legislator::source_bind::InterpreterKind;
+
+    // A source-payload draft has no ELF syscall table — without the
+    // interpreter baseline its `syscalls` block would allow nothing and
+    // the enforced launch would be refused outright.
+    let result = CrossValidationResult {
+        allowed: vec![],
+        blocked: vec![],
+        warnings: vec![],
+    };
+    let cap = CapabilityProfile::empty();
+    let workload = crate::legislator::source_bind::WorkloadHashes {
+        interpreter: Some(InterpreterKind::Node),
+        ..Default::default()
+    };
+    let kdl_str = generate_policy(&result, &cap, None, &[], &workload);
+    assert!(
+        kdl_str.contains("examples/policies/runtime/node.kdl"),
+        "baseline provenance comment missing: {kdl_str}"
+    );
+    let policy = load_policy_str(&kdl_str);
+    assert!(
+        policy.syscalls.allowed.contains(&"execve".to_string()),
+        "node baseline must land in the parsed syscalls allowlist: {:?}",
+        policy.syscalls.allowed
+    );
+}
+
+#[test]
+fn baseline_respects_blocked_permission_classes() {
+    use crate::legislator::source_bind::InterpreterKind;
+
+    // The baseline is permission-filtered like analyzed syscalls: a
+    // blocked class must not re-enter through the seeded list
+    // (python.kdl carries execve/socket/connect/sendto/...).
+    let result = CrossValidationResult {
+        allowed: vec![],
+        blocked: vec![
+            make_verdict(Permission::ProcessExec, None, VerdictCase::B),
+            make_verdict(Permission::NetworkOutbound, None, VerdictCase::B),
+        ],
+        warnings: vec![],
+    };
+    let cap = CapabilityProfile::empty();
+    let workload = crate::legislator::source_bind::WorkloadHashes {
+        interpreter: Some(InterpreterKind::Python),
+        ..Default::default()
+    };
+    let kdl_str = generate_policy(&result, &cap, None, &[], &workload);
+    let policy = load_policy_str(&kdl_str);
+    for denied in ["execve", "clone", "socket", "connect", "sendto"] {
+        assert!(
+            !policy.syscalls.allowed.iter().any(|s| s == denied),
+            "blocked-permission syscall '{denied}' must not enter via baseline: {kdl_str}"
+        );
+    }
+    assert!(
+        kdl_str.contains("baseline entries dropped"),
+        "dropped baseline entries must be REVIEW-visible: {kdl_str}"
+    );
+    // The rest of the runtime baseline still lands.
+    assert!(policy.syscalls.allowed.contains(&"mmap".to_string()));
+}
+
+#[test]
+fn allowed_verdict_keeps_blocked_class_baseline_syscalls() {
+    use crate::legislator::source_bind::InterpreterKind;
+
+    // cross_validate_source emits per-tool verdicts: one tool's Case-B
+    // NetworkOutbound block must not strip the baseline's network
+    // syscalls when another tool was allowed the same permission —
+    // the seccomp list is process-wide and cannot scope by tool.
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::NetworkOutbound,
+            Some("fetch_data"),
+            VerdictCase::A,
+        )],
+        blocked: vec![make_verdict(
+            Permission::NetworkOutbound,
+            Some("read_only_tool"),
+            VerdictCase::B,
+        )],
+        warnings: vec![],
+    };
+    let cap = CapabilityProfile::empty();
+    let workload = crate::legislator::source_bind::WorkloadHashes {
+        interpreter: Some(InterpreterKind::Python),
+        ..Default::default()
+    };
+    let kdl_str = generate_policy(&result, &cap, None, &[], &workload);
+    let policy = load_policy_str(&kdl_str);
+    for kept in ["socket", "connect", "sendto"] {
+        assert!(
+            policy.syscalls.allowed.iter().any(|s| s == kept),
+            "syscall '{kept}' needed by the allowed tool must be kept: {kdl_str}"
+        );
+    }
+    assert!(
+        !kdl_str.contains("baseline entries dropped"),
+        "nothing may be reported dropped when the class is allowed: {kdl_str}"
+    );
+}
+
+#[test]
+fn baseline_merges_into_linux_analyzed_syscalls() {
+    use crate::legislator::source_bind::InterpreterKind;
+
+    // A modeled interpreter alongside a Linux-analyzed image keeps both:
+    // the analyzed names and the runtime baseline under one filter.
+    let result = CrossValidationResult {
+        allowed: vec![],
+        blocked: vec![],
+        warnings: vec![],
+    };
+    let cap = make_capability(RiskFlags::default(), &["ptrace"], vec![], vec![]);
+    let workload = crate::legislator::source_bind::WorkloadHashes {
+        interpreter: Some(InterpreterKind::Node),
+        ..Default::default()
+    };
+    let kdl_str = generate_policy(&result, &cap, None, &[], &workload);
+    let policy = load_policy_str(&kdl_str);
+    assert!(
+        policy.syscalls.allowed.contains(&"ptrace".to_string()),
+        "analyzed name lost: {kdl_str}"
+    );
+    assert!(
+        policy.syscalls.allowed.contains(&"execve".to_string()),
+        "interpreter baseline lost: {kdl_str}"
+    );
+}
+
+#[test]
+fn native_or_unknown_workload_emits_no_syscall_baseline() {
+    let result = CrossValidationResult {
+        allowed: vec![],
+        blocked: vec![],
+        warnings: vec![],
+    };
+    let cap = CapabilityProfile::empty();
+    let kdl_str = generate_policy(
+        &result,
+        &cap,
+        None,
+        &[],
+        &crate::legislator::source_bind::WorkloadHashes::default(),
+    );
+    assert!(
+        !kdl_str
+            .lines()
+            .filter(|line| line.trim_start().starts_with("allow "))
+            .any(|line| line.contains("\"execve\"")),
+        "no interpreter means no seeded baseline: {kdl_str}"
+    );
+}
+
+#[test]
 fn workload_hashes_end_to_end_from_argv() {
     use crate::legislator::source_bind::{
         InterpreterKind, PayloadDiscovery, PayloadKind, workload_hashes,

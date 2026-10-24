@@ -534,28 +534,10 @@ impl Warden {
             cmd.arg("-p").arg(&sbpl).arg("--");
             // sandbox-exec re-execs the given path with argv[0] equal to
             // that path, so a distinct verified executable goes through
-            // bash — `exec -a` is a bash builtin, while /bin/sh may
-            // resolve (via /var/select/sh) to a shell that lacks it. `-p`
-            // keeps the wrapper in privileged mode: $ENV/$BASH_ENV are
-            // not read, exported functions are not imported, and
-            // SHELLOPTS/BASHOPTS/CDPATH/GLOBIGNORE from the environment
-            // are ignored — a hostile spawn environment cannot reshape
-            // the launch. `builtin` pins the exec call to the builtin as
-            // well, so no inherited function name can intercept it.
-            match program {
-                Some(p) if p != Path::new(command) => {
-                    cmd.arg("/bin/bash")
-                        .arg("-p")
-                        .arg("-c")
-                        .arg("builtin exec -a \"$0\" \"$@\"")
-                        .arg(command)
-                        .arg(p)
-                        .args(args);
-                }
-                _ => {
-                    cmd.arg(command).args(args);
-                }
-            }
+            // bash `exec -a` — `apply_exec_a_wrapper` keeps the wrapper
+            // args, ordering, and DYLD fallback re-export identical on
+            // every `sandbox-exec` route.
+            macos_sandbox::apply_exec_a_wrapper(&mut cmd, program, command, args, opts);
             cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit());

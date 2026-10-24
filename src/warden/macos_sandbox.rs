@@ -19,6 +19,8 @@ use crate::error::{SandboxStage, WardenError};
 use crate::execution::TargetOs;
 use crate::policy::Policy;
 use crate::policy::validator::covers_or_same_for;
+use crate::warden::SpawnOptions;
+use crate::warden::env::DYLD_FALLBACK_DIRS;
 
 fn is_local_hostname(name: &str) -> bool {
     name == "localhost" || name == "*" || name == "127.0.0.1" || name == "[::1]" || name == "::1"
@@ -218,10 +220,8 @@ const BASE_READ_ROOTS: &[&str] = &[
 const XCSELECT_DYLIB: &str = "libxcselect.dylib";
 const CLT_ROOT: &str = "/Library/Developer/CommandLineTools";
 
-/// dyld's built-in fallback for an `@rpath` reference with no matching
-/// LC_RPATH (`~/lib` is deliberately absent — a home-dir library root
-/// is not a system code source we bless).
-const DYLD_FALLBACK_DIRS: &[&str] = &["/usr/local/lib", "/usr/lib"];
+// dyld's built-in fallback for an `@rpath` reference lives next to the
+// env-block merge that re-exports it: crate::warden::env::DYLD_FALLBACK_DIRS.
 
 /// Dep-walk bounds: hostile or corrupt binaries cannot balloon the
 /// derivation. Real interpreter closures (python → a dozen dylibs) sit
@@ -315,7 +315,7 @@ fn dep_candidates(
 /// `(libs, rpaths)` pairs for every Mach-O slice in `bytes` — fat
 /// containers contribute all arches so the grant set stays correct
 /// regardless of which slice the machine runs.
-fn macho_linkage(bytes: &[u8]) -> Vec<(Vec<String>, Vec<String>)> {
+pub(crate) fn macho_linkage(bytes: &[u8]) -> Vec<(Vec<String>, Vec<String>)> {
     use goblin::mach::{Mach, SingleArch};
     let mut slices = Vec::new();
     match Mach::parse(bytes) {
@@ -344,6 +344,151 @@ fn macho_linkage(bytes: &[u8]) -> Vec<(Vec<String>, Vec<String>)> {
             )
         })
         .collect()
+}
+
+/// `..`/`.` folding without touching the filesystem — the rpath dirs a
+/// relocated binary needs are a *spelling* problem, not a resolution
+/// one, so symlink-following canonicalization would hide `..` escapes
+/// the same way `components().collect()` keeps them.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The `DYLD_FALLBACK_LIBRARY_PATH` a *relocated* executable needs: a
+/// verified exe is exec'd through its staged snapshot path, so its own
+/// `LC_RPATH` entries spelled relative to `@executable_path`/
+/// `@loader_path` — e.g. a shared Node build's
+/// `@rpath/libnode.N.dylib` — resolve against the empty staging dir and
+/// die in dyld before the workload runs. dyld consults the fallback
+/// list only after every `LC_RPATH` candidate misses, so expanding
+/// those rpaths against the *real* exe dir recovers the install prefix
+/// the launch verified. Deps load from their real locations — runtime
+/// code is outside the pin scope exactly like interpreter imports —
+/// while the staged image itself stays the verified bytes.
+///
+/// `staged` is the staged executable path; `real_exe` is the verified
+/// image's original path (its parent is what `@executable_path` means
+/// when the launch is not relocated). Best-effort: bytes that cannot
+/// be read or parsed contribute no dirs — a monolithic binary needs
+/// none anyway.
+pub(crate) fn staged_exec_dyld_fallback_dirs(staged: &Path, real_exe: &Path) -> Vec<PathBuf> {
+    let Ok(bytes) = std::fs::read(staged) else {
+        return Vec::new();
+    };
+    let real_dir = real_exe
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let expand = |rpath: &str| -> Option<PathBuf> {
+        if let Some(rest) = rpath.strip_prefix("@executable_path/") {
+            Some(normalize_lexically(&real_dir.join(rest)))
+        } else if rpath == "@executable_path" {
+            Some(real_dir.clone())
+        } else if let Some(rest) = rpath.strip_prefix("@loader_path/") {
+            Some(normalize_lexically(&real_dir.join(rest)))
+        } else if rpath == "@loader_path" {
+            Some(real_dir.clone())
+        } else {
+            None
+        }
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for (_, rpaths) in macho_linkage(&bytes) {
+        for rpath in &rpaths {
+            if let Some(dir) = expand(rpath)
+                && dir.is_dir()
+                && !dirs.contains(&dir)
+            {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
+/// The `bash -c` body that re-execs a distinct verified image under the
+/// caller's `argv[0]` spelling. When the exe launched relocated (its
+/// staged snapshot), [`staged_exec_dyld_fallback_dirs`] recovers the
+/// real install prefix as `DYLD_FALLBACK_LIBRARY_PATH` — but on the
+/// sandboxed route that env value never reaches the workload: dyld
+/// prunes `DYLD_*` from the environment of the SIP-restricted
+/// `sandbox-exec`/`bash` in between. Re-exporting it inside the
+/// wrapper survives — bash is already running when `export` executes,
+/// and the following `exec` targets an unrestricted binary whose dyld
+/// honors the var. Outside the bash arm the env applies directly.
+pub(crate) fn exec_a_command(fallback_dirs: &[PathBuf]) -> String {
+    const EXEC_A: &str = "builtin exec -a \"$0\" \"$@\"";
+    if fallback_dirs.is_empty() {
+        return EXEC_A.to_string();
+    }
+    let joined = fallback_dirs
+        .iter()
+        .map(|d| d.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(":");
+    // Single-quote the path list; a literal ' re-opens and escapes.
+    let quoted = joined.replace('\'', "'\\''");
+    format!("export DYLD_FALLBACK_LIBRARY_PATH='{quoted}'; {EXEC_A}")
+}
+
+/// Append the workload launch args to a `sandbox-exec` command —
+/// `command args…` directly, or through `bash -p -c "exec -a"` when a
+/// distinct verified executable must run under the caller's argv[0].
+///
+/// `sandbox-exec` re-execs the given path with argv[0] equal to that
+/// path, so a distinct verified executable goes through bash —
+/// `exec -a` is a bash builtin, while /bin/sh may resolve (via
+/// /var/select/sh) to a shell that lacks it. `-p` keeps the wrapper in
+/// privileged mode: $ENV/$BASH_ENV are not read, exported functions are
+/// not imported, and SHELLOPTS/BASHOPTS/CDPATH/GLOBIGNORE from the
+/// environment are ignored — a hostile spawn environment cannot
+/// reshape the launch. `builtin` pins the exec call to the builtin as
+/// well, so no inherited function name can intercept it.
+///
+/// A relocated exe also needs its fallback lib dirs re-exported
+/// *inside* the wrapper — SIP-restricted `sandbox-exec`/`bash` execs
+/// prune `DYLD_*` from the environment before the `-c` string runs.
+/// [`exec_a_command`] emits that export over the *merged* fallback the
+/// env block computes (`spawn_dyld_fallback_dirs`: inherited entries +
+/// derived dirs + the platform defaults that replace an absent
+/// inherited list), so the in-wrapper `DYLD_FALLBACK_LIBRARY_PATH`
+/// matches what the child env would have carried. Both `sandbox-exec`
+/// spawn paths share this construction so argument order, argv[0]
+/// handling, and fallback quoting can never diverge.
+pub(crate) fn apply_exec_a_wrapper(
+    cmd: &mut tokio::process::Command,
+    program: Option<&Path>,
+    command: &str,
+    args: &[String],
+    opts: &SpawnOptions,
+) {
+    match program {
+        Some(p) if p != Path::new(command) => {
+            cmd.arg("/bin/bash")
+                .arg("-p")
+                .arg("-c")
+                .arg(exec_a_command(
+                    &crate::warden::env::spawn_dyld_fallback_dirs(opts),
+                ))
+                .arg(command)
+                .arg(p)
+                .args(args);
+        }
+        _ => {
+            cmd.arg(command).args(args);
+        }
+    }
 }
 
 /// The directories the workload legitimately maps code from — every

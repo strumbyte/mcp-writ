@@ -727,7 +727,9 @@ mod tests {
     #[tokio::test]
     async fn read_picks_up_late_arriving_report() {
         // The deadline covers delayed mount visibility: a file landing
-        // inside the wait window is still collected.
+        // inside the wait window is still collected. The window must
+        // outlast CI scheduler/disk jitter on the writer thread's short
+        // sleep — a tight deadline flakes the test, not the contract.
         let dir = tempfile::tempdir().unwrap();
         let id = uuid::Uuid::now_v7();
         let path = dir.path().join(GUEST_REPORT_FILENAME);
@@ -736,7 +738,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(80));
             std::fs::write(path, text).unwrap();
         });
-        let read = read_guest_report(dir.path(), id, Some("0.5.0")).await;
+        let read =
+            read_guest_report_within(dir.path(), id, Some("0.5.0"), Duration::from_secs(2)).await;
         assert!(matches!(read, GuestReportRead::Received(_)), "{read:?}");
     }
 }

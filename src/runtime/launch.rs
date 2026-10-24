@@ -102,17 +102,20 @@ pub struct Launched {
     /// Audit identity the session-teardown events are stamped with —
     /// passed to `wait_for_shutdown`.
     pub session_audit: crate::runtime::lifecycle::SessionAuditContext,
-    /// Windows only: keeps the staged entrypoint copy pinned under
-    /// read-only sharing for the whole session — the interpreter opens
-    /// it by pathname after process creation, so the pin must outlive
-    /// that open. Dropping removes the owner-only staging dir.
-    #[cfg(windows)]
-    pub _entrypoint_staging: Option<crate::verifier::hash::StagedEntrypoint>,
-    /// Non-Linux Unix: the exec plan's spelling is the staged copy's
-    /// path — it must resolve at the child's `execve`, which runs after
-    /// `spawn()` returns on the fork+pre_exec path, so the plan rides
-    /// the session like `_entrypoint_staging`. Linux needs nothing: its
-    /// inherited descriptor names the snapshot, not a path.
+    /// The verified workload objects (executable + any payload-bound
+    /// entrypoint script), held open for the session. On Windows the
+    /// `FILE_SHARE_READ`-only share mode is load-bearing for the whole
+    /// lifetime: a pinned entrypoint launches by its real path — the
+    /// interpreter opens it *after* CreateProcess — so the held pin is
+    /// what keeps that path naming the verified object; dropping it at
+    /// spawn-return reopens the replace window. On Unix the held
+    /// handles remain the identity anchors `verify_spawn_path` checked.
+    pub _spawn_pin: Option<hash::SpawnPin>,
+    /// Non-Linux Unix: the exec plan's exe spelling is the staged
+    /// copy's path — it must resolve at the child's `execve`, which
+    /// runs after `spawn()` returns on the fork+pre_exec path, so the
+    /// plan rides the session like `_spawn_pin`. Linux needs nothing:
+    /// its inherited descriptor names the snapshot, not a path.
     #[cfg(all(unix, not(target_os = "linux")))]
     pub _exec_staging: Option<crate::verifier::hash::FdExecPlan>,
 }
@@ -362,12 +365,17 @@ pub async fn launch(
     // in-guest runner's contract) lands on the same native route the
     // selection calls unenforceable, with no verdict in the middle:
     // a UDP-covering allow under deny-all would be dead policy there
-    // (the seccomp pin denies datagram socket creation outright).
-    // Refuse it pre-spawn — the same predicate the selection reports —
-    // rather than run a workload whose declared grant never applies.
+    // (the seccomp pin denies datagram socket creation outright), and
+    // an fs grant rooted on a filesystem Landlock cannot mediate is
+    // dead the same way. Refuse both pre-spawn — the same predicates
+    // the selection reports — rather than run a workload whose
+    // declared grant never applies.
     #[cfg(target_os = "linux")]
     if linux_mechanism.is_none() && sandbox_skip_reason.is_none() {
-        let dead = crate::warden::select::dead_udp_allows_without_selection(&policy);
+        let mut dead = crate::warden::select::dead_udp_allows_without_selection(&policy);
+        dead.extend(crate::warden::select::dead_fs_grants_without_selection(
+            &policy,
+        ));
         if !dead.is_empty() {
             let reason = dead.join("; ");
             let detail = format!("linux egress policy refused: {reason}");
@@ -513,33 +521,16 @@ pub async fn launch(
     if let Some(reason) = sandbox_skip_reason {
         tracing::warn!("sandboxing disabled ({reason})");
     }
-    // The last check before the spawn opens the image — on Unix the
-    // fd-exec plan below names the pinned descriptors rather than the
-    // path, so this re-check pins the *decision* (a retargeted path
-    // still fails the launch) while exec itself is immune to a swap.
-    if let Some(pin) = &spawn_pin
-        && let Err(source) = pin.verify_spawn_path(&resolved_exe)
-    {
-        let detail = format!("supply chain verification failed at spawn: {source}");
-        let report = fail(failure_report(
-            launch_id,
-            target,
-            &policy_context,
-            dry_run,
-            launch_plan(Some(&resolved_exe)),
-            vec![identity_observation_failed(&detail)],
-            code_identity.clone(),
-            detail,
-        ));
-        return Err(LaunchError::ReverifyBeforeSpawn { source, report });
-    }
-    // Unix: exec the pinned object's snapshot — a `/proc/self/fd`
-    // descriptor spelling on Linux, the staged copy's owner-only path
-    // on Unixes without an exec'able fd directory. The plan holds the
-    // snapshot backing and must stay alive until the child has exec'd
-    // (Linux: spawn return; path-exec: the session — it lands in
-    // `Launched`). Windows needs nothing: the share-mode pin already
-    // makes replacement impossible.
+    // Unix: the executable execs the pinned object's snapshot — a
+    // `/proc/self/fd` descriptor spelling on Linux, the staged copy's
+    // owner-only path on Unixes without an exec'able fd directory. A
+    // pinned entrypoint script keeps its *real path* instead: the
+    // interpreter opens it by name, realpaths it, and resolves sibling
+    // and relative imports from its directory, which neither the memfd
+    // pseudo-path nor a staged copy in an empty dir can carry. The
+    // plan holds the snapshot backing and must stay alive until the
+    // child has exec'd (Linux: spawn return; path-exec: the session —
+    // it lands in `Launched`).
     #[cfg(unix)]
     let fd_exec_plan = match &spawn_pin {
         Some(pin) => match pin.fd_exec_plan(&argv, &resolved_exe) {
@@ -568,9 +559,15 @@ pub async fn launch(
             // spawn clears the flag inside the child's pre_exec. The
             // staged dirs name the paths a sandboxed child must be
             // granted to exec/read the snapshots (no fd spelling on
-            // macOS); empty on Linux.
+            // macOS); empty on Linux. The entrypoint pin's fd+path ride
+            // `exec_entry_pin` so the namespaced dispatch can hand init
+            // the descriptor it bind-mounts over the payload path —
+            // inert on every other route.
             spawn_opts.exec_uncloak_fds = plan.uncloak_fds();
             spawn_opts.exec_map_dirs = plan.staged_dirs().to_vec();
+            spawn_opts.exec_entry_pin = plan
+                .entrypoint_bind_pin()
+                .map(|(fd, p, sha)| (fd, p.to_path_buf(), sha.to_string()));
             (plan.exe_path().to_path_buf(), plan.exec_argv(&argv))
         }
         None => (resolved_exe.clone(), argv.clone()),
@@ -581,22 +578,37 @@ pub async fn launch(
     // dir) so the sandboxed child can actually start. Independent of
     // pinning: an unpinned Homebrew interpreter needs the same grants.
     #[cfg(target_os = "macos")]
-    spawn_opts
-        .exec_map_dirs
-        .extend(crate::warden::macos_sandbox::code_map_dirs(
-            &resolved_exe,
-            &argv,
-        ));
-    // Windows: an entrypoint-pinned interpreted launch reads its script
-    // by pathname after CreateProcess — pinning only until spawn leaves
-    // a replace window the interpreter opens through. Stage the
-    // verified bytes into an owner-only dir, hold the staged copy under
-    // read-only sharing for the session, and point argv at it. The
-    // guard lives in `Launched` so the pin outlives the child's open.
+    {
+        spawn_opts
+            .exec_map_dirs
+            .extend(crate::warden::macos_sandbox::code_map_dirs(
+                &resolved_exe,
+                &argv,
+            ));
+        // The staged exe relocates `@executable_path`-relative rpaths
+        // to the staging dir; the derived dirs restore the real install
+        // prefix as dyld's fallback so a shared build (`libnode.dylib`)
+        // still links. Deps resolve from their real locations — runtime
+        // code is unpinned, same as interpreter imports.
+        if let Some(plan) = &fd_exec_plan {
+            spawn_opts.exec_dyld_fallback =
+                crate::warden::macos_sandbox::staged_exec_dyld_fallback_dirs(
+                    plan.exe_path(),
+                    &resolved_exe,
+                );
+        }
+    }
+    // Windows: a payload-bound entrypoint launches through its real
+    // path — the interpreter opens it by name *after* CreateProcess and
+    // resolves sibling/relative imports from its directory, so a staged
+    // copy cannot carry the launch. `entrypoint_exec_argv` re-spells
+    // the payload arg to the resolved path the pin verified; the
+    // share-mode pin rides `Launched` for the session so the path the
+    // interpreter re-opens still names the verified object.
     #[cfg(windows)]
-    let staged_entry = match &spawn_pin {
-        Some(pin) => match pin.stage_entrypoint_copy(&argv, &resolved_exe) {
-            Ok(staged) => staged,
+    let spawn_argv_storage = match &spawn_pin {
+        Some(pin) => match pin.entrypoint_exec_argv(&argv, &resolved_exe) {
+            Ok(argv) => argv,
             Err(source) => {
                 let detail = format!("supply chain verification failed at spawn: {source}");
                 let report = fail(failure_report(
@@ -612,16 +624,10 @@ pub async fn launch(
                 return Err(LaunchError::ReverifyBeforeSpawn { source, report });
             }
         },
-        None => None,
+        None => argv.clone(),
     };
     #[cfg(windows)]
-    let (spawn_exe, spawn_argv_storage) = (
-        resolved_exe.clone(),
-        staged_entry
-            .as_ref()
-            .map(|s| s.argv.clone())
-            .unwrap_or_else(|| argv.clone()),
-    );
+    let spawn_exe = resolved_exe.clone();
     #[cfg(all(not(unix), not(windows)))]
     let (spawn_exe, spawn_argv_storage) = (resolved_exe.clone(), argv.clone());
     let spawn_argv: &[String] = &spawn_argv_storage;
@@ -640,6 +646,39 @@ pub async fn launch(
     });
     #[cfg(not(target_os = "linux"))]
     let ns_ctx = None;
+    // The last identity check before the spawn — kept after the exec
+    // plan/argv are built so it sits immediately against `spawn()`.
+    // For a payload-bound entrypoint (which the child interpreter
+    // opens by real path) this same-object + stamp re-check *is* the
+    // exec-time guarantee; for the exe it pins the *decision* — a
+    // retargeted path still fails the launch — while the snapshot
+    // exec (or, on Windows, the share-mode pin) binds the *object*.
+    // `launch_plan` cannot be consulted here — its `&spawn_opts`
+    // borrow is dead once `exec_uncloak_fds`/`exec_map_dirs` were
+    // assigned — so the failure report describes the spawn-time plan
+    // via a direct call.
+    if let Some(pin) = &spawn_pin
+        && let Err(source) = pin.verify_spawn_path(&resolved_exe)
+    {
+        let detail = format!("supply chain verification failed at spawn: {source}");
+        let report = fail(failure_report(
+            launch_id,
+            target,
+            &policy_context,
+            dry_run,
+            warden.enforcement_plan(
+                Some(&resolved_exe),
+                argv0,
+                &spawn_opts,
+                sandbox_skip_reason,
+                dry_run,
+            ),
+            vec![identity_observation_failed(&detail)],
+            code_identity.clone(),
+            detail,
+        ));
+        return Err(LaunchError::ReverifyBeforeSpawn { source, report });
+    }
     let attempt = match sandbox_skip_reason {
         Some(reason) => warden.spawn_unsandboxed_async_exe_with_report(
             &spawn_exe,
@@ -824,6 +863,28 @@ pub async fn launch(
         // the spawn record names it rather than reading as neutral.
         details.push_str(" env=inherit-parent");
     }
+    // The exec method a hash pin produced is part of the launch's
+    // security surface: the exe image is snapshot-exec'd (`fd` on
+    // Linux, `staged` on other Unix) or path-launched under the
+    // share-mode pin (`path` on Windows); a payload-bound entrypoint
+    // launches by `path` — an interpreter resolves its module and
+    // imports from that path, which a snapshot spelling cannot carry.
+    #[cfg(unix)]
+    if let Some(plan) = &fd_exec_plan {
+        details.push_str(&format!(" exe_exec={}", plan.exe_exec_mode()));
+        if plan.entrypoint_exec_mode().is_some() {
+            details.push_str(" entrypoint_exec=path");
+        }
+    }
+    #[cfg(windows)]
+    if let Some(pin) = &spawn_pin {
+        // The exe launches by its real path too — the session-held
+        // share-mode pin is the object binding there.
+        details.push_str(" exe_exec=path");
+        if pin.has_pinned_entrypoint() {
+            details.push_str(" entrypoint_exec=path");
+        }
+    }
     // OS controls the launch tolerated below full enforcement ride the
     // same observations the report carries — not a separate computation.
     details.push_str(&weakened_os_tokens(&report.observations));
@@ -842,8 +903,7 @@ pub async fn launch(
         auditor_handle,
         report,
         session_audit,
-        #[cfg(windows)]
-        _entrypoint_staging: staged_entry,
+        _spawn_pin: spawn_pin,
         #[cfg(all(unix, not(target_os = "linux")))]
         _exec_staging: fd_exec_plan,
     })

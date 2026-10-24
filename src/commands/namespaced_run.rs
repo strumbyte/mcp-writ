@@ -503,12 +503,21 @@ mod imp {
         // holds the verified object — init execs `resolved_exe` and
         // the pin stays open across the whole supervised lifetime.
         let _held_spawn_pin = spawn_pin;
-        // The pin's CLOEXEC dup descriptors are uncloaked in the init
-        // spawn's pre_exec (never in the parent) and kept through
-        // init's fd scrub via `MCP_WRIT_NS_KEEPFDS`, so handing it
-        // `/proc/self/fd` spellings makes the in-namespace exec map
-        // the verified objects — a pathname swap after verification
-        // cannot reach the workload exec.
+        // The pin's CLOEXEC dup descriptor for the *executable* is
+        // uncloaked in the init spawn's pre_exec (never in the parent)
+        // and kept through init's fd scrub via `MCP_WRIT_NS_KEEPFDS`,
+        // so handing init a `/proc/self/fd` exe spelling makes the
+        // in-namespace exec map the verified object — a pathname swap
+        // after verification cannot reach it. A pinned entrypoint
+        // script instead rides argv as its real path — the interpreter
+        // inside the namespace opens it by name and resolves imports
+        // relative to it — and the pin's verified bytes are mounted
+        // over that path inside the mountns (the `entry_pin` handoff:
+        // init re-hashes the pinned object and binds a staged copy),
+        // so the spelling resolves to the pinned content for the
+        // session: a host-side swap or rewrite after
+        // `verify_spawn_path` cannot reach the interpreter's open —
+        // the window closes rather than narrows.
         let fd_exec_plan = match &_held_spawn_pin {
             Some(pin) => match pin.fd_exec_plan(&command_argv, &resolved_exe) {
                 Ok(plan) => Some(plan),
@@ -535,6 +544,38 @@ mod imp {
             None => None,
         };
         let _held_fd_exec_plan = fd_exec_plan;
+
+        // A payload pinned under a tree init masks with a private
+        // tmpfs (`/run` always; `/tmp` when the resolv.conf bridge
+        // needs it) can never resolve inside the namespace — refuse
+        // now, with the cause named, rather than let init's bind-mount
+        // or the interpreter's open surface it as a bare ENOENT.
+        if let Some(plan) = &_held_fd_exec_plan
+            && let Some((_, target, _)) = plan.entrypoint_bind_pin()
+            && let Some(why) = crate::warden::select::masked_namespace_root(target)
+        {
+            let detail = format!(
+                "refusing namespaced launch: pinned entrypoint '{}' is \
+                 rooted under a masked tree — {why}",
+                target.display()
+            );
+            eprintln!("Error: {detail}");
+            write_report(
+                "failed",
+                Some(&detail),
+                Some(&policy),
+                policy_context.as_ref(),
+            );
+            lifecycle::guard_stopped(
+                &audit_logger,
+                &session_audit,
+                "failed",
+                Some(1),
+                Some(&detail),
+            );
+            let _ = audit_logger.shutdown().await;
+            std::process::exit(1);
+        }
 
         // Effective policy → read-only memfd — init rebuilds its
         // Landlock/seccomp bits from byte-identical policy.
@@ -572,6 +613,31 @@ mod imp {
         };
         let env_pairs = crate::warden::spawn_env_pairs(&spawn_opts);
 
+        // The entrypoint's exec-time guarantee is this re-check — it
+        // runs last, after the plan and env are staged, immediately
+        // before the init spawn the interpreter launch goes through.
+        if let Some(pin) = &_held_spawn_pin
+            && let Err(e) = pin.verify_spawn_path(&resolved_exe)
+        {
+            let detail = format!("supply chain verification failed at spawn: {e}");
+            eprintln!("Error: {detail}");
+            write_report(
+                "failed",
+                Some(&detail),
+                Some(&policy),
+                policy_context.as_ref(),
+            );
+            lifecycle::guard_stopped(
+                &audit_logger,
+                &session_audit,
+                "failed",
+                Some(1),
+                Some(&detail),
+            );
+            let _ = audit_logger.shutdown().await;
+            std::process::exit(1);
+        }
+
         // Spawn the init helper; complete the handshake.
         let spawn_res = {
             let (cfg_exe, cfg_argv) = match &_held_fd_exec_plan {
@@ -587,6 +653,10 @@ mod imp {
                     .as_ref()
                     .map(|p| p.uncloak_fds())
                     .unwrap_or_default(),
+                entry_pin: _held_fd_exec_plan
+                    .as_ref()
+                    .and_then(|p| p.entrypoint_bind_pin())
+                    .map(|(fd, p, sha)| (fd, p.to_path_buf(), sha.to_string())),
             };
             tokio::task::spawn_blocking(move || namespaced::spawn_namespaced_child(&cfg))
                 .await

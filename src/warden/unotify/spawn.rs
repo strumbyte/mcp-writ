@@ -53,11 +53,14 @@ pub fn spawn_supervised(
         tmpdir: None,
         ..Default::default()
     };
-    // Exec through the pinned descriptors' `/proc/self/fd` spellings
-    // when a pin exists — the kernel maps the verified object itself,
-    // so a pathname swap after verification cannot reach the exec.
-    // The plan holds the inherited dup handles and must outlive
-    // `cmd.spawn()`.
+    // Exec the executable through the pinned descriptor's
+    // `/proc/self/fd` spelling when a pin exists — the kernel maps the
+    // verified object itself, so a pathname swap after verification
+    // cannot reach the exec. A pinned entrypoint script instead keeps
+    // its real path inside argv (`exec_argv` re-spells the payload
+    // arg): an interpreter resolves its module and imports relative to
+    // that path, which the fd spelling cannot carry. The plan holds
+    // the inherited dup handles and must outlive `cmd.spawn()`.
     let fd_exec_plan = match spawn_pin {
         Some(pin) => Some(pin.fd_exec_plan(argv, resolved_exe).map_err(|e| {
             WardenError::sandbox_setup(
@@ -94,7 +97,9 @@ pub fn spawn_supervised(
     let record = linux_spawn::attach_linux_pre_exec(&mut cmd, bits);
     // The pin's identity re-check still runs last — a retargeted path
     // fails the launch rather than silently diverging from argv's own
-    // resolution; the exec itself is immune via the fd spellings above.
+    // resolution; for a path-launched entrypoint this same-object +
+    // stamp check is the exec-time guarantee, while the exe's exec is
+    // immune via the fd spelling above.
     if let Some(pin) = spawn_pin {
         pin.verify_spawn_path(resolved_exe).map_err(|e| {
             WardenError::sandbox_setup(

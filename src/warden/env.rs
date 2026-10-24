@@ -11,19 +11,116 @@
 //! there too.
 
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 
 use super::SpawnOptions;
 
 /// Apply the [`SpawnOptions`] environment to an async command.
 ///
 /// `None` (inherit parent) leaves the command untouched: no `env_clear`.
+/// `exec_dyld_fallback` applies either way — it is exec plumbing the
+/// launcher derives (a staged executable's relocated rpath lookup), not
+/// parent-environment passthrough subject to the restriction. When the
+/// env block legitimately carries `DYLD_FALLBACK_LIBRARY_PATH` (inherit
+/// mode, or an allowlisted name under restriction) the derived dirs are
+/// appended to that search list rather than replacing it; a name the
+/// restriction dropped stays dropped.
 pub(crate) fn apply_spawn_env(cmd: &mut tokio::process::Command, opts: &SpawnOptions) {
-    if let Some(pairs) = spawn_env_pairs(opts) {
+    let pairs = spawn_env_pairs(opts);
+    if let Some(ref p) = pairs {
         cmd.env_clear();
-        for (key, value) in pairs {
+        for (key, value) in p {
             cmd.env(key, value);
         }
     }
+    if !opts.exec_dyld_fallback.is_empty()
+        && let Some(joined) = merged_dyld_fallback(
+            dyld_fallback_inherited(pairs.as_deref()),
+            &opts.exec_dyld_fallback,
+        )
+    {
+        cmd.env("DYLD_FALLBACK_LIBRARY_PATH", joined);
+    }
+}
+
+/// The `DYLD_FALLBACK_LIBRARY_PATH` value the spawn would carry before
+/// the derived dirs are appended: `None` env block means the parent's
+/// value passes through untouched; an explicit block means whatever
+/// the block holds — the parent snapshot under tmpdir-override, or an
+/// allowlisted copy under restriction.
+fn dyld_fallback_inherited(pairs: Option<&[(OsString, OsString)]>) -> Option<OsString> {
+    match pairs {
+        None => std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH"),
+        Some(p) => p
+            .iter()
+            .find(|(k, _)| env_key_eq(k, OsStr::new("DYLD_FALLBACK_LIBRARY_PATH")))
+            .map(|(_, v)| v.clone()),
+    }
+}
+
+/// dyld's built-in fallback for an `@rpath` reference with no matching
+/// `LC_RPATH` (`~/lib` is deliberately absent — a home-dir library root
+/// is not a system code source we bless). `macos_sandbox`'s dep walk
+/// uses the same platform constant.
+pub(crate) const DYLD_FALLBACK_DIRS: &[&str] = &["/usr/local/lib", "/usr/lib"];
+
+/// The fallback dir list the spawn would merge for `opts` —
+/// [`merged_dyld_fallback`]'s composition (inherited entries + derived
+/// dirs + the platform defaults when no inherited list survives),
+/// expressed as dirs so the `sandbox-exec` bash wrapper can re-join and
+/// quote it inside its `-c` string. Empty when the launch carries no
+/// relocation fallback. macOS-only — its sole consumer is the
+/// `sandbox-exec` wrapper construction.
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_dyld_fallback_dirs(opts: &SpawnOptions) -> Vec<PathBuf> {
+    if opts.exec_dyld_fallback.is_empty() {
+        return Vec::new();
+    }
+    merged_dyld_fallback_dirs(
+        dyld_fallback_inherited(spawn_env_pairs(opts).as_deref()),
+        &opts.exec_dyld_fallback,
+    )
+}
+
+/// Concatenate `inherited` + `dirs` into one
+/// `DYLD_FALLBACK_LIBRARY_PATH` spelling — the derived fallback extends
+/// the inherited search list instead of replacing it. `split_paths`
+/// decomposes the inherited list on the platform separator; its empty
+/// elements (a `::` gap in the spelling) are dropped — a search-path
+/// empty entry reads as cwd. `join_paths` re-assembles the survivors,
+/// so no literal separator is written here.
+fn merged_dyld_fallback(inherited: Option<OsString>, dirs: &[PathBuf]) -> Option<OsString> {
+    let parts = merged_dyld_fallback_dirs(inherited, dirs);
+    if parts.is_empty() {
+        return None;
+    }
+    std::env::join_paths(&parts).ok()
+}
+
+fn merged_dyld_fallback_dirs(inherited: Option<OsString>, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut parts: Vec<PathBuf> = Vec::new();
+    if let Some(v) = inherited.filter(|v| !v.is_empty()) {
+        parts.extend(std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()));
+    }
+    let has_inherited = !parts.is_empty();
+    // A dir itself containing the list separator cannot join a path
+    // list — exclude it alone rather than let `join_paths` discard the
+    // entire fallback for one unusable entry.
+    parts.extend(
+        dirs.iter()
+            .filter(|d| std::env::join_paths([d]).is_ok())
+            .cloned(),
+    );
+    // Setting the var replaces dyld's built-in fallback list entirely —
+    // with no usable inherited entries the platform defaults are
+    // re-appended after the derived dirs so the relocated exe keeps
+    // them. They are appended even when an environment restriction
+    // dropped the parent's value: the defaults are platform constants,
+    // not the removed spelling.
+    if !has_inherited {
+        parts.extend(DYLD_FALLBACK_DIRS.iter().map(PathBuf::from));
+    }
+    parts
 }
 
 /// Apply the [`SpawnOptions`] environment to a synchronous command —
@@ -287,6 +384,143 @@ mod tests {
         unsafe {
             std::env::remove_var("MCP_WRIT_ENV_ALLOWLIST_INHERIT");
         }
+    }
+
+    /// `exec_dyld_fallback` merges onto an inherited
+    /// `DYLD_FALLBACK_LIBRARY_PATH` instead of replacing it; a
+    /// restriction-dropped name stays dropped. Unix-only: the var and
+    /// its `:`-joined values are a dyld (macOS) concept — Windows
+    /// `split_paths` would treat `:` as path content, not a separator.
+    #[cfg(unix)]
+    #[test]
+    fn dyld_fallback_appends_to_inherited_and_respects_restriction() {
+        let _env = lock_process_env();
+        let var = "DYLD_FALLBACK_LIBRARY_PATH";
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::set_var(var, "/inherited/lib:/opt/extra");
+        }
+        let derived = vec![PathBuf::from("/real/lib"), PathBuf::from("/real2/lib")];
+        // Decode merged values back through split_paths — the platform
+        // separator (`:` / `;`) must not leak into the assertions.
+        let parts_of = |v: &OsString| -> Vec<String> {
+            std::env::split_paths(v)
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // Inherit mode (no env block): parent value + derived.
+        let merged =
+            merged_dyld_fallback(dyld_fallback_inherited(None), &derived).expect("merged fallback");
+        assert_eq!(
+            parts_of(&merged),
+            vec![
+                "/inherited/lib".to_string(),
+                "/opt/extra".to_string(),
+                "/real/lib".to_string(),
+                "/real2/lib".to_string(),
+            ],
+            "inherited dirs must lead, derived append; got {}",
+            merged.to_string_lossy()
+        );
+
+        // Restricted + allowlisted: the copied parent value is kept.
+        let pairs = vec![
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from(var), OsString::from("/allowed/lib")),
+        ];
+        let merged = merged_dyld_fallback(dyld_fallback_inherited(Some(&pairs)), &derived).unwrap();
+        assert_eq!(
+            parts_of(&merged),
+            vec![
+                "/allowed/lib".to_string(),
+                "/real/lib".to_string(),
+                "/real2/lib".to_string(),
+            ],
+            "allowlisted parent dirs must lead; got {}",
+            merged.to_string_lossy()
+        );
+
+        // Restricted without the name: derived dirs + the platform
+        // defaults the var now stands in for — nothing the policy
+        // excluded is restored.
+        let merged =
+            merged_dyld_fallback(dyld_fallback_inherited(Some(&pairs[..1])), &derived).unwrap();
+        assert_eq!(
+            parts_of(&merged),
+            vec![
+                "/real/lib".to_string(),
+                "/real2/lib".to_string(),
+                "/usr/local/lib".to_string(),
+                "/usr/lib".to_string(),
+            ],
+            "restriction must not restore excluded dirs; got {}",
+            merged.to_string_lossy()
+        );
+
+        // An inherited-but-empty spelling behaves like absent — same
+        // derived + defaults composition.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::set_var(var, "");
+        }
+        let merged = merged_dyld_fallback(dyld_fallback_inherited(None), &derived).unwrap();
+        assert_eq!(
+            parts_of(&merged),
+            vec![
+                "/real/lib".to_string(),
+                "/real2/lib".to_string(),
+                "/usr/local/lib".to_string(),
+                "/usr/lib".to_string(),
+            ],
+            "empty inherited value must still yield platform defaults; got {}",
+            merged.to_string_lossy()
+        );
+        // Inherited spellings with empty elements (`::` gaps, a leading
+        // or trailing `:`) must not carry cwd-reading empty entries into
+        // the merged list.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::set_var(var, ":lead::mid:/trail:");
+        }
+        let merged = merged_dyld_fallback(dyld_fallback_inherited(None), &derived).unwrap();
+        assert_eq!(
+            parts_of(&merged),
+            vec![
+                "lead".to_string(),
+                "mid".to_string(),
+                "/trail".to_string(),
+                "/real/lib".to_string(),
+                "/real2/lib".to_string(),
+            ],
+            "empty inherited entries must be dropped; got {}",
+            merged.to_string_lossy()
+        );
+
+        // A derived dir itself containing the separator is unusable in a
+        // path list — excluded individually, the rest still join.
+        let derived_with_bad = vec![
+            PathBuf::from("/real/lib"),
+            PathBuf::from("/bad:dir/lib"),
+            PathBuf::from("/real2/lib"),
+        ];
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::remove_var(var);
+        }
+        let merged =
+            merged_dyld_fallback(dyld_fallback_inherited(None), &derived_with_bad).unwrap();
+        assert_eq!(
+            parts_of(&merged),
+            vec![
+                "/real/lib".to_string(),
+                "/real2/lib".to_string(),
+                "/usr/local/lib".to_string(),
+                "/usr/lib".to_string(),
+            ],
+            "separator-containing dir must drop alone; got {}",
+            merged.to_string_lossy()
+        );
     }
 
     /// Duplicate allowlist entries collapse to a single env pair.

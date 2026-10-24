@@ -486,6 +486,13 @@ async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&src_dir).map_err(|e| format!("mkdir src: {e}"))?;
     copy_dir_recursive(&project_dir.join("src"), &src_dir)?;
 
+    // `include_str!` in `legislator/policy_generator.rs` embeds the
+    // interpreter runtime baselines from `examples/policies/runtime/` —
+    // the vendored build fails without them in the context.
+    let examples_dir = temp_dir.join("examples");
+    std::fs::create_dir_all(&examples_dir).map_err(|e| format!("mkdir examples: {e}"))?;
+    copy_dir_recursive(&project_dir.join("examples"), &examples_dir)?;
+
     std::fs::copy(project_dir.join("Cargo.toml"), temp_dir.join("Cargo.toml"))
         .map_err(|e| format!("copy Cargo.toml: {e}"))?;
     std::fs::copy(project_dir.join("Cargo.lock"), temp_dir.join("Cargo.lock"))
@@ -499,6 +506,7 @@ async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
 WORKDIR /build
 COPY vendor/ /vendor/
 COPY src/ src/
+COPY examples/ examples/
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p .cargo && \
     printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "/vendor"\n' > .cargo/config.toml && \
