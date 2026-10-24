@@ -177,12 +177,34 @@ assertions. The `windows-isolation` job
 `MCP_WRIT_REQUIRE_WINISO_TESTS=1`) owns execution and must re-record on
 the merge commit — see [windows-isolation.md](windows-isolation.md).
 
+## Log rotation reopen and disk-full latching (PR-27 evidence)
+
+`tests/audit_reopen_e2e.rs` (Unix only — file rotation and its signal
+are POSIX semantics) re-execs the test binary as a sink-owning child
+for two legs:
+
+| Leg | Fixture op | Asserted |
+|---|---|---|
+| `sigusr1_reopen_continues_in_new_file` | parent renames the live `audit.jsonl` to `audit.jsonl.1`, sends SIGUSR1 | rotated file holds only the pre-signal record; the new file at the audit path opens with `audit.reopened` (`signal=sigusr1`) as its first record and takes every later record |
+| `full_disk_latches_and_does_not_recover` | child sets `RLIMIT_FSIZE` (SIGXFSZ ignored) so writes fail EFBIG — the same writer-fault path an ENOSPC takes | the refused write latches `writer_failed` and `is_failed`; lifting the limit does not revive the sink — `log_committed` still fails closed |
+
+Executed on WSL2 (kernel 6.18.x, x86-64, rustc 1.99.0): both legs
+pass — the target's three test functions include the `audit_reopen_child`
+re-exec entry point alongside the two parent-driven legs. The
+`RLIMIT_FSIZE` fixture stands in for a full filesystem —
+EFBIG and ENOSPC reach the writer through the identical
+`write`/`fsync` error path, which is what the fail-closed contract
+latches on.
+
 ## Registered ownership
 
 - `denial_audit_e2e` — CI, Platform tests, Linux tests (all set
   `MCP_WRIT_REQUIRE_E2E_TESTS=1`); row in
   [test-matrix.md](../test-matrix.md).
 - `audit_durability_e2e` — same workflows (pre-existing).
+- `audit_reopen_e2e` — CI, Platform tests, Linux tests; row in
+  [test-matrix.md](../test-matrix.md). PR-27 rotation/disk-full
+  fixture (Unix only — the target compiles empty on Windows).
 - `windows_isolation_e2e` PSEC legs — VM tests `windows-isolation` job /
   `scripts/validate-windows-isolation.ps1`.
 

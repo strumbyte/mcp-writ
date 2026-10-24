@@ -1,6 +1,6 @@
 use super::emit::days_to_civil;
 use super::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 fn make_test_dir(label: &str) -> PathBuf {
@@ -62,6 +62,7 @@ fn test_event_type_as_str() {
     );
     assert_eq!(EventType::GuardStarted.as_str(), "guard.started");
     assert_eq!(EventType::GuardStopped.as_str(), "guard.stopped");
+    assert_eq!(EventType::AuditReopened.as_str(), "audit.reopened");
     assert_eq!(EventType::PolicyLoaded.as_str(), "policy.loaded");
     assert_eq!(EventType::PolicyReloaded.as_str(), "policy.reloaded");
     assert_eq!(EventType::PolicyError.as_str(), "policy.error");
@@ -90,6 +91,7 @@ fn test_event_type_category() {
     assert_eq!(EventType::SandboxFileDenied.category(), "sandbox");
     assert_eq!(EventType::ValidationPathTraversal.category(), "validation");
     assert_eq!(EventType::GuardStarted.category(), "system");
+    assert_eq!(EventType::AuditReopened.category(), "system");
     assert_eq!(EventType::PolicyLoaded.category(), "configuration");
     assert_eq!(EventType::SessionStarted.category(), "session");
     assert_eq!(EventType::ServerConnected.category(), "server");
@@ -488,6 +490,72 @@ fn test_generate_session_id_not_empty() {
 
 // ─── AuditLogger integration tests ──────────────────────────────────────
 
+/// Assemble an `AuditLogger` from parts the test controls — the
+/// writer-level tests drive the channel ends and writer task directly
+/// instead of going through `to_file`, so fail-closed mode, channel
+/// capacity, and the byte budget stay test-tunable. The logger's own
+/// `reopen_tx` stays empty: these fixtures never expose a live reopen
+/// sink to `AuditLogger::reopen`.
+fn assemble_logger(
+    tx: mpsc::Sender<AuditItem>,
+    writer_handle: tokio::task::JoinHandle<()>,
+    fail_closed: bool,
+    byte_budget: usize,
+    writer_failed: super::FailureFlag,
+) -> AuditLogger {
+    AuditLogger {
+        inner: std::sync::Arc::new(AuditLoggerInner {
+            tx: std::sync::Mutex::new(Some(tx)),
+            reopen_tx: std::sync::Mutex::new(None),
+            session_id: generate_session_id(),
+            writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
+            fail_closed,
+            dropped: AtomicU64::new(0),
+            writer_failed,
+            bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(byte_budget)),
+        }),
+    }
+}
+
+/// A file-sink fixture: a real file at `path` drained by a spawned
+/// `file_writer_task`, behind a record channel of `channel_capacity`.
+/// Returns the logger plus the reopen sender — held by the test so the
+/// writer's reopen arm stays live for the test's scope.
+fn file_sink_logger(
+    path: &Path,
+    channel_capacity: usize,
+    fail_closed: bool,
+) -> (AuditLogger, mpsc::Sender<ReopenRequest>) {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
+    let (tx, rx) = mpsc::channel(channel_capacity);
+    let (reopen_tx, reopen_rx) = mpsc::channel(REOPEN_QUEUE_CAPACITY);
+    let writer_failed = super::FailureFlag::new();
+    let writer_handle = tokio::spawn(file_writer_task(
+        rx,
+        writer,
+        writer_failed.clone(),
+        None,
+        AuditSyncMode::Buffered,
+        path.to_path_buf(),
+        reopen_rx,
+    ));
+    (
+        assemble_logger(
+            tx,
+            writer_handle,
+            fail_closed,
+            QUEUE_BYTE_BUDGET,
+            writer_failed,
+        ),
+        reopen_tx,
+    )
+}
+
 #[tokio::test]
 async fn test_logger_to_file_writes_jsonl() {
     let dir = make_test_dir("audit_new");
@@ -698,33 +766,7 @@ async fn test_logger_backpressure_channel_full() {
     let dir = make_test_dir("audit_bp");
     let path = dir.join("bp.jsonl");
 
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .unwrap();
-    let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
-    let (tx, rx) = mpsc::channel(2);
-    let session_id = generate_session_id();
-    let writer_failed = super::FailureFlag::new();
-    let writer_handle = tokio::spawn(file_writer_task(
-        rx,
-        writer,
-        writer_failed.clone(),
-        None,
-        AuditSyncMode::Buffered,
-    ));
-    let logger = AuditLogger {
-        inner: std::sync::Arc::new(AuditLoggerInner {
-            tx: std::sync::Mutex::new(Some(tx)),
-            session_id,
-            writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
-            fail_closed: true,
-            dropped: AtomicU64::new(0),
-            writer_failed,
-            bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET)),
-        }),
-    };
+    let (logger, _reopen_tx) = file_sink_logger(&path, 2, true);
 
     for _ in 0..64 {
         logger.log(make_test_event());
@@ -744,33 +786,7 @@ async fn test_logger_channel_full_best_effort_stays_available() {
     let dir = make_test_dir("audit_bp_open");
     let path = dir.join("bp.jsonl");
 
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .unwrap();
-    let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
-    let (tx, rx) = mpsc::channel(2);
-    let session_id = generate_session_id();
-    let writer_failed = super::FailureFlag::new();
-    let writer_handle = tokio::spawn(file_writer_task(
-        rx,
-        writer,
-        writer_failed.clone(),
-        None,
-        AuditSyncMode::Buffered,
-    ));
-    let logger = AuditLogger {
-        inner: std::sync::Arc::new(AuditLoggerInner {
-            tx: std::sync::Mutex::new(Some(tx)),
-            session_id,
-            writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
-            fail_closed: false,
-            dropped: AtomicU64::new(0),
-            writer_failed,
-            bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET)),
-        }),
-    };
+    let (logger, _reopen_tx) = file_sink_logger(&path, 2, false);
 
     for _ in 0..64 {
         logger.log(make_test_event());
@@ -856,32 +872,7 @@ async fn test_logger_shutdown_reports_writer_failure() {
     let dir = make_test_dir("audit_sd_err");
     let path = dir.join("err.jsonl");
 
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .unwrap();
-    let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
-    let (tx, rx) = mpsc::channel(2);
-    let writer_failed = super::FailureFlag::new();
-    let writer_handle = tokio::spawn(file_writer_task(
-        rx,
-        writer,
-        writer_failed.clone(),
-        None,
-        AuditSyncMode::Buffered,
-    ));
-    let logger = AuditLogger {
-        inner: std::sync::Arc::new(AuditLoggerInner {
-            tx: std::sync::Mutex::new(Some(tx)),
-            session_id: generate_session_id(),
-            writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
-            fail_closed: true,
-            dropped: AtomicU64::new(0),
-            writer_failed,
-            bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET)),
-        }),
-    };
+    let (logger, _reopen_tx) = file_sink_logger(&path, 2, true);
 
     // Drop the sender — a subsequent log attempt latches the writer
     // fault deterministically (no saturation race).
@@ -1093,18 +1084,8 @@ async fn test_logger_byte_budget_fail_closed() {
     // accounting is queue-side, so no writer task is needed.
     let rx = Some(rx);
     let writer_handle = tokio::spawn(async move {});
-    let logger = AuditLogger {
-        inner: std::sync::Arc::new(AuditLoggerInner {
-            tx: std::sync::Mutex::new(Some(tx)),
-            session_id: generate_session_id(),
-            writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
-            fail_closed: true,
-            dropped: AtomicU64::new(0),
-            writer_failed,
-            // One record (~300 wire bytes) fits; a second cannot.
-            bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(600)),
-        }),
-    };
+    // One record (~300 wire bytes) fits the 600 budget; a second cannot.
+    let logger = assemble_logger(tx, writer_handle, true, 600, writer_failed);
 
     let mut big = make_test_event();
     big.details = Some("y".repeat(500));
@@ -1117,5 +1098,186 @@ async fn test_logger_byte_budget_fail_closed() {
 
     drop(rx);
     let _ = logger.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─── Sink reopen (PR-27, F-11) ────────────────────────────────────────
+
+/// The in-band rotation marker a reopen carries — the same shape
+/// `lifecycle::audit_reopened_event` builds, kept local so these
+/// writer-level tests stay in the audit_log module.
+fn reopen_marker() -> ReopenMarker {
+    Box::new(|err| {
+        let mut evt = AuditEvent::new(
+            Uuid::now_v7(),
+            EventType::AuditReopened,
+            Severity::Info,
+            if err.is_some() {
+                Outcome::Failure
+            } else {
+                Outcome::Success
+            },
+            Action::Observed,
+        );
+        evt.details = Some(match err {
+            Some(e) => format!("signal=sigusr1 error={e}"),
+            None => "signal=sigusr1".to_string(),
+        });
+        evt
+    })
+}
+
+/// The rotation contract: records queued before the reopen reach the
+/// renamed old file, the reopen swaps the handle to a freshly opened
+/// file at the audit path, and everything after continues there — with
+/// the `audit.reopened` marker written in-band as the new file's first
+/// record. Renames while the sink is open are a Unix semantic — the
+/// Windows append handle does not grant delete sharing, so an external
+/// rotator cannot move the file there.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_logger_reopen_continues_to_new_file() {
+    let dir = make_test_dir("audit_reopen");
+    let path = dir.join("audit.jsonl");
+    let rotated = dir.join("audit.jsonl.1");
+
+    let logger = AuditLogger::to_file(&path).unwrap();
+    let mut pre = make_test_event();
+    pre.details = Some("pre-rotation".to_string());
+    logger.log_committed(pre).await.unwrap();
+
+    std::fs::rename(&path, &rotated).unwrap();
+    assert!(
+        logger.reopen(reopen_marker()).await.unwrap(),
+        "file sink must report a real reopen"
+    );
+
+    let mut post = make_test_event();
+    post.details = Some("post-rotation".to_string());
+    logger.log_committed(post).await.unwrap();
+    let _ = logger.shutdown().await;
+
+    let old = std::fs::read_to_string(&rotated).unwrap();
+    assert!(old.contains("pre-rotation"), "old file: {old}");
+    assert!(
+        !old.contains("post-rotation"),
+        "a post-rotation record must not land in the rotated file: {old}"
+    );
+    assert!(
+        !old.contains("audit.reopened"),
+        "the marker belongs to the new file: {old}"
+    );
+    let new = std::fs::read_to_string(&path).unwrap();
+    let new_lines: Vec<&str> = new.lines().collect();
+    assert_eq!(new_lines.len(), 2, "marker plus post record: {new}");
+    assert!(
+        new_lines[0].contains("\"event_type\":\"audit.reopened\""),
+        "the marker is the new file's first record: {}",
+        new_lines[0]
+    );
+    assert!(new_lines[0].contains("\"outcome\":\"success\""));
+    assert!(
+        new_lines[1].contains("post-rotation"),
+        "new file must continue the stream: {new}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A reopen that fails the trust-boundary open — here the path was
+/// replaced by a directory — keeps the old handle: records continue
+/// into the previously opened file object while `writer_failed`
+/// latches, so a fail-closed logger reports the session dead.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_logger_reopen_failure_keeps_old_sink() {
+    let dir = make_test_dir("audit_reopen_fail");
+    let path = dir.join("audit.jsonl");
+    let rotated = dir.join("audit.jsonl.1");
+
+    let logger = AuditLogger::to_file(&path).unwrap(); // fail_closed
+    logger.log_committed(make_test_event()).await.unwrap();
+
+    std::fs::rename(&path, &rotated).unwrap();
+    std::fs::create_dir(&path).unwrap(); // a non-regular leaf refuses the reopen
+    let err = logger.reopen(reopen_marker()).await.unwrap_err();
+    assert!(
+        matches!(err, crate::error::AuditorError::AuditUnavailable(_)),
+        "expected AuditUnavailable, got: {err:?}"
+    );
+    assert!(logger.writer_failed(), "failed reopen must latch the fault");
+    assert!(logger.is_failed(), "fail-closed logger must report failed");
+
+    // The old handle still accepts records — the failed reopen did not
+    // lose the sink's remaining stream.
+    let mut post = make_test_event();
+    post.details = Some("after-failed-reopen".to_string());
+    logger.log(post);
+    let _ = logger.shutdown().await;
+
+    let old = std::fs::read_to_string(&rotated).unwrap();
+    assert!(
+        old.contains("after-failed-reopen"),
+        "old file must keep receiving records: {old}"
+    );
+    // The failure marker was emitted in-band on the surviving handle.
+    assert!(
+        old.contains("\"event_type\":\"audit.reopened\""),
+        "the failed reopen still records its marker: {old}"
+    );
+    assert!(
+        old.contains("\"outcome\":\"failure\"") && old.contains("error="),
+        "the failure marker carries the refusal: {old}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reopening the same path — no external rotation at all — swaps to an
+/// equivalent handle and loses nothing.
+#[tokio::test]
+async fn test_logger_reopen_same_path_loses_nothing() {
+    let dir = make_test_dir("audit_reopen_same");
+    let path = dir.join("audit.jsonl");
+
+    let logger = AuditLogger::to_file(&path).unwrap();
+    logger.log_committed(make_test_event()).await.unwrap();
+    assert!(logger.reopen(reopen_marker()).await.unwrap());
+    let mut post = make_test_event();
+    post.details = Some("still-here".to_string());
+    logger.log_committed(post).await.unwrap();
+    let _ = logger.shutdown().await;
+
+    let body = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "both records plus the marker must survive: {body}"
+    );
+    assert!(lines[1].contains("\"event_type\":\"audit.reopened\""));
+    assert!(body.contains("still-here"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tracing sink has nothing to reopen, and a shut-down file sink
+/// reports the same — neither is an error. `has_file_sink` tracks the
+/// same liveness, so signal plumbing can skip registering a reopen
+/// listener that could only no-op.
+#[tokio::test]
+async fn test_logger_reopen_without_file_sink() {
+    let tracing_logger = AuditLogger::to_tracing();
+    assert!(!tracing_logger.has_file_sink());
+    assert!(!tracing_logger.reopen(reopen_marker()).await.unwrap());
+    let _ = tracing_logger.shutdown().await;
+
+    let dir = make_test_dir("audit_reopen_dead");
+    let path = dir.join("audit.jsonl");
+    let logger = AuditLogger::to_file(&path).unwrap();
+    assert!(logger.has_file_sink());
+    let _ = logger.shutdown().await;
+    assert!(
+        !logger.has_file_sink(),
+        "shutdown retires the sink the signal path checks"
+    );
+    assert!(!logger.reopen(reopen_marker()).await.unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }

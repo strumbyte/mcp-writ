@@ -33,6 +33,7 @@ pub enum EventType {
     // system
     GuardStarted,
     GuardStopped,
+    AuditReopened,
     // configuration
     PolicyLoaded,
     PolicyReloaded,
@@ -72,6 +73,7 @@ impl EventType {
             Self::ValidationArgumentInvalid => "validation.argument_invalid",
             Self::GuardStarted => "guard.started",
             Self::GuardStopped => "guard.stopped",
+            Self::AuditReopened => "audit.reopened",
             Self::PolicyLoaded => "policy.loaded",
             Self::PolicyReloaded => "policy.reloaded",
             Self::PolicyError => "policy.error",
@@ -104,7 +106,7 @@ impl EventType {
             | Self::SandboxNetworkResolved
             | Self::SandboxProcessDenied => "sandbox",
             Self::ValidationPathTraversal | Self::ValidationArgumentInvalid => "validation",
-            Self::GuardStarted | Self::GuardStopped => "system",
+            Self::GuardStarted | Self::GuardStopped | Self::AuditReopened => "system",
             Self::PolicyLoaded | Self::PolicyReloaded | Self::PolicyError => "configuration",
             Self::SessionStarted | Self::SessionEnded => "session",
             Self::ServerConnected | Self::ServerDisconnected | Self::ServerError => "server",

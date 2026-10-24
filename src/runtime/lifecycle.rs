@@ -202,6 +202,35 @@ pub fn policy_error(
     logger.log(event);
 }
 
+/// Build the `audit.reopened` record for a completed reopen attempt —
+/// `detail = Some(error)` marks `outcome=failure`. The signal-driven
+/// rotation path hands this factory to [`AuditLogger::reopen`], whose
+/// writer runs it in-band: on success the record is the *new* file's
+/// first — proof of the switch no queued record can overtake — and on
+/// failure it lands on the surviving handle carrying `outcome=failure`
+/// plus the error.
+pub fn audit_reopened_event(
+    ctx: &SessionAuditContext,
+    session_id: &str,
+    detail: Option<&str>,
+) -> AuditEvent {
+    let mut event = lifecycle_event(
+        ctx,
+        EventType::AuditReopened,
+        if detail.is_some() {
+            Outcome::Failure
+        } else {
+            Outcome::Success
+        },
+    );
+    let mut details = format!("signal=sigusr1 session_id={session_id}");
+    if let Some(d) = detail {
+        details.push_str(&format!(" error={d}"));
+    }
+    event.details = Some(details);
+    event
+}
+
 /// `session.started`: the audited session is open — the child was
 /// spawned and the Auditor relay is running. Pairs with
 /// `session.ended`; a launch that fails earlier emits `server.error`
@@ -555,6 +584,38 @@ mod tests {
         assert!(lines[1].contains("stage=bind"));
         assert!(lines[2].contains("\"event_type\":\"guard.stopped\""));
         assert!(lines[2].contains("status=aborted"));
+        let corr = format!("\"correlation_id\":\"{}\"", ctx.launch_id);
+        assert!(lines.iter().all(|l| l.contains(&corr)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `audit.reopened` marks the rotation boundary: a success names
+    /// the signal and session, a failure flips the outcome and carries
+    /// the error — under the launch correlation either way.
+    #[tokio::test]
+    async fn audit_reopened_records_signal_and_outcome() {
+        let dir = test_dir();
+        let path = dir.join("audit.jsonl");
+        let logger = AuditLogger::to_file(&path).unwrap();
+        let ctx = ctx_with_policy("srv");
+
+        logger.log(audit_reopened_event(&ctx, logger.session_id(), None));
+        logger.log(audit_reopened_event(
+            &ctx,
+            logger.session_id(),
+            Some("open denied"),
+        ));
+        logger.shutdown().await.unwrap();
+
+        let lines = read_events(&path);
+        assert_eq!(lines.len(), 2, "got: {lines:?}");
+        assert!(lines[0].contains("\"event_type\":\"audit.reopened\""));
+        assert!(lines[0].contains("\"event_category\":\"system\""));
+        assert!(lines[0].contains("\"outcome\":\"success\""));
+        assert!(lines[0].contains("signal=sigusr1"));
+        assert!(lines[0].contains(&format!("session_id={}", logger.session_id())));
+        assert!(lines[1].contains("\"outcome\":\"failure\""));
+        assert!(lines[1].contains("error=open denied"), "got: {}", lines[1]);
         let corr = format!("\"correlation_id\":\"{}\"", ctx.launch_id);
         assert!(lines.iter().all(|l| l.contains(&corr)));
         let _ = std::fs::remove_dir_all(&dir);

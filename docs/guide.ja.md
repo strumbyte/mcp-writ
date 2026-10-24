@@ -1573,7 +1573,7 @@ logging level="info"
 - `policy_enforcement`: `tool_call.allowed`、`tool_call.denied`、`tool_call.modified`、`tools_list.filtered`、`mcp_message.allowed`、`mcp_message.denied`、`mcp_message.dropped`、`mcp_message.undecided`
 - `sandbox`: `sandbox.file_denied`、`sandbox.network_allowed`、`sandbox.network_denied`、`sandbox.network_resolved`、`sandbox.process_denied`
 - `validation`: `validation.path_traversal`、`validation.argument_invalid`
-- `system`: `guard.started`、`guard.stopped`
+- `system`: `guard.started`、`guard.stopped`、`audit.reopened`
 - `configuration`: `policy.loaded`、`policy.reloaded`、`policy.error`
 - `session`: `session.started`、`session.ended`
 - `server`: `server.connected`、`server.disconnected`、`server.error`
@@ -1645,7 +1645,19 @@ tail -F /var/log/mcp-audit.jsonl | socat - UDP:siem.internal:514 &
 
 転送側は別プロセスなので、`mcp-writ` が SIGKILL されても転送側は生き残り、ライターが同期済みの分 — バッファ末尾をバイパスした `high` 以上のレコードを含む — をすべて排出して送り出せる。転送の下にファイルシンクは残すこと: 転送は搬送の利便であって永続化シンクではない。`tail` / stdout パイプラインにも独自のバッファがあり、コレクタやパイプが滞る・死ぬとレコードを失う。stderr / tracing ストリーム（`--audit-log` なしの `run`）に至っては耐久性の契約自体がない — `logging.fail_closed` がファイルシンクを要求するのはこのためである。推奨構成はファイルシンク（必要なら `--audit-sync`）+ 転送側であり、転送側単独にしないこと。
 
-**回帰カバレッジ。** 本節と上記イベント一覧の主張は `tests/denial_audit_e2e.rs`（PR-08）が end to end で固定している: 拒否された RPC 脚は `tool_call.denied` / `mcp_message.denied` がクライアントへの拒否応答とともにログへ残ることを、実 `unotify-run`・`dns-gate` 脚は IP 層・名前層の `sandbox.network_denied` を、そして Landlock/seccomp 脚は上述のカーネル内拒否が `sandbox.*_denied` レコードを*残さない*ことを検証する — 「観測不能」の契約を仕様として表明する試験であり、ワークロード自身の EACCES/EPERM 報告が「拒否は実際に発生した」ことの証人となる。SIGKILL 末尾欠損の上限は `tests/audit_durability_e2e.rs` が計測する。シナリオ定義・実行コマンド・記録値は [`docs/validation/denial-audit.md`](validation/denial-audit.md) を参照。
+**ログローテーション。** Unix ではファイルシンクは外部ローテータと共存できる。`run` と `mcp-secure-runner` はファイル監査シンクが生きている間、SIGUSR1 をシンクの開き直しに束ねる — tracing のみのセッション（`--audit-log` なしの `run`）では USR1 は既定 disposition（終了）のままである。受信するとライターはキュー内の全レコードをまず旧ファイルへ書き切り — シグナル到着前のレコードが新ファイルへ紛れ込むことはない — flush + fsync したうえで、起動時と同じ信頼境界の open で監査パスを再解決する。起動後に仕掛けられたリンクや非通常の leaf、ローテータが別 uid で作り直したファイルは、起動時の open と同じく reopen を拒否する。このドレインは順序保証の代償でもある: 飽和し続けるストリームでは reopen はキューが最初に空いた瞬間に実行されるため、回転が即座に完了するのはキューが時折空く範囲に限られる。開き直しの成功は `audit.reopened`（`system` カテゴリ）として記録される — ライターが in-band で書き込み、reopen 応答の前に同期するため常に新ファイルの先頭レコードとなり、`signal=sigusr1` と `session_id` を持つ。開き直しの失敗のうち、ハンドル差替前のものは旧ハンドルを維持するため、レコードは既存のファイルオブジェクトへ書き続ける。差替後の失敗（新ファイルのディレクトリエントリ fsync）は `Err` を返すが、レコードは正しい名前の新ハンドルへ継続する。いずれの失敗も書き込み失敗と同じライター障害をラッチし — `logging.fail_closed` では未監査のまま走らせるよりセッションを中断する — `audit.reopened` は生存ハンドルがまだ書き込みを受け付ける限り `outcome=failure` と `error=` を持つ。原因がシンク自身 — ファイルシステム満杯や死んだディスクリプタ — の場合は、マーカーも `writer_failed=true` を報告するはずの `guard.stopped` 行もそのシンクへは永続化できず、耐久側の証拠は fail-closed 中断そのもの（kill されたワークロード・非ゼロ終了・stderr のエラー）となる。SIGHUP はあえてローテーション用シグナルにしていない: PoC 系コマンド（`unotify-run`・`namespaced-run`・`ebpf-run`・`macos-proxy-run`）はこれを終了扱い（終了コード 129）とするためである。それ以外 — PoC 系コマンドと `dns-gate` — では SIGUSR1 を束ねず、既定の disposition（終了）のままである。
+
+推奨するローテータ設定は `copytruncate` — ライブのファイルをコピーしてから元ファイルをその場で切り詰める方式。シンクの `O_APPEND` ハンドルはオフセット 0 から書き続けるためシグナルは不要で、所有者とモードもそのまま維持される。代償も明記する: コピーと切り詰めの間に書かれたレコードはどちらのファイルにも残らず、バースト時はローテーションごとにごく少数のレコードを失い得る。`create` 方式（移動 + 再作成 + `postrotate kill -USR1 <pid>`）は欠落がない一方、作り直すファイルはロギング主体の所有でなければならない — `create 0600 <user> <group>` — 他人所有のファイルは次回の open で拒否されるため。Windows にはローテーション経路がない: append ハンドルは delete 共有を許可しないため、セッション中にファイルを移動・差し替えできない。
+
+**容量枯渇時の挙動。** ファイルシステム満杯 — クォータやファイルサイズ上限も同じ — で書き込みが失敗した場合、他のシンク障害と同じく扱われる:
+
+- `logging.fail_closed`（既定）ではセッションが中断する — 未監査のまま走らせるより、ワークロードを kill して起動は非ゼロで終了する
+- 空きを作ってもセッションは復帰しない: ライター障害は恒久的にラッチされ、起動をやり直すまでレコードは fail-closed に失敗し続ける
+- レコードが行の途中で切れることがある — 部分書き込みは末尾に JSON として不正な切れた行を残す。読み手は最終行が非 JSON であることを許容すること
+
+容量管理はガードではなく外部ローテータの責務である。起動時の空き容量検査も内部 `max_size` 上限も、あえて実装していない: 起動時の statfs では走り続けるセッションの増加を縛れず、ガード側のサイズ上限は、過去の拒否記録をファイルから追い出す（上限付きシンクは攻撃者がノイズで押し流せる）か、fail-closed 中断を別のダイヤル名で言い換えるに過ぎない。ボリュームを確保し、外部でローテートし、`guard.stopped` の `writer_failed=true` を監視すること。
+
+**回帰カバレッジ。** 本節と上記イベント一覧の主張は `tests/denial_audit_e2e.rs`（PR-08）が end to end で固定している: 拒否された RPC 脚は `tool_call.denied` / `mcp_message.denied` がクライアントへの拒否応答とともにログへ残ることを、実 `unotify-run`・`dns-gate` 脚は IP 層・名前層の `sandbox.network_denied` を、そして Landlock/seccomp 脚は上述のカーネル内拒否が `sandbox.*_denied` レコードを*残さない*ことを検証する — 「観測不能」の契約を仕様として表明する試験であり、ワークロード自身の EACCES/EPERM 報告が「拒否は実際に発生した」ことの証人となる。SIGKILL 末尾欠損の上限は `tests/audit_durability_e2e.rs` が計測し、上記のローテーションと容量枯渇の契約は `tests/audit_reopen_e2e.rs`（PR-27）が固定する。シナリオ定義・実行コマンド・記録値は [`docs/validation/denial-audit.md`](validation/denial-audit.md) を参照。
 
 ---
 
