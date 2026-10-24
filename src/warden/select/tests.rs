@@ -877,7 +877,7 @@ fn dead_udp_allows_ignores_tcp_denies_and_open_posture() {
 
 // --- Landlock-unmediatable filesystems ----------------------------
 
-///  is procfs — always Landlock-mediatable. Nonexistent and
+/// `/proc` is procfs — always Landlock-mediatable. Nonexistent and
 /// mid-glob spellings are indeterminate and must not verdict.
 #[test]
 fn unmediatable_grant_fs_ignores_mediated_and_unknown() {

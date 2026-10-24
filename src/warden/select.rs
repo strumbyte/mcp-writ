@@ -736,9 +736,11 @@ fn unmediatable_grant_fs(spelling: &str) -> Option<&'static str> {
     if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
         return None;
     }
-    const V9FS_MAGIC: i64 = 0x0102_1997;
-    match st.f_type as i64 {
-        V9FS_MAGIC => Some("9p/v9fs — e.g. a WSL drvfs mount"),
+    // V9FS_MAGIC — the literal infers to `f_type`'s `__fsword_t`
+    // spelling (`c_long` on glibc, `c_ulong` on musl, i32 on 32-bit),
+    // so no arch-dependent conversion is needed.
+    match st.f_type {
+        0x0102_1997 => Some("9p/v9fs — e.g. a WSL drvfs mount"),
         _ => None,
     }
 }

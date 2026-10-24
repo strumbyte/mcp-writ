@@ -566,17 +566,17 @@ impl SpawnPin {
     /// `/proc/self/fd/N` spelling realpaths to `/memfd:… (deleted)`
     /// and fails outright; a staged copy in an empty owner-only
     /// directory has no siblings either. The script's exec-time
-    /// guarantee is the pin itself: `verify_spawn_path`'s same-object
-    /// + stamp re-check is the last gate before the spawn, and the
-    /// residual — the interpreter's `open(2)` after process creation —
-    /// is the window every import the workload loads at run time has
-    /// always lived at. The Linux namespaced route closes even that
-    /// residual: init re-hashes the pinned object and mounts a
-    /// verified copy over the script's path inside its mount
-    /// namespace, so the spelling resolves to the pinned content
-    /// whatever the host pathname later names. On Windows the
-    /// session-held share-mode pin also makes the object at that path
-    /// unswappable.
+    /// guarantee is the pin itself: `verify_spawn_path`'s
+    /// same-object + stamp re-check is the last gate before the
+    /// spawn, and the residual — the interpreter's `open(2)` after
+    /// process creation — is the window every import the workload
+    /// loads at run time has always lived at. The Linux namespaced
+    /// route closes even that residual: init re-hashes the pinned
+    /// object and mounts a verified copy over the script's path
+    /// inside its mount namespace, so the spelling resolves to the
+    /// pinned content whatever the host pathname later names. On
+    /// Windows the session-held share-mode pin also makes the object
+    /// at that path unswappable.
     ///
     /// Non-Linux Unix has no exec'able fd spelling (`/dev/fd/N` cannot
     /// be `execve`'d on macOS), so the exe plan names the staged
@@ -948,7 +948,7 @@ impl FdExecPlan {
     /// handoff — `Some` only on Linux with a payload-bound pin. Init
     /// reads the pinned object through the descriptor (never the
     /// path), re-hashes it against `sha256`, and mounts the verified
-    /// bytes over the path inside its mount namespace: the
+    /// bytes read-only over the path inside its mount namespace: the
     /// interpreter's open then reaches the pinned content even if a
     /// host-side swap retargeted the pathname — or rewrote the object
     /// — after `verify_spawn_path`. Other routes ignore this — their
@@ -993,6 +993,40 @@ fn dup_inheritable(file: &std::fs::File) -> io::Result<std::fs::File> {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         Ok(unsafe { std::fs::File::from_raw_fd(fd) })
     }
+}
+
+/// Strip a Windows verbatim (`\\?\`) prefix when the path can be
+/// spelled in the ordinary form: `current_dir` returns verbatim
+/// spelling, so a cwd-joined payload path would otherwise surface in
+/// the child's argv as `\\?\C:\…` — a valid but poorly-tested
+/// interpreter spelling. `\\?\C:\x` simplifies to `C:\x` and
+/// `\\?\UNC\srv\shr\x` to `\\srv\shr\x`; any other verbatim form
+/// keeps its prefix (it may be the only spelling that resolves).
+/// Identity unchanged on non-Windows.
+pub(super) fn simplify_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = path.components();
+        let base = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => Some(format!("{}:", drive as char)),
+                Prefix::VerbatimUNC(server, share) => Some(format!(
+                    "\\\\{}\\{}",
+                    server.to_string_lossy(),
+                    share.to_string_lossy()
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(base) = base {
+            let mut out = PathBuf::from(base);
+            out.extend(components);
+            return out;
+        }
+    }
+    path
 }
 
 /// Re-run the binding checks immediately before spawn — the launched
@@ -1094,7 +1128,7 @@ pub fn reverify_immediately_before_spawn(
             };
             // `.` components normalize away (a leading one too — the
             // path is absolute after the join); `..` stays literal.
-            joined.components().collect::<PathBuf>()
+            simplify_verbatim(joined.components().collect::<PathBuf>())
         });
         let payload_match = payload_path.as_ref().is_some_and(|p| same_file(p, target));
         if !payload_match || same_file(target, resolved_exe) {

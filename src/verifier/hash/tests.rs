@@ -510,6 +510,28 @@ fn test_entrypoint_exec_argv_respells_real_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A cwd-joined payload path keeps no `\\?\` prefix — the argv
+/// re-spelling hands the interpreter an ordinary spelling it can
+/// realpath and resolve imports against.
+#[cfg(windows)]
+#[test]
+fn test_simplify_verbatim_strips_prefix() {
+    use super::pin::simplify_verbatim;
+    assert_eq!(
+        simplify_verbatim(PathBuf::from(r"\\?\C:\work\server.mjs")),
+        PathBuf::from(r"C:\work\server.mjs")
+    );
+    assert_eq!(
+        simplify_verbatim(PathBuf::from(r"\\?\UNC\srv\share\server.mjs")),
+        PathBuf::from(r"\\srv\share\server.mjs")
+    );
+    // Ordinary spellings pass through untouched.
+    assert_eq!(
+        simplify_verbatim(PathBuf::from(r"C:\work\server.mjs")),
+        PathBuf::from(r"C:\work\server.mjs")
+    );
+}
+
 /// Windows pins carry no write/delete share: while the handle is
 /// held the OS itself refuses the rename a swap needs.
 #[cfg(windows)]

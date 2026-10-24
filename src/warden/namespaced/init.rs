@@ -42,8 +42,8 @@
 //!    exist we leave resolution broken (fail-closed — a workload that
 //!    cannot resolve cannot turn name rules into flows). A pinned
 //!    entrypoint script then has its verified content staged and
-//!    mounted over its payload path (`MCP_WRIT_NS_ENTRYPIN_*`): the
-//!    real-path spelling stays while the bytes behind it are anchored
+//!    mounted read-only over its payload path (`MCP_WRIT_NS_ENTRYPIN_*`):
+//!    the real-path spelling stays while the bytes behind it are anchored
 //!    to the pinned object for the session — the verify→exec window a
 //!    pathname launch can only narrow elsewhere closes here.
 //! 7. Handshake: `READY` + the TUN fd via `SCM_RIGHTS`; wait for `GO`.
@@ -391,19 +391,29 @@ fn parse_keep_fds(raw: &str) -> Vec<i32> {
 /// `(pin fd, payload path, sha256)` named by the
 /// `MCP_WRIT_NS_ENTRYPIN_*` envs; `None` when the launch pins no
 /// payload-bound entrypoint. Read before the env scrub removes the
-/// variables. Stdio descriptors never qualify — a forged entry must
-/// not alias a real fd.
-fn entry_pin_from_env() -> Option<(RawFd, std::path::PathBuf, String)> {
-    let fd: RawFd = std::env::var(super::init_env::ENTRYPIN_FD)
-        .ok()?
-        .parse()
-        .ok()?;
-    if fd <= 2 {
-        return None;
+/// variables. The spawn path writes the trio together, so a partial
+/// or unreadable set — a missing target/sha, an unparseable fd, or a
+/// stdio number a forged entry could alias — is a handoff bug and
+/// fails the launch rather than silently running the entrypoint
+/// unanchored.
+fn entry_pin_from_env() -> std::io::Result<Option<(RawFd, std::path::PathBuf, String)>> {
+    let fd_raw = std::env::var_os(super::init_env::ENTRYPIN_FD);
+    let target = std::env::var_os(super::init_env::ENTRYPIN_TARGET);
+    let sha_raw = std::env::var_os(super::init_env::ENTRYPIN_SHA);
+    if fd_raw.is_none() && target.is_none() && sha_raw.is_none() {
+        return Ok(None);
     }
-    let target = std::env::var_os(super::init_env::ENTRYPIN_TARGET)?;
-    let sha = std::env::var(super::init_env::ENTRYPIN_SHA).ok()?;
-    Some((fd, std::path::PathBuf::from(target), sha))
+    let eperm = || std::io::Error::from_raw_os_error(libc::EPERM);
+    let fd: RawFd = fd_raw
+        .and_then(|v| v.into_string().ok())
+        .and_then(|s| s.parse().ok())
+        .filter(|f| *f > 2)
+        .ok_or_else(eperm)?;
+    let target = target.ok_or_else(eperm)?;
+    let sha = sha_raw
+        .and_then(|v| v.into_string().ok())
+        .ok_or_else(eperm)?;
+    Ok(Some((fd, std::path::PathBuf::from(target), sha)))
 }
 
 /// Anchor the pinned entrypoint's content at its payload path. The
@@ -421,11 +431,16 @@ fn entry_pin_from_env() -> Option<(RawFd, std::path::PathBuf, String)> {
 /// later resolution land on the pinned content even if the host
 /// pathname — or the object's own bytes — changed after the parent's
 /// check: the verify→exec window other routes can only narrow closes
-/// here. Runs at the mount stage (after `/run`/`/tmp` are covered,
+/// here. The bind is remounted `MS_RDONLY` and the staged name is
+/// then unlinked: the read-only flag binds the target spelling only,
+/// and the staged copy shares the workload's owner — with its path
+/// still linked the workload could chmod +w the source and rewrite
+/// the bytes under its own entrypoint path.
+/// Runs at the mount stage (after `/run`/`/tmp` are covered,
 /// so a payload under a masked tree fails the attach cleanly); a
 /// no-op when the launch pins no payload-bound entrypoint.
 fn pin_entrypoint_mount() -> std::io::Result<()> {
-    let Some((fd, target, want_sha)) = entry_pin_from_env() else {
+    let Some((fd, target, want_sha)) = entry_pin_from_env()? else {
         return Ok(());
     };
     use std::io::Read;
@@ -442,7 +457,7 @@ fn pin_entrypoint_mount() -> std::io::Result<()> {
     std::fs::write(&staged, &bytes)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o400))?;
-    let src = CString::new(staged).map_err(std::io::Error::other)?;
+    let src = CString::new(staged.as_str()).map_err(std::io::Error::other)?;
     let dst = CString::new(target.as_os_str().as_encoded_bytes()).map_err(std::io::Error::other)?;
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
@@ -457,6 +472,33 @@ fn pin_entrypoint_mount() -> std::io::Result<()> {
     {
         return Err(std::io::Error::last_os_error());
     }
+    // Remount read-only — a plain bind inherits the source's rw mode,
+    // and the staged copy's owner is the workload's own mapped uid:
+    // without this the workload could chmod the staged file and
+    // rewrite the "pinned" bytes under its entrypoint path. `MS_BIND`
+    // must ride the remount flags or the kernel ignores the ro bit.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe {
+        libc::mount(
+            std::ptr::null(),
+            dst.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // The mount pins the inode, so the staging name is no longer
+    // needed — and must not survive: `MS_RDONLY` binds the target
+    // spelling only, while the staged file belongs to the workload's
+    // own mapped uid. Left linked, the workload could chmod +w the
+    // source path and rewrite the pinned bytes the entrypoint path
+    // resolves to. A failed unlink leaves that writable spelling, so
+    // it refuses the launch like the mounts above.
+    std::fs::remove_file(&staged)?;
+    let _ = std::fs::remove_dir(stage);
     Ok(())
 }
 
