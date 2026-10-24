@@ -312,6 +312,54 @@ async fn supervision_lost_exit(
     std::process::exit(code);
 }
 
+/// SIGUSR1 → reopen the file audit sink, so an external rotator
+/// (`postrotate kill -USR1 <guard pid>`) can swap the file underneath
+/// the guard without a stop/start. The detached task drains the signal
+/// stream for the session's life: each receipt asks the writer to
+/// flush+fsync, re-resolve the path through the sink's trust-boundary
+/// open, and swap handles. The writer then emits `audit.reopened`
+/// in-band — the new file's first record on success, an
+/// `outcome=failure` record on the surviving handle on error — before
+/// acknowledging the reopen, so the marker is durable when `reopen()`
+/// resolves and cannot be overtaken by queued records or shed by a
+/// saturated channel (a fail-closed session still aborts via the
+/// `failure_watch` arm on a reopen failure, as with any sink fault).
+/// SIGHUP stays a termination signal — the PoC commands' `129` —
+/// precisely because rotation must not look like a hangup.
+#[cfg(unix)]
+fn spawn_audit_reopen_listener(audit_logger: &AuditLogger, session: &SessionAuditContext) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(mut sigusr1) = signal(SignalKind::user_defined1()) else {
+        // A failed registration leaves USR1 at its default disposition
+        // (terminate) — the session still runs exactly as it did
+        // before the reopen path existed.
+        return;
+    };
+    let logger = audit_logger.clone();
+    let ctx = session.clone();
+    tokio::spawn(async move {
+        while sigusr1.recv().await.is_some() {
+            let marker_ctx = ctx.clone();
+            let marker_logger = logger.clone();
+            // The writer emits the marker in-band before replying, so
+            // the only path left here is a request that never reached a
+            // live writer — the sink itself is already latched dead.
+            if let Err(e) = logger
+                .reopen(Box::new(move |err| {
+                    lifecycle::audit_reopened_event(
+                        &marker_ctx,
+                        marker_logger.session_id(),
+                        err.as_deref(),
+                    )
+                }))
+                .await
+            {
+                tracing::error!("Audit reopen request failed: {e}");
+            }
+        }
+    });
+}
+
 /// Shared ctrl_c shutdown for the host / non-Unix-PID1 loop — used both
 /// when the signal wins the main `select!` and when it arrives inside
 /// the auditor-first settle window (the relay's win must not swallow
@@ -393,6 +441,11 @@ pub async fn wait_for_shutdown(
     session: SessionAuditContext,
     report: Option<ReportTarget>,
 ) -> ! {
+    // SIGUSR1 re-opens the file audit sink — the logrotate coexistence
+    // path. The listener is detached: every exit arm below ends in
+    // `std::process::exit`, which reaps it.
+    #[cfg(unix)]
+    spawn_audit_reopen_listener(&audit_logger, &session);
     match policy {
         ShutdownPolicy::Host => {
             wait_interruptible(

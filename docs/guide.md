@@ -2487,7 +2487,7 @@ Each line carries:
   `sandbox.network_denied`, `sandbox.network_resolved`,
   `sandbox.process_denied`
 - `validation`: `validation.path_traversal`, `validation.argument_invalid`
-- `system`: `guard.started`, `guard.stopped`
+- `system`: `guard.started`, `guard.stopped`, `audit.reopened`
 - `configuration`: `policy.loaded`, `policy.reloaded`, `policy.error`
 - `session`: `session.started`, `session.ended`
 - `server`: `server.connected`, `server.disconnected`, `server.error`
@@ -2805,6 +2805,64 @@ contract at all — `logging.fail_closed` therefore requires the file
 sink. The recommended deployment is the file sink (optionally
 `--audit-sync`) plus a forwarder; never the forwarder alone.
 
+**Log rotation.** On Unix the file sink coexists with an external
+rotator. `run` and `mcp-secure-runner` bind SIGUSR1 to a sink reopen
+for the life of the session: on receipt the writer drains every queued
+record into the old file first — a pre-signal record is never
+interleaved into the new file — flushes and fsyncs it, then re-resolves
+the audit path through the same trust-boundary open the launch used, so
+a link or non-regular leaf planted since launch, or a file a rotator
+recreated under a different uid, fails the reopen exactly as it would
+have failed the launch. A successful reopen is recorded as
+`audit.reopened` (`system` category) — the writer emits it in-band and
+syncs it before the reopen is acknowledged, so it is always the first
+record in the new file, carrying `signal=sigusr1` and `session_id`. A failed reopen keeps
+the old handle, so records continue into the previously opened file
+object, but latches the same writer fault a write failure does —
+`logging.fail_closed` aborts the session rather than let it run
+unrecorded, and the `audit.reopened` record then carries
+`outcome=failure` with `error=`. SIGHUP is deliberately not the
+rotation signal: the PoC commands (`unotify-run`, `namespaced-run`,
+`ebpf-run`, `macos-proxy-run`) already treat it as termination (exit
+129). Everywhere else — the PoC commands and `dns-gate` — SIGUSR1 is
+not bound and keeps its default disposition.
+
+The recommended rotator configuration is `copytruncate` — copy the
+live file, then truncate it in place: no signal is needed because the
+sink's `O_APPEND` handle resumes at offset zero, and ownership and mode
+survive untouched. The trade-off, stated plainly: records written
+between the copy and the truncate land in neither file, so a burst can
+lose a handful of records per rotation. `create`-mode rotation (move
+aside + recreate + `postrotate kill -USR1 <pid>`) loses nothing, but
+the recreated file must be owned by the logging identity — `create
+0600 <user> <group>` — because a foreign-owned file is refused at the
+next open. On Windows there is no rotation path: the append handle
+grants no delete sharing, so the file can neither be moved nor replaced
+while the session lives.
+
+**Disk-full behavior.** A write that fails because the filesystem is
+full — or hits a quota or file-size limit — is a sink fault like any
+other:
+
+- under `logging.fail_closed` (the default) the session aborts — the
+  workload is killed and the launch exits nonzero rather than run
+  unrecorded;
+- making room afterwards does not recover the session: the writer
+  fault latches permanently, so records keep failing closed until the
+  launch is restarted;
+- a record can be cut mid-line — a partial write leaves a truncated
+  tail line that is not valid JSON; readers must tolerate a non-JSON
+  final line.
+
+Capacity management is the external rotator's job, not the guard's.
+Neither a startup free-space check nor an internal `max_size` cap is
+implemented, deliberately: a statfs probe at launch cannot bound a live
+session's growth, and a guard-side size cap would either rotate earlier
+denial evidence out of the file — a bounded sink an attacker can flush
+with noise — or rename the fail-closed abort under a second dial.
+Provision the volume, rotate externally, and alert on `guard.stopped`'s
+`writer_failed=true`.
+
 **Regression coverage.** The claims in this section and the event list
 above are pinned end to end by `tests/denial_audit_e2e.rs` (PR-08): the
 denied-RPC legs prove `tool_call.denied`/`mcp_message.denied` reach the
@@ -2814,8 +2872,9 @@ Landlock/seccomp legs prove the kernel-internal denials above leave *no*
 `sandbox.*_denied` record — the "unobservable" contract asserted as a
 specification, with the workload's own EACCES/EPERM report as the
 witness that the denial happened. SIGKILL tail-loss bounds are measured
-by `tests/audit_durability_e2e.rs`. Scenario definitions, commands, and
-recorded numbers live in
+by `tests/audit_durability_e2e.rs`; the rotation and disk-full
+contracts above are pinned by `tests/audit_reopen_e2e.rs` (PR-27).
+Scenario definitions, commands, and recorded numbers live in
 [`docs/validation/denial-audit.md`](validation/denial-audit.md).
 
 ---

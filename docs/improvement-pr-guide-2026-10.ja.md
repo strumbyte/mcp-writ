@@ -1071,13 +1071,13 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] シグナルで監査ログを開き直し、`audit.reopened` を記録する。
-  - SIGHUP は PoC 系コマンドで終了扱い（129）なので、使うシグナルと `run` 側の扱いを整理する。
-  - 開き直す前に flush と fsync を行う。
-- [ ] 起動時に空き容量を検査するか、`logging max_size=` を設けるかを判断する。
-- [ ] 容量が尽きたときの挙動を guide に書く。fail-closed で中断する、空きを作っても復帰しない、行が途中で切れることがある、の 3 点。あわせて `copytruncate` を推奨し、別の uid で作り直すと次の起動を拒否することも書く。
+- [x] シグナルで監査ログを開き直し、`audit.reopened` を記録する。→ 実施（2026-10-24）
+  - SIGHUP は PoC 系コマンドで終了扱い（129）なので、使うシグナルと `run` 側の扱いを整理する。→ **SIGUSR1 を採用**（ログ再オープンの Unix 慣例）。`wait_for_shutdown` が独立タスクを立て、`run`（Host）と `mcp-secure-runner`（Pid1Unix）の両待機経路で受け付ける — 子プロセスへは転送しない（シグナルはガード宛）。PoC 系コマンドは SIGUSR1 を束ねず既定 disposition（終了）のままで、SIGHUP の終了扱いも据え置き。`audit.reopened` は `system` カテゴリで `signal=sigusr1`・`session_id=` を持つ。マーカーは `AuditLogger::reopen(marker)` のファクトリとして渡しライターが in-band で書き込む — 成功時は新ファイルの先頭レコード（ack 前に flush + fsync 済みで、キュー滞留レコードに抜かれずチャネル飽和でも落ちない）、失敗時は生存ハンドルに `outcome=failure` + `error=` で記録される
+  - 開き直す前に flush と fsync を行う。→ ライターの reopen 腕は `biased` select でレコード腕の後ろに置き、キュー滞留分を旧ファイルへ書き切ってから flush + `sync_all` → `open_audit_sink` で同一信頼境界（リンク拒否・通常ファイル検証・所有者一致・0600 化）を再解決 → ハンドル差替 → 新規作成時は親ディレクトリを即 fsync。失敗は `writer_failed` をラッチし旧ハンドルを維持 — fail-closed は `failure_watch` 経路でセッションを中断する
+- [x] 起動時に空き容量を検査するか、`logging max_size=` を設けるかを判断する。→ **いずれも設けない**。起動時の statfs は稼働中セッションの増加を縛れず、ガード内 `max_size` は過去の拒否記録をファイルから追い出す上限付きシンク（攻撃者がノイズで証拠を押し流せる）になるか fail-closed 中断の別名に過ぎない。容量管理は外部ローテータの責務として guide 英日に明記
+- [x] 容量が尽きたときの挙動を guide に書く。fail-closed で中断する、空きを作っても復帰しない、行が途中で切れることがある、の 3 点。あわせて `copytruncate` を推奨し、別の uid で作り直すと次の起動を拒否することも書く。→ guide.md「Log rotation」・「Disk-full behavior」、guide.ja.md「ログローテーション」・「容量枯渇時の挙動」節に記載し、イベント一覧の `system` に `audit.reopened` を追加。`copytruncate` の copy→truncate 間の損失窓も明記し、欠落なしは `create` + `postrotate kill -USR1` 方式（`create 0600 <user> <group>` でロギング主体の所有にする）と併記
 
-**検証:** T-BASE。開き直したあとの記録が新しいファイルへ続くことと、容量が尽きたときの中断を fixture で確認する。
+**検証:** T-BASE。開き直したあとの記録が新しいファイルへ続くことと、容量が尽きたときの中断を fixture で確認する。→ 実施（2026-10-24・WSL2・x86-64・rustc 1.99.0）: `src/audit_log/tests.rs` に reopen 系 4 件（rename 後の新ファイル継続・失敗時の旧シンク維持と latch・同パス reopen・非ファイル/停止後シンク）と `runtime::lifecycle` の `audit_reopened` emit 件を追加、`tests/audit_reopen_e2e.rs` 3 件 — 実 SIGUSR1 → reopen で `audit.reopened` マーカーと後続レコードが新ファイルへ続くこと、`RLIMIT_FSIZE` で容量枯渇を模した書き込み失敗が fail-closed にラッチされ空きを戻しても復帰しないこと（EFBIG は ENOSPC と同一のライター障害経路）を実プロセス fixture で確認
 
 **完了条件:** logrotate と共存でき、容量が尽きたときの挙動が文書から読める。
 
