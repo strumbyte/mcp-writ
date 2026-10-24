@@ -537,10 +537,12 @@ fn fake_macho(libs: &[&str], rpaths: &[&str]) -> Vec<u8> {
     for rp in rpaths {
         let name = rp.as_bytes();
         let start = cmds.len();
-        let size = 8 + ((name.len() + 1 + 7) & !7);
+        // rpath_command = cmd + cmdsize + path-offset, then the path —
+        // the string sits at offset 12 inside the command.
+        let size = 12 + ((name.len() + 1 + 7) & !7);
         cmds.extend_from_slice(&0x8000_001cu32.to_le_bytes()); // LC_RPATH
         cmds.extend_from_slice(&(size as u32).to_le_bytes());
-        cmds.extend_from_slice(&8u32.to_le_bytes()); // path offset
+        cmds.extend_from_slice(&12u32.to_le_bytes()); // path offset
         cmds.extend_from_slice(name);
         cmds.push(0);
         cmds.resize(start + size, 0);
