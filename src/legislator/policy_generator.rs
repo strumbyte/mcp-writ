@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::inspector::profile::CapabilityProfile;
 use crate::legislator::cross_validator::CrossValidationResult;
 use crate::legislator::heuristics::Permission;
-use crate::legislator::source_bind::WorkloadHashes;
+use crate::legislator::source_bind::{InterpreterKind, WorkloadHashes};
 use crate::termutil::{escape_kdl_comment, escape_kdl_string};
 use crate::tool_def::ToolDefinition;
 use crate::verifier::manifest::{ManifestFinding, scan_manifest};
@@ -102,7 +102,8 @@ pub fn generate_policy(
     build_fs_section(&mut out, result, capability);
 
     // syscalls
-    build_syscalls_section(&mut out, result, capability);
+    let interpreter_baseline = workload.interpreter.and_then(interpreter_syscall_baseline);
+    build_syscalls_section(&mut out, result, capability, interpreter_baseline.as_ref());
 
     // network (advisory only — destinations are never inferred)
     build_network_section(&mut out, result, capability);
@@ -507,11 +508,38 @@ fn build_fs_section(
     out.push_str("    }\n");
 }
 
+/// The interpreter's shared seccomp baseline, compiled in from the same
+/// `examples/policies/runtime/<name>.kdl` that host policies `extends` —
+/// a generated draft stays self-contained wherever it is saved, so the
+/// baseline travels with the binary rather than the checkout. Returns
+/// `(source label, allow names)`; `None` when the embedded file cannot
+/// yield a list (in-repo content — that would be a build bug, not an
+/// operator error, and the draft falls back to REVIEW comments).
+fn interpreter_syscall_baseline(
+    interpreter: InterpreterKind,
+) -> Option<(&'static str, Vec<String>)> {
+    let (label, text) = match interpreter {
+        InterpreterKind::Node | InterpreterKind::Npx => (
+            "examples/policies/runtime/node.kdl",
+            include_str!("../../examples/policies/runtime/node.kdl"),
+        ),
+        InterpreterKind::Python => (
+            "examples/policies/runtime/python.kdl",
+            include_str!("../../examples/policies/runtime/python.kdl"),
+        ),
+    };
+    crate::policy::kdl_loader::parse_kdl_policy(text)
+        .ok()
+        .map(|p| (label, p.syscalls.allowed))
+        .filter(|(_, names)| !names.is_empty())
+}
+
 /// Build the syscalls sub-section inside defaults.
 fn build_syscalls_section(
     out: &mut String,
     result: &CrossValidationResult,
     capability: &CapabilityProfile,
+    interpreter_baseline: Option<&(&'static str, Vec<String>)>,
 ) {
     out.push_str("    // === Syscalls ===\n");
     out.push_str("    syscalls {\n");
@@ -553,14 +581,41 @@ fn build_syscalls_section(
     // tables (BSD syscalls and Mach traps in separate namespaces), and an
     // undetermined ABI means the numbering convention itself is unknown —
     // neither may feed a Linux allowlist, so both get review comments.
+    // A blocked verdict only vetoes a syscall class when no allowed verdict
+    // claims the same permission — `cross_validate_source` emits per-tool
+    // verdicts, so one tool's Case-B block must not strip the syscalls a
+    // Case-A tool legitimately needs (the process-wide seccomp list cannot
+    // express "allowed for this tool only", and `build_network_section`
+    // keys its advisory off `result.allowed` the same way).
+    let allowed_perms: HashSet<&Permission> =
+        result.allowed.iter().map(|v| &v.permission).collect();
+    let blocked_perms: Vec<&Permission> = result
+        .blocked
+        .iter()
+        .map(|v| &v.permission)
+        .filter(|p| !allowed_perms.contains(p))
+        .collect();
+
     if t.abi == crate::inspector::target::SyscallAbi::Linux {
         let mut allowed_set: Vec<&str> = BASE_SYSCALLS.to_vec();
 
-        let blocked_perms: Vec<&Permission> =
-            result.blocked.iter().map(|v| &v.permission).collect();
-
         for sc in &capability.syscalls {
             if let Some(ref name) = sc.syscall_name {
+                let name_str = name.as_str();
+                if is_syscall_blocked(name_str, &blocked_perms) {
+                    continue;
+                }
+                if !allowed_set.contains(&name_str) {
+                    allowed_set.push(name_str);
+                }
+            }
+        }
+
+        // A launch that pairs native analysis with a modeled interpreter
+        // still needs the interpreter's runtime syscalls — merge the shared
+        // baseline under the same blocked-permission filter.
+        if let Some((_, baseline_names)) = interpreter_baseline {
+            for name in baseline_names {
                 let name_str = name.as_str();
                 if is_syscall_blocked(name_str, &blocked_perms) {
                     continue;
@@ -580,8 +635,13 @@ fn build_syscalls_section(
             out.push_str(&format!("        allow {}\n", args.join(" ")));
         }
 
-        // REVIEW comments for blocked syscalls
+        // REVIEW comments for blocked syscalls — skip verdicts whose
+        // permission class another tool was allowed: those syscalls were
+        // kept in the allowlist above and "blocked" would misreport them.
         for verdict in &result.blocked {
+            if allowed_perms.contains(&verdict.permission) {
+                continue;
+            }
             match verdict.permission {
                 Permission::ProcessExec => {
                     for sc in &capability.syscalls {
@@ -611,6 +671,48 @@ fn build_syscalls_section(
                 _ => {}
             }
         }
+    } else if let Some((baseline_src, names)) = interpreter_baseline {
+        // Interpreted payload: the analyzed object is source text, not an
+        // ELF, so there is no syscall table to resolve — but the runtime
+        // that executes it has a known seccomp footprint. Emitting the
+        // shared baseline keeps the draft enforceable instead of an
+        // allow-nothing list that refuses the launch outright. Baseline
+        // names pass the same blocked-permission filter as analyzed
+        // syscalls — a denied capability class must not re-enter through
+        // the baseline (e.g. `execve` under a blocked ProcessExec, or
+        // `socket` under a blocked NetworkOutbound).
+        let usable: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|n| !is_syscall_blocked(n, &blocked_perms))
+            .collect();
+        out.push_str("        // Interpreted workload: no ELF syscall table exists for a source\n");
+        out.push_str(&format!(
+            "        // payload — seeded the shared interpreter baseline from {}\n",
+            escape_kdl_comment(baseline_src)
+        ));
+        for chunk in usable.chunks(6) {
+            let args: Vec<String> = chunk
+                .iter()
+                .map(|s| format!("\"{}\"", escape_kdl_string(s)))
+                .collect();
+            out.push_str(&format!("        allow {}\n", args.join(" ")));
+        }
+        let dropped: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|n| is_syscall_blocked(n, &blocked_perms))
+            .collect();
+        if !dropped.is_empty() {
+            out.push_str(&format!(
+                "        // REVIEW: baseline entries dropped by blocked permissions: {}\n",
+                escape_kdl_comment(&dropped.join(", "))
+            ));
+        }
+        out.push_str("        // REVIEW: covers interpreter runtime needs; workload-specific\n");
+        out.push_str("        // syscalls may still be missing — `unknown syscall` or EPERM in\n");
+        out.push_str("        // stderr or the audit log names what to add. A child `syscalls`\n");
+        out.push_str("        // allow REPLACES this whole list — it does not append.\n");
     } else {
         out.push_str(
             "        // REVIEW: target uses a non-Linux syscall ABI — the entries below are\n",

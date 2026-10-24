@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use super::{PayloadDiscovery, PayloadKind, delegating_launcher_reason};
 use crate::workload::{
-    CommandNames, argv_contains_inline_eval_with_exe, first_payload_arg_with_exe, is_perl_command,
-    is_powershell_command, is_ruby_command, is_shell_command, node_preload_flags_present_with_exe,
-    payload_boundary_blocker_with_exe,
+    CommandNames, InterpreterKind, argv_contains_inline_eval_with_exe, first_payload_arg_with_exe,
+    is_perl_command, is_powershell_command, is_ruby_command, is_shell_command,
+    node_preload_flags_present_with_exe, payload_boundary_blocker_with_exe,
 };
 
 /// One `<type> "<sha256>" target="<path>"` line's data for the draft.
@@ -38,6 +38,14 @@ pub struct WorkloadHashes {
     pub entrypoint: Option<HashLine>,
     /// Why launch targets could not be pinned (empty when fully bound).
     pub unbound_reasons: Vec<String>,
+    /// The modeled interpreter family this workload launches under
+    /// (`Source` / `InlineEval` payloads); `None` for native launches and
+    /// unclassifiable invocations. The draft generator seeds the matching
+    /// `examples/policies/runtime/*.kdl` seccomp baseline from it — an
+    /// interpreted payload has no ELF syscall table to analyze, and without
+    /// the baseline the emitted `syscalls` block is an allow-nothing list
+    /// that refuses the enforced launch outright.
+    pub interpreter: Option<InterpreterKind>,
 }
 
 impl WorkloadHashes {
@@ -82,7 +90,14 @@ pub fn workload_hashes(
     discovery: &PayloadDiscovery,
     analyzed: Option<&AnalyzedDigest>,
 ) -> WorkloadHashes {
-    let mut out = WorkloadHashes::default();
+    let mut out = WorkloadHashes {
+        interpreter: match &discovery.kind {
+            PayloadKind::Source { interpreter, .. }
+            | PayloadKind::InlineEval { interpreter, .. } => Some(*interpreter),
+            PayloadKind::Native | PayloadKind::Unresolved { .. } => None,
+        },
+        ..Default::default()
+    };
     let mut reasons: Vec<String> = Vec::new();
 
     // Resolve `argv[0]` the way `run` does under a hash policy: a `#!`

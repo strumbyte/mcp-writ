@@ -915,7 +915,9 @@ fn native_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
                         "egress rule '{text}' binds a destination — Landlock \
                          netport rules bind a port only, so the allow's \
                          connects would be kernel-denied; destination \
-                         narrowing needs the namespaced route"
+                         narrowing needs the namespaced route, or spell the \
+                         grant port-only (`allow host=\"*\" port=<port>`) to \
+                         stay on this route"
                     ));
                 }
             }
