@@ -994,6 +994,45 @@ fn test_v3_defaults_filesystem_bare_replace_node_moves_nothing() {
     );
 }
 
+// `defaults.syscalls` has no `allow none=#true` spelling, so a
+// `replace=#true` block with an empty allow side is itself the explicit
+// empty list — it clears the inherited allows.
+#[test]
+fn test_v3_defaults_syscalls_empty_replace_clears_inherited() {
+    let dir = make_test_dir("v3_sc_empty_replace");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "execve"
+                    allow "openat"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=3
+            defaults {
+                syscalls replace=#true
+            }
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
+    assert!(
+        policy.syscalls.allowed.is_empty(),
+        "an explicit empty replace clears the inherited allow list: {:?}",
+        policy.syscalls.allowed
+    );
+}
+
 // ── none-needs-replace is a grammar rule, not a merge rule ──────────
 
 // The simulated load keeps each document's declared grammar: a v2
