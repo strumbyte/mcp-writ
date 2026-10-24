@@ -619,6 +619,15 @@ async fn real_main() {
             cross_uid_channel: false,
         });
 
+    // SIGUSR1 re-opens the file audit sink — the logrotate coexistence
+    // path. The binding is a per-binary opt-in ahead of the shared wait
+    // loop, not part of it: a command that never asks for rotation keeps
+    // USR1's default terminate disposition. The listener is detached —
+    // every `wait_for_shutdown` exit arm ends in `std::process::exit`,
+    // which reaps it.
+    #[cfg(unix)]
+    mcp_writ::runtime::wait::spawn_audit_reopen_listener(&audit_logger, &launched.session_audit);
+
     // 7. Wait for child exit, auditor completion, or SIGINT. The wait
     //    loop closes the audit bracket (server.disconnected →
     //    session.ended → guard.stopped) on every exit path.

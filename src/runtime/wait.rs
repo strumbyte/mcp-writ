@@ -314,10 +314,15 @@ async fn supervision_lost_exit(
 
 /// SIGUSR1 → reopen the file audit sink, so an external rotator
 /// (`postrotate kill -USR1 <guard pid>`) can swap the file underneath
-/// the guard without a stop/start. The detached task drains the signal
-/// stream for the session's life: each receipt asks the writer to
-/// flush+fsync, re-resolve the path through the sink's trust-boundary
-/// open, and swap handles. The writer then emits `audit.reopened`
+/// the guard without a stop/start. This is a per-binary opt-in invoked
+/// ahead of [`wait_for_shutdown`] by the durable-session callers —
+/// `run` (host) and `mcp-secure-runner` (PID1) — never inside the
+/// shared wait loop itself, so a command that does not ask for
+/// rotation (the PoC commands) keeps SIGUSR1's default disposition:
+/// terminate. The detached task drains the signal stream for the
+/// session's life: each receipt asks the writer to flush+fsync,
+/// re-resolve the path through the sink's trust-boundary open, and
+/// swap handles. The writer then emits `audit.reopened`
 /// in-band — the new file's first record on success, an
 /// `outcome=failure` record on the surviving handle on error — before
 /// acknowledging the reopen, so the marker is durable when `reopen()`
@@ -327,7 +332,7 @@ async fn supervision_lost_exit(
 /// SIGHUP stays a termination signal — the PoC commands' `129` —
 /// precisely because rotation must not look like a hangup.
 #[cfg(unix)]
-fn spawn_audit_reopen_listener(audit_logger: &AuditLogger, session: &SessionAuditContext) {
+pub fn spawn_audit_reopen_listener(audit_logger: &AuditLogger, session: &SessionAuditContext) {
     use tokio::signal::unix::{SignalKind, signal};
     // A session without a file sink has nothing to reopen — leave
     // USR1 at its default disposition (terminate) instead of binding a
@@ -447,11 +452,6 @@ pub async fn wait_for_shutdown(
     session: SessionAuditContext,
     report: Option<ReportTarget>,
 ) -> ! {
-    // SIGUSR1 re-opens the file audit sink — the logrotate coexistence
-    // path. The listener is detached: every exit arm below ends in
-    // `std::process::exit`, which reaps it.
-    #[cfg(unix)]
-    spawn_audit_reopen_listener(&audit_logger, &session);
     match policy {
         ShutdownPolicy::Host => {
             wait_interruptible(

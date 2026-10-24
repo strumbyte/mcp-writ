@@ -602,6 +602,13 @@ async fn main() {
         cross_uid_channel: true,
     });
 
+    // SIGUSR1 re-opens the file audit sink — the guest-side logrotate
+    // coexistence path. The binding is a per-binary opt-in ahead of the
+    // shared wait loop, matching the host `run` call site; binaries that
+    // do not opt in keep USR1's default terminate disposition.
+    #[cfg(unix)]
+    mcp_writ::runtime::wait::spawn_audit_reopen_listener(&audit_logger, &launched.session_audit);
+
     // 6. PID1 signal management: SIGTERM, SIGINT → forward to child, exit with child's code
     #[cfg(unix)]
     let shutdown_policy = mcp_writ::runtime::wait::ShutdownPolicy::Pid1Unix;

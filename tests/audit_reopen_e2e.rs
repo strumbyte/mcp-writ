@@ -3,9 +3,11 @@
 //! grants no delete sharing for a rotator to move anyway.
 //!
 //! - `rotate` leg: a re-exec'd child opens the file audit sink,
-//!   registers a SIGUSR1 stream (the same mechanism `wait_for_shutdown`
-//!   wires), and proves the stream continues into the *new* file after
-//!   the parent renames the old one away and signals.
+//!   registers the production SIGUSR1 listener (the same
+//!   `spawn_audit_reopen_listener` call `run` and `mcp-secure-runner`
+//!   make ahead of `wait_for_shutdown`), and proves the stream
+//!   continues into the *new* file after the parent renames the old
+//!   one away and signals.
 //! - `enospc` leg: `RLIMIT_FSIZE` stands in for a full filesystem —
 //!   writes past the limit fail `EFBIG` through the identical writer
 //!   fault path an `ENOSPC` takes — proving the fail-closed latch and
@@ -20,7 +22,7 @@ use std::process::{Child, Command, Stdio};
 use mcp_writ::audit_log::{
     Action, AuditEvent, AuditLogger, AuditSyncMode, EventType, Outcome, Severity,
 };
-use mcp_writ::runtime::lifecycle::{self, SessionAuditContext};
+use mcp_writ::runtime::lifecycle::SessionAuditContext;
 use uuid::Uuid;
 
 const CHILD_FLAG: &str = "MCP_WRIT_REOPEN_FIXTURE_CHILD";
@@ -55,16 +57,15 @@ async fn audit_reopen_child() {
     }
 }
 
-/// The rotate leg: one committed record anchors the old file, then
-/// SIGUSR1 drives `reopen()` with the `audit.reopened` marker emitted
-/// in-band — the same sequence the wait loop's listener runs — and a
-/// second committed record proves the stream resumed on the new file.
+/// The rotate leg: one committed record anchors the old file, then the
+/// production listener — `spawn_audit_reopen_listener`, the same call
+/// `run` and `mcp-secure-runner` make ahead of `wait_for_shutdown` —
+/// turns the parent's SIGUSR1 into a `reopen()` with the
+/// `audit.reopened` marker emitted in-band, and a second committed
+/// record proves the stream resumed on the new file.
 async fn run_rotate_leg(path: &Path) {
-    use tokio::signal::unix::{SignalKind, signal};
-
     let logger = AuditLogger::to_file_with_options(path, true, AuditSyncMode::EveryEvent)
         .expect("child logger");
-    let mut sigusr1 = signal(SignalKind::user_defined1()).expect("SIGUSR1 handler");
     let ctx = SessionAuditContext::pre_policy(Uuid::now_v7(), "test-reopen");
     let cid = ctx.launch_id;
 
@@ -72,25 +73,25 @@ async fn run_rotate_leg(path: &Path) {
         .log_committed(fixture_event(cid, "pre-rotation"))
         .await
         .expect("pre-rotation record");
+    mcp_writ::runtime::wait::spawn_audit_reopen_listener(&logger, &ctx);
     println!("READY");
     std::io::stdout().flush().unwrap();
 
-    sigusr1.recv().await.expect("SIGUSR1 delivery");
-    let marker_ctx = ctx.clone();
-    let marker_logger = logger.clone();
-    assert!(
-        logger
-            .reopen(Box::new(move |err| {
-                lifecycle::audit_reopened_event(
-                    &marker_ctx,
-                    marker_logger.session_id(),
-                    err.as_deref(),
-                )
-            }))
-            .await
-            .expect("reopen call"),
-        "file sink"
-    );
+    // Wait out the listener's reopen: the marker is written in-band as
+    // the new file's first record before `reopen()` acknowledges, so
+    // seeing it here means the handle swap already completed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !read_lines(path)
+        .iter()
+        .any(|line| line.contains("\"event_type\":\"audit.reopened\""))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SIGUSR1 listener did not complete the reopen"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
     logger
         .log_committed(fixture_event(cid, "post-rotation"))
         .await
