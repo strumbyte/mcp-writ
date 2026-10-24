@@ -353,7 +353,7 @@ pub fn bind_launched_workload(
 ///
 /// On Unix the pin also mints [`FdExecPlan`]: the *executable* —
 /// always the image the kernel maps (`resolve_launch` already expands
-/// a `#!` argv[0] to its interpreter launch under a pin, so the
+/// a `#!` `argv[0]` to its interpreter launch under a pin, so the
 /// resolved exe is never itself a script payload) — execs the pinned
 /// object's snapshot: an inherited `/proc/self/fd` descriptor on
 /// Linux, the staged copy's path in its owner-only directory on the

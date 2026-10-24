@@ -127,6 +127,29 @@ fn spawn_guard_report(
 
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"workload-hash-e2e","version":"0.0.0"}}}"#;
 
+/// When the guard's stdout closes early, surface the child's exit
+/// status and captured stderr so the panic names the failure instead of
+/// a bare EOF.
+async fn early_eof_detail(child: &mut tokio::process::Child) -> String {
+    let status = match timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(Ok(s)) => format!("exit status {s}"),
+        Ok(Err(e)) => format!("wait error {e}"),
+        Err(_) => "still running after 3s".to_string(),
+    };
+    let stderr = match child.stderr.take() {
+        Some(mut err) => {
+            let mut buf = Vec::new();
+            let _ = timeout(Duration::from_secs(3), async {
+                tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await
+            })
+            .await;
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+        None => String::new(),
+    };
+    format!("{status}; stderr: {}", stderr.trim())
+}
+
 /// Drive one `initialize` over the child's pipes; the response must be a
 /// JSON-RPC result (the server answered through the Auditor relay).
 async fn drive_handshake(child: &mut tokio::process::Child) {
@@ -142,13 +165,17 @@ async fn drive_handshake(child: &mut tokio::process::Child) {
 
     let line = timeout(Duration::from_secs(TIMEOUT_SECS), async {
         loop {
-            let line = reader
+            match reader
                 .next_line()
                 .await
                 .expect("IO error reading mcp-writ stdout")
-                .expect("unexpected EOF on mcp-writ stdout - child may have exited");
-            if line.starts_with("{\"jsonrpc\"") {
-                return line;
+            {
+                Some(line) if line.starts_with("{\"jsonrpc\"") => return line,
+                Some(_) => continue,
+                None => panic!(
+                    "unexpected EOF on mcp-writ stdout - child may have exited: {}",
+                    early_eof_detail(child).await
+                ),
             }
         }
     })
@@ -312,11 +339,17 @@ async fn drive_handshake_and_list(child: &mut tokio::process::Child) {
     let mut saw_tools = false;
     timeout(Duration::from_secs(TIMEOUT_SECS), async {
         while !saw_init {
-            let line = reader
+            let line = match reader
                 .next_line()
                 .await
                 .expect("IO error reading mcp-writ stdout")
-                .expect("unexpected EOF on mcp-writ stdout - child may have exited");
+            {
+                Some(line) => line,
+                None => panic!(
+                    "unexpected EOF on mcp-writ stdout - child may have exited: {}",
+                    early_eof_detail(child).await
+                ),
+            };
             if !line.starts_with("{\"jsonrpc\"") || !line.contains("\"id\":1") {
                 continue;
             }
@@ -340,11 +373,17 @@ async fn drive_handshake_and_list(child: &mut tokio::process::Child) {
         stdin.flush().await.expect("flush tools/list");
 
         while !saw_tools {
-            let line = reader
+            let line = match reader
                 .next_line()
                 .await
                 .expect("IO error reading mcp-writ stdout")
-                .expect("unexpected EOF on mcp-writ stdout - child may have exited");
+            {
+                Some(line) => line,
+                None => panic!(
+                    "unexpected EOF on mcp-writ stdout - child may have exited: {}",
+                    early_eof_detail(child).await
+                ),
+            };
             if !line.starts_with("{\"jsonrpc\"") || !line.contains("\"id\":2") {
                 continue;
             }
