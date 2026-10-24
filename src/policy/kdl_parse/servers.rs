@@ -190,7 +190,7 @@ pub(crate) fn parse_servers(
                             !policy.allowed_paths.is_empty(),
                             tool_fs_replace,
                             &format!("{tool_ctx}.filesystem"),
-                            rules,
+                            version,
                         )?;
                         Some(policy)
                     } else {
@@ -234,7 +234,7 @@ pub(crate) fn parse_servers(
                                 || policy.egress_rules.iter().any(|r| r.allow),
                             tool_network_replace,
                             &format!("{tool_ctx}.network"),
-                            rules,
+                            version,
                         )?;
                         Some(policy)
                     } else {

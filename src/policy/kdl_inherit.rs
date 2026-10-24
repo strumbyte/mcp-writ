@@ -377,6 +377,12 @@ fn load_kdl_policy_subtree(
         pending.push_weakened(path, weakened);
     }
     decl.merge(&when_decl);
+    // The decl a caller reuses as `inc_decl` may carry only this
+    // file's own `replace` intent: deeper ancestors' and included
+    // files' flags were consumed by their own merges inside this
+    // subtree, and re-exporting one would re-fire that narrowing at
+    // an includer's boundary against grants it never declared against.
+    decl.retain_own_replace_flags(&doc_decl, &when_decl);
     rematerialize_inherited_defaults(&mut policy, cx.prov, path);
 
     Ok((policy, decl, pending))

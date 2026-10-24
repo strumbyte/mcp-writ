@@ -564,6 +564,487 @@ fn test_v3_ancestor_version_still_validated() {
     );
 }
 
+// A `replace=#true` consumed inside a subtree must not re-fire when
+// that subtree is itself overlaid elsewhere — `mid.kdl` declared no
+// replace on its `filesystem` block, so including it unions.
+#[test]
+fn test_v3_ancestor_fs_replace_flag_does_not_leak_through_include() {
+    let dir = make_test_dir("v3_fs_replace_leak");
+    std::fs::write(
+        dir.join("gp.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                filesystem replace=#true {
+                    allow "/gp/**"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("mid.kdl"),
+        r#"
+            extends "gp.kdl"
+            policy version=3
+            defaults {
+                filesystem {
+                    allow "/mid/**"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("other.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                filesystem {
+                    allow "/other/**"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("top.kdl"),
+        r#"
+            extends "other.kdl"
+            include "mid.kdl"
+            policy version=3
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("top.kdl")).unwrap();
+    assert!(
+        policy.fs.read_only.contains(&"/other/**".to_string())
+            && policy.fs.read_only.contains(&"/gp/**".to_string())
+            && policy.fs.read_only.contains(&"/mid/**".to_string()),
+        "gp's consumed replace must not re-fire at mid's include boundary: {:?}",
+        policy.fs.read_only
+    );
+}
+
+// The same boundary rule for `defaults.syscalls` — the accumulated
+// decl must not carry an ancestor's `replace` forward.
+#[test]
+fn test_v3_ancestor_syscalls_replace_flag_does_not_leak_through_include() {
+    let dir = make_test_dir("v3_sc_replace_leak");
+    std::fs::write(
+        dir.join("gp.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                syscalls replace=#true {
+                    allow "execve"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("mid.kdl"),
+        r#"
+            extends "gp.kdl"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "openat"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("other.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "read"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("top.kdl"),
+        r#"
+            extends "other.kdl"
+            include "mid.kdl"
+            policy version=3
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("top.kdl")).unwrap();
+    for sc in ["read", "execve", "openat"] {
+        assert!(
+            policy.syscalls.allowed.contains(&sc.to_string()),
+            "mid's syscalls union — it declared no replace: {:?}",
+            policy.syscalls.allowed
+        );
+    }
+}
+
+// A subtree that declares no `filesystem` block at all must not carry
+// an ancestor's `replace` out either: the flag was consumed by the
+// ancestor's own merge inside the subtree.
+#[test]
+fn test_v3_ancestor_fs_replace_flag_cleared_when_subtree_silent() {
+    let dir = make_test_dir("v3_fs_replace_silent");
+    std::fs::write(
+        dir.join("gp.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                filesystem replace=#true {
+                    allow "/gp/**"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("mid.kdl"),
+        r#"
+            extends "gp.kdl"
+            policy version=3
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("other.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                filesystem {
+                    allow "/other/**"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("top.kdl"),
+        r#"
+            extends "other.kdl"
+            include "mid.kdl"
+            policy version=3
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("top.kdl")).unwrap();
+    assert_eq!(
+        policy.fs.read_only,
+        vec!["/other/**", "/gp/**"],
+        "gp's replace fired inside mid's subtree — it must not reach top's boundary"
+    );
+}
+
+// Same boundary rule for `defaults.syscalls` when the included subtree
+// is silent on the block.
+#[test]
+fn test_v3_ancestor_syscalls_replace_flag_cleared_when_subtree_silent() {
+    let dir = make_test_dir("v3_sc_replace_silent");
+    std::fs::write(
+        dir.join("gp.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                syscalls replace=#true {
+                    allow "execve"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("mid.kdl"),
+        r#"
+            extends "gp.kdl"
+            policy version=3
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("other.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "read"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("top.kdl"),
+        r#"
+            extends "other.kdl"
+            include "mid.kdl"
+            policy version=3
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("top.kdl")).unwrap();
+    assert!(
+        policy.syscalls.allowed.contains(&"read".to_string())
+            && policy.syscalls.allowed.contains(&"execve".to_string()),
+        "mid's silent subtree unions: {:?}",
+        policy.syscalls.allowed
+    );
+}
+
+// Same boundary rule for `defaults.network` when the included subtree
+// is silent on the block.
+#[test]
+fn test_v3_ancestor_network_replace_flag_cleared_when_subtree_silent() {
+    let dir = make_test_dir("v3_net_replace_silent");
+    std::fs::write(
+        dir.join("gp.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                network replace=#true {
+                    allow host="gp.example.com"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("mid.kdl"),
+        r#"
+            extends "gp.kdl"
+            policy version=3
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("other.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                network {
+                    allow host="other.example.com"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("top.kdl"),
+        r#"
+            extends "other.kdl"
+            include "mid.kdl"
+            policy version=3
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("top.kdl")).unwrap();
+    assert!(
+        policy
+            .network
+            .outbound
+            .allowed
+            .contains(&"other.example.com".to_string())
+            && policy
+                .network
+                .outbound
+                .allowed
+                .contains(&"gp.example.com".to_string()),
+        "gp's network replace must not drop top's base: {:?}",
+        policy.network.outbound.allowed
+    );
+}
+
+// The subtree's own head declaration still governs: an included file
+// that itself writes `replace=#true` applies it at the include
+// boundary — the flag that travels is the last writer's, not a
+// consumed ancestor's.
+#[test]
+fn test_v3_included_file_own_replace_applies_at_include_boundary() {
+    let dir = make_test_dir("v3_include_own_replace");
+    std::fs::write(
+        dir.join("mid.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                filesystem replace=#true {
+                    allow "/mid/**"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("other.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                filesystem {
+                    allow "/other/**"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("top.kdl"),
+        r#"
+            extends "other.kdl"
+            include "mid.kdl"
+            policy version=3
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("top.kdl")).unwrap();
+    assert_eq!(
+        policy.fs.read_only,
+        vec!["/mid/**"],
+        "the included file's own replace replaces the accumulated allow side"
+    );
+}
+
+// ── defaults-level filesystem replace without an allow side ─────────
+
+// `defaults.filesystem replace=#true` narrows even when the block
+// declares no allow side — an empty allow list clears the inherited
+// grants, the same gate syscalls/network and every other scope apply.
+#[test]
+fn test_v3_defaults_filesystem_replace_with_deny_only_clears_allows() {
+    let dir = make_test_dir("v3_fs_replace_deny_only");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                filesystem {
+                    allow "/base/**"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=3
+            defaults {
+                filesystem replace=#true {
+                    deny "/secret"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
+    assert!(
+        policy.fs.read_only.is_empty() && policy.fs.read_write.is_empty(),
+        "deny-only replace must clear the inherited allow lists: {:?}",
+        (policy.fs.read_only, policy.fs.read_write)
+    );
+    assert_eq!(policy.fs.denied_paths, vec!["/secret"]);
+}
+
+// A bare `filesystem` node moves no value even with `replace=#true` —
+// mirroring the childless-`network` rule, it declares nothing.
+#[test]
+fn test_v3_defaults_filesystem_bare_replace_node_moves_nothing() {
+    let dir = make_test_dir("v3_fs_bare_replace");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                filesystem {
+                    allow "/base/**"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=3
+            defaults {
+                filesystem replace=#true
+            }
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
+    assert_eq!(
+        policy.fs.read_only,
+        vec!["/base/**"],
+        "a childless filesystem node declares nothing to replace with"
+    );
+}
+
+// ── none-needs-replace is a grammar rule, not a merge rule ──────────
+
+// The simulated load keeps each document's declared grammar: a v2
+// `allow none=#true` is legal v2 spelling, so a simulated v3 load
+// composes (and widens) it rather than failing — every scope applies
+// the declared-version check, not the simulated-rules check.
+#[test]
+fn test_v2_allow_none_under_simulated_v3_composes_and_widens() {
+    let dir = make_test_dir("v2_none_sim_v3");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        r#"
+            policy version=2
+            defaults {
+                filesystem {
+                    allow "/base/**"
+                }
+            }
+            profile "p" {
+                filesystem {
+                    allow none=#true
+                }
+            }
+            server "s" {
+                tool "t" {
+                    profile "p"
+                    filesystem {
+                        allow none=#true
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let (policy, _diag) = crate::policy::kdl_loader::load_kdl_policy_for_target_scanned_rules(
+        &dir.join("policy.kdl"),
+        "",
+        &linux_target(),
+        Some(3),
+    )
+    .expect("v2 grammar still applies under simulated v3 rules");
+    let t = policy.tools.iter().find(|t| t.name == "t").unwrap();
+    let fs = t.fs.as_ref().unwrap();
+    assert_eq!(
+        fs.allowed_paths,
+        vec!["/base/**"],
+        "simulated v3 unions the v2 `none` back into the inherited grants"
+    );
+}
+
 // ── when / include composition keeps v3 semantics ───────────────────
 
 #[test]

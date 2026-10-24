@@ -367,11 +367,43 @@ impl OverlayDecl {
         self.network |= other.network;
         self.network_posture |= other.network_posture;
         self.network_inbound |= other.network_inbound;
-        self.defaults_fs_replace |= other.defaults_fs_replace;
-        self.defaults_syscalls_replace |= other.defaults_syscalls_replace;
-        self.defaults_network_replace |= other.defaults_network_replace;
+        // `replace` applies at the merge boundary of the document that
+        // declared it — an ancestor's flag must not re-fire when a
+        // descendant is itself overlaid. Like `origins`, each flag
+        // tracks the most recent declaration: a scope that did not
+        // declare the block leaves the earlier writer's flag alone.
+        if other.defaults_filesystem {
+            self.defaults_fs_replace = other.defaults_fs_replace;
+        }
+        if other.origins.contains_key("defaults.syscalls") {
+            self.defaults_syscalls_replace = other.defaults_syscalls_replace;
+        }
+        if other.network {
+            self.defaults_network_replace = other.defaults_network_replace;
+        }
         self.origins
             .extend(other.origins.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+
+    /// At a subtree boundary only this file's own `replace` intent may
+    /// travel upward: an ancestor's or an included file's flag was
+    /// consumed by its own merge inside this subtree — re-exporting it
+    /// would re-fire that narrowing at an includer's boundary against
+    /// grants the declaring file never saw. `merge` already keeps the
+    /// latest writer's flag, so a block this file declared (doc or
+    /// `when`) keeps its value; a flag left by anything else clears.
+    pub(super) fn retain_own_replace_flags(&mut self, doc_decl: &Self, when_decl: &Self) {
+        if !doc_decl.defaults_filesystem && !when_decl.defaults_filesystem {
+            self.defaults_fs_replace = false;
+        }
+        if !doc_decl.origins.contains_key("defaults.syscalls")
+            && !when_decl.origins.contains_key("defaults.syscalls")
+        {
+            self.defaults_syscalls_replace = false;
+        }
+        if !doc_decl.network && !when_decl.network {
+            self.defaults_network_replace = false;
+        }
     }
 
     /// The origin recorded for `key`, or the merge's file with no line
@@ -846,10 +878,14 @@ pub(super) fn merge_into_policy(
 
     // fs: extends/include union allow lists; denies stay sticky. Under
     // v3 an explicit `replace=#true` on the overlay's `defaults.filesystem`
-    // block opts back into wholesale replacement.
-    if overlay.fs.allow_specified {
+    // block opts back into wholesale replacement — including an empty
+    // allow side, which clears the accumulated lists — but only when
+    // the block declared a value at all: a bare `filesystem` node moves
+    // nothing, mirroring the childless-`network` rule.
+    let fs_replaces = rules >= 3 && decl.defaults_fs_replace;
+    if overlay.fs.allow_specified || (fs_replaces && !overlay.fs.denied_paths.is_empty()) {
         let (f, l) = decl.origin("defaults.filesystem", file);
-        if rules >= 3 && decl.defaults_fs_replace {
+        if fs_replaces {
             prov.replace(
                 "defaults.filesystem.read_only",
                 f,
@@ -2032,7 +2068,7 @@ fn apply_overrides_from_doc(
                             !over_fs.allowed_paths.is_empty(),
                             fs_replace,
                             &format!("{tool_ctx}.filesystem"),
-                            rules,
+                            policy.version,
                         )?;
                         if !existing.fs_explicit {
                             // Re-base inherited grants on the current
@@ -2094,7 +2130,7 @@ fn apply_overrides_from_doc(
                                 || over_net.egress_rules.iter().any(|r| r.allow),
                             net_replace,
                             &format!("{tool_ctx}.network"),
-                            rules,
+                            policy.version,
                         )?;
                         if !existing.network_explicit {
                             existing.network = Some(tool_network_base(
