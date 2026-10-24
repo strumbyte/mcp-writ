@@ -64,6 +64,16 @@ pub struct SpawnOptions {
     /// the pinned content whatever the host later does. Set from
     /// `FdExecPlan::entrypoint_bind_pin`; unused on every other route.
     pub exec_entry_pin: Option<(SpawnFd, PathBuf, String)>,
+    /// macOS staged-exe support: when the verified executable is exec'd
+    /// through its relocated snapshot path, `LC_RPATH` entries spelled
+    /// relative to `@executable_path`/`@loader_path` resolve against the
+    /// empty staging dir — a shared build (`@rpath/libnode.N.dylib`)
+    /// dies in dyld before main. These are the dirs those rpaths would
+    /// have meant at the real path; the spawn exports them as
+    /// `DYLD_FALLBACK_LIBRARY_PATH`, dyld's last-resort lookup consulted
+    /// only after every `LC_RPATH` candidate misses. See
+    /// `macos_sandbox::staged_exec_dyld_fallback_dirs`. Empty elsewhere.
+    pub exec_dyld_fallback: Vec<PathBuf>,
 }
 
 /// Unix fd-exec handoff: clear `FD_CLOEXEC` on the pin's duplicated

@@ -25,7 +25,12 @@ use tokio::time::{Duration, timeout};
 
 mod common;
 
-const TIMEOUT_SECS: u64 = 12;
+/// Handshake bound per round-trip. The pinned-exe path hashes and
+/// snapshots the workload binary twice — a ~100MB shared-build
+/// interpreter under a fully parallel `cargo test` on a small CI VM
+/// can exceed 12s before the workload even starts. 30s still bounds a
+/// genuine hang; `early_eof_detail` then reports status + stderr.
+const TIMEOUT_SECS: u64 = 30;
 
 struct ChildGuard(tokio::process::Child);
 
@@ -127,10 +132,12 @@ fn spawn_guard_report(
 
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"workload-hash-e2e","version":"0.0.0"}}}"#;
 
-/// When the guard's stdout closes early, surface the child's exit
-/// status and captured stderr so the panic names the failure instead of
-/// a bare EOF.
+/// When the guard's stdout closes early or goes silent, surface the
+/// child's exit status and captured stderr so the panic names the
+/// failure instead of a bare EOF/elapsed. The child is killed first so
+/// a still-running workload terminates instead of being waited on.
 async fn early_eof_detail(child: &mut tokio::process::Child) -> String {
+    let _ = child.start_kill();
     let status = match timeout(Duration::from_secs(3), child.wait()).await {
         Ok(Ok(s)) => format!("exit status {s}"),
         Ok(Err(e)) => format!("wait error {e}"),
@@ -163,7 +170,7 @@ async fn drive_handshake(child: &mut tokio::process::Child) {
         .expect("write initialize");
     stdin.flush().await.expect("flush initialize");
 
-    let line = timeout(Duration::from_secs(TIMEOUT_SECS), async {
+    let line = match timeout(Duration::from_secs(TIMEOUT_SECS), async {
         loop {
             match reader
                 .next_line()
@@ -180,7 +187,13 @@ async fn drive_handshake(child: &mut tokio::process::Child) {
         }
     })
     .await
-    .expect("timeout waiting for initialize response");
+    {
+        Ok(line) => line,
+        Err(_) => panic!(
+            "timeout waiting for initialize response: {}",
+            early_eof_detail(child).await
+        ),
+    };
 
     let json = nojson::RawJson::parse(&line).expect("response is JSON");
     assert!(
@@ -391,7 +404,14 @@ async fn drive_handshake_and_list(child: &mut tokio::process::Child) {
         }
     })
     .await
-    .expect("timeout waiting for initialize + tools/list");
+    .ok();
+
+    if !saw_init || !saw_tools {
+        panic!(
+            "timeout waiting for initialize + tools/list: {}",
+            early_eof_detail(child).await
+        );
+    }
     assert!(
         saw_tools,
         "tools/list must return the sibling module's echo_tool — the relative \

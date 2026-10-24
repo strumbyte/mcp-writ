@@ -544,10 +544,14 @@ impl Warden {
             // well, so no inherited function name can intercept it.
             match program {
                 Some(p) if p != Path::new(command) => {
+                    // A relocated exe also needs its fallback lib dirs
+                    // re-exported *inside* the wrapper — SIP-restricted
+                    // `sandbox-exec`/`bash` execs prune DYLD_* from the
+                    // environment before this -c string runs.
                     cmd.arg("/bin/bash")
                         .arg("-p")
                         .arg("-c")
-                        .arg("builtin exec -a \"$0\" \"$@\"")
+                        .arg(macos_sandbox::exec_a_command(&opts.exec_dyld_fallback))
                         .arg(command)
                         .arg(p)
                         .args(args);

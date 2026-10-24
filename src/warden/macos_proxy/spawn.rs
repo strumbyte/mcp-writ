@@ -65,10 +65,15 @@ async fn build_proxy_command(
     // executable goes through bash -p so argv[0] stays `command`.
     match program {
         Some(p) if p != Path::new(command) => {
+            // Same SIP-pruning workaround as the audited spawn: the
+            // relocated exe's dyld fallback dirs must be re-exported
+            // inside the wrapper or the stripped env never reaches it.
             cmd.arg("/bin/bash")
                 .arg("-p")
                 .arg("-c")
-                .arg("builtin exec -a \"$0\" \"$@\"")
+                .arg(super::super::macos_sandbox::exec_a_command(
+                    &opts.exec_dyld_fallback,
+                ))
                 .arg(command)
                 .arg(p)
                 .args(args);

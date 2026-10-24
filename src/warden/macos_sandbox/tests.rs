@@ -767,6 +767,112 @@ fn test_code_map_dirs_homebrew_binary_derives_prefix() {
 }
 
 // ---------------------------------------------------------------
+// staged_exec_dyld_fallback_dirs — relocated-exe rpath recovery
+// ---------------------------------------------------------------
+
+#[test]
+fn test_dyld_fallback_dirs_restore_executable_path_rpaths() {
+    // Shared-build layout: real/bin/tool links @rpath/libnode.dylib with
+    // LC_RPATH=@executable_path/../lib. Staged into an empty dir the
+    // exe's rpaths would resolve against the staging dir; the fallback
+    // list must name the real install's lib dir instead.
+    let dir = fresh_dir("dyldfb").canonicalize().unwrap();
+    let real_lib = dir.join("real").join("lib");
+    std::fs::create_dir_all(&real_lib).unwrap();
+    write_fake_macho(&real_lib.join("libnode.dylib"), &[], &[]);
+    let real_exe = dir.join("real").join("bin").join("node");
+    write_fake_macho(
+        &real_exe,
+        &["@rpath/libnode.dylib"],
+        &["@executable_path/../lib"],
+    );
+    let stage = dir.join("stage");
+    std::fs::create_dir_all(&stage).unwrap();
+    let staged = stage.join("object");
+    std::fs::copy(&real_exe, &staged).unwrap();
+
+    let dirs = staged_exec_dyld_fallback_dirs(&staged, &real_exe);
+    assert_eq!(
+        dirs,
+        vec![real_lib.clone()],
+        "@executable_path/../lib must expand against the real exe dir; got {dirs:?}"
+    );
+}
+
+#[test]
+fn test_dyld_fallback_dirs_skip_absolute_and_missing() {
+    let dir = fresh_dir("dyldfb_skip").canonicalize().unwrap();
+    let real_exe = dir.join("real").join("bin").join("tool");
+    // Absolute rpath resolves unchanged (no restore needed); the
+    // missing dir contributes nothing.
+    write_fake_macho(
+        &real_exe,
+        &[],
+        &["/usr/lib", "@executable_path/../no_such_lib"],
+    );
+    let staged = dir.join("stage").join("object");
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::copy(&real_exe, &staged).unwrap();
+
+    let dirs = staged_exec_dyld_fallback_dirs(&staged, &real_exe);
+    assert!(
+        dirs.iter().all(|d| d.is_dir()),
+        "only existing dirs belong in the fallback list; got {dirs:?}"
+    );
+    assert!(
+        dirs.iter().all(|d| d != Path::new("/usr/lib")),
+        "absolute rpaths are not relabeled; got {dirs:?}"
+    );
+}
+
+#[test]
+fn test_exec_a_command_plain_without_fallback() {
+    assert_eq!(
+        exec_a_command(&[]),
+        "builtin exec -a \"$0\" \"$@\"",
+        "no fallback dirs must keep the historical wrapper string"
+    );
+}
+
+#[test]
+fn test_exec_a_command_exports_fallback() {
+    let dirs = vec![
+        PathBuf::from("/opt/hostedtoolcache/node/22.23.3/arm64/lib"),
+        PathBuf::from("/Users/o'brien/sdk/lib"),
+    ];
+    let cmd = exec_a_command(&dirs);
+    assert!(
+        cmd.starts_with("export DYLD_FALLBACK_LIBRARY_PATH='"),
+        "fallback dirs must be re-exported inside the wrapper; got {cmd}"
+    );
+    assert!(
+        cmd.contains("/opt/hostedtoolcache/node/22.23.3/arm64/lib"),
+        "the real lib dir must appear; got {cmd}"
+    );
+    assert!(
+        cmd.contains("o'\\''brien"),
+        "embedded quotes must be shell-escaped; got {cmd}"
+    );
+    assert!(
+        cmd.ends_with("builtin exec -a \"$0\" \"$@\""),
+        "the exec-a tail must be preserved; got {cmd}"
+    );
+}
+
+#[test]
+fn test_dyld_fallback_dirs_unreadable_or_unparseable() {
+    // A staged file that is not Mach-O (or unreadable) yields no dirs —
+    // a monolithic exe needs no fallback, and the parse is best-effort.
+    let dir = fresh_dir("dyldfb_plain").canonicalize().unwrap();
+    let staged = dir.join("object");
+    std::fs::write(&staged, b"not a mach-o").unwrap();
+    let real_exe = dir.join("real").join("bin").join("tool");
+    write_fake_macho(&real_exe, &[], &[]);
+    assert!(staged_exec_dyld_fallback_dirs(&staged, &real_exe).is_empty());
+    assert!(staged_exec_dyld_fallback_dirs(&dir.join("missing"), &real_exe).is_empty());
+}
+
+// ---------------------------------------------------------------
 // generate_sbpl — network policy
 // ---------------------------------------------------------------
 

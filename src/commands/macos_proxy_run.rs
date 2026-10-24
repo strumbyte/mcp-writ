@@ -559,6 +559,19 @@ mod imp {
                 .unwrap_or_default(),
             // The bind-mount handoff exists only on Linux.
             exec_entry_pin: None,
+            // The staged exe's `@executable_path`-relative rpaths
+            // resolve against the staging dir — restore the real
+            // install prefix as dyld's fallback so shared builds
+            // (e.g. libnode.dylib) still link under a relocated exec.
+            exec_dyld_fallback: _held_fd_exec_plan
+                .as_ref()
+                .map(|p| {
+                    crate::warden::macos_sandbox::staged_exec_dyld_fallback_dirs(
+                        p.exe_path(),
+                        &resolved_exe,
+                    )
+                })
+                .unwrap_or_default(),
         };
         // Plus the dirs dyld will load the runtime's own libraries and
         // modules from — without exec-map on them the child dies in dyld.

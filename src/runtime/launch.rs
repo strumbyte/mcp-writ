@@ -578,12 +578,26 @@ pub async fn launch(
     // dir) so the sandboxed child can actually start. Independent of
     // pinning: an unpinned Homebrew interpreter needs the same grants.
     #[cfg(target_os = "macos")]
-    spawn_opts
-        .exec_map_dirs
-        .extend(crate::warden::macos_sandbox::code_map_dirs(
-            &resolved_exe,
-            &argv,
-        ));
+    {
+        spawn_opts
+            .exec_map_dirs
+            .extend(crate::warden::macos_sandbox::code_map_dirs(
+                &resolved_exe,
+                &argv,
+            ));
+        // The staged exe relocates `@executable_path`-relative rpaths
+        // to the staging dir; the derived dirs restore the real install
+        // prefix as dyld's fallback so a shared build (`libnode.dylib`)
+        // still links. Deps resolve from their real locations — runtime
+        // code is unpinned, same as interpreter imports.
+        if let Some(plan) = &fd_exec_plan {
+            spawn_opts.exec_dyld_fallback =
+                crate::warden::macos_sandbox::staged_exec_dyld_fallback_dirs(
+                    plan.exe_path(),
+                    &resolved_exe,
+                );
+        }
+    }
     // Windows: a payload-bound entrypoint launches through its real
     // path — the interpreter opens it by name *after* CreateProcess and
     // resolves sibling/relative imports from its directory, so a staged
