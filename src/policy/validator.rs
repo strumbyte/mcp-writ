@@ -76,6 +76,7 @@ fn validate_policy_inner(
         validate_psec_expressibility(policy, target)?;
     }
     validate_per_tool_syscalls(policy)?;
+    validate_v3_declarations(policy)?;
     validate_per_tool_environment(policy)?;
     validate_environment_names(policy)?;
     validate_hash_workload_identity(policy)?;
@@ -475,6 +476,30 @@ fn validate_per_tool_syscalls(policy: &Policy) -> Result<(), PolicyError> {
             return Err(PolicyError::Validation(format!(
                 "tool '{}' declares per-tool syscalls, which are not enforced; \
                  move syscall rules to defaults.syscalls",
+                tool.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `policy version=3` declarations — `deny` under `defaults.syscalls`
+/// and `replace=#true` on tool sub-blocks — must not appear in a policy
+/// an earlier version produced. The parser gates them for KDL input;
+/// this guards policies assembled programmatically.
+fn validate_v3_declarations(policy: &Policy) -> Result<(), PolicyError> {
+    if policy.version >= 3 {
+        return Ok(());
+    }
+    if !policy.syscalls.denied.is_empty() {
+        return Err(PolicyError::Validation(
+            "'deny' under 'defaults.syscalls' requires 'policy version=3'".into(),
+        ));
+    }
+    for tool in &policy.tools {
+        if tool.fs_replace || tool.network_replace || tool.syscalls_replace {
+            return Err(PolicyError::Validation(format!(
+                "tool '{}' carries 'replace=#true', which requires 'policy version=3'",
                 tool.name
             )));
         }

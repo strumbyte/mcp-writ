@@ -1484,3 +1484,190 @@ fn test_policy_resolve_reports_review_markers() {
         "hash is the sha256 digest: {hash}"
     );
 }
+
+// `--version-diff` (PR-28): the same documents resolve under both
+// composition-rules versions and the report names every effective
+// field the rule change moves. A v3 union document simulating v2 must
+// show the allow list the v2 replace would have dropped.
+#[test]
+fn test_policy_resolve_version_diff_v3_doc() {
+    let dir = make_test_dir("resolve_vdiff_v3");
+    std::fs::write(
+        dir.path().join("base.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "read" "execve"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    let child = write_policy(
+        dir.path(),
+        "child.kdl",
+        r#"
+            extends "base.kdl"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "write"
+                }
+            }
+        "#,
+    );
+
+    let (code, stdout, stderr) =
+        resolve_policy(&child, &["--format", "json", "--version-diff"], &[]);
+    assert_eq!(code, 0, "resolve exits 0: {stdout} {stderr}");
+    let json = resolve_json(&stdout);
+    let diff = resolve_json_member(json.value(), "version_diff");
+    assert_eq!(
+        resolve_json_member(diff, "declared_version")
+            .as_number_str()
+            .unwrap(),
+        "3"
+    );
+    assert_eq!(
+        resolve_json_member(diff, "simulated_version")
+            .as_number_str()
+            .unwrap(),
+        "2"
+    );
+    let fields: Vec<_> = resolve_json_member(diff, "fields")
+        .to_array()
+        .expect("fields array")
+        .collect();
+    let entry = fields
+        .iter()
+        .find(|f| {
+            resolve_json_member(**f, "field").as_string_str().unwrap()
+                == "defaults.syscalls.allowed"
+        })
+        .unwrap_or_else(|| panic!("syscalls.allowed must move: {stdout}"));
+    let declared: Vec<String> = resolve_json_member(*entry, "declared")
+        .to_array()
+        .unwrap()
+        .map(|v| v.as_string_str().unwrap().to_string())
+        .collect();
+    let simulated: Vec<String> = resolve_json_member(*entry, "simulated")
+        .to_array()
+        .unwrap()
+        .map(|v| v.as_string_str().unwrap().to_string())
+        .collect();
+    assert_eq!(declared, vec!["execve", "read", "write"], "v3 unions");
+    assert_eq!(simulated, vec!["write"], "v2 would have replaced");
+}
+
+// The reverse direction: a v2 document simulating v3 shows the grants
+// union semantics would add back.
+#[test]
+fn test_policy_resolve_version_diff_v2_doc() {
+    let dir = make_test_dir("resolve_vdiff_v2");
+    std::fs::write(
+        dir.path().join("base.kdl"),
+        r#"
+            policy version=2
+            defaults {
+                syscalls {
+                    allow "read" "execve"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    let child = write_policy(
+        dir.path(),
+        "child.kdl",
+        r#"
+            extends "base.kdl"
+            policy version=2
+            defaults {
+                syscalls {
+                    allow "write"
+                }
+            }
+        "#,
+    );
+
+    let (code, stdout, _) = resolve_policy(&child, &["--format", "json", "--version-diff"], &[]);
+    assert_eq!(code, 0, "resolve exits 0: {stdout}");
+    let json = resolve_json(&stdout);
+    let diff = resolve_json_member(json.value(), "version_diff");
+    assert_eq!(
+        resolve_json_member(diff, "declared_version")
+            .as_number_str()
+            .unwrap(),
+        "2"
+    );
+    assert_eq!(
+        resolve_json_member(diff, "simulated_version")
+            .as_number_str()
+            .unwrap(),
+        "3"
+    );
+    let fields: Vec<_> = resolve_json_member(diff, "fields")
+        .to_array()
+        .expect("fields array")
+        .collect();
+    let entry = fields
+        .iter()
+        .find(|f| {
+            resolve_json_member(**f, "field").as_string_str().unwrap()
+                == "defaults.syscalls.allowed"
+        })
+        .expect("syscalls.allowed must move");
+    let simulated: Vec<String> = resolve_json_member(*entry, "simulated")
+        .to_array()
+        .unwrap()
+        .map(|v| v.as_string_str().unwrap().to_string())
+        .collect();
+    assert_eq!(simulated, vec!["execve", "read", "write"], "v3 unions");
+}
+
+// `kdl` mode keeps stdout re-loadable — the diff rides in `//` comments.
+#[test]
+fn test_policy_resolve_version_diff_kdl_comments() {
+    let dir = make_test_dir("resolve_vdiff_kdl");
+    std::fs::write(
+        dir.path().join("base.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "read" "execve"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    let child = write_policy(
+        dir.path(),
+        "child.kdl",
+        r#"
+            extends "base.kdl"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "write"
+                }
+            }
+        "#,
+    );
+
+    let (code, stdout, _) = resolve_policy(&child, &["--version-diff"], &[]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("// version-diff:"),
+        "kdl output carries the diff comments: {stdout}"
+    );
+    assert!(
+        stdout.contains("defaults.syscalls.allowed"),
+        "the moved field is named: {stdout}"
+    );
+    assert!(
+        stdout.contains("policy"),
+        "the composed document still follows: {stdout}"
+    );
+}

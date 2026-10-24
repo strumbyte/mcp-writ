@@ -167,6 +167,91 @@ fn fork_pinned_reason_matches_clone_allowance() {
 }
 
 #[test]
+fn denied_alias_closes_the_shared_syscall_number() {
+    // Deny-wins compares syscall numbers, not names: `fork` resolves
+    // to SYS_clone on every supported arch, so `deny "fork"` must
+    // also close an `allow "clone"` grant — and on x86_64 the native
+    // SYS_fork nr along with it.
+    let mut policy = Policy::default();
+    policy.syscalls.allowed = vec!["clone".to_string(), "read".to_string()];
+    policy.syscalls.denied = vec!["fork".to_string()];
+    let allowed = allowed_syscall_names(&policy, false);
+    let rules = collect_syscall_rules(&policy, &allowed, false).unwrap();
+    assert!(
+        !rules.contains_key(&libc::SYS_clone),
+        "denied fork must close the SYS_clone an allowed clone grants"
+    );
+    #[cfg(target_arch = "x86_64")]
+    assert!(!rules.contains_key(&libc::SYS_fork));
+    assert!(rules.contains_key(&libc::SYS_read));
+
+    // The grant report agrees: clone's only mapping is denied, so the
+    // entry reports Skipped rather than Planned.
+    let grant = syscall_grant_intents(&policy, false, false)
+        .into_iter()
+        .find(|g| matches!(&g.subject, GrantSubject::Syscall { name } if name == "clone"))
+        .expect("clone grant intent must still be reported");
+    assert_eq!(grant.state, ControlState::Skipped);
+    assert!(
+        grant
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("denied by policy")),
+        "clone skip reason must name the deny: {:?}",
+        grant.reason
+    );
+
+    // A partially overlapping deny keeps the untouched numbers:
+    // `deny "open"` closes SYS_openat for every alias (open IS openat
+    // in libc), but an `access` grant keeps the faccessat nrs open
+    // never mapped to.
+    let mut policy = Policy::default();
+    policy.syscalls.allowed = vec!["creat".to_string(), "access".to_string()];
+    policy.syscalls.denied = vec!["open".to_string()];
+    let allowed = allowed_syscall_names(&policy, false);
+    let rules = collect_syscall_rules(&policy, &allowed, false).unwrap();
+    assert!(
+        !rules.contains_key(&libc::SYS_openat),
+        "denied open must close the SYS_openat creat shares"
+    );
+    #[cfg(target_arch = "x86_64")]
+    assert!(rules.contains_key(&libc::SYS_creat));
+    assert!(rules.contains_key(&libc::SYS_faccessat));
+
+    // execve denies refuse the spawn check through the same nr set.
+    // The spawn entrypoint issues execve specifically (execvpe/execvp
+    // land on SYS_execve on every supported libc), so an execveat-only
+    // grant must NOT satisfy the check — the filter it selects would
+    // block the child's startup exec.
+    let mut policy = Policy::default();
+    policy.syscalls.allowed = vec!["execve".to_string()];
+    policy.syscalls.denied = vec!["execve".to_string()];
+    assert!(!policy_allows_execve(&policy));
+    let injected = allowed_syscall_names(&policy, true);
+    assert!(
+        !injected.iter().any(|s| s == "execve"),
+        "denied execve must not be re-injected for startup"
+    );
+    assert!(
+        injected.iter().any(|s| s == "execveat"),
+        "non-denied execveat is still injected for startup"
+    );
+
+    policy.syscalls.allowed = vec!["execveat".to_string()];
+    policy.syscalls.denied.clear();
+    assert!(
+        !policy_allows_execve(&policy),
+        "an execveat-only grant cannot carry the spawn — the entrypoint issues execve"
+    );
+
+    policy.syscalls.allowed = vec!["execve".to_string(), "execveat".to_string()];
+    assert!(
+        policy_allows_execve(&policy),
+        "an allowed, non-denied execve satisfies the spawn check"
+    );
+}
+
+#[test]
 fn io_uring_grants_are_surfaced_as_dangerous() {
     let mut policy = Policy::default();
     policy.syscalls.allowed = ["io_uring_setup", "io_uring_enter", "io_uring_register"]

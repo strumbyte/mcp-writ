@@ -222,6 +222,12 @@ pub struct PolicyResolveArgs {
     pub env: Option<String>,
     /// `--format <kdl|json>` (default `kdl`).
     pub format: ResolveFormat,
+    /// `--version-diff` — also resolve the same documents under the
+    /// other composition-rules version (v2 vs v3) and report which
+    /// effective fields the rule change moves. PR-28's migration aid:
+    /// it shows what adopting `version=3` (or reverting to `version=2`)
+    /// does to each composed grant.
+    pub version_diff: bool,
     pub verbose: u8,
     /// A parse/semantic error captured for the machine-readable
     /// `invalid` result.
@@ -236,6 +242,7 @@ impl Default for PolicyResolveArgs {
             server: None,
             env: None,
             format: ResolveFormat::Kdl,
+            version_diff: false,
             verbose: 0,
             invalid_input: None,
         }

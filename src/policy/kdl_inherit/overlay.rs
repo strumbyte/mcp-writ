@@ -9,12 +9,12 @@ use kdl::{KdlDocument, KdlNode};
 
 use crate::error::PolicyError;
 use crate::policy::kdl_parse::{
-    Defaults, defaults_to_layer, parse_deputy_node, parse_environment_node, parse_fs_allows,
-    parse_logging_fail_closed, parse_network_rules, parse_process_exec_allowed,
-    parse_server_hashes, parse_server_mcp_rules, parse_servers, parse_syscall_allows,
-    parse_tool_fs, parse_tool_network, parse_tool_syscalls, parse_tools_list_hashes,
-    parse_trajectory, resolve_tool_args_schema, resolve_tool_profile_name, unique_child,
-    validate_logging_level, validate_tool_shape_v2,
+    Defaults, check_none_needs_replace, defaults_to_layer, parse_deputy_node,
+    parse_environment_node, parse_fs_allows, parse_logging_fail_closed, parse_network_rules,
+    parse_process_exec_allowed, parse_replace_flag, parse_server_hashes, parse_server_mcp_rules,
+    parse_servers, parse_syscall_allows, parse_tool_fs, parse_tool_network, parse_tool_syscalls,
+    parse_tools_list_hashes, parse_trajectory, resolve_tool_args_schema,
+    resolve_tool_profile_names, unique_child, validate_logging_level, validate_tool_shape_v2,
 };
 use crate::policy::merge::PolicyLayer;
 use crate::policy::provenance::{DeclOrigin, LoadWarning, LoadWarningKind, Provenance};
@@ -46,7 +46,7 @@ fn prune_covered(
 }
 use crate::policy::{
     EnvironmentPolicy, FsPolicy, FsToolPolicy, InputResponsesMode, NetworkPolicy, Policy,
-    ToolNetworkPolicy, ToolPolicy, ToolSyscallPolicy, TrajectoryRule,
+    SyscallPolicy, ToolNetworkPolicy, ToolPolicy, ToolSyscallPolicy, TrajectoryRule,
 };
 
 /// Which optional fields the overlay side declared — computed from the
@@ -88,6 +88,14 @@ pub(super) struct OverlayDecl {
     /// with the decl, so a replacement recorded at the boundary names
     /// the file and node that actually wrote the overlay value.
     pub(super) origins: HashMap<String, DeclOrigin>,
+    /// `policy version=3`: the overlay's `defaults.filesystem` block
+    /// carried `replace=#true` — its allow side replaces the base's
+    /// instead of unioning.
+    pub(super) defaults_fs_replace: bool,
+    /// Same for `defaults.syscalls`.
+    pub(super) defaults_syscalls_replace: bool,
+    /// Same for `defaults.network`.
+    pub(super) defaults_network_replace: bool,
 }
 
 /// The 1-based line a node starts on inside its source text — `None`
@@ -189,8 +197,10 @@ pub(crate) fn tool_key(server: Option<&str>, name: &str) -> String {
 }
 
 impl OverlayDecl {
-    /// Declarations in a top-level policy document.
-    pub(super) fn for_doc(doc: &KdlDocument, file: &Path, content: &str) -> Self {
+    /// Declarations in a top-level policy document. `version` is the
+    /// document's declared `policy version=` — the `replace=#true`
+    /// properties only count under v3, where the grammar admits them.
+    pub(super) fn for_doc(doc: &KdlDocument, file: &Path, content: &str, version: u32) -> Self {
         let mut decl = Self {
             transport: doc.get("transport").is_some(),
             ..Self::default()
@@ -238,16 +248,16 @@ impl OverlayDecl {
                 _ => {}
             }
         }
-        decl.absorb_shared(doc, file, content);
+        decl.absorb_shared(doc, file, content, version);
         decl
     }
 
     /// Declarations inside a matching `when` block's children — the
     /// fields `apply_overrides_from_doc` can apply. `transport` is not
     /// one of them, so it stays unset.
-    fn for_when_children(children: &KdlDocument, file: &Path, content: &str) -> Self {
+    fn for_when_children(children: &KdlDocument, file: &Path, content: &str, version: u32) -> Self {
         let mut decl = Self::default();
-        decl.absorb_shared(children, file, content);
+        decl.absorb_shared(children, file, content, version);
         // Origins for the server-side overrides the when path applies —
         // tool merges inside `when` attribute to the tool nodes here.
         for node in children.nodes() {
@@ -277,7 +287,7 @@ impl OverlayDecl {
     /// Flags both scopes share: every overlay-able top-level node other
     /// than `transport`, plus the `defaults` children gates and the
     /// origins for the nodes that set them.
-    fn absorb_shared(&mut self, doc: &KdlDocument, file: &Path, content: &str) {
+    fn absorb_shared(&mut self, doc: &KdlDocument, file: &Path, content: &str, version: u32) {
         for name in [
             "logging",
             "sandbox",
@@ -313,6 +323,26 @@ impl OverlayDecl {
                 }
             }
             self.defaults_filesystem |= defaults.get("filesystem").is_some();
+            // `replace=#true` is a `policy version=3` property — under
+            // earlier versions it cannot have parsed, so the flag only
+            // reads when this document declared v3.
+            if version >= 3 {
+                self.defaults_fs_replace |= defaults
+                    .get("filesystem")
+                    .and_then(|n| n.get("replace"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.defaults_syscalls_replace |= defaults
+                    .get("syscalls")
+                    .and_then(|n| n.get("replace"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.defaults_network_replace |= defaults
+                    .get("network")
+                    .and_then(|n| n.get("replace"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            }
             // `network` needs children to declare anything — a bare
             // node moves no value, so it must not trigger the
             // inherited-inbound warning either.
@@ -337,6 +367,9 @@ impl OverlayDecl {
         self.network |= other.network;
         self.network_posture |= other.network_posture;
         self.network_inbound |= other.network_inbound;
+        self.defaults_fs_replace |= other.defaults_fs_replace;
+        self.defaults_syscalls_replace |= other.defaults_syscalls_replace;
+        self.defaults_network_replace |= other.defaults_network_replace;
         self.origins
             .extend(other.origins.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
@@ -772,6 +805,12 @@ impl PendingWarnings {
 ///   `when` path uses — so re-declaring a tool for an unrelated
 ///   property cannot widen or drop the base's scope.
 ///
+/// `rules` is the composition-semantics version the overlay document
+/// runs under — its declared `policy version`, or the simulated version
+/// `policy resolve --version-diff` asks for. Under v3 (`rules >= 3`),
+/// allow sides union by default; `replace=#true` on the overlay's
+/// `defaults` sub-blocks or tool blocks opts back into replacement.
+///
 /// Every write the merge performs is logged on `prov` — `file` is the
 /// fallback attribution when the decl carries no node origin (e.g. a
 /// flag set by an untracked subtree member); the decl's origins name
@@ -782,8 +821,18 @@ pub(super) fn merge_into_policy(
     decl: &OverlayDecl,
     file: &Path,
     prov: &mut Provenance,
+    rules: u32,
 ) {
-    // version: overlay wins — every document declares `policy`.
+    // version: overlay wins — every document declares `policy`. The
+    // entry file's version stamps the merged artifact, which is what
+    // makes version a feature boundary rather than a max: a v2
+    // declaration composing into a v1 document (a `deputy` block
+    // through `include`) must keep the effective version at 1 so the
+    // validator refuses it — the same fail-closed rule a v3
+    // declaration (`defaults.syscalls { deny }` inherited from a v3
+    // ancestor into a v2 child) hits. Taking the maximum would let a
+    // higher-version ancestor silently upgrade the feature set the
+    // entry document opted into.
     base.version = overlay.version;
     let (f, l) = decl.origin("policy", file);
     prov.set("version", f, l);
@@ -795,40 +844,66 @@ pub(super) fn merge_into_policy(
         prov.set("transport", f, l);
     }
 
-    // fs: extends/include union allow lists; denies stay sticky.
+    // fs: extends/include union allow lists; denies stay sticky. Under
+    // v3 an explicit `replace=#true` on the overlay's `defaults.filesystem`
+    // block opts back into wholesale replacement.
     if overlay.fs.allow_specified {
         let (f, l) = decl.origin("defaults.filesystem", file);
-        prov.union(
-            "defaults.filesystem.read_only",
-            f,
-            l,
-            overlay.fs.read_only.iter().cloned(),
-        );
-        prov.union(
-            "defaults.filesystem.read_write",
-            f,
-            l,
-            overlay.fs.read_write.iter().cloned(),
-        );
-        prov.union(
-            "defaults.filesystem.executable",
-            f,
-            l,
-            overlay.fs.executable.iter().cloned(),
-        );
-        for p in &overlay.fs.read_only {
-            if !base.fs.read_only.contains(p) {
-                base.fs.read_only.push(p.clone());
+        if rules >= 3 && decl.defaults_fs_replace {
+            prov.replace(
+                "defaults.filesystem.read_only",
+                f,
+                l,
+                overlay.fs.read_only.clone(),
+            );
+            prov.replace(
+                "defaults.filesystem.read_write",
+                f,
+                l,
+                overlay.fs.read_write.clone(),
+            );
+            prov.replace(
+                "defaults.filesystem.executable",
+                f,
+                l,
+                overlay.fs.executable.clone(),
+            );
+            base.fs.read_only = overlay.fs.read_only.clone();
+            base.fs.read_write = overlay.fs.read_write.clone();
+            base.fs.executable = overlay.fs.executable.clone();
+        } else {
+            prov.union(
+                "defaults.filesystem.read_only",
+                f,
+                l,
+                overlay.fs.read_only.iter().cloned(),
+            );
+            prov.union(
+                "defaults.filesystem.read_write",
+                f,
+                l,
+                overlay.fs.read_write.iter().cloned(),
+            );
+            prov.union(
+                "defaults.filesystem.executable",
+                f,
+                l,
+                overlay.fs.executable.iter().cloned(),
+            );
+            for p in &overlay.fs.read_only {
+                if !base.fs.read_only.contains(p) {
+                    base.fs.read_only.push(p.clone());
+                }
             }
-        }
-        for p in &overlay.fs.read_write {
-            if !base.fs.read_write.contains(p) {
-                base.fs.read_write.push(p.clone());
+            for p in &overlay.fs.read_write {
+                if !base.fs.read_write.contains(p) {
+                    base.fs.read_write.push(p.clone());
+                }
             }
-        }
-        for p in &overlay.fs.executable {
-            if !base.fs.executable.contains(p) {
-                base.fs.executable.push(p.clone());
+            for p in &overlay.fs.executable {
+                if !base.fs.executable.contains(p) {
+                    base.fs.executable.push(p.clone());
+                }
             }
         }
         base.fs.allow_specified = true;
@@ -869,11 +944,65 @@ pub(super) fn merge_into_policy(
         prune_covered(list, |p| read_now.contains(p), prov, field, f, l);
     }
 
-    // syscalls: overlay replaces if non-empty
-    if !overlay.syscalls.allowed.is_empty() {
+    // syscalls: under v3 the allow side unions by default (replace only
+    // on `replace=#true`, including an explicit empty list); under v2 a
+    // non-empty allow list replaces. `deny` entries — a v3 declaration —
+    // union like every deny side, then prune the allow side.
+    let sc_origin = decl.origin("defaults.syscalls", file);
+    let sc_declared = !overlay.syscalls.allowed.is_empty() || !overlay.syscalls.denied.is_empty();
+    if sc_declared && rules >= 3 {
+        if decl.defaults_syscalls_replace {
+            prov.replace(
+                "defaults.syscalls",
+                sc_origin.0,
+                sc_origin.1,
+                overlay.syscalls.allowed.clone(),
+            );
+            base.syscalls.allowed = overlay.syscalls.allowed.clone();
+        } else {
+            prov.union(
+                "defaults.syscalls",
+                sc_origin.0,
+                sc_origin.1,
+                overlay.syscalls.allowed.iter().cloned(),
+            );
+            for s in &overlay.syscalls.allowed {
+                if !base.syscalls.allowed.contains(s) {
+                    base.syscalls.allowed.push(s.clone());
+                }
+            }
+        }
+    } else if !overlay.syscalls.allowed.is_empty() {
         base.syscalls.allowed = overlay.syscalls.allowed.clone();
-        let (f, l) = decl.origin("defaults.syscalls", file);
-        prov.replace("defaults.syscalls", f, l, overlay.syscalls.allowed.clone());
+        prov.replace(
+            "defaults.syscalls",
+            sc_origin.0,
+            sc_origin.1,
+            overlay.syscalls.allowed.clone(),
+        );
+    }
+    if !overlay.syscalls.denied.is_empty() {
+        prov.union(
+            "defaults.syscalls.denied",
+            sc_origin.0,
+            sc_origin.1,
+            overlay.syscalls.denied.iter().cloned(),
+        );
+        for s in &overlay.syscalls.denied {
+            if !base.syscalls.denied.contains(s) {
+                base.syscalls.denied.push(s.clone());
+            }
+        }
+        // Deny-wins: a syscall denied at any layer leaves the allow side.
+        let denied_now = base.syscalls.denied.clone();
+        prune_covered(
+            &mut base.syscalls.allowed,
+            |s| denied_now.contains(s),
+            prov,
+            "defaults.syscalls",
+            sc_origin.0,
+            sc_origin.1,
+        );
     }
 
     // environment: an `environment` node declared on the overlay's side —
@@ -907,25 +1036,14 @@ pub(super) fn merge_into_policy(
     // field was never parser-populated.
     base.network.outbound.egress_rules = base.network.outbound.egress_rules();
     let overlay_rules = overlay.network.outbound.egress_rules();
-    if !overlay.network.outbound.allowed.is_empty()
+    let overlay_has_allow = !overlay.network.outbound.allowed.is_empty()
         || !overlay.network.outbound.allowed_cidrs.is_empty()
-        || overlay_rules.iter().any(|r| r.allow)
-    {
-        base.network.outbound.allowed = overlay.network.outbound.allowed.clone();
-        base.network.outbound.allowed_port_qualified =
-            overlay.network.outbound.allowed_port_qualified.clone();
-        base.network.outbound.allowed_cidrs = overlay.network.outbound.allowed_cidrs.clone();
-        base.network.outbound.allowed_cidrs_port_qualified = overlay
-            .network
-            .outbound
-            .allowed_cidrs_port_qualified
-            .clone();
-        base.network.outbound.egress_rules.retain(|r| !r.allow);
-        for r in &overlay_rules {
-            if r.allow && !base.network.outbound.egress_rules.contains(r) {
-                base.network.outbound.egress_rules.push(r.clone());
-            }
-        }
+        || overlay_rules.iter().any(|r| r.allow);
+    // Under v3 the allow side unions by default; `replace=#true` on the
+    // overlay's `defaults.network` block opts back into replacement —
+    // including an empty allow side, which clears the accumulated rules.
+    let net_replace = rules < 3 || decl.defaults_network_replace;
+    if overlay_has_allow || (rules >= 3 && decl.defaults_network_replace && decl.network) {
         let (f, l) = decl.origin("defaults.network", file);
         // One `describe`d spelling per declared allow rule — the flat
         // lists are the same rules' projections, so chaining them would
@@ -935,7 +1053,59 @@ pub(super) fn merge_into_policy(
             .filter(|r| r.allow)
             .map(|r| r.describe())
             .collect();
-        prov.replace("defaults.network.allow", f, l, items);
+        if net_replace {
+            base.network.outbound.allowed = overlay.network.outbound.allowed.clone();
+            base.network.outbound.allowed_port_qualified =
+                overlay.network.outbound.allowed_port_qualified.clone();
+            base.network.outbound.allowed_cidrs = overlay.network.outbound.allowed_cidrs.clone();
+            base.network.outbound.allowed_cidrs_port_qualified = overlay
+                .network
+                .outbound
+                .allowed_cidrs_port_qualified
+                .clone();
+            base.network.outbound.egress_rules.retain(|r| !r.allow);
+            for r in &overlay_rules {
+                if r.allow && !base.network.outbound.egress_rules.contains(r) {
+                    base.network.outbound.egress_rules.push(r.clone());
+                }
+            }
+            prov.replace("defaults.network.allow", f, l, items);
+        } else {
+            for h in &overlay.network.outbound.allowed {
+                if !base.network.outbound.allowed.contains(h) {
+                    base.network.outbound.allowed.push(h.clone());
+                }
+            }
+            for s in &overlay.network.outbound.allowed_port_qualified {
+                if !base.network.outbound.allowed_port_qualified.contains(s) {
+                    base.network.outbound.allowed_port_qualified.push(s.clone());
+                }
+            }
+            for c in &overlay.network.outbound.allowed_cidrs {
+                if !base.network.outbound.allowed_cidrs.contains(c) {
+                    base.network.outbound.allowed_cidrs.push(c.clone());
+                }
+            }
+            for s in &overlay.network.outbound.allowed_cidrs_port_qualified {
+                if !base
+                    .network
+                    .outbound
+                    .allowed_cidrs_port_qualified
+                    .contains(s)
+                {
+                    base.network
+                        .outbound
+                        .allowed_cidrs_port_qualified
+                        .push(s.clone());
+                }
+            }
+            for r in &overlay_rules {
+                if r.allow && !base.network.outbound.egress_rules.contains(r) {
+                    base.network.outbound.egress_rules.push(r.clone());
+                }
+            }
+            prov.union("defaults.network.allow", f, l, items);
+        }
     }
     {
         let (f, l) = decl.origin("defaults.network", file);
@@ -1064,7 +1234,16 @@ pub(super) fn merge_into_policy(
             // would replace the base tool's explicit scope with
             // defaults, silently widening or dropping it.
             if tool.fs_explicit {
-                merge_tool_fs(&mut existing.fs, tool.fs.as_ref(), prov, &key, f, l);
+                merge_tool_fs(
+                    &mut existing.fs,
+                    tool.fs.as_ref(),
+                    prov,
+                    &key,
+                    f,
+                    l,
+                    rules >= 3,
+                    tool.fs_replace,
+                );
             }
 
             // Syscalls merge — the same declaration gate as fs/network
@@ -1081,6 +1260,8 @@ pub(super) fn merge_into_policy(
                     &key,
                     f,
                     l,
+                    rules >= 3,
+                    tool.syscalls_replace,
                 );
             }
 
@@ -1095,6 +1276,8 @@ pub(super) fn merge_into_policy(
                     &key,
                     f,
                     l,
+                    rules >= 3,
+                    tool.network_replace,
                 );
             }
 
@@ -1233,6 +1416,7 @@ pub(super) fn apply_when_overrides(
     content: &str,
     pending: &mut PendingWarnings,
     prov: &mut Provenance,
+    rules: u32,
 ) -> Result<OverlayDecl, PolicyError> {
     let mut decl = OverlayDecl::default();
     for node in doc.nodes() {
@@ -1256,15 +1440,22 @@ pub(super) fn apply_when_overrides(
 
         // Apply overrides from the when block
         apply_overrides_from_doc(
-            children, policy, profiles, base_dir, path, content, pending, prov,
+            children, policy, profiles, base_dir, path, content, pending, prov, rules,
         )?;
-        decl.merge(&OverlayDecl::for_when_children(children, path, content));
+        decl.merge(&OverlayDecl::for_when_children(
+            children,
+            path,
+            content,
+            policy.version,
+        ));
     }
 
     Ok(decl)
 }
 
 /// Apply override fields parsed from a KdlDocument (used by `when` blocks).
+/// `rules` is the composition-semantics version — under v3 the allow
+/// sides below union unless the block declared `replace=#true`.
 #[expect(clippy::too_many_arguments)]
 fn apply_overrides_from_doc(
     doc: &KdlDocument,
@@ -1275,6 +1466,7 @@ fn apply_overrides_from_doc(
     content: &str,
     pending: &mut PendingWarnings,
     prov: &mut Provenance,
+    rules: u32,
 ) -> Result<(), PolicyError> {
     // defaults overrides
     if let Some(defaults_node) = unique_child(doc, "defaults", "the override document")?
@@ -1284,36 +1476,76 @@ fn apply_overrides_from_doc(
             let line = node_line(content, fs_node);
             // `secret-overlay` rides the declared block; omitted stays
             // default-on (fail-secure), same as the inheritance merge.
+            let fs_replace = parse_replace_flag(fs_node, "defaults.filesystem", policy.version)?;
             let fs = match fs_node.children() {
                 Some(fs_children) => parse_fs_allows(fs_children)?,
                 None => FsPolicy::default(),
             };
             policy.fs.secret_overlay = fs.secret_overlay;
             prov.set("defaults.filesystem.secret-overlay", path, line);
-            if fs.allow_specified {
-                // A matching `when` block replaces the allow lists
-                // wholesale — unlike extends/include, which union.
-                prov.replace(
-                    "defaults.filesystem.read_only",
-                    path,
-                    line,
-                    fs.read_only.clone(),
-                );
-                prov.replace(
-                    "defaults.filesystem.read_write",
-                    path,
-                    line,
-                    fs.read_write.clone(),
-                );
-                prov.replace(
-                    "defaults.filesystem.executable",
-                    path,
-                    line,
-                    fs.executable.clone(),
-                );
-                policy.fs.read_only = fs.read_only;
-                policy.fs.read_write = fs.read_write;
-                policy.fs.executable = fs.executable;
+            if fs.allow_specified || (rules >= 3 && fs_replace) {
+                if rules >= 3 && !fs_replace {
+                    // Under v3 the allow lists union by default — a
+                    // matching `when` adds to what the doc built.
+                    prov.union(
+                        "defaults.filesystem.read_only",
+                        path,
+                        line,
+                        fs.read_only.iter().cloned(),
+                    );
+                    prov.union(
+                        "defaults.filesystem.read_write",
+                        path,
+                        line,
+                        fs.read_write.iter().cloned(),
+                    );
+                    prov.union(
+                        "defaults.filesystem.executable",
+                        path,
+                        line,
+                        fs.executable.iter().cloned(),
+                    );
+                    for p in &fs.read_only {
+                        if !policy.fs.read_only.contains(p) {
+                            policy.fs.read_only.push(p.clone());
+                        }
+                    }
+                    for p in &fs.read_write {
+                        if !policy.fs.read_write.contains(p) {
+                            policy.fs.read_write.push(p.clone());
+                        }
+                    }
+                    for p in &fs.executable {
+                        if !policy.fs.executable.contains(p) {
+                            policy.fs.executable.push(p.clone());
+                        }
+                    }
+                } else {
+                    // A matching `when` block replaces the allow lists
+                    // wholesale under v1/v2 — and under v3 only on an
+                    // explicit `replace=#true`.
+                    prov.replace(
+                        "defaults.filesystem.read_only",
+                        path,
+                        line,
+                        fs.read_only.clone(),
+                    );
+                    prov.replace(
+                        "defaults.filesystem.read_write",
+                        path,
+                        line,
+                        fs.read_write.clone(),
+                    );
+                    prov.replace(
+                        "defaults.filesystem.executable",
+                        path,
+                        line,
+                        fs.executable.clone(),
+                    );
+                    policy.fs.read_only = fs.read_only;
+                    policy.fs.read_write = fs.read_write;
+                    policy.fs.executable = fs.executable;
+                }
                 policy.fs.allow_specified = true;
             }
             prov.union(
@@ -1350,14 +1582,47 @@ fn apply_overrides_from_doc(
                 prune_covered(list, |p| read_now.contains(p), prov, field, path, line);
             }
         }
-        if let Some(sc_node) = unique_child(children, "syscalls", "'defaults'")?
-            && let Some(sc_children) = sc_node.children()
-        {
-            let sc = parse_syscall_allows(sc_children)?;
-            if !sc.allowed.is_empty() {
-                let line = node_line(content, sc_node);
-                prov.replace("defaults.syscalls", path, line, sc.allowed.clone());
-                policy.syscalls.allowed = sc.allowed;
+        if let Some(sc_node) = unique_child(children, "syscalls", "'defaults'")? {
+            let line = node_line(content, sc_node);
+            let sc_replace = parse_replace_flag(sc_node, "defaults.syscalls", policy.version)?;
+            let sc = match sc_node.children() {
+                Some(sc_children) => parse_syscall_allows(sc_children, policy.version)?,
+                None => SyscallPolicy::default(),
+            };
+            if !sc.allowed.is_empty() || (rules >= 3 && sc_replace) {
+                if rules >= 3 && !sc_replace {
+                    prov.union("defaults.syscalls", path, line, sc.allowed.iter().cloned());
+                    for s in &sc.allowed {
+                        if !policy.syscalls.allowed.contains(s) {
+                            policy.syscalls.allowed.push(s.clone());
+                        }
+                    }
+                } else {
+                    prov.replace("defaults.syscalls", path, line, sc.allowed.clone());
+                    policy.syscalls.allowed = sc.allowed;
+                }
+            }
+            if !sc.denied.is_empty() {
+                prov.union(
+                    "defaults.syscalls.denied",
+                    path,
+                    line,
+                    sc.denied.iter().cloned(),
+                );
+                for s in &sc.denied {
+                    if !policy.syscalls.denied.contains(s) {
+                        policy.syscalls.denied.push(s.clone());
+                    }
+                }
+                let denied_now = policy.syscalls.denied.clone();
+                prune_covered(
+                    &mut policy.syscalls.allowed,
+                    |s| denied_now.contains(s),
+                    prov,
+                    "defaults.syscalls",
+                    path,
+                    line,
+                );
             }
         }
         // Node presence in a matching `when` block marks the contract
@@ -1383,19 +1648,22 @@ fn apply_overrides_from_doc(
         if let Some(net_node) = unique_child(children, "network", "'defaults'")?
             && let Some(net_children) = net_node.children()
         {
+            let net_replace = parse_replace_flag(net_node, "defaults.network", policy.version)?;
             let net = parse_network_rules(net_children)?;
             let line = node_line(content, net_node);
             // Same allow-replaces / deny-accumulates semantics as the
             // inheritance merge — including the qualified `egress_rules`
-            // entries the flat lists cannot carry. Materialize the stored
-            // rule set so replacement sees the effective rules.
+            // entries the flat lists cannot carry. Under v3 the allow
+            // side unions unless the block carried `replace=#true`.
+            // Materialize the stored rule set so composition sees the
+            // effective rules.
             policy.network.outbound.egress_rules = policy.network.outbound.egress_rules();
             let net_rules = net.outbound.egress_rules();
-            if !net.outbound.allowed.is_empty()
+            let net_has_allow = !net.outbound.allowed.is_empty()
                 || !net.outbound.allowed_cidrs.is_empty()
                 || !net.outbound.deny_all_others
-                || net_rules.iter().any(|r| r.allow)
-            {
+                || net_rules.iter().any(|r| r.allow);
+            if net_has_allow || (rules >= 3 && net_replace) {
                 // One `describe`d spelling per declared allow rule —
                 // the flat lists are the same rules' projections, so
                 // chaining them would double-count and lose the
@@ -1405,17 +1673,59 @@ fn apply_overrides_from_doc(
                     .filter(|r| r.allow)
                     .map(|r| r.describe())
                     .collect();
-                prov.replace("defaults.network.allow", path, line, allow_items);
-                policy.network.outbound.allowed = net.outbound.allowed;
-                policy.network.outbound.allowed_port_qualified =
-                    net.outbound.allowed_port_qualified;
-                policy.network.outbound.allowed_cidrs = net.outbound.allowed_cidrs;
-                policy.network.outbound.allowed_cidrs_port_qualified =
-                    net.outbound.allowed_cidrs_port_qualified;
-                policy.network.outbound.egress_rules.retain(|r| !r.allow);
-                for r in &net_rules {
-                    if r.allow && !policy.network.outbound.egress_rules.contains(r) {
-                        policy.network.outbound.egress_rules.push(r.clone());
+                if rules >= 3 && !net_replace {
+                    prov.union("defaults.network.allow", path, line, allow_items);
+                    for h in &net.outbound.allowed {
+                        if !policy.network.outbound.allowed.contains(h) {
+                            policy.network.outbound.allowed.push(h.clone());
+                        }
+                    }
+                    for s in &net.outbound.allowed_port_qualified {
+                        if !policy.network.outbound.allowed_port_qualified.contains(s) {
+                            policy
+                                .network
+                                .outbound
+                                .allowed_port_qualified
+                                .push(s.clone());
+                        }
+                    }
+                    for c in &net.outbound.allowed_cidrs {
+                        if !policy.network.outbound.allowed_cidrs.contains(c) {
+                            policy.network.outbound.allowed_cidrs.push(c.clone());
+                        }
+                    }
+                    for s in &net.outbound.allowed_cidrs_port_qualified {
+                        if !policy
+                            .network
+                            .outbound
+                            .allowed_cidrs_port_qualified
+                            .contains(s)
+                        {
+                            policy
+                                .network
+                                .outbound
+                                .allowed_cidrs_port_qualified
+                                .push(s.clone());
+                        }
+                    }
+                    for r in &net_rules {
+                        if r.allow && !policy.network.outbound.egress_rules.contains(r) {
+                            policy.network.outbound.egress_rules.push(r.clone());
+                        }
+                    }
+                } else {
+                    prov.replace("defaults.network.allow", path, line, allow_items);
+                    policy.network.outbound.allowed = net.outbound.allowed;
+                    policy.network.outbound.allowed_port_qualified =
+                        net.outbound.allowed_port_qualified;
+                    policy.network.outbound.allowed_cidrs = net.outbound.allowed_cidrs;
+                    policy.network.outbound.allowed_cidrs_port_qualified =
+                        net.outbound.allowed_cidrs_port_qualified;
+                    policy.network.outbound.egress_rules.retain(|r| !r.allow);
+                    for r in &net_rules {
+                        if r.allow && !policy.network.outbound.egress_rules.contains(r) {
+                            policy.network.outbound.egress_rules.push(r.clone());
+                        }
                     }
                 }
             }
@@ -1642,16 +1952,17 @@ fn apply_overrides_from_doc(
                     existing.input_responses_specified = true;
                     prov.set(format!("{tkey}.input_responses"), path, tline);
                 }
-                // A `when` override that names a profile must apply it
+                // A `when` override that names profiles must apply them
                 // to an existing tool too — the inline parse resolves
                 // the same spellings, so an unresolvable name is a
-                // load error, not a silently dropped restriction. The
-                // layer merges onto the tool's effective state in the
-                // same position it holds inline — below this override's
-                // own field blocks — so those still replace it.
-                if let Some(pname) = resolve_tool_profile_name(child, child.children(), &tool_ctx)?
-                {
-                    let profile_layer = profiles.get(&pname).ok_or_else(|| {
+                // load error, not a silently dropped restriction. Each
+                // layer merges onto the tool's effective state in
+                // declaration order — under v3 they union, under v2 a
+                // later layer replaces the earlier allow side.
+                let when_tool_profiles =
+                    resolve_tool_profile_names(child, child.children(), &tool_ctx, policy.version)?;
+                for pname in &when_tool_profiles {
+                    let profile_layer = profiles.get(pname).ok_or_else(|| {
                         PolicyError::Validation(format!(
                             "unknown profile '{pname}' referenced by tool '{tool_name}'"
                         ))
@@ -1669,6 +1980,8 @@ fn apply_overrides_from_doc(
                             &tkey,
                             path,
                             tline,
+                            rules >= 3,
+                            profile_layer.fs_replace,
                         );
                     }
                     if profile_layer.syscalls.is_some() {
@@ -1680,6 +1993,8 @@ fn apply_overrides_from_doc(
                             &tkey,
                             path,
                             tline,
+                            rules >= 3,
+                            profile_layer.syscalls_replace,
                         );
                     }
                     if profile_layer.network.is_some() {
@@ -1697,6 +2012,8 @@ fn apply_overrides_from_doc(
                             &tkey,
                             path,
                             tline,
+                            rules >= 3,
+                            profile_layer.network_replace,
                         );
                     }
                 }
@@ -1704,7 +2021,19 @@ fn apply_overrides_from_doc(
                     if let Some(fs_node) = unique_child(tc, "filesystem", &tool_ctx)?
                         && let Some(fs_children) = fs_node.children()
                     {
+                        let fs_replace = parse_replace_flag(
+                            fs_node,
+                            &format!("{tool_ctx}.filesystem"),
+                            policy.version,
+                        )?;
                         let over_fs = parse_tool_fs(fs_children)?;
+                        check_none_needs_replace(
+                            over_fs.allow_specified,
+                            !over_fs.allowed_paths.is_empty(),
+                            fs_replace,
+                            &format!("{tool_ctx}.filesystem"),
+                            rules,
+                        )?;
                         if !existing.fs_explicit {
                             // Re-base inherited grants on the current
                             // (post-`when`) defaults so the override folds the
@@ -1712,16 +2041,32 @@ fn apply_overrides_from_doc(
                             existing.fs = Some(tool_fs_base(&policy.fs, existing.fs.as_ref()));
                         }
                         existing.fs_explicit = true;
-                        merge_tool_fs(&mut existing.fs, Some(&over_fs), prov, &tkey, path, tline);
+                        existing.fs_replace |= fs_replace;
+                        merge_tool_fs(
+                            &mut existing.fs,
+                            Some(&over_fs),
+                            prov,
+                            &tkey,
+                            path,
+                            tline,
+                            rules >= 3,
+                            fs_replace,
+                        );
                     }
                     if let Some(sc_node) = unique_child(tc, "syscalls", &tool_ctx)?
                         && let Some(sc_children) = sc_node.children()
                     {
+                        let sc_replace = parse_replace_flag(
+                            sc_node,
+                            &format!("{tool_ctx}.syscalls"),
+                            policy.version,
+                        )?;
                         let over_sc = parse_tool_syscalls(sc_children)?;
                         // Per-tool syscalls are not enforced; mark explicit so
                         // rematerialize keeps them and load-time validation
                         // rejects the policy like an inline declaration.
                         existing.syscalls_explicit = true;
+                        existing.syscalls_replace |= sc_replace;
                         merge_tool_syscalls(
                             &mut existing.syscalls,
                             Some(&over_sc),
@@ -1729,12 +2074,28 @@ fn apply_overrides_from_doc(
                             &tkey,
                             path,
                             tline,
+                            rules >= 3,
+                            sc_replace,
                         );
                     }
                     if let Some(net_node) = unique_child(tc, "network", &tool_ctx)?
                         && let Some(net_children) = net_node.children()
                     {
+                        let net_replace = parse_replace_flag(
+                            net_node,
+                            &format!("{tool_ctx}.network"),
+                            policy.version,
+                        )?;
                         let over_net = parse_tool_network(net_children)?;
+                        check_none_needs_replace(
+                            over_net.allow_specified,
+                            !over_net.allowed_hosts.is_empty()
+                                || !over_net.allowed_cidrs.is_empty()
+                                || over_net.egress_rules.iter().any(|r| r.allow),
+                            net_replace,
+                            &format!("{tool_ctx}.network"),
+                            rules,
+                        )?;
                         if !existing.network_explicit {
                             existing.network = Some(tool_network_base(
                                 &policy.network,
@@ -1742,6 +2103,7 @@ fn apply_overrides_from_doc(
                             ));
                         }
                         existing.network_explicit = true;
+                        existing.network_replace |= net_replace;
                         merge_tool_network(
                             &mut existing.network,
                             Some(&over_net),
@@ -1749,6 +2111,8 @@ fn apply_overrides_from_doc(
                             &tkey,
                             path,
                             tline,
+                            rules >= 3,
+                            net_replace,
                         );
                     }
                     if let Some(proc_node) = unique_child(tc, "process", &tool_ctx)? {
@@ -1782,6 +2146,7 @@ fn apply_overrides_from_doc(
                     syscalls: policy.syscalls.clone(),
                     network: policy.network.clone(),
                     environment: EnvironmentPolicy::default(),
+                    ..Defaults::default()
                 });
                 let mut dummy_doc = KdlDocument::new();
                 let mut s_node = kdl::KdlNode::new("server");
@@ -1804,6 +2169,7 @@ fn apply_overrides_from_doc(
                     profiles,
                     base_dir,
                     policy.version,
+                    rules,
                     &mut schema_sources,
                 )?;
                 for source in schema_sources {
@@ -1896,15 +2262,19 @@ fn apply_overrides_from_doc(
 }
 
 /// Merge an overlay tool's declared `filesystem` block onto the base
-/// tool's: `require_path` replaces when the overlay set it, the allow
-/// side replaces when the overlay spelled one, denies accumulate, then
-/// deny-wins prunes every allow a deny pattern covers (`fs_deny_covers`
-/// — additive OS rulesets have no negative rule to carve a covered
-/// allow back out). A missing base adopts the overlay wholesale; a
-/// missing overlay leaves the base untouched. Shared by the
-/// extends/include merge and `when` overrides so both paths apply the
-/// same semantics — callers gate on the tool's own declaration
+/// tool's: `require_path` replaces when the overlay set it, denies
+/// accumulate, then deny-wins prunes every allow a deny pattern covers
+/// (`fs_deny_covers` — additive OS rulesets have no negative rule to
+/// carve a covered allow back out). The allow side replaces when the
+/// overlay spelled one under v1/v2 (`union_allows` false); under v3 it
+/// unions unless the overlay's block carried `replace=#true`
+/// (`over_replace`) — including an explicit empty allow side, which
+/// clears the accumulated list. A missing base adopts the overlay
+/// wholesale; a missing overlay leaves the base untouched. Shared by
+/// the extends/include merge and `when` overrides so both paths apply
+/// the same semantics — callers gate on the tool's own declaration
 /// (`fs_explicit`), never on materialized defaults.
+#[expect(clippy::too_many_arguments)]
 fn merge_tool_fs(
     base: &mut Option<FsToolPolicy>,
     over: Option<&FsToolPolicy>,
@@ -1912,6 +2282,8 @@ fn merge_tool_fs(
     key: &str,
     file: &Path,
     line: Option<u32>,
+    union_allows: bool,
+    over_replace: bool,
 ) {
     let Some(over_fs) = over else { return };
     let allow_key = format!("{key}.filesystem.allowed");
@@ -1932,11 +2304,44 @@ fn merge_tool_fs(
         base_fs.require_path = over_fs.require_path;
         prov.set(format!("{key}.filesystem.require-path"), file, line);
     }
-    if over_fs.allow_specified {
+    let replaces_allow = over_fs.allow_specified && !(union_allows && !over_replace);
+    if replaces_allow {
         prov.replace(&allow_key, file, line, over_fs.allowed_paths.clone());
         base_fs.allowed_paths = over_fs.allowed_paths.clone();
         base_fs.read_only_paths = over_fs.read_only_paths.clone();
         base_fs.read_write_paths = over_fs.read_write_paths.clone();
+        base_fs.allow_specified = true;
+    } else if over_fs.allow_specified {
+        prov.union(
+            &allow_key,
+            file,
+            line,
+            over_fs.allowed_paths.iter().cloned(),
+        );
+        for p in &over_fs.allowed_paths {
+            if !base_fs.allowed_paths.contains(p) {
+                base_fs.allowed_paths.push(p.clone());
+            }
+        }
+        for p in &over_fs.read_only_paths {
+            if !base_fs.read_only_paths.contains(p) {
+                base_fs.read_only_paths.push(p.clone());
+            }
+        }
+        for p in &over_fs.read_write_paths {
+            if !base_fs.read_write_paths.contains(p) {
+                base_fs.read_write_paths.push(p.clone());
+            }
+        }
+        base_fs.allow_specified = true;
+    } else if union_allows && over_replace {
+        // `filesystem replace=#true` with no allow side declared —
+        // clear the inherited allow lists (the `allow none=#true`
+        // spelling pairs with `replace` for exactly this).
+        prov.replace(&allow_key, file, line, Vec::new());
+        base_fs.allowed_paths.clear();
+        base_fs.read_only_paths.clear();
+        base_fs.read_write_paths.clear();
         base_fs.allow_specified = true;
     }
     prov.union(&deny_key, file, line, over_fs.denied_paths.iter().cloned());
@@ -1961,8 +2366,11 @@ fn merge_tool_fs(
     }
 }
 
-/// Same shape for a tool's `syscalls` block: a non-empty allow list
-/// replaces, denied names accumulate and re-prune the allow side.
+/// Same shape for a tool's `syscalls` block: under v1/v2 a non-empty
+/// allow list replaces; under v3 (`union_allows`) it unions unless the
+/// overlay block carried `replace=#true` (`over_replace`). Denied
+/// names accumulate and re-prune the allow side either way.
+#[expect(clippy::too_many_arguments)]
 fn merge_tool_syscalls(
     base: &mut Option<ToolSyscallPolicy>,
     over: Option<&ToolSyscallPolicy>,
@@ -1970,6 +2378,8 @@ fn merge_tool_syscalls(
     key: &str,
     file: &Path,
     line: Option<u32>,
+    union_allows: bool,
+    over_replace: bool,
 ) {
     let Some(over_sc) = over else { return };
     let allow_key = format!("{key}.syscalls.allowed");
@@ -1981,9 +2391,18 @@ fn merge_tool_syscalls(
         prov.union(&deny_key, file, line, over_sc.denied.iter().cloned());
         return;
     };
-    if !over_sc.allowed.is_empty() {
-        prov.replace(&allow_key, file, line, over_sc.allowed.clone());
-        base_sc.allowed = over_sc.allowed.clone();
+    if !(over_sc.allowed.is_empty() && !(union_allows && over_replace)) {
+        if union_allows && !over_replace {
+            prov.union(&allow_key, file, line, over_sc.allowed.iter().cloned());
+            for s in &over_sc.allowed {
+                if !base_sc.allowed.contains(s) {
+                    base_sc.allowed.push(s.clone());
+                }
+            }
+        } else {
+            prov.replace(&allow_key, file, line, over_sc.allowed.clone());
+            base_sc.allowed = over_sc.allowed.clone();
+        }
     }
     prov.union(&deny_key, file, line, over_sc.denied.iter().cloned());
     for denied in &over_sc.denied {
@@ -2003,9 +2422,12 @@ fn merge_tool_syscalls(
     }
 }
 
-/// And for a tool's `network` block: the allow side (hosts, CIDRs and
-/// allow-rules) replaces when the overlay declared one; denied hosts,
-/// CIDRs and deny-rules accumulate, then deny precedence reapplies.
+/// And for a tool's `network` block: under v1/v2 the allow side
+/// (hosts, CIDRs and allow-rules) replaces when the overlay declared
+/// one; under v3 (`union_allows`) it unions unless the overlay block
+/// carried `replace=#true` (`over_replace`). Denied hosts, CIDRs and
+/// deny-rules accumulate either way, then deny precedence reapplies.
+#[expect(clippy::too_many_arguments)]
 fn merge_tool_network(
     base: &mut Option<ToolNetworkPolicy>,
     over: Option<&ToolNetworkPolicy>,
@@ -2013,6 +2435,8 @@ fn merge_tool_network(
     key: &str,
     file: &Path,
     line: Option<u32>,
+    union_allows: bool,
+    over_replace: bool,
 ) {
     let Some(over_net) = over else { return };
     let allow_key = format!("{key}.network.allow");
@@ -2029,7 +2453,8 @@ fn merge_tool_network(
     // Materialize so the allow-side replacement covers rules only the
     // accessor could see.
     base_net.egress_rules = base_net.egress_rule_set();
-    if over_net.allow_specified || over_net.egress_rules.iter().any(|r| r.allow) {
+    let over_has_allow = over_net.allow_specified || over_net.egress_rules.iter().any(|r| r.allow);
+    if over_has_allow && !(union_allows && !over_replace) {
         prov.replace(&allow_key, file, line, allow_items(over_net));
         base_net.allowed_hosts = over_net.allowed_hosts.clone();
         base_net.allowed_cidrs = over_net.allowed_cidrs.clone();
@@ -2040,6 +2465,33 @@ fn merge_tool_network(
                 base_net.egress_rules.push(r.clone());
             }
         }
+    } else if over_has_allow {
+        prov.union(&allow_key, file, line, allow_items(over_net));
+        for h in &over_net.allowed_hosts {
+            if !base_net.allowed_hosts.contains(h) {
+                base_net.allowed_hosts.push(h.clone());
+            }
+        }
+        for c in &over_net.allowed_cidrs {
+            if !base_net.allowed_cidrs.contains(c) {
+                base_net.allowed_cidrs.push(c.clone());
+            }
+        }
+        base_net.allow_specified = true;
+        for r in &over_net.egress_rules {
+            if r.allow && !base_net.egress_rules.contains(r) {
+                base_net.egress_rules.push(r.clone());
+            }
+        }
+    } else if union_allows && over_replace {
+        // `network replace=#true` with no allow side — the tool's v3
+        // declaration means "clear the inherited allow side" (the
+        // `allow none=#true` spelling pairs with `replace` for this).
+        prov.replace(&allow_key, file, line, allow_items(over_net));
+        base_net.allowed_hosts.clear();
+        base_net.allowed_cidrs.clear();
+        base_net.allow_specified = true;
+        base_net.egress_rules.retain(|r| !r.allow);
     }
     prov.union(&deny_key, file, line, deny_items(over_net));
     for denied in &over_net.denied_hosts {
@@ -2342,9 +2794,15 @@ pub(crate) fn rematerialize_inherited_defaults(
         }
 
         if !tool.syscalls_explicit {
-            let mut denied = Vec::new();
+            // Deny is sticky: defaults-level `deny` entries (v3) and any
+            // the tool already carries narrow the materialized grant.
+            let mut denied = global_sc.denied.clone();
             if let Some(ref existing) = tool.syscalls {
-                denied = existing.denied.clone();
+                for d in &existing.denied {
+                    if !denied.contains(d) {
+                        denied.push(d.clone());
+                    }
+                }
             }
             let denied_check = denied.clone();
             let allowed: Vec<String> = global_sc
@@ -2368,10 +2826,36 @@ pub(crate) fn rematerialize_inherited_defaults(
                 format!("{key}.syscalls.denied"),
                 (&origin.0, origin.1),
                 denied.clone(),
-                &[],
+                SC_SOURCES,
                 |_| false,
             );
             tool.syscalls = keep.then_some(ToolSyscallPolicy { allowed, denied });
+        } else if let Some(sc) = tool.syscalls.as_mut() {
+            // Even a tool with its own `syscalls` block takes the global
+            // denies — deny-wins does not stop at a declared scope.
+            for d in &global_sc.denied {
+                if !sc.denied.contains(d) {
+                    sc.denied.push(d.clone());
+                }
+            }
+            let dropped: Vec<String> = sc
+                .allowed
+                .iter()
+                .filter(|s| sc.denied.contains(s))
+                .cloned()
+                .collect();
+            sc.allowed.retain(|s| !dropped.contains(s));
+            if !dropped.is_empty() {
+                let origin = prov
+                    .last_writer_of(SC_SOURCES)
+                    .unwrap_or_else(|| (file.to_path_buf(), None));
+                prov.prune(
+                    format!("{key}.syscalls.allowed"),
+                    &origin.0,
+                    origin.1,
+                    dropped,
+                );
+            }
         }
     }
 }

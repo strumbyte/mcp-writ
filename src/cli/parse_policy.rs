@@ -94,6 +94,14 @@ pub(super) fn parse_policy_args(
         missing_value.get_or_insert_with(|| "--format requires a value: kdl or json".to_string());
     }
 
+    // --version-diff — resolve the same documents under the other
+    // composition-rules version (v2 vs v3) and report which effective
+    // fields the rule change moves (PR-28).
+    args.version_diff = noargs::flag("version-diff")
+        .doc("Report effective-policy differences between v2 and v3 composition rules")
+        .take(&mut raw)
+        .is_present();
+
     // -v / --verbose
     args.verbose = if noargs::flag("verbose")
         .short('v')

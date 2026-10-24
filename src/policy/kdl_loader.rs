@@ -66,9 +66,24 @@ pub fn load_kdl_policy_for_target_scanned(
     env: &str,
     target: &ExecutionTarget,
 ) -> Result<(Policy, LoadDiagnostics), PolicyError> {
+    load_kdl_policy_for_target_scanned_rules(path, env, target, None)
+}
+
+/// Same scanned load as [`load_kdl_policy_for_target_scanned`], but
+/// every composition merge runs under `rules` — the v2/v3
+/// semantics override `policy resolve --version-diff` uses to replay
+/// the same documents under the other rules version. Declaration
+/// grammar and version validation still follow each file's declared
+/// `policy version=`.
+pub fn load_kdl_policy_for_target_scanned_rules(
+    path: &Path,
+    env: &str,
+    target: &ExecutionTarget,
+    rules: Option<u32>,
+) -> Result<(Policy, LoadDiagnostics), PolicyError> {
     let mut visited = HashSet::new();
     let (policy, diagnostics) =
-        super::kdl_inherit::load_kdl_policy_internal(path, &mut visited, env)?;
+        super::kdl_inherit::load_kdl_policy_internal_rules(path, &mut visited, env, rules)?;
     super::validator::validate_policy_for_target(&policy, target)?;
     Ok((policy, diagnostics))
 }

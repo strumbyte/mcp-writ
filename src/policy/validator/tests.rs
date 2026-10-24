@@ -34,11 +34,18 @@ fn test_version_two_accepted() {
 }
 
 #[test]
-fn test_version_three_rejected() {
+fn test_version_three_accepted() {
     let mut policy = default_policy();
     policy.version = 3;
+    validate_policy(&policy).expect("v3 is a supported schema");
+}
+
+#[test]
+fn test_version_four_rejected() {
+    let mut policy = default_policy();
+    policy.version = 4;
     let err = validate_policy(&policy).unwrap_err();
-    assert!(err.to_string().contains("unsupported policy version 3"));
+    assert!(err.to_string().contains("unsupported policy version 4"));
 }
 
 // --- required fields ---
@@ -76,6 +83,9 @@ fn test_empty_tool_name() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -102,6 +112,9 @@ fn test_whitespace_tool_name() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -130,6 +143,9 @@ fn test_duplicate_tool_names() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -149,6 +165,9 @@ fn test_duplicate_tool_names() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -175,6 +194,9 @@ fn test_duplicate_tool_names_after_trimming() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -194,6 +216,9 @@ fn test_duplicate_tool_names_after_trimming() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -220,6 +245,9 @@ fn test_unique_tool_names_pass() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -239,6 +267,9 @@ fn test_unique_tool_names_pass() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -266,6 +297,9 @@ fn test_empty_allowed_path_in_tool() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -297,6 +331,9 @@ fn test_whitespace_denied_path_in_tool() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -348,6 +385,9 @@ fn test_valid_paths_pass() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -896,6 +936,9 @@ fn test_r06_parent_allow_child_deny_rejected() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -928,6 +971,9 @@ fn test_per_tool_syscalls_are_rejected() {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: true,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,
@@ -1166,6 +1212,9 @@ fn policy_with_schema(version: u32, schema: &str) -> Policy {
         fs_explicit: false,
         network_explicit: false,
         syscalls_explicit: false,
+        fs_replace: false,
+        network_replace: false,
+        syscalls_replace: false,
         environment_explicit: false,
         process_exec_allowed: false,
         process_explicit: false,

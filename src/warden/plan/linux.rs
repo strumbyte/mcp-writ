@@ -66,7 +66,7 @@ pub(crate) fn os_controls(
         {
             // The plan models the same gate `run` applies at spawn
             // (`require_execve_allowance`): an effective `syscalls.allowed`
-            // without execve/execveat fails the launch — so a `plan`
+            // without a usable execve fails the launch — so a `plan`
             // that said `ready` for a launch `run` would refuse is
             // reported `failed`, with the file that wrote the list.
             let mut c = planned("os.syscalls", ControlLayer::Os, "seccomp");
@@ -80,7 +80,7 @@ pub(crate) fn os_controls(
                 } else {
                     c.state = ControlState::Failed;
                     let mut reason = String::from(
-                        "syscalls.allowed must include execve (or execveat) to spawn a \
+                        "syscalls.allowed must include execve to spawn a \
                          child process, or set sandbox.allow_degraded=#true",
                     );
                     if let Some(detail) =

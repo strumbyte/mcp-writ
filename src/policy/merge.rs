@@ -30,6 +30,15 @@ pub struct PolicyLayer {
     /// launch-level contract, not a per-tool category, so it never merges;
     /// the flag only marks the (unsupported) declaration for validation.
     pub environment_explicit: bool,
+    /// `policy version=3`: the layer's `filesystem` block declared
+    /// `replace=#true`, so it replaces (not unions) the accumulated
+    /// allow side. Ignored under v1/v2, where any spelled allow side
+    /// already replaces.
+    pub fs_replace: bool,
+    /// Same for the layer's `syscalls` block.
+    pub syscalls_replace: bool,
+    /// Same for the layer's `network` block.
+    pub network_replace: bool,
 }
 
 /// The effective policy for a single tool after all layers have been merged.
@@ -45,15 +54,20 @@ pub struct MergedToolPolicy {
 ///
 /// # Rules
 ///
-/// 1. **Override**: If a higher-priority layer specifies a category (`Some(..)`),
-///    its `allow`-side values **replace** the lower layers' values.
+/// 1. **Override (v1/v2)** or **union (v3)**: under `version < 3` a
+///    higher-priority layer's spelled allow side **replaces** the lower
+///    layers' values. Under `version = 3` a layer's allow side **unions**
+///    by default, and replaces only when the block declared
+///    `replace=#true` — including an allow side declared empty, which
+///    clears the accumulated values.
 /// 2. **Deny is sticky**: `denied_*` / `denied` lists **accumulate** across all
 ///    layers.  An item denied at *any* layer stays denied regardless of later allows.
 /// 3. **Tool-level deny**: If *any* layer sets `allowed = Some(false)`, the tool
 ///    is denied and cannot be un-denied by a later layer.
 /// 4. **Inheritance**: Unspecified (`None`) categories inherit the running value
 ///    from lower layers.
-pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
+pub fn merge_policy(layers: &[&PolicyLayer], version: u32) -> MergedToolPolicy {
+    let union_allows = version >= 3;
     let mut result = MergedToolPolicy {
         allowed: true,
         fs: FsToolPolicy {
@@ -88,16 +102,41 @@ pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
             }
             // If this layer specifies any allow rules, overwrite the entire allow category
             // (allowed_paths, read_only_paths, read_write_paths) to prevent leaking old permissions.
+            // Under v3 the allow side unions instead unless the block
+            // declared `replace=#true`; a replace-flagged block replaces
+            // even when its allow side is empty (an explicit clear).
             let has_allow_rules = fs.allow_specified
                 || !fs.allowed_paths.is_empty()
                 || !fs.read_only_paths.is_empty()
                 || !fs.read_write_paths.is_empty();
 
-            if has_allow_rules {
+            let replaces = if union_allows {
+                layer.fs_replace
+            } else {
+                has_allow_rules
+            };
+            if replaces {
                 result.fs.allowed_paths = fs.allowed_paths.clone();
                 result.fs.read_only_paths = fs.read_only_paths.clone();
                 result.fs.read_write_paths = fs.read_write_paths.clone();
                 result.fs.allow_specified = true;
+            } else {
+                for p in &fs.allowed_paths {
+                    if !result.fs.allowed_paths.contains(p) {
+                        result.fs.allowed_paths.push(p.clone());
+                    }
+                }
+                for p in &fs.read_only_paths {
+                    if !result.fs.read_only_paths.contains(p) {
+                        result.fs.read_only_paths.push(p.clone());
+                    }
+                }
+                for p in &fs.read_write_paths {
+                    if !result.fs.read_write_paths.contains(p) {
+                        result.fs.read_write_paths.push(p.clone());
+                    }
+                }
+                result.fs.allow_specified |= has_allow_rules;
             }
 
             // Denied paths accumulate (deny-sticky)
@@ -110,8 +149,19 @@ pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
 
         // ── syscalls ────────────────────────────────────
         if let Some(ref sc) = layer.syscalls {
-            if !sc.allowed.is_empty() {
+            let replaces = if union_allows {
+                layer.syscalls_replace
+            } else {
+                !sc.allowed.is_empty()
+            };
+            if replaces {
                 result.syscalls.allowed = sc.allowed.clone();
+            } else {
+                for s in &sc.allowed {
+                    if !result.syscalls.allowed.contains(s) {
+                        result.syscalls.allowed.push(s.clone());
+                    }
+                }
             }
             for name in &sc.denied {
                 if !result.syscalls.denied.contains(name) {
@@ -125,11 +175,18 @@ pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
             // An explicit allowlist replaces the whole allow side —
             // host (name layer) and cidr (IP layer) rules together,
             // including the qualified rules that ride beside them.
+            // Under v3 the allow side unions unless the block declared
+            // `replace=#true`.
             let has_allow_rules = net.allow_specified
                 || !net.allowed_hosts.is_empty()
                 || !net.allowed_cidrs.is_empty()
                 || net.egress_rules.iter().any(|r| r.allow);
-            if has_allow_rules {
+            let replaces = if union_allows {
+                layer.network_replace
+            } else {
+                has_allow_rules
+            };
+            if replaces {
                 result.network.allowed_hosts = net.allowed_hosts.clone();
                 result.network.allowed_cidrs = net.allowed_cidrs.clone();
                 result.network.egress_rules.retain(|r| !r.allow);
@@ -139,6 +196,23 @@ pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
                     }
                 }
                 result.network.allow_specified = true;
+            } else {
+                for h in &net.allowed_hosts {
+                    if !result.network.allowed_hosts.contains(h) {
+                        result.network.allowed_hosts.push(h.clone());
+                    }
+                }
+                for c in &net.allowed_cidrs {
+                    if !result.network.allowed_cidrs.contains(c) {
+                        result.network.allowed_cidrs.push(c.clone());
+                    }
+                }
+                for r in &net.egress_rules {
+                    if r.allow && !result.network.egress_rules.contains(r) {
+                        result.network.egress_rules.push(r.clone());
+                    }
+                }
+                result.network.allow_specified |= has_allow_rules;
             }
             for host in &net.denied_hosts {
                 if !result.network.denied_hosts.contains(host) {
@@ -331,7 +405,7 @@ mod tests {
     #[test]
     fn test_empty_layers_produce_empty_result() {
         let layer = empty_layer();
-        let result = merge_policy(&[&layer]);
+        let result = merge_policy(&[&layer], 2);
         assert!(result.allowed);
         assert!(result.fs.allowed_paths.is_empty());
         assert!(result.fs.denied_paths.is_empty());
@@ -342,7 +416,7 @@ mod tests {
     #[test]
     fn test_single_defaults_layer_inherited() {
         let defaults = fs_layer(&["/usr/lib/**"], &[]);
-        let result = merge_policy(&[&defaults]);
+        let result = merge_policy(&[&defaults], 2);
         assert_eq!(result.fs.allowed_paths, vec!["/usr/lib/**"]);
     }
 
@@ -362,7 +436,7 @@ mod tests {
         };
         // Tool layer only specifies fs, syscalls should inherit
         let tool = fs_layer(&["/workspace/**"], &[]);
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         assert_eq!(result.fs.allowed_paths, vec!["/workspace/**"]);
         assert_eq!(result.syscalls.allowed, vec!["read", "write"]);
     }
@@ -373,7 +447,7 @@ mod tests {
     fn test_higher_priority_overrides_allowed_paths() {
         let defaults = fs_layer(&["/usr/lib/**"], &[]);
         let tool = fs_layer(&["/workspace/**"], &[]);
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         assert_eq!(result.fs.allowed_paths, vec!["/workspace/**"]);
     }
 
@@ -381,7 +455,7 @@ mod tests {
     fn test_higher_priority_overrides_allowed_syscalls() {
         let defaults = syscall_layer(&["read", "write", "openat"], &[]);
         let tool = syscall_layer(&["read"], &[]);
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         assert_eq!(result.syscalls.allowed, vec!["read"]);
     }
 
@@ -389,7 +463,7 @@ mod tests {
     fn test_higher_priority_overrides_allowed_hosts() {
         let defaults = network_layer(&["api.example.com"], &[]);
         let tool = network_layer(&["cdn.example.com"], &[]);
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         assert_eq!(result.network.allowed_hosts, vec!["cdn.example.com"]);
     }
 
@@ -400,7 +474,7 @@ mod tests {
         let defaults = fs_layer(&["/usr/lib/**"], &["/etc/shadow"]);
         let server_defaults = fs_layer(&[], &["/root/**"]);
         let tool = fs_layer(&["/workspace/**"], &["/tmp/secrets"]);
-        let result = merge_policy(&[&defaults, &server_defaults, &tool]);
+        let result = merge_policy(&[&defaults, &server_defaults, &tool], 2);
         assert_eq!(result.fs.allowed_paths, vec!["/workspace/**"]);
         assert_eq!(
             result.fs.denied_paths,
@@ -412,7 +486,7 @@ mod tests {
     fn test_denied_syscalls_accumulate_across_layers() {
         let defaults = syscall_layer(&["read", "write"], &["execve"]);
         let tool = syscall_layer(&["read", "write", "openat"], &["fork"]);
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         assert_eq!(result.syscalls.allowed, vec!["read", "write", "openat"]);
         assert_eq!(result.syscalls.denied, vec!["execve", "fork"]);
     }
@@ -421,7 +495,7 @@ mod tests {
     fn test_denied_hosts_accumulate_across_layers() {
         let defaults = network_layer(&["api.example.com"], &["evil.com"]);
         let tool = network_layer(&["cdn.example.com"], &["malware.org"]);
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         assert_eq!(result.network.allowed_hosts, vec!["cdn.example.com"]);
         assert_eq!(result.network.denied_hosts, vec!["evil.com", "malware.org"]);
     }
@@ -430,7 +504,7 @@ mod tests {
     fn test_deny_duplicates_are_deduplicated() {
         let layer1 = fs_layer(&[], &["/etc/shadow"]);
         let layer2 = fs_layer(&[], &["/etc/shadow"]);
-        let result = merge_policy(&[&layer1, &layer2]);
+        let result = merge_policy(&[&layer1, &layer2], 2);
         assert_eq!(result.fs.denied_paths, vec!["/etc/shadow"]);
     }
 
@@ -448,7 +522,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         // /tmp/** was in allowed but later denied → removed from allowed
         assert_eq!(result.fs.allowed_paths, vec!["/workspace/**"]);
         assert_eq!(result.fs.denied_paths, vec!["/tmp/**"]);
@@ -458,7 +532,7 @@ mod tests {
     fn test_denied_syscall_removed_from_allowed() {
         let defaults = syscall_layer(&["read", "write", "execve"], &[]);
         let tool = syscall_layer(&[], &["execve"]);
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         assert_eq!(result.syscalls.allowed, vec!["read", "write"]);
         assert_eq!(result.syscalls.denied, vec!["execve"]);
     }
@@ -467,7 +541,7 @@ mod tests {
     fn test_denied_host_removed_from_allowed() {
         let defaults = network_layer(&["api.example.com", "evil.com"], &[]);
         let tool = network_layer(&[], &["evil.com"]);
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         assert_eq!(result.network.allowed_hosts, vec!["api.example.com"]);
         assert_eq!(result.network.denied_hosts, vec!["evil.com"]);
     }
@@ -479,7 +553,7 @@ mod tests {
         // identical strings.
         let defaults = network_layer(&["api.evil.com", "cdn.example.com"], &[]);
         let tool = network_layer(&[], &["*.evil.com"]);
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         assert_eq!(result.network.allowed_hosts, vec!["cdn.example.com"]);
         assert_eq!(result.network.denied_hosts, vec!["*.evil.com"]);
     }
@@ -488,7 +562,7 @@ mod tests {
     fn test_denied_host_star_clears_allowed() {
         let defaults = network_layer(&["api.example.com"], &[]);
         let tool = network_layer(&[], &["*"]);
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         assert!(result.network.allowed_hosts.is_empty());
         assert_eq!(result.network.denied_hosts, vec!["*"]);
     }
@@ -509,7 +583,7 @@ mod tests {
             allowed: Some(true), // try to re-allow → denied still wins
             ..Default::default()
         };
-        let result = merge_policy(&[&defaults, &server_defaults, &tool]);
+        let result = merge_policy(&[&defaults, &server_defaults, &tool], 2);
         assert!(!result.allowed);
     }
 
@@ -523,14 +597,14 @@ mod tests {
             allowed: Some(true),
             ..Default::default()
         };
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         assert!(!result.allowed);
     }
 
     #[test]
     fn test_no_explicit_allowed_defaults_to_true() {
         let layer = empty_layer();
-        let result = merge_policy(&[&layer]);
+        let result = merge_policy(&[&layer], 2);
         assert!(result.allowed);
     }
 
@@ -540,7 +614,7 @@ mod tests {
             allowed: Some(true),
             ..Default::default()
         };
-        let result = merge_policy(&[&layer]);
+        let result = merge_policy(&[&layer], 2);
         assert!(result.allowed);
     }
 
@@ -602,7 +676,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = merge_policy(&[&defaults, &profile, &server_defaults, &tool]);
+        let result = merge_policy(&[&defaults, &profile, &server_defaults, &tool], 2);
 
         // Tool is allowed (no deny at any stage)
         assert!(result.allowed);
@@ -637,7 +711,7 @@ mod tests {
             allowed: Some(false), // tool explicitly denied
             ..Default::default()
         };
-        let result = merge_policy(&[&defaults, &profile, &server_defaults, &tool]);
+        let result = merge_policy(&[&defaults, &profile, &server_defaults, &tool], 2);
         assert!(!result.allowed);
         // FS inherited from defaults
         assert_eq!(result.fs.allowed_paths, vec!["/usr/lib/**"]);
@@ -776,7 +850,7 @@ mod tests {
 
     #[test]
     fn test_zero_layers() {
-        let result = merge_policy(&[]);
+        let result = merge_policy(&[], 2);
         assert!(result.allowed);
         assert!(result.fs.allowed_paths.is_empty());
     }
@@ -792,7 +866,7 @@ mod tests {
             allowed: Some(false),
             ..Default::default()
         };
-        let result = merge_policy(&[&allow, &allow, &deny, &allow, &allow]);
+        let result = merge_policy(&[&allow, &allow, &deny, &allow, &allow], 2);
         assert!(!result.allowed);
     }
 
@@ -808,7 +882,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         // allowed_paths inherited from defaults (tool's empty list doesn't replace)
         assert_eq!(result.fs.allowed_paths, vec!["/usr/lib/**"]);
         assert_eq!(result.fs.denied_paths, vec!["/etc/shadow"]);
@@ -824,7 +898,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let result = merge_policy(&[&layer]);
+        let result = merge_policy(&[&layer], 2);
         // execve should be removed from allowed
         assert_eq!(result.syscalls.allowed, vec!["read"]);
         assert_eq!(result.syscalls.denied, vec!["execve"]);
@@ -834,7 +908,7 @@ mod tests {
     fn test_deny_from_lower_layer_removes_from_higher_allowed() {
         let defaults = syscall_layer(&[], &["execve"]); // deny at defaults
         let tool = syscall_layer(&["execve", "read"], &[]); // tool tries to allow execve
-        let result = merge_policy(&[&defaults, &tool]);
+        let result = merge_policy(&[&defaults, &tool], 2);
         // execve denied at defaults → removed from tool's allowed
         assert_eq!(result.syscalls.allowed, vec!["read"]);
         assert_eq!(result.syscalls.denied, vec!["execve"]);
@@ -868,7 +942,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = merge_policy(&[&profile, &tool]);
+        let result = merge_policy(&[&profile, &tool], 2);
         assert_eq!(result.fs.allowed_paths, vec!["/new/**"]);
         assert_eq!(result.fs.read_only_paths, vec!["/new/**"]);
         assert!(
@@ -884,7 +958,7 @@ mod tests {
         // A deny covering a spelled allow removes it — additive OS
         // rulesets cannot carve the grant back out.
         let layer = fs_layer(&["/srv/deny/child"], &["/srv/deny"]);
-        let result = merge_policy(&[&layer]);
+        let result = merge_policy(&[&layer], 2);
         assert!(
             result.fs.allowed_paths.is_empty(),
             "deny /srv/deny must suppress allow /srv/deny/child"
@@ -896,11 +970,11 @@ mod tests {
     fn test_deny_prune_uses_normalized_identities() {
         // `/srv/x/` and `/srv/x` name the same object.
         let layer = fs_layer(&["/srv/x"], &["/srv/x/"]);
-        let result = merge_policy(&[&layer]);
+        let result = merge_policy(&[&layer], 2);
         assert!(result.fs.allowed_paths.is_empty());
         // A wildcard deny covers the descendant it spells.
         let layer = fs_layer(&["/srv/y"], &["/srv/*"]);
-        let result = merge_policy(&[&layer]);
+        let result = merge_policy(&[&layer], 2);
         assert!(result.fs.allowed_paths.is_empty());
     }
 
@@ -909,7 +983,7 @@ mod tests {
         // F87: `foo*` is a literal component, not a prefix grant —
         // deny "/a/foo*" must not suppress allow "/a/foo".
         let layer = fs_layer(&["/a/foo"], &["/a/foo*"]);
-        let result = merge_policy(&[&layer]);
+        let result = merge_policy(&[&layer], 2);
         assert_eq!(result.fs.allowed_paths, vec!["/a/foo"]);
     }
 }

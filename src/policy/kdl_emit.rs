@@ -130,13 +130,26 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
         out.push_str("    }\n");
     }
 
-    if !policy.syscalls.allowed.is_empty() {
+    if !policy.syscalls.allowed.is_empty() || !policy.syscalls.denied.is_empty() {
         out.push_str("    syscalls {\n");
-        out.push_str("        allow");
-        for sc in &policy.syscalls.allowed {
-            out.push_str(&format!(" \"{}\"", escape_kdl(sc)));
+        if !policy.syscalls.allowed.is_empty() {
+            out.push_str("        allow");
+            for sc in &policy.syscalls.allowed {
+                out.push_str(&format!(" \"{}\"", escape_kdl(sc)));
+            }
+            out.push('\n');
         }
-        out.push_str("\n    }\n");
+        // `deny` is a `policy version=3` declaration — only a v3
+        // effective policy can carry it, and the emitted header keeps
+        // that version, so the document re-parses.
+        if !policy.syscalls.denied.is_empty() {
+            out.push_str("        deny");
+            for sc in &policy.syscalls.denied {
+                out.push_str(&format!(" \"{}\"", escape_kdl(sc)));
+            }
+            out.push('\n');
+        }
+        out.push_str("    }\n");
     }
 
     let has_net = !policy.network.outbound.allowed.is_empty()
@@ -599,6 +612,12 @@ fn normalized_for_export(policy: &Policy) -> Policy {
         tool.syscalls_explicit = false;
         tool.environment_explicit = false;
         tool.process_explicit = false;
+        // `*_replace` records the v3 declaration-site merge mode — the
+        // serialized effective policy has no layers left to replace, so
+        // the flags do not round-trip and are normalized out.
+        tool.fs_replace = false;
+        tool.network_replace = false;
+        tool.syscalls_replace = false;
         if let Some(ref mut fs) = tool.fs {
             // `to_kdl` emits read allows before write allows, so the
             // source's mixed-mode declaration order survives only per

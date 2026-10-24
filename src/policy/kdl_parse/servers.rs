@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use kdl::KdlDocument;
 
 use super::{
-    parse_deputy_node, parse_layer_children, parse_process_exec_allowed, parse_tool_fs,
-    parse_tool_network, parse_tool_syscalls, resolve_tool_args_schema, unique_child,
-    validate_tool_shape_v2,
+    check_none_needs_replace, parse_deputy_node, parse_layer_children, parse_process_exec_allowed,
+    parse_replace_flag, parse_tool_fs, parse_tool_network, parse_tool_syscalls,
+    resolve_tool_args_schema, unique_child, validate_tool_shape_v2,
 };
 use crate::error::PolicyError;
 use crate::policy::merge::{PolicyLayer, merge_policy, validate_merged};
@@ -15,12 +15,20 @@ use crate::policy::{HashEntry, HashType, InputResponsesMode, ToolPolicy, ToolsLi
 /// `schema_sources` collects every `@file` document resolved here —
 /// the load records them as policy sources a launch must protect from
 /// workload write grants.
+///
+/// `version` is the document's declared `policy version=` — it gates
+/// the *grammar* (closed tool shape, multi-profile references, the
+/// `replace` property). `rules` is the composition-semantics version
+/// the layer merge runs under — normally equal to `version`; the
+/// `--version-diff` resolution path passes a simulated version so the
+/// same declarations can be composed under v2 versus v3 rules.
 pub(crate) fn parse_servers(
     doc: &KdlDocument,
     defaults_layer: &PolicyLayer,
     profiles: &HashMap<String, PolicyLayer>,
     base_dir: Option<&Path>,
     version: u32,
+    rules: u32,
     schema_sources: &mut Vec<PathBuf>,
 ) -> Result<Vec<ToolPolicy>, PolicyError> {
     let mut tools = Vec::new();
@@ -42,7 +50,7 @@ pub(crate) fn parse_servers(
         let server_defaults_layer =
             if let Some(sd_node) = unique_child(children, "server-defaults", &server_ctx)? {
                 if let Some(sd_children) = sd_node.children() {
-                    parse_layer_children(sd_children, &server_ctx)?
+                    parse_layer_children(sd_children, &server_ctx, version)?
                 } else {
                     PolicyLayer::default()
                 }
@@ -147,29 +155,44 @@ pub(crate) fn parse_servers(
                     (InputResponsesMode::Auto, false)
                 };
 
-            let profile_name = resolve_tool_profile_name(child, tool_children, &tool_ctx)?;
+            let profile_names =
+                resolve_tool_profile_names(child, tool_children, &tool_ctx, version)?;
 
-            let profile_layer = if let Some(ref pname) = profile_name {
-                profiles
-                    .get(pname)
-                    .ok_or_else(|| {
-                        PolicyError::Validation(format!(
-                            "unknown profile '{}' referenced by tool '{}'",
-                            pname, tool_name
-                        ))
-                    })?
-                    .clone()
-            } else {
-                PolicyLayer::default()
-            };
+            // Multiple profiles are a `policy version=3` composition —
+            // their layers stack in declaration order between defaults
+            // and server-defaults, so under v3 semantics they union.
+            let mut profile_layers: Vec<PolicyLayer> = Vec::new();
+            for pname in &profile_names {
+                profile_layers.push(
+                    profiles
+                        .get(pname)
+                        .ok_or_else(|| {
+                            PolicyError::Validation(format!(
+                                "unknown profile '{pname}' referenced by tool '{tool_name}'"
+                            ))
+                        })?
+                        .clone(),
+                );
+            }
 
             // Parse tool-level rules. Same-named policy blocks are
             // unique per tool — `get` would take the first and silently
             // drop the rest.
+            let mut tool_fs_replace = false;
             let tool_fs = if let Some(tc) = tool_children {
                 if let Some(fs_node) = unique_child(tc, "filesystem", &tool_ctx)? {
+                    tool_fs_replace =
+                        parse_replace_flag(fs_node, &format!("{tool_ctx}.filesystem"), version)?;
                     if let Some(c) = fs_node.children() {
-                        Some(parse_tool_fs(c)?)
+                        let policy = parse_tool_fs(c)?;
+                        check_none_needs_replace(
+                            policy.allow_specified,
+                            !policy.allowed_paths.is_empty(),
+                            tool_fs_replace,
+                            &format!("{tool_ctx}.filesystem"),
+                            rules,
+                        )?;
+                        Some(policy)
                     } else {
                         None
                     }
@@ -180,8 +203,11 @@ pub(crate) fn parse_servers(
                 None
             };
 
+            let mut tool_syscalls_replace = false;
             let tool_syscalls = if let Some(tc) = tool_children {
                 if let Some(sc_node) = unique_child(tc, "syscalls", &tool_ctx)? {
+                    tool_syscalls_replace =
+                        parse_replace_flag(sc_node, &format!("{tool_ctx}.syscalls"), version)?;
                     if let Some(c) = sc_node.children() {
                         Some(parse_tool_syscalls(c)?)
                     } else {
@@ -194,10 +220,23 @@ pub(crate) fn parse_servers(
                 None
             };
 
+            let mut tool_network_replace = false;
             let tool_network = if let Some(tc) = tool_children {
                 if let Some(net_node) = unique_child(tc, "network", &tool_ctx)? {
+                    tool_network_replace =
+                        parse_replace_flag(net_node, &format!("{tool_ctx}.network"), version)?;
                     if let Some(c) = net_node.children() {
-                        Some(parse_tool_network(c)?)
+                        let policy = parse_tool_network(c)?;
+                        check_none_needs_replace(
+                            policy.allow_specified,
+                            !policy.allowed_hosts.is_empty()
+                                || !policy.allowed_cidrs.is_empty()
+                                || policy.egress_rules.iter().any(|r| r.allow),
+                            tool_network_replace,
+                            &format!("{tool_ctx}.network"),
+                            rules,
+                        )?;
+                        Some(policy)
                     } else {
                         None
                     }
@@ -253,20 +292,25 @@ pub(crate) fn parse_servers(
                 syscalls: tool_syscalls,
                 network: tool_network,
                 environment_explicit: has_tool_environment,
+                fs_replace: tool_fs_replace,
+                syscalls_replace: tool_syscalls_replace,
+                network_replace: tool_network_replace,
             };
 
-            // 4-stage merge: defaults → profile → server-defaults → tool
-            let merged = merge_policy(&[
-                defaults_layer,
-                &profile_layer,
-                &server_defaults_layer,
-                &tool_layer,
-            ]);
+            // Merge order: defaults → profile(s) → server-defaults → tool.
+            // `rules` selects union-by-default (v3) vs replace-on-allow
+            // (v1/v2) semantics; the grammar above already ran under the
+            // document's declared `version`.
+            let mut merge_layers: Vec<&PolicyLayer> = vec![defaults_layer];
+            merge_layers.extend(profile_layers.iter());
+            merge_layers.push(&server_defaults_layer);
+            merge_layers.push(&tool_layer);
+            let merged = merge_policy(&merge_layers, rules);
 
             validate_merged(&merged)?;
 
             let has_fs = has_tool_fs
-                || profile_layer.fs.is_some()
+                || profile_layers.iter().any(|l| l.fs.is_some())
                 || server_defaults_layer.fs.is_some()
                 || defaults_layer.fs.is_some()
                 || !merged.fs.allowed_paths.is_empty()
@@ -277,7 +321,7 @@ pub(crate) fn parse_servers(
             let fs = if has_fs { Some(merged.fs) } else { None };
 
             let has_syscalls = has_tool_syscalls
-                || profile_layer.syscalls.is_some()
+                || profile_layers.iter().any(|l| l.syscalls.is_some())
                 || server_defaults_layer.syscalls.is_some()
                 || defaults_layer.syscalls.is_some()
                 || !merged.syscalls.allowed.is_empty()
@@ -290,7 +334,7 @@ pub(crate) fn parse_servers(
             };
 
             let has_network = has_tool_network
-                || profile_layer.network.is_some()
+                || profile_layers.iter().any(|l| l.network.is_some())
                 || server_defaults_layer.network.is_some()
                 || defaults_layer.network.is_some()
                 || !merged.network.allowed_hosts.is_empty()
@@ -314,16 +358,19 @@ pub(crate) fn parse_servers(
                 input_responses,
                 input_responses_specified,
                 fs_explicit: has_tool_fs
-                    || profile_layer.fs.is_some()
+                    || profile_layers.iter().any(|l| l.fs.is_some())
                     || server_defaults_layer.fs.is_some(),
                 network_explicit: has_tool_network
-                    || profile_layer.network.is_some()
+                    || profile_layers.iter().any(|l| l.network.is_some())
                     || server_defaults_layer.network.is_some(),
                 syscalls_explicit: has_tool_syscalls
-                    || profile_layer.syscalls.is_some()
+                    || profile_layers.iter().any(|l| l.syscalls.is_some())
                     || server_defaults_layer.syscalls.is_some(),
+                fs_replace: tool_fs_replace,
+                network_replace: tool_network_replace,
+                syscalls_replace: tool_syscalls_replace,
                 environment_explicit: has_tool_environment
-                    || profile_layer.environment_explicit
+                    || profile_layers.iter().any(|l| l.environment_explicit)
                     || server_defaults_layer.environment_explicit,
                 process_exec_allowed,
                 process_explicit,
@@ -335,18 +382,21 @@ pub(crate) fn parse_servers(
     Ok(tools)
 }
 
-/// The profile a `tool` node names, in either spelling: the
+/// The profiles a `tool` node names, in either spelling: the
 /// `profile="name"` property or a `profile "name"` / `profiles "name"`
 /// child node. The property and a child node together are ambiguous
 /// about which applies — as are both child nodes — so either pairing is
-/// a parse error rather than a silent pick. Shared by the inline parse
-/// and the `when`-override application on an existing tool so the two
+/// a parse error rather than a silent pick. Under `policy version=3` a
+/// `profile`/`profiles` child may carry several name arguments; their
+/// layers compose in declaration order. Shared by the inline parse and
+/// the `when`-override application on an existing tool so the two
 /// resolve (and reject) identically.
-pub(crate) fn resolve_tool_profile_name(
+pub(crate) fn resolve_tool_profile_names(
     child: &kdl::KdlNode,
     tool_children: Option<&KdlDocument>,
     tool_ctx: &str,
-) -> Result<Option<String>, PolicyError> {
+    version: u32,
+) -> Result<Vec<String>, PolicyError> {
     if let Some(val) = child.get("profile") {
         let Some(s) = val.as_string() else {
             return Err(PolicyError::KdlParse(format!(
@@ -365,10 +415,10 @@ pub(crate) fn resolve_tool_profile_name(
                 )));
             }
         }
-        return Ok(Some(s.to_string()));
+        return Ok(vec![s.to_string()]);
     }
     let Some(tc) = tool_children else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let prof = unique_child(tc, "profile", tool_ctx)?;
     let profs = unique_child(tc, "profiles", tool_ctx)?;
@@ -380,18 +430,58 @@ pub(crate) fn resolve_tool_profile_name(
         )));
     }
     let Some(node) = prof.or(profs) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     // A *present* `profile`/`profiles` child whose first argument is
     // missing or not a string must not collapse to `None` — the tool
     // would load without the profile restrictions the document declares.
-    let name = node.get(0).and_then(|v| v.as_string()).ok_or_else(|| {
-        PolicyError::KdlParse(format!(
-            "'{}' child node on {tool_ctx} requires a string profile-name argument",
+    let mut names = Vec::new();
+    for entry in node.entries() {
+        match entry.name() {
+            Some(prop) => {
+                // v1's permissive grammar ignores the property — the
+                // schema pass still warns. v2+ treats it as ambiguous.
+                if version >= 2 {
+                    return Err(PolicyError::KdlParse(format!(
+                        "unexpected property '{}' on '{}' child node on {tool_ctx}; \
+                         it takes profile-name arguments only",
+                        prop.value(),
+                        node.name().value(),
+                    )));
+                }
+            }
+            None => {
+                let s = entry.value().as_string().ok_or_else(|| {
+                    PolicyError::KdlParse(format!(
+                        "'{}' child node on {tool_ctx} requires string profile-name arguments",
+                        node.name().value(),
+                    ))
+                })?;
+                names.push(s.to_string());
+            }
+        }
+    }
+    if names.is_empty() {
+        return Err(PolicyError::KdlParse(format!(
+            "'{}' child node on {tool_ctx} requires a profile-name argument",
             node.name().value(),
-        ))
-    })?;
-    Ok(Some(name.to_string()))
+        )));
+    }
+    if names.len() > 1 {
+        if version >= 3 {
+            // Multiple profile composition — union in declaration order.
+        } else if version == 2 {
+            return Err(PolicyError::KdlParse(format!(
+                "{tool_ctx} names several profiles — multiple profile composition \
+                 requires 'policy version=3'"
+            )));
+        } else {
+            // v1 reads the first name like the pre-v3 grammar did —
+            // the schema pass already warned about the extras.
+            names.truncate(1);
+        }
+    }
+    Ok(names)
 }
 
 /// Parse hash entries (binary-hash, lockfile-hash, entrypoint-hash,

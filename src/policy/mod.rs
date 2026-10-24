@@ -311,6 +311,14 @@ pub struct ToolPolicy {
     pub network_explicit: bool,
     /// True when this tool declared its own `syscalls` block.
     pub syscalls_explicit: bool,
+    /// `policy version=3`: this tool's `filesystem` block carried
+    /// `replace=#true`, so it replaces (not unions) the accumulated
+    /// allow side wherever the tool merges.
+    pub fs_replace: bool,
+    /// Same for the tool's `network` block.
+    pub network_replace: bool,
+    /// Same for the tool's `syscalls` block.
+    pub syscalls_replace: bool,
     /// True when an `environment` block appeared under this tool, its
     /// profile, or its server-defaults. Per-tool environment is not
     /// enforced; the validator rejects it at load time.
@@ -342,6 +350,9 @@ impl ToolPolicy {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            fs_replace: false,
+            network_replace: false,
+            syscalls_replace: false,
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
@@ -570,6 +581,12 @@ impl SideEffect {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyscallPolicy {
     pub allowed: Vec<String>,
+    /// `deny` entries under `defaults.syscalls` — a `policy version=3`
+    /// declaration. Union semantics make the allow side monotonically
+    /// additive across `extends`/`include`/`when`, so denying is the only
+    /// way a later document narrows an inherited syscall grant;
+    /// deny-wins prunes covered allows wherever the two merge.
+    pub denied: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -616,9 +633,13 @@ pub fn tracing_level_from_policy(level: &str) -> tracing::Level {
 /// Supported `policy version=` range. v1 keeps the legacy open `tool`
 /// shape and the default passage profile; v2 adds the closed `tool`
 /// shape and `server` `mcp` passage rules (MRTR additional requests are
-/// denied without an explicit rule either way).
+/// denied without an explicit rule either way). v3 keeps the v2 schema
+/// but changes merge semantics: allow lists union across composition
+/// layers by default, an allow side is replaced only by an explicit
+/// `replace=#true`, `defaults.syscalls` gains `deny`, and a tool may
+/// name multiple profiles (their layers union).
 const MIN_SUPPORTED_VERSION: u32 = 1;
-const MAX_SUPPORTED_VERSION: u32 = 2;
+const MAX_SUPPORTED_VERSION: u32 = 3;
 
 impl Default for Policy {
     fn default() -> Self {
@@ -891,6 +912,7 @@ pub fn default_policy() -> Policy {
         },
         syscalls: SyscallPolicy {
             allowed: Vec::new(),
+            denied: Vec::new(),
         },
         network: NetworkPolicy {
             outbound: OutboundPolicy::default(),

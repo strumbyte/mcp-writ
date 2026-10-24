@@ -130,7 +130,7 @@ sequenceDiagram
 **重要なポイント:**
 
 - **Auditor** はクライアントからサーバーへの JSON-RPC `tools/call` リクエストをリアルタイムに検査し、未許可のツールや範囲外引数をサーバー到達前にブロックする。
-- **Warden（seccomp + Landlock + no_new_privs）** はサーバープロセスに OS レベルのサンドボックスを適用する。Linux の通常起動には `execve` または `execveat` の明示許可が必要で、その許可は子プロセスにも残る。サンプルポリシーにはこの起動用権限を含めている。`exec_shell` の拒否は RPC 検査であり、それだけでは直接の `execve` を止めない。
+- **Warden（seccomp + Landlock + no_new_privs）** はサーバープロセスに OS レベルのサンドボックスを適用する。Linux の通常起動には `execve` の明示許可が必要で（起動エントリポイントが発行するのは `execve` であり、別システムコールの `execveat` では肩代わりできない）、その許可は子プロセスにも残る。サンプルポリシーにはこの起動用権限を含めている。`exec_shell` の拒否は RPC 検査であり、それだけでは直接の `execve` を止めない。
 - ファイルシステムの制限は、プロセスレベルの Landlock（加算型アクセス制御）と RPC レベルの引数検査（きめ細かな拒否ルール）が組み合わさって提供される。
 - **Landlock** はファイルシステムアクセスをポリシーで定義されたパスのみに制限する。
 - **`no_new_privs`** は setuid バイナリによる権限昇格を防止する。
@@ -1027,9 +1027,14 @@ mcp-writ policy resolve --policy policy.kdl --format json
 # 別の環境・サーバー識別として解決する
 mcp-writ policy resolve --policy policy.kdl --env production
 mcp-writ policy resolve --policy policy.kdl --server svc-b
+
+# v2/v3 の合成規則で動く実効フィールドを比較する
+mcp-writ policy resolve --policy policy.kdl --version-diff
 ```
 
 `--format kdl`（既定）は合成ドキュメントのみを stdout に書く — `to_kdl` と同じシリアライズ — ため、出力は diff・コミット・再読み込みができる。出所ログ、ロード時の警告（後のファイルが置換した継承項目、スキーマ緩和の注記、弱められた posture）、未解消の `// REVIEW` マーカーは stderr に出る。`--format json` は 1 つのオブジェクトを出力する: `schema_version`（`"1"`）、`status`、`policy`（`version`、`hash` — 正規ハッシュを算出できない場合は `null`）、`kdl`（合成ドキュメント）、`provenance[]`（`field`、`file`、`line`、`op`、`items`、`replaced[]` — 貢献したファイルごとに、その書き込みが捨てた項目数）、`review_markers[]`（`{file, line, text}` — ロードで見つかった未解消の `// REVIEW` マーカー）、`warnings[]`（`{kind, file, line, message}`）。
+
+`--version-diff`（`policy version=3` への移行補助）は同じ文書をもう一方の合成規則バージョンでもう一度解決し — v3 宣言のポリシーは v2 の規則で、その逆も同様 — 規則変更で動く実効フィールドをすべて報告する: 置換だった箇所の和集合、それを取り除く deny、置き換えではなく積み上がるツールスコープ。`--format kdl` では差分はドキュメント先頭の `//` コメント行に入り、`--format json` では `version_diff` メンバ（`{declared_version, simulated_version, fields[]}` — `field`・`declared`・`simulated`。もう一方の規則で文書を合成できない場合は `simulated_error`）を追加する。シミュレーション側のロードはマージ規則だけを変える — 文法は宣言されたバージョンのまま — ので、ファイルを書き換えずに「version=3 に上げる（または戻す）と何が変わるか」に答える。
 
 `--env` は `when` ブロックが評価する値を与える — 省略時は環境変数 `MCP_WRIT_ENV` がそのまま使われ、起動時のロードと同じ見え方になる。`--server` は複数サーバーのポリシーを 1 つの識別に束縛する（`run`/`plan`/`check` と同じ選択）。`policy resolve` は `MCP_WRIT_REPLACE_MODE` も `MCP_WRIT_REVIEW_MODE` も強制しない — ロード時に死ぬ検査コマンドは、示すために存在する所見自体を隠してしまう。
 
@@ -1043,7 +1048,7 @@ mcp-writ policy resolve --policy policy.kdl --server svc-b
 
 | ノード / プロパティ | 型 | 必須 | デフォルト | 説明 |
 |-----------------|------|----------|---------|-------------|
-| `policy version` | integer | はい | — | ポリシーフォーマットバージョン（`1` または `2`。`deputy` ブロックや `mcp` ルールなどのスキーマ v2 機能を使う場合は `2` が必須） |
+| `policy version` | integer | はい | — | ポリシーフォーマットバージョン（`1`、`2`、または `3`。`deputy` ブロックや `mcp` ルールなどのスキーマ v2 機能を使う場合は `2` が必須。`3` は合成規則を「既定は追加・置換は明示（`replace=#true`）」へ切り替える — [ポリシー作成ガイド](policy-authoring.ja.md#policy-version3--既定は追加置換は明示)参照） |
 | `transport` | ノード | いいえ | stdio | `type="stdio"`（HTTP listen はパースされるが v1 の実行パスではない） |
 | `extends` / `include` | パス文字列 | いいえ | — | KDL の継承または分割（含むファイルからの相対パス。循環は拒否）。宣言されたフィールドは継承済みの値を上書きし — 取り込むファイルの祖先やマッチした `when` 由来の値も対象 — マージで fail-secure の姿勢（リスナ許可・外向き全開・`secret-overlay`・監査フラグ・`environment` 制限）が弱まる場合、その宣言を行ったファイル名付きでロード時に警告される |
 | `defaults.filesystem` | `allow` / `deny` | いいえ | 空 | Linux Landlock パス。`mode="read"`（デフォルト）、`mode="write"`、または `mode="exec"`。Landlock は加算型制御のため、許可した親パスの下で子パスを拒否するポリシーは OS 層で表現できず、読み込み時に拒否される。`mode="exec"` はワークロードが *コードをマップしてよい* ディレクトリを示す — macOS では `file-read*` + `file-map-executable` を発行して dyld が非システム dylib をロードできるようにする。Linux では read 同等（Landlock の読み取り権が `Execute` を含むため）、Windows では読み取り専用 ACL 付与として扱う（実行可否は readability に従う）。exec は read を含むが write は含まない — writable な許可とどちらの向きでも重なるパスは読み込み時に拒否される（writable+executable ディレクトリは drop-and-run チャネル）。`mode="exec"` はグローバル専用: ツール単位 `filesystem` に起動時のコードマップ権はないため、同スペルはそこでは拒否される。**Windows:** これらのパスは **グローバル** リストからの AppContainer ACL 付与になる。照合は **大文字小文字を無視** する。`/workspace` のような POSIX ルートはカレントドライブへ書き換えない |
@@ -1168,7 +1173,7 @@ macOS の Warden は Landlock/seccomp ではなく、動的に生成した Seatb
 |---|---|---|---|
 | ファイルシステム | **OS で適用**（Landlock 既定拒否）。グローバルの `defaults.filesystem` に加え、*許可された* ツールの `filesystem` も 1 つのプロセス共通ルールセットへ合成される — 付与はツール呼び出し単位ではない。`mode="read"` は `Execute` を含む Landlock 読み取り権へ、`mode="write"` は `Truncate` を含む書き込み権へ対応（truncate の適用はカーネル 6.2 以降）。末尾のグロブは実在ディレクトリへ還元。`/home/*/.ssh` のような中間グロブや存在しないパス → **警告**、規則はスキップ（既定拒否は維持）。許可親配下の `deny` → 全 OS で読み込み時に **拒否**（Landlock は spawn 時にも再検査）。Landlock が仲介できないファイルシステム上の `allow` — 9p/v9fs マウント（WSL2 の `drvfs` など）のように永続的なカーネル inode 同一性を持たない疑似ファイルシステム — は起動時に **拒否** される（ruleset は enforced と報告しつつ付与対象に一度もマッチしないため）。ワークロードはローカルファイルシステム上に置くこと。 | **OS で適用**（SBPL `subpath` 規則）は **グローバル** リストのみ。ツール単位 `filesystem` → **Auditor で検査**。`mode="exec"` は `file-map-executable` を追加する — dyld が非システム dylib をマップするのに必要な許可。ポリシーとは独立に、起動ごとにワークロード自身のコードルートを導出する — インストール済みランタイムの prefix（Homebrew/MacPorts/Nix/CLT ツリー・ツールチェーンディレクトリ）、Mach-O dylib 依存クロージャ（`@rpath`/`@loader_path`/`@executable_path` 解決済み）、インタプリタ起動のペイロードプロジェクトディレクトリ — に read+map-executable を付与するため、Homebrew/CLT のインタプリタやベンダー済みネイティブアドオンは `mode="exec"` の記述なしで起動する。writable+executable の重複 → 読み込み時に **拒否**。 | **OS で適用** — `appcontainer` では spawn 時に存在するグローバルパスへ AppContainer SID の DACL を付与し、存在しないパスは警告なしにスキップ。`psec` では同じリストが DACL 書き込みではなく security-environment spec にエンコードされる — エントリはリテラルな絶対パスのみ（グロブ・相対形式は policy-check ステージで拒否）、存在しないパスはスキップ。ツール単位 `filesystem` はいずれの機構でも **Auditor で検査**。照合は大文字小文字を無視。 |
 | ネットワーク（アウトバウンド） | **OS で適用**は TCP *ポート* 単位のみ: 数値のみのエントリ（`allow host="443"`）は、そのポートへの **任意の宛先** の Landlock `ConnectTcp` 規則になる（カーネル 6.7 以降）。ホスト名・URL・`host:port` のエントリ → **警告** でスキップされ、**Auditor で検査** のホスト規則として残る。`inbound allow` → **未適用**（TCP bind は常に不許可）。 | deny-all モード: **OS で適用**は loopback TCP ポートのみ。リモートホスト名 → spawn 時に **拒否**。ポートなしの `localhost` 単体は OS 規則を生成しない。無制限モード → 包括許可（`inbound allow=#true` なら `network-bind` も）。 | `appcontainer`: **OS で適用**は deny-all（ケイパビリティなし）か無制限（`internetClient` + `privateNetworkClientServer`、`inbound allow=#true` なら `internetClientServer` 追加）。deny-all と空でない `allow` リストの併用 → 読み込み時に **拒否**。宛先単位の OS 制御はなく、ホスト検査は **Auditor で検査** のまま。`psec`: **OS で適用**される egress は明示的な default-deny と宛先単位の allow ルール — `allow` エントリは素の IPv4 リテラルのみ。ホスト名・IPv6・`host:port`・無制限 egress・`inbound allow`・HTTP トランスポート → 読み込み時／policy-check で **拒否**。ループバック免除は存在しない。 |
-| システムコール | **OS で適用**: `defaults.syscalls` から seccomp-BPF 許可リストを生成し、`no_new_privs` のあと子プロセスで適用。`execve`/`execveat` を含まない許可リスト → `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。ツール単位 `syscalls` → 全 OS で読み込み時に **拒否**。`deny_all_others` 下の `socket` は seccomp 条件で `AF_INET`/`AF_INET6` の `SOCK_STREAM` のみにファミリ固定 — AF_UNIX・AF_VSOCK・AF_PACKET・datagram 型は失敗閉じ。`socketpair(AF_UNIX, SOCK_DGRAM)` は namespaced 経路と native deny-all 下で拒否（native のオープン方針では両コールとも無ピン）。スキーマ v2 の `allow unix=` opt-in が AF_UNIX を再許可する（`"*"` はファミリ全体、絶対パスは ABI v9 で Landlock スコープ付きの接続指向ソケットのみ）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 |
+| システムコール | **OS で適用**: `defaults.syscalls` から seccomp-BPF 許可リストを生成し、`no_new_privs` のあと子プロセスで適用。利用可能な `execve` を含まない許可リスト（`execveat` は別システムコールであり spawn を担えない）→ `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。ツール単位 `syscalls` → 全 OS で読み込み時に **拒否**。`deny_all_others` 下の `socket` は seccomp 条件で `AF_INET`/`AF_INET6` の `SOCK_STREAM` のみにファミリ固定 — AF_UNIX・AF_VSOCK・AF_PACKET・datagram 型は失敗閉じ。`socketpair(AF_UNIX, SOCK_DGRAM)` は namespaced 経路と native deny-all 下で拒否（native のオープン方針では両コールとも無ピン）。スキーマ v2 の `allow unix=` opt-in が AF_UNIX を再許可する（`"*"` はファミリ全体、絶対パスは ABI v9 で Landlock スコープ付きの接続指向ソケットのみ）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 |
 | 環境変数 | **起動時に適用**（Warden）: `defaults.environment` の許可リストで、子の環境は `PATH`・一時ディレクトリ変数・列挙名のみに制限される。OS サンドボックスの有無に関わらず同一に適用され（`--dry-run` と `MCP_WRIT_SKIP_SANDBOX` を含む）、ツール単位 `environment` → 読み込み時に **拒否**。 | 同様 — Warden が起動時に適用。 | 同様 — `appcontainer` では Warden が起動時に適用（AppContainer spawn には `LOCALAPPDATA` が必須のため、制限モードでは常に供給される）。`psec` では子環境は機構管理 — 非空の `allow` リスト、`inherit-parent #true`、`tmpdir` 上書きは読み込み時に **拒否**。 |
 | 適用失敗 | Landlock ルールセットが完全に適用されない（要求 ABI 権より古いカーネル）→ `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。同フラグ指定時は部分適用のサンドボックスを受け入れて続行する — その許容は監査記録（`policy.loaded` の `allow_degraded=true`、`server.connected` の `os.*` 状態）とレポート `observations` に残り、`verified` へは昇格しない。 | `sandbox-exec` がない → spawn 失敗（**拒否**）。生成プロファイルが起動時に拒否された場合は子が数ミリ秒で終了する — レポートは `os.sandbox` に終了を `unknown` として記録し（早期終了はすぐ終わる workload と区別できない）、起動は MCP ハンドシェイクで失敗する。 | `appcontainer`: プロファイル・ケイパビリティの設定失敗 → spawn 失敗（**拒否**）。個々の DACL 付与失敗 → **警告** — 付与要求は保証されないが、実際のアクセス可否は対象の既存 ACL に従う（既存の ALL_APPLICATION_PACKAGES ACE が許可を継続し得る）。失敗はレポートに `Failed` として記録。`psec`: capability probe・spec 変換・環境生成の失敗 → 該当ステージ名で起動を **拒否**。パス単位のベストエフォート付与は存在しない。 |
 | 非隔離実行 | `--dry-run` → **警告**、子はサンドボックスなしで実行され、`tools/call` 違反は転送される（`observed` として記録、遮断しない）。`MCP_WRIT_SKIP_SANDBOX=1` → **警告**、子はサンドボックスなしで実行（副作用が起こり得る）が、Auditor の `tools/call` 検査は違反を引き続き **遮断** する（`denied`）。Linux/macOS/Windows 以外の OS → **警告**（"sandbox not available on this platform"）、子は制約なしで実行。 | 同様 — dry-run と skip 環境変数は `sandbox-exec` を迂回する。 | 同様 — dry-run と skip 環境変数はいずれの機構のサンドボックスも迂回する。 |
@@ -1294,7 +1299,7 @@ defaults {
 }
 ```
 
-すべての OS で読み込み可能。**Linux** では、`sandbox allow_degraded=#true` がなければ `Sandbox setup failed during 'policy' stage on linux: syscalls.allowed must include execve (or execveat) to spawn a child process, or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter` で spawn が失敗する（同フラグ指定時は警告を記録し execve を残したまま起動）。macOS と Windows ではこのリストは一切適用されない。
+すべての OS で読み込み可能。**Linux** では、`sandbox allow_degraded=#true` がなければ `Sandbox setup failed during 'policy' stage on linux: syscalls.allowed must include execve to spawn a child process — the spawn entrypoint issues execve (execveat is a different syscall and cannot carry it) — or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter` で spawn が失敗する（同フラグ指定時は警告を記録し execve を残したまま起動）。macOS と Windows ではこのリストは一切適用されない。
 
 ### ツール制御と制約
 

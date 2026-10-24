@@ -578,6 +578,7 @@ fn test_merge_tool_syscalls_gated_on_explicit() {
         &OverlayDecl::default(),
         std::path::Path::new("overlay.kdl"),
         &mut crate::policy::provenance::Provenance::default(),
+        2,
     );
     let tool = base.tools.iter().find(|t| t.name == "t").unwrap();
     let sc = tool.syscalls.as_ref().unwrap();
@@ -605,6 +606,7 @@ fn test_merge_tool_syscalls_gated_on_explicit() {
         &OverlayDecl::default(),
         std::path::Path::new("overlay.kdl"),
         &mut crate::policy::provenance::Provenance::default(),
+        2,
     );
     let sc = base
         .tools
@@ -877,6 +879,7 @@ fn test_include_onto_default_base_records_no_weakening() {
             warnings: &mut warnings,
             prov: &mut prov,
             profile_files: &mut profile_files,
+            rules: None,
         };
         load_kdl_policy_recursive_with_decl(
             &dir.join("main.kdl"),
