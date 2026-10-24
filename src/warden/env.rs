@@ -60,25 +60,28 @@ fn dyld_fallback_inherited(pairs: Option<&[(OsString, OsString)]>) -> Option<OsS
 
 /// Concatenate `inherited` + `dirs` into one
 /// `DYLD_FALLBACK_LIBRARY_PATH` spelling — the derived fallback extends
-/// the inherited search list instead of replacing it. The inherited
-/// value is already a `:`-joined list, so it is appended raw (re-running
-/// `join_paths` over it would reject the separators it contains). An
-/// empty inherited spelling contributes nothing — a bare `:` would
-/// read as a cwd entry.
+/// the inherited search list instead of replacing it. `split_paths`
+/// decomposes the inherited list on the platform separator; its empty
+/// elements (a `::` gap in the spelling) are dropped — a search-path
+/// empty entry reads as cwd. `join_paths` re-assembles the survivors,
+/// so no literal separator is written here.
 fn merged_dyld_fallback(inherited: Option<OsString>, dirs: &[PathBuf]) -> Option<OsString> {
-    let mut out = OsString::new();
+    let mut parts: Vec<PathBuf> = Vec::new();
     if let Some(v) = inherited.filter(|v| !v.is_empty()) {
-        out.push(v);
+        parts.extend(std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()));
     }
-    if let Ok(d) = std::env::join_paths(dirs)
-        && !d.is_empty()
-    {
-        if !out.is_empty() {
-            out.push(":");
-        }
-        out.push(d);
+    // A dir itself containing the list separator cannot join a path
+    // list — exclude it alone rather than let `join_paths` discard the
+    // entire fallback for one unusable entry.
+    parts.extend(
+        dirs.iter()
+            .filter(|d| std::env::join_paths([d]).is_ok())
+            .cloned(),
+    );
+    if parts.is_empty() {
+        return None;
     }
-    (!out.is_empty()).then_some(out)
+    std::env::join_paths(&parts).ok()
 }
 
 /// Apply the [`SpawnOptions`] environment to a synchronous command —
@@ -346,7 +349,10 @@ mod tests {
 
     /// `exec_dyld_fallback` merges onto an inherited
     /// `DYLD_FALLBACK_LIBRARY_PATH` instead of replacing it; a
-    /// restriction-dropped name stays dropped.
+    /// restriction-dropped name stays dropped. Unix-only: the var and
+    /// its `:`-joined values are a dyld (macOS) concept — Windows
+    /// `split_paths` would treat `:` as path content, not a separator.
+    #[cfg(unix)]
     #[test]
     fn dyld_fallback_appends_to_inherited_and_respects_restriction() {
         let _env = lock_process_env();
@@ -356,18 +362,27 @@ mod tests {
             std::env::set_var(var, "/inherited/lib:/opt/extra");
         }
         let derived = vec![PathBuf::from("/real/lib"), PathBuf::from("/real2/lib")];
+        // Decode merged values back through split_paths — the platform
+        // separator (`:` / `;`) must not leak into the assertions.
+        let parts_of = |v: &OsString| -> Vec<String> {
+            std::env::split_paths(v)
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        };
 
         // Inherit mode (no env block): parent value + derived.
         let merged =
             merged_dyld_fallback(dyld_fallback_inherited(None), &derived).expect("merged fallback");
-        let text = merged.to_string_lossy();
-        assert!(
-            text.starts_with("/inherited/lib:/opt/extra:"),
-            "inherited dirs must lead the merged list; got {text}"
-        );
-        assert!(
-            text.ends_with("/real/lib:/real2/lib"),
-            "derived dirs must append; got {text}"
+        assert_eq!(
+            parts_of(&merged),
+            vec![
+                "/inherited/lib".to_string(),
+                "/opt/extra".to_string(),
+                "/real/lib".to_string(),
+                "/real2/lib".to_string(),
+            ],
+            "inherited dirs must lead, derived append; got {}",
+            merged.to_string_lossy()
         );
 
         // Restricted + allowlisted: the copied parent value is kept.
@@ -376,8 +391,13 @@ mod tests {
             (OsString::from(var), OsString::from("/allowed/lib")),
         ];
         let merged = merged_dyld_fallback(dyld_fallback_inherited(Some(&pairs)), &derived).unwrap();
-        assert!(
-            merged.to_string_lossy().starts_with("/allowed/lib:"),
+        assert_eq!(
+            parts_of(&merged),
+            vec![
+                "/allowed/lib".to_string(),
+                "/real/lib".to_string(),
+                "/real2/lib".to_string(),
+            ],
             "allowlisted parent dirs must lead; got {}",
             merged.to_string_lossy()
         );
@@ -392,15 +412,44 @@ mod tests {
             "restriction must not restore excluded dirs; got {}",
             merged.to_string_lossy()
         );
+        // Inherited spellings with empty elements (`::` gaps, a leading
+        // or trailing `:`) must not carry cwd-reading empty entries into
+        // the merged list.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::set_var(var, ":lead::mid:/trail:");
+        }
+        let merged = merged_dyld_fallback(dyld_fallback_inherited(None), &derived).unwrap();
+        assert_eq!(
+            parts_of(&merged),
+            vec![
+                "lead".to_string(),
+                "mid".to_string(),
+                "/trail".to_string(),
+                "/real/lib".to_string(),
+                "/real2/lib".to_string(),
+            ],
+            "empty inherited entries must be dropped; got {}",
+            merged.to_string_lossy()
+        );
+
+        // A derived dir itself containing the separator is unusable in a
+        // path list — excluded individually, the rest still join.
+        let derived_with_bad = vec![
+            PathBuf::from("/real/lib"),
+            PathBuf::from("/bad:dir/lib"),
+            PathBuf::from("/real2/lib"),
+        ];
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var(var);
         }
-        // Unset parent var in inherit mode: derived only.
-        let merged = merged_dyld_fallback(dyld_fallback_inherited(None), &derived).unwrap();
-        assert!(
-            !merged.to_string_lossy().contains("inherited"),
-            "unset var must not contribute; got {}",
+        let merged =
+            merged_dyld_fallback(dyld_fallback_inherited(None), &derived_with_bad).unwrap();
+        assert_eq!(
+            parts_of(&merged),
+            vec!["/real/lib".to_string(), "/real2/lib".to_string()],
+            "separator-containing dir must drop alone; got {}",
             merged.to_string_lossy()
         );
     }
