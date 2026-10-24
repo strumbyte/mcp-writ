@@ -19,6 +19,8 @@ use crate::error::{SandboxStage, WardenError};
 use crate::execution::TargetOs;
 use crate::policy::Policy;
 use crate::policy::validator::covers_or_same_for;
+use crate::warden::SpawnOptions;
+use crate::warden::env::DYLD_FALLBACK_DIRS;
 
 fn is_local_hostname(name: &str) -> bool {
     name == "localhost" || name == "*" || name == "127.0.0.1" || name == "[::1]" || name == "::1"
@@ -218,10 +220,8 @@ const BASE_READ_ROOTS: &[&str] = &[
 const XCSELECT_DYLIB: &str = "libxcselect.dylib";
 const CLT_ROOT: &str = "/Library/Developer/CommandLineTools";
 
-/// dyld's built-in fallback for an `@rpath` reference with no matching
-/// LC_RPATH (`~/lib` is deliberately absent — a home-dir library root
-/// is not a system code source we bless).
-const DYLD_FALLBACK_DIRS: &[&str] = &["/usr/local/lib", "/usr/lib"];
+// dyld's built-in fallback for an `@rpath` reference lives next to the
+// env-block merge that re-exports it: crate::warden::env::DYLD_FALLBACK_DIRS.
 
 /// Dep-walk bounds: hostile or corrupt binaries cannot balloon the
 /// derivation. Real interpreter closures (python → a dozen dylibs) sit
@@ -440,6 +440,55 @@ pub(crate) fn exec_a_command(fallback_dirs: &[PathBuf]) -> String {
     // Single-quote the path list; a literal ' re-opens and escapes.
     let quoted = joined.replace('\'', "'\\''");
     format!("export DYLD_FALLBACK_LIBRARY_PATH='{quoted}'; {EXEC_A}")
+}
+
+/// Append the workload launch args to a `sandbox-exec` command —
+/// `command args…` directly, or through `bash -p -c "exec -a"` when a
+/// distinct verified executable must run under the caller's argv[0].
+///
+/// `sandbox-exec` re-execs the given path with argv[0] equal to that
+/// path, so a distinct verified executable goes through bash —
+/// `exec -a` is a bash builtin, while /bin/sh may resolve (via
+/// /var/select/sh) to a shell that lacks it. `-p` keeps the wrapper in
+/// privileged mode: $ENV/$BASH_ENV are not read, exported functions are
+/// not imported, and SHELLOPTS/BASHOPTS/CDPATH/GLOBIGNORE from the
+/// environment are ignored — a hostile spawn environment cannot
+/// reshape the launch. `builtin` pins the exec call to the builtin as
+/// well, so no inherited function name can intercept it.
+///
+/// A relocated exe also needs its fallback lib dirs re-exported
+/// *inside* the wrapper — SIP-restricted `sandbox-exec`/`bash` execs
+/// prune `DYLD_*` from the environment before the `-c` string runs.
+/// [`exec_a_command`] emits that export over the *merged* fallback the
+/// env block computes (`spawn_dyld_fallback_dirs`: inherited entries +
+/// derived dirs + the platform defaults that replace an absent
+/// inherited list), so the in-wrapper `DYLD_FALLBACK_LIBRARY_PATH`
+/// matches what the child env would have carried. Both `sandbox-exec`
+/// spawn paths share this construction so argument order, argv[0]
+/// handling, and fallback quoting can never diverge.
+pub(crate) fn apply_exec_a_wrapper(
+    cmd: &mut tokio::process::Command,
+    program: Option<&Path>,
+    command: &str,
+    args: &[String],
+    opts: &SpawnOptions,
+) {
+    match program {
+        Some(p) if p != Path::new(command) => {
+            cmd.arg("/bin/bash")
+                .arg("-p")
+                .arg("-c")
+                .arg(exec_a_command(
+                    &crate::warden::env::spawn_dyld_fallback_dirs(opts),
+                ))
+                .arg(command)
+                .arg(p)
+                .args(args);
+        }
+        _ => {
+            cmd.arg(command).args(args);
+        }
+    }
 }
 
 /// The directories the workload legitimately maps code from — every

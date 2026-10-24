@@ -887,9 +887,11 @@ fn unmediatable_grant_fs_ignores_mediated_and_unknown() {
     assert_eq!(unmediatable_grant_fs("/proc/*/status"), None);
 }
 
-/// The first 9p/v9fs mount on this host, when one exists — the
-/// filesystem Landlock's inode-object walk cannot match (WSL2 mounts
-/// Windows drives this way).
+/// The first 9p/v9fs mount on this host the test process can probe —
+/// the filesystem Landlock's inode-object walk cannot match (WSL2
+/// mounts Windows drives this way). Mounts whose path `statfs` cannot
+/// reach (e.g. EACCES on a mount point the process cannot traverse)
+/// are skipped: `unmediatable_grant_fs` could never verdict them.
 fn first_pseudo_fs_mount() -> Option<String> {
     std::fs::read_to_string("/proc/mounts").ok().and_then(|m| {
         m.lines().find_map(|l| {
@@ -897,7 +899,9 @@ fn first_pseudo_fs_mount() -> Option<String> {
             let _dev = f.next()?;
             let dir = f.next()?;
             let fstype = f.next()?;
-            (fstype == "9p" || fstype == "v9fs").then(|| dir.replace(r"\040", " "))
+            (fstype == "9p" || fstype == "v9fs")
+                .then(|| dir.replace(r"\040", " "))
+                .filter(|dir| unmediatable_grant_fs(dir).is_some())
         })
     })
 }

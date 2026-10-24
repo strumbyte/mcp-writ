@@ -61,27 +61,9 @@ async fn build_proxy_command(
 
     let mut cmd = Command::new(&helper);
     cmd.arg("-p").arg(&sbpl).arg("--");
-    // Same `exec -a` dance as the audited spawn: a distinct verified
-    // executable goes through bash -p so argv[0] stays `command`.
-    match program {
-        Some(p) if p != Path::new(command) => {
-            // Same SIP-pruning workaround as the audited spawn: the
-            // relocated exe's dyld fallback dirs must be re-exported
-            // inside the wrapper or the stripped env never reaches it.
-            cmd.arg("/bin/bash")
-                .arg("-p")
-                .arg("-c")
-                .arg(super::super::macos_sandbox::exec_a_command(
-                    &opts.exec_dyld_fallback,
-                ))
-                .arg(command)
-                .arg(p)
-                .args(args);
-        }
-        _ => {
-            cmd.arg(command).args(args);
-        }
-    }
+    // Same `exec -a` dance as the audited spawn — the shared helper
+    // keeps the wrapper args, ordering, and DYLD re-export identical.
+    super::super::macos_sandbox::apply_exec_a_wrapper(&mut cmd, program, command, args, opts);
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

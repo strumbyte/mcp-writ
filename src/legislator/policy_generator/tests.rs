@@ -1273,7 +1273,10 @@ fn native_or_unknown_workload_emits_no_syscall_baseline() {
         &crate::legislator::source_bind::WorkloadHashes::default(),
     );
     assert!(
-        !kdl_str.contains("allow \"execve\""),
+        !kdl_str
+            .lines()
+            .filter(|line| line.trim_start().starts_with("allow "))
+            .any(|line| line.contains("\"execve\"")),
         "no interpreter means no seeded baseline: {kdl_str}"
     );
 }
