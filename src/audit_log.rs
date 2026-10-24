@@ -530,6 +530,16 @@ impl AuditLogger {
         self.inner.writer_failed.get()
     }
 
+    /// True while this logger drives a live file sink — the only sink
+    /// [`AuditLogger::reopen`] can act on. Signal plumbing checks this
+    /// before registering a reopen handler so a tracing-only session
+    /// keeps the signal's default disposition instead of binding a
+    /// listener that can only no-op. `false` after `shutdown()`,
+    /// matching `reopen()`'s no-live-sink result.
+    pub fn has_file_sink(&self) -> bool {
+        self.inner.reopen_tx.lock().unwrap().is_some()
+    }
+
     /// Events dropped because the writer channel was full. A
     /// best-effort (fail-open) logger counts saturation here instead of
     /// failing — this counter is the only observable trace of it.

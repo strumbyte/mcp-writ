@@ -202,7 +202,9 @@ latches on.
   `MCP_WRIT_REQUIRE_E2E_TESTS=1`); row in
   [test-matrix.md](../test-matrix.md).
 - `audit_durability_e2e` — same workflows (pre-existing).
-- `audit_reopen_e2e` — PR-27 rotation/disk-full fixture (Unix only).
+- `audit_reopen_e2e` — CI, Platform tests, Linux tests; row in
+  [test-matrix.md](../test-matrix.md). PR-27 rotation/disk-full
+  fixture (Unix only — the target compiles empty on Windows).
 - `windows_isolation_e2e` PSEC legs — VM tests `windows-isolation` job /
   `scripts/validate-windows-isolation.ps1`.
 

@@ -1293,17 +1293,25 @@ async fn test_logger_reopen_same_path_loses_nothing() {
 }
 
 /// A tracing sink has nothing to reopen, and a shut-down file sink
-/// reports the same — neither is an error.
+/// reports the same — neither is an error. `has_file_sink` tracks the
+/// same liveness, so signal plumbing can skip registering a reopen
+/// listener that could only no-op.
 #[tokio::test]
 async fn test_logger_reopen_without_file_sink() {
     let tracing_logger = AuditLogger::to_tracing();
+    assert!(!tracing_logger.has_file_sink());
     assert!(!tracing_logger.reopen(reopen_marker()).await.unwrap());
     let _ = tracing_logger.shutdown().await;
 
     let dir = make_test_dir("audit_reopen_dead");
     let path = dir.join("audit.jsonl");
     let logger = AuditLogger::to_file(&path).unwrap();
+    assert!(logger.has_file_sink());
     let _ = logger.shutdown().await;
+    assert!(
+        !logger.has_file_sink(),
+        "shutdown retires the sink the signal path checks"
+    );
     assert!(!logger.reopen(reopen_marker()).await.unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }

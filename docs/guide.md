@@ -2807,25 +2807,40 @@ sink. The recommended deployment is the file sink (optionally
 
 **Log rotation.** On Unix the file sink coexists with an external
 rotator. `run` and `mcp-secure-runner` bind SIGUSR1 to a sink reopen
-for the life of the session: on receipt the writer drains every queued
-record into the old file first — a pre-signal record is never
-interleaved into the new file — flushes and fsyncs it, then re-resolves
-the audit path through the same trust-boundary open the launch used, so
-a link or non-regular leaf planted since launch, or a file a rotator
-recreated under a different uid, fails the reopen exactly as it would
-have failed the launch. A successful reopen is recorded as
-`audit.reopened` (`system` category) — the writer emits it in-band and
-syncs it before the reopen is acknowledged, so it is always the first
-record in the new file, carrying `signal=sigusr1` and `session_id`. A failed reopen keeps
-the old handle, so records continue into the previously opened file
-object, but latches the same writer fault a write failure does —
+while a file audit sink is live — a tracing-only session (`run`
+without `--audit-log`) leaves USR1 at its default disposition. On
+receipt the writer drains every queued record into the old file first
+— a pre-signal record is never interleaved into the new file —
+flushes and fsyncs it, then re-resolves the audit path through the
+same trust-boundary open the launch used, so a link or non-regular
+leaf planted since launch, or a file a rotator recreated under a
+different uid, fails the reopen exactly as it would have failed the
+launch. The drain is the ordering guarantee's cost: under a sustained
+saturated stream the reopen runs at the first queue lull, so a
+rotation completes promptly only while the queue sometimes empties. A
+successful reopen is recorded as `audit.reopened` (`system` category)
+— the writer emits it in-band and syncs it before the reopen is
+acknowledged, so it is always the first record in the new file,
+carrying `signal=sigusr1` and `session_id`. A reopen that fails
+before the handle swap keeps the old handle — records continue into
+the previously opened file object — while a post-swap failure (the
+new file's directory-entry fsync) still reports `Err` but leaves
+records flowing into the correctly named new handle. Either failure
+latches the same writer fault a write failure does —
 `logging.fail_closed` aborts the session rather than let it run
-unrecorded, and the `audit.reopened` record then carries
-`outcome=failure` with `error=`. SIGHUP is deliberately not the
-rotation signal: the PoC commands (`unotify-run`, `namespaced-run`,
-`ebpf-run`, `macos-proxy-run`) already treat it as termination (exit
-129). Everywhere else — the PoC commands and `dns-gate` — SIGUSR1 is
-not bound and keeps its default disposition.
+unrecorded — and the `audit.reopened` record then carries
+`outcome=failure` with `error=` wherever a surviving handle still
+accepts writes. When the failure is the sink itself — a full
+filesystem, a dead descriptor — neither that marker nor the
+`guard.stopped` line that would carry `writer_failed=true` can be
+persisted to it; the durable signal is the fail-closed abort itself
+(killed workload, nonzero exit, the stderr error), with
+`writer_failed` latched for whatever still observes it. SIGHUP is
+deliberately not the rotation signal: the PoC commands
+(`unotify-run`, `namespaced-run`, `ebpf-run`, `macos-proxy-run`)
+already treat it as termination (exit 129). Everywhere else — the PoC
+commands and `dns-gate` — SIGUSR1 is not bound and keeps its default
+disposition.
 
 The recommended rotator configuration is `copytruncate` — copy the
 live file, then truncate it in place: no signal is needed because the

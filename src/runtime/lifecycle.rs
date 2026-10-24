@@ -231,16 +231,6 @@ pub fn audit_reopened_event(
     event
 }
 
-/// `audit.reopened`: enqueue the rotation marker through the regular
-/// channel — the enqueued variant of [`audit_reopened_event`]. The
-/// signal-driven path does not use this: it passes the factory to
-/// [`AuditLogger::reopen`] so the marker is written in-band before the
-/// reopen is acknowledged, guaranteed ahead of every queued record and
-/// exempt from channel-saturation drop accounting.
-pub fn audit_reopened(logger: &AuditLogger, ctx: &SessionAuditContext, detail: Option<&str>) {
-    logger.log(audit_reopened_event(ctx, logger.session_id(), detail));
-}
-
 /// `session.started`: the audited session is open — the child was
 /// spawned and the Auditor relay is running. Pairs with
 /// `session.ended`; a launch that fails earlier emits `server.error`
@@ -609,8 +599,12 @@ mod tests {
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
 
-        audit_reopened(&logger, &ctx, None);
-        audit_reopened(&logger, &ctx, Some("open denied"));
+        logger.log(audit_reopened_event(&ctx, logger.session_id(), None));
+        logger.log(audit_reopened_event(
+            &ctx,
+            logger.session_id(),
+            Some("open denied"),
+        ));
         logger.shutdown().await.unwrap();
 
         let lines = read_events(&path);

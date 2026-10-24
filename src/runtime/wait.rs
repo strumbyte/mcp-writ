@@ -329,6 +329,12 @@ async fn supervision_lost_exit(
 #[cfg(unix)]
 fn spawn_audit_reopen_listener(audit_logger: &AuditLogger, session: &SessionAuditContext) {
     use tokio::signal::unix::{SignalKind, signal};
+    // A session without a file sink has nothing to reopen — leave
+    // USR1 at its default disposition (terminate) instead of binding a
+    // listener that would swallow the signal into a `reopen()` no-op.
+    if !audit_logger.has_file_sink() {
+        return;
+    }
     let Ok(mut sigusr1) = signal(SignalKind::user_defined1()) else {
         // A failed registration leaves USR1 at its default disposition
         // (terminate) — the session still runs exactly as it did
