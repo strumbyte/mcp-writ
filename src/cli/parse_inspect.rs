@@ -49,16 +49,27 @@ pub(super) fn parse_inspect_args(
         0u8
     };
 
-    // Positional argument: <binary> (optional when `-- <command>` is present)
-    let binary_arg = noargs::arg("<binary>")
-        .doc("Path to the ELF/Mach-O binary or script to inspect (optional when `-- <command>` is given)")
+    // Positional argument: [<binary>] (optional when `-- <command>` is
+    // present — one of the two is required)
+    let binary_arg = noargs::arg("[<binary>]")
+        .doc("Path to the ELF/Mach-O binary or script to inspect (either <binary> or `-- <command>` is required)")
         .take(&mut raw);
+
+    // Help-only positional for `-- <command> [args...]`: `parse_from`
+    // splits the trailing argv off before noargs sees it, so this entry
+    // exists purely to document it — in help mode `Arg::take` consumes
+    // nothing and real parsing still reads the pre-split `command`.
+    if raw.metadata().help_mode {
+        noargs::arg("[-- <command> [args...]]")
+            .doc("The command whose argv[0] and payload are inspected (alternative to <binary>; one of the two is required)")
+            .take(&mut raw);
+    }
 
     if let Some(help) = raw
         .finish()
         .map_err(|e| CliError::Parse(format!("{e:?}")))?
     {
-        return Ok(CliOutput::Info(help.to_string()));
+        return Ok(CliOutput::Info(help));
     }
 
     let binary_path = if binary_arg.is_present() {

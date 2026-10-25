@@ -113,8 +113,21 @@ pub(super) fn parse_check_args(
         return Ok(invalid_args(args, msg));
     }
 
+    // Help-only positional for `-- <command> [args...]`: `parse_from`
+    // splits the trailing argv off before noargs sees it, so this entry
+    // exists purely to document it — in help mode `Arg::take` consumes
+    // nothing and real parsing still reads the pre-split `command`.
+    if raw.metadata().help_mode {
+        noargs::arg("[-- <command> [args...]]")
+            .doc(
+                "The server's launch argv — respawned to re-verify \
+                 tools-list pins and the binary/entrypoint hash binding",
+            )
+            .take(&mut raw);
+    }
+
     match raw.finish() {
-        Ok(Some(help)) => return Ok(CliOutput::Info(help.to_string())),
+        Ok(Some(help)) => return Ok(CliOutput::Info(help)),
         Ok(None) => {}
         Err(e) => {
             return Ok(invalid_args(args, format!("unrecognized arguments: {e:?}")));

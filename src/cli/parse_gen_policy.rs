@@ -86,11 +86,23 @@ pub(super) fn parse_gen_policy_args(
 
     let static_only = !live_discovery && !unsafe_unsandboxed_discovery;
 
+    // Help-only positional for `-- <command> [args...]`: `parse_from`
+    // splits the trailing argv off before noargs sees it, so this entry
+    // exists purely to document it — in help mode `Arg::take` consumes
+    // nothing and real parsing still reads the pre-split `command`.
+    if raw.metadata().help_mode {
+        noargs::arg("-- <command> [args...]")
+            .doc("The MCP server command to analyze (its argv[0] is the default --binary)")
+            .take(&mut raw);
+    }
+
     if let Some(help) = raw
         .finish()
         .map_err(|e| CliError::Parse(format!("{e:?}")))?
     {
-        return Ok(CliOutput::Info(help.to_string()));
+        let mut help = help;
+        help.push_str(super::QUICKSTART_FLOW);
+        return Ok(CliOutput::Info(help));
     }
 
     if command.is_empty() {

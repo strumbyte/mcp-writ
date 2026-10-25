@@ -1398,3 +1398,269 @@ fn test_capability_matrix_help() {
         other => panic!("expected Info with help text, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------
+// Subcommand --help scoping (PR-30): each subcommand's help must show
+// only its own Usage, options, positional arguments, and example —
+// never the sibling "Commands:" listing. The top-level `--help` keeps
+// listing every subcommand.
+// ---------------------------------------------------------------
+
+fn unwrap_help(result: Result<CliOutput, CliError>) -> String {
+    match result.expect("should parse") {
+        CliOutput::Info(help) => help,
+        other => panic!("expected Info with help text, got {other:?}"),
+    }
+}
+
+const ALL_SUBCOMMANDS: &[&str] = &[
+    "run",
+    "plan",
+    "inspect",
+    "generate-policy",
+    "capability-matrix",
+    "run-image",
+    "wrap-image",
+    "containerize",
+    "dns-gate",
+    "unotify-run",
+    "namespaced-run",
+    "ebpf-run",
+    "macos-proxy-run",
+    "check",
+    "policy",
+];
+
+/// True when `line` is a "Commands:"-style listing entry for `name`
+/// (two-space indent followed by the bare name, or the name alone in
+/// full-help layout).
+fn is_command_listing_line(line: &str, name: &str) -> bool {
+    match line.strip_prefix("  ") {
+        Some(rest) => rest == name || rest.starts_with(&format!("{name} ")),
+        None => false,
+    }
+}
+
+fn assert_no_sibling_commands(help: &str, self_name: &str) {
+    assert!(
+        !help.contains("Commands:"),
+        "{self_name} --help must not render a Commands section: {help}"
+    );
+    for &sibling in ALL_SUBCOMMANDS.iter().filter(|name| **name != self_name) {
+        assert!(
+            !help
+                .lines()
+                .any(|line| is_command_listing_line(line, sibling)),
+            "'{sibling}' must not appear as a command entry in {self_name} --help: {help}"
+        );
+    }
+}
+
+#[test]
+fn test_run_help_shows_only_run() {
+    let help = unwrap_help(parse_from(args("mcp-writ run --help")));
+    assert!(
+        help.contains("run [OPTIONS] -- <command> [args...]"),
+        "run --help must show run's own usage line: {help}"
+    );
+    assert_no_sibling_commands(&help, "run");
+    for opt in ["--policy", "--audit-log", "--report", "--dry-run"] {
+        assert!(help.contains(opt), "run --help missing {opt}: {help}");
+    }
+}
+
+#[test]
+fn test_run_help_shows_quickstart_flow() {
+    let help = unwrap_help(parse_from(args("mcp-writ run --help")));
+    for line in [
+        "mcp-writ generate-policy --live-discovery --output draft.kdl -- node server.js",
+        "mcp-writ plan --policy draft.kdl -- node server.js",
+        "mcp-writ run --policy draft.kdl --dry-run --audit-log audit.jsonl -- node server.js",
+        "mcp-writ run --policy draft.kdl --audit-log audit.jsonl --report report.json -- node server.js",
+    ] {
+        assert!(
+            help.contains(line),
+            "run --help missing flow step {line:?}: {help}"
+        );
+    }
+}
+
+#[test]
+fn test_generate_policy_help_shows_only_itself() {
+    let help = unwrap_help(parse_from(args("mcp-writ generate-policy --help")));
+    assert!(
+        help.contains("generate-policy [OPTIONS] -- <command> [args...]"),
+        "generate-policy --help must show its own usage line: {help}"
+    );
+    assert_no_sibling_commands(&help, "generate-policy");
+    for opt in ["--live-discovery", "--static-only", "--output"] {
+        assert!(
+            help.contains(opt),
+            "generate-policy --help missing {opt}: {help}"
+        );
+    }
+    for line in [
+        "mcp-writ generate-policy --live-discovery --output draft.kdl -- node server.js",
+        "mcp-writ plan --policy draft.kdl -- node server.js",
+        "mcp-writ run --policy draft.kdl --dry-run --audit-log audit.jsonl -- node server.js",
+        "mcp-writ run --policy draft.kdl --audit-log audit.jsonl --report report.json -- node server.js",
+    ] {
+        assert!(
+            help.contains(line),
+            "generate-policy --help missing flow step {line:?}: {help}"
+        );
+    }
+}
+
+#[test]
+fn test_check_help_shows_only_check() {
+    let help = unwrap_help(parse_from(args("mcp-writ check --help")));
+    assert!(
+        help.contains("check [OPTIONS]"),
+        "check --help must show check's own usage line: {help}"
+    );
+    assert_no_sibling_commands(&help, "check");
+    for opt in ["--policy", "--server", "--engine", "--report"] {
+        assert!(help.contains(opt), "check --help missing {opt}: {help}");
+    }
+}
+
+#[test]
+fn test_plan_help_shows_only_plan() {
+    let help = unwrap_help(parse_from(args("mcp-writ plan --help")));
+    assert!(
+        help.contains("plan [OPTIONS]"),
+        "plan --help must show plan's own usage line: {help}"
+    );
+    assert_no_sibling_commands(&help, "plan");
+    for opt in ["--policy", "--image", "--engine", "--report"] {
+        assert!(help.contains(opt), "plan --help missing {opt}: {help}");
+    }
+}
+
+#[test]
+fn test_inspect_help_shows_only_inspect() {
+    let help = unwrap_help(parse_from(args("mcp-writ inspect --help")));
+    assert!(
+        help.contains("inspect [OPTIONS]"),
+        "inspect --help must show inspect's own usage line: {help}"
+    );
+    assert!(
+        help.contains("[<binary>]"),
+        "<binary> must render as optional: {help}"
+    );
+    assert!(
+        help.contains("either <binary> or `-- <command>` is required"),
+        "help must state that one of the two targets is required: {help}"
+    );
+    assert_no_sibling_commands(&help, "inspect");
+    for opt in ["--format", "--output", "--project"] {
+        assert!(help.contains(opt), "inspect --help missing {opt}: {help}");
+    }
+}
+
+#[test]
+fn test_subcommand_help_documents_trailing_command() {
+    // The `-- <command> [args...]` argv is split off before noargs sees
+    // it, so each parser registers a help-only positional entry.
+    for argv in [
+        "mcp-writ run --help",
+        "mcp-writ plan --help",
+        "mcp-writ generate-policy --help",
+        "mcp-writ check --help",
+        "mcp-writ inspect --help",
+    ] {
+        let help = unwrap_help(parse_from(args(argv)));
+        assert!(
+            help.contains("<command>"),
+            "{argv} must document the trailing command: {help}"
+        );
+    }
+}
+
+#[test]
+fn test_top_level_help_keeps_commands_section() {
+    let help = unwrap_help(parse_from(args("mcp-writ --help")));
+    assert!(
+        help.contains("Commands:"),
+        "top-level --help must still list the Commands section: {help}"
+    );
+    for &cmd in ALL_SUBCOMMANDS {
+        assert!(
+            help.lines().any(|line| is_command_listing_line(line, cmd)),
+            "top-level --help missing the '{cmd}' entry: {help}"
+        );
+    }
+}
+
+#[test]
+fn test_every_subcommand_help_shows_only_itself() {
+    // Regression pin for the sequential dispatch: whatever the cmd's
+    // registration position, its help must scope to its own entries.
+    // `policy` is the worst case — all 14 siblings are logged as
+    // non-present `Cmd` entries before it.
+    for &cmd in ALL_SUBCOMMANDS {
+        for flag in ["--help", "-h"] {
+            let help = unwrap_help(parse_from(args(&format!("mcp-writ {cmd} {flag}"))));
+            assert!(
+                help.contains(&format!("... {cmd}")),
+                "{cmd} {flag} must render {cmd}'s own usage line: {help}"
+            );
+            assert_no_sibling_commands(&help, cmd);
+        }
+    }
+}
+
+#[test]
+fn test_second_token_sibling_names_reach_the_parser() {
+    // With sequential dispatch, a second token colliding with a
+    // later-registered subcommand name is no longer consumed by that
+    // sibling's `cmd().take()`: parsers without a positional reject it,
+    // parsers with one accept it as their operand.
+    for argv in ["mcp-writ run plan", "mcp-writ capability-matrix run-image"] {
+        let second = argv.split_whitespace().nth(2).unwrap();
+        let err = parse_from(args(argv)).unwrap_err();
+        assert!(
+            matches!(err, CliError::Parse(_)),
+            "{argv} must be a parse error: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&format!("unexpected argument '{second}'")),
+            "{argv} must name the stray token: {err}"
+        );
+    }
+
+    // `plan`/`check` record the stray argument in `invalid_input`
+    // rather than returning a parse error.
+    for argv in ["mcp-writ check run", "mcp-writ plan run"] {
+        let invalid = match parse_from(args(argv)).expect("should parse") {
+            CliOutput::Check(a) => a.invalid_input,
+            CliOutput::Plan(a) => a.invalid_input,
+            other => panic!("{argv}: expected Check or Plan, got {other:?}"),
+        };
+        assert!(
+            invalid
+                .as_deref()
+                .is_some_and(|m| m.contains("unexpected argument 'run'")),
+            "{argv} must record the stray token in invalid_input: {invalid:?}"
+        );
+    }
+
+    // Parsers taking a positional consume the sibling name as the
+    // operand — previously it was swallowed by the sibling's cmd take.
+    match parse_from(args("mcp-writ inspect policy")) {
+        Ok(CliOutput::Inspect(a)) => assert_eq!(a.binary_path, PathBuf::from("policy")),
+        other => panic!("expected Inspect, got {other:?}"),
+    }
+    match parse_from(args("mcp-writ policy run")) {
+        Ok(CliOutput::PolicyResolve(a)) => assert!(
+            a.invalid_input
+                .as_deref()
+                .is_some_and(|m| m.contains("unknown policy action 'run'")),
+            "policy's invalid_input must name the unknown action: {:?}",
+            a.invalid_input
+        ),
+        other => panic!("expected PolicyResolve, got {other:?}"),
+    }
+}
