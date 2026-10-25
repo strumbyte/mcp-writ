@@ -121,7 +121,13 @@ fn load_kdl_policy_recursive_with_decl(
             path.display(),
         )));
     }
-    let canonical = path.canonicalize().map_err(PolicyError::FileRead)?;
+    // One open: the parsed bytes and the recorded identity come from
+    // the same handle — a link repointed between resolution and the
+    // read cannot split the source a launch protects from the content
+    // actually parsed. `canonical` is the opened object's real path.
+    let (content, canonical) =
+        crate::fspriv::read_text_bounded_follow_links_resolved(path, MAX_POLICY_FILE_BYTES)
+            .map_err(PolicyError::FileRead)?;
     if !visited.insert(canonical.clone()) {
         return Err(PolicyError::Validation(format!(
             "circular reference detected: '{}'",
@@ -136,17 +142,19 @@ fn load_kdl_policy_recursive_with_decl(
     cx.prov.record_source(canonical.clone());
     cx.prov
         .record_source_spelling(crate::fsoverlap::absolutize_lexical(path));
-    let result = load_kdl_policy_subtree(path, visited, env, cx, budget, depth);
+    let result = load_kdl_policy_subtree(path, &content, visited, env, cx, budget, depth);
     visited.remove(&canonical);
     result
 }
 
 /// Body of [`load_kdl_policy_recursive_with_decl`] — the file's own
-/// bookkeeping is done, so this reads and merges the subtree. Warnings
-/// the merges raised stay pending and travel back with the result; the
-/// root of the load emits them against the final merged policy.
+/// bookkeeping is done and `content` carries the bytes the caller's
+/// open read, so this merges the subtree. Warnings the merges raised
+/// stay pending and travel back with the result; the root of the load
+/// emits them against the final merged policy.
 fn load_kdl_policy_subtree(
     path: &Path,
+    content: &str,
     visited: &mut HashSet<PathBuf>,
     env: &str,
     cx: &mut LoadCx<'_>,
@@ -161,10 +169,8 @@ fn load_kdl_policy_subtree(
         )));
     }
 
-    let content = crate::fspriv::read_bounded_text(path, MAX_POLICY_FILE_BYTES)
-        .map_err(PolicyError::FileRead)?;
     cx.markers
-        .extend(crate::policy::review::scan_review_markers(path, &content));
+        .extend(crate::policy::review::scan_review_markers(path, content));
     budget.bytes += content.len() as u64;
     if budget.bytes > MAX_INHERIT_BYTES {
         return Err(PolicyError::Validation(format!(
@@ -268,7 +274,7 @@ fn load_kdl_policy_subtree(
                 n.name().value() == "profile"
                     && n.get(0).and_then(|v| v.as_string()) == Some(name.as_str())
             })
-            .and_then(|n| node_line(&content, n));
+            .and_then(|n| node_line(content, n));
         match cx.profile_files.get(name) {
             Some(prev) => {
                 let existing = cx.profiles.get(name);
@@ -291,7 +297,7 @@ fn load_kdl_policy_subtree(
 
     let mut schema_sources = Vec::new();
     let this_policy = parse_kdl_policy_with_profiles(
-        &content,
+        content,
         cx.profiles,
         Some(base_dir),
         &mut schema_sources,
@@ -315,11 +321,11 @@ fn load_kdl_policy_subtree(
     crate::policy::kdl_strict::check_doc_schema(
         &doc,
         path,
-        &content,
+        content,
         this_policy.version,
         cx.warnings,
     )?;
-    let doc_decl = OverlayDecl::for_doc(&doc, path, &content, this_policy.version);
+    let doc_decl = OverlayDecl::for_doc(&doc, path, content, this_policy.version);
 
     // If this file has an extends, merge current on top of base+includes.
     // Otherwise, current IS the base.
@@ -368,7 +374,7 @@ fn load_kdl_policy_subtree(
         cx.profiles,
         Some(base_dir),
         path,
-        &content,
+        content,
         &mut pending,
         cx.prov,
         when_rules,

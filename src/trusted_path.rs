@@ -430,8 +430,9 @@ impl BoundDriver {
 }
 
 /// Open the resolved driver leaf for pinning and identity capture:
-/// unix opens `O_NOFOLLOW|O_CLOEXEC` so a final-component link fails
-/// `ELOOP`; Windows opens with `FILE_SHARE_READ` only — denying
+/// unix opens `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC` so a final-component
+/// link fails `ELOOP` and a FIFO planted at the spelling cannot stall
+/// the open; Windows opens with `FILE_SHARE_READ` only — denying
 /// share-write/share-delete so the validated bytes cannot be replaced
 /// or deleted while the pin lives.
 #[cfg(unix)]
@@ -439,7 +440,7 @@ fn open_driver_pin(path: &Path) -> std::io::Result<(std::fs::File, crate::fspriv
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
     let identity = crate::fspriv::file_identity(&file)?;
     Ok((file, identity))
@@ -756,6 +757,7 @@ mod tests {
 
     /// The identity binding: a driver renamed away and recreated after
     /// binding fails `verify`, even though the spelling still resolves.
+    #[cfg(not(windows))]
     #[test]
     fn bound_driver_detects_rename_swap() {
         let dir = tempfile::tempdir().unwrap();
@@ -772,8 +774,29 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     }
 
+    /// Windows variant of [`bound_driver_detects_rename_swap`]: the
+    /// pin's read-only share mode denies share-delete, so the rename
+    /// that would stage a same-name replacement is refused outright —
+    /// the bound object cannot be swapped and still verifies.
+    #[cfg(windows)]
+    #[test]
+    fn bound_driver_detects_rename_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        write_executable(&exe);
+        let bound = BoundDriver::bind_for_test(&exe).unwrap();
+        assert!(bound.verify().is_ok());
+        let swapped = dir.path().join("tool.old");
+        assert!(
+            std::fs::rename(&exe, &swapped).is_err(),
+            "the pin denies share-delete — the rename must be refused"
+        );
+        assert!(bound.verify().is_ok());
+    }
+
     /// An in-place rewrite that keeps `(dev, ino)` still fails
     /// `verify` through the size/mtime detectors.
+    #[cfg(not(windows))]
     #[test]
     fn bound_driver_detects_inplace_rewrite() {
         let dir = tempfile::tempdir().unwrap();
@@ -785,9 +808,27 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     }
 
+    /// Windows variant of [`bound_driver_detects_inplace_rewrite`]:
+    /// the pin denies share-write, so the rewrite itself is refused —
+    /// the pinned bytes cannot change under the binding.
+    #[cfg(windows)]
+    #[test]
+    fn bound_driver_detects_inplace_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        write_executable(&exe);
+        let bound = BoundDriver::bind_for_test(&exe).unwrap();
+        assert!(
+            std::fs::write(&exe, b"MZ replaced").is_err(),
+            "the pin denies share-write — the rewrite must be refused"
+        );
+        assert!(bound.verify().is_ok());
+    }
+
     /// `tokio_command`/`std_command` refuse to hand back a spawnable
     /// command once the bound object is gone — the spawn cannot be
     /// redirected to a replacement.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn bound_driver_command_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
@@ -798,6 +839,25 @@ mod tests {
         write_executable(&exe);
         assert!(bound.std_command().is_err());
         assert!(bound.tokio_command().is_err());
+    }
+
+    /// Windows variant of [`bound_driver_command_fails_closed`]: the
+    /// pin denies share-delete, so the removal is refused and the bound
+    /// object survives — the commands keep building on the still-pinned
+    /// file.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn bound_driver_command_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        write_executable(&exe);
+        let bound = BoundDriver::bind_for_test(&exe).unwrap();
+        assert!(
+            std::fs::remove_file(&exe).is_err(),
+            "the pin denies share-delete — the removal must be refused"
+        );
+        assert!(bound.std_command().is_ok());
+        assert!(bound.tokio_command().is_ok());
     }
 
     /// `verify` passes while the bound object is untouched — the

@@ -80,7 +80,7 @@ pub fn load_baseline_from(
     // A baseline is a tools/list array persisted to disk — bound the
     // read before it is wrapped and parsed.
     const MAX_BASELINE_BYTES: u64 = 4 * 1024 * 1024;
-    let content = match crate::fspriv::read_bounded_text(&path, MAX_BASELINE_BYTES) {
+    let content = match crate::fspriv::read_text_bounded_follow_links(&path, MAX_BASELINE_BYTES) {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),

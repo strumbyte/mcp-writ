@@ -76,8 +76,19 @@ pub fn resolve_schema(schema_ref: &str) -> Result<String, String> {
             ));
         }
 
-        crate::fspriv::read_bounded_text(&canonical, crate::policy::MAX_SCHEMA_FILE_BYTES)
-            .map_err(|e| format!("failed to read schema file '{path}': {e}"))
+        // Bind the read to the containment check: the opened handle is
+        // the same object whose real path must stay under `base` — a
+        // component swapped for a link after canonicalization fails the
+        // handle-side proof instead of serving out-of-tree bytes.
+        let root = crate::fspriv::canonical_root(&base)
+            .map_err(|e| format!("failed to resolve schema file path '{path}': {e}"))?;
+        let bytes = crate::fspriv::read_no_follow_bounded_in(
+            &canonical,
+            crate::policy::MAX_SCHEMA_FILE_BYTES,
+            &root,
+        )
+        .map_err(|e| format!("failed to read schema file '{path}': {e}"))?;
+        String::from_utf8(bytes).map_err(|e| format!("failed to read schema file '{path}': {e}"))
     } else {
         Ok(schema_ref.to_string())
     }
