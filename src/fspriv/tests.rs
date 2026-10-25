@@ -5,7 +5,7 @@ use super::*;
 #[cfg(windows)]
 use super::winsec::{
     SdGuard, dacl_grants_replace_rights, dacl_has_untrusted_grant, dir_replace_rights,
-    file_write_rights, process_user_sid,
+    file_write_rights, on_disk_entry_name, process_user_sid,
 };
 #[cfg(unix)]
 use std::io;
@@ -333,6 +333,50 @@ fn inherit_only_grants_do_not_replace_the_directory_itself() {
         "drive root's inherit-only Authenticated Users ACE must be skipped: {:?}",
         dacl_grants_replace_rights(&root, true)
     );
+}
+
+/// `on_disk_entry_name` folds a spelled component to the real
+/// directory-entry name — a case-only variant resolves to the on-disk
+/// casing, while a missing entry or a wildcard-shaped spelling returns
+/// `None` rather than folding to an unrelated entry.
+#[cfg(windows)]
+#[test]
+fn on_disk_entry_name_resolves_and_refuses() {
+    let dir = create_private_tempdir("entry-name").unwrap();
+    fs::write(dir.join("MixedCase.txt"), b"x").unwrap();
+    assert_eq!(
+        on_disk_entry_name(&dir.join("mixedcase.txt")).as_deref(),
+        Some("MixedCase.txt")
+    );
+    assert_eq!(on_disk_entry_name(&dir.join("absent.txt")), None);
+    // `*`/`?` are FindFirstFileW metacharacters, never real names —
+    // the spelled component must not fold to a sibling.
+    assert_eq!(on_disk_entry_name(&dir.join("*.txt")), None);
+    assert_eq!(on_disk_entry_name(&dir.join("Mixed?.txt")), None);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A path past MAX_PATH resolves under its verbatim `\\?\` spelling —
+/// the form `literal_normalized_path` hands the query for deep
+/// driver/audit trees.
+#[cfg(windows)]
+#[test]
+fn on_disk_entry_name_resolves_verbatim_long_path() {
+    use std::os::windows::ffi::OsStrExt;
+    let dir = create_private_tempdir("entry-long").unwrap();
+    let mut p = dir.canonicalize().unwrap();
+    for _ in 0..10 {
+        p = p.join("component-name-padding-the-path-past-max-path");
+    }
+    fs::create_dir_all(&p).unwrap();
+    let leaf = p.join("leaf-entry.txt");
+    fs::write(&leaf, b"x").unwrap();
+    assert!(
+        leaf.as_os_str().encode_wide().count() > 260,
+        "fixture must exceed MAX_PATH: {leaf:?}"
+    );
+    assert_eq!(on_disk_entry_name(&leaf).as_deref(), Some("leaf-entry.txt"));
+    let _ = fs::remove_dir_all(&dir.canonicalize().unwrap());
 }
 
 /// Evaluate `dacl_has_untrusted_grant` on a DACL spelled in SDDL —

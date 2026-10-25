@@ -14,11 +14,10 @@
 //!
 //! - **`Admin`** (the default): every component of the resolved path
 //!   may be replaced only by an administrator principal — on Unix a
-//!   root-owned, non-world-writable entry whose group-write (if any)
-//!   names a group the caller does not belong to; on Windows an object
-//!   owned by SYSTEM/Administrators/TrustedInstaller whose DACL hands
-//!   dangerous rights to no other trustee — so a caller-managed `PATH`
-//!   entry can never supply the driver.
+//!   root-owned entry writable by neither group nor other; on Windows
+//!   an object owned by SYSTEM/Administrators/TrustedInstaller whose
+//!   DACL hands dangerous rights to no other trustee — so a
+//!   caller-managed `PATH` entry can never supply the driver.
 //! - **`Caller`**: the pre-hardening class — the caller's own files and
 //!   sticky-protected shared dirs count as trusted. It applies only to
 //!   explicit fixture overrides (`MCP_WRIT_*_EXE`) and to the unsafe
@@ -287,8 +286,17 @@ fn driver_replacement_gap(
 /// [`verify`](Self::verify) re-opens the spelling and compares identity
 /// immediately before every spawn, so an executable replaced after
 /// resolution — rename-swap or in-place rewrite — fails closed instead
-/// of running with launcher privileges. The retained pin handle also
-/// denies share-write/share-delete on Windows while the binding lives,
+/// of running with launcher privileges. On Linux the spawn execs a
+/// `/proc/self/fd` spelling of the pin — the leaf descriptor itself
+/// for binaries (fully object-bound, no name lookup), and for `#!`
+/// scripts a non-CLOEXEC dup of the pin's *parent-directory* handle
+/// joined with the leaf name, so `$0` keeps a usable, bound dirname
+/// for sibling loads; the leaf inside the pinned dir is re-verified
+/// pre-exec. The exec descriptor is owned by the returned `Command`,
+/// so a substitution landing inside the residual verify→execve
+/// window fails closed rather than running the replacement. The
+/// retained pin handle also denies share-write/share-delete on
+/// Windows while the binding lives,
 /// and on every platform holds `(dev, ino)`-level identity plus
 /// size+mtime as the swap detectors — on Unix also the inode change
 /// time, which `utimens` cannot restore, so a rewrite that preserves
@@ -319,6 +327,16 @@ struct DriverPin {
     /// binding's lifetime.
     #[cfg(unix)]
     changed: (i64, i64),
+    /// Pinned parent directory — `Some` only for `#!` leaves. The
+    /// script exec spelling resolves the leaf inside this object, so
+    /// `$0`'s dirname stays a bound, usable location (binary leaves
+    /// exec the leaf descriptor itself and need no dir pin).
+    #[cfg(target_os = "linux")]
+    dir_handle: Option<std::fs::File>,
+    /// The leaf entry name inside `dir_handle` — the final component
+    /// of the script exec spelling.
+    #[cfg(target_os = "linux")]
+    leaf_name: std::ffi::OsString,
     /// Retained open handle — the pinned object cannot be deleted or
     /// rewritten out from under verification while the binding lives.
     _handle: std::fs::File,
@@ -379,18 +397,160 @@ impl BoundDriver {
         Ok(())
     }
 
+    /// The spelling a spawned child execs, plus — on Linux — the
+    /// descriptor it resolves through. A `#!` leaf needs a usable
+    /// `$0`: the interpreter re-opens the spelling and scripts resolve
+    /// siblings via `dirname $0`, so scripts get the *parent-directory*
+    /// dup's `/proc/self/fd/N/<leaf>` spelling — the dirname binds the
+    /// pinned directory object (the leaf name is re-verified pre-exec,
+    /// see [`bind_exec_fd`]). Anything else execs a dup of the *leaf
+    /// descriptor itself* — `/proc/self/fd/N` — fully object-bound,
+    /// no name lookup remains. Dup clears CLOEXEC, so the descriptor
+    /// survives `execve` for the interpreter's re-open too.
+    /// [`finish_command`] parks the dup inside the returned command so
+    /// it cannot be closed or its number reused while the command
+    /// exists. Other platforms spawn the canonical path — Windows
+    /// cannot be swapped while the pin's share mode lives, and unixes
+    /// without fd-exec keep `verify`'s residual window, the narrowest
+    /// portable bound.
+    fn exec_program(&self) -> std::io::Result<(PathBuf, Option<std::fs::File>)> {
+        #[cfg(target_os = "linux")]
+        if let Some(pin) = &self.pin {
+            use std::os::unix::io::{AsRawFd, FromRawFd};
+            let (pin_fd, leaf) = match &pin.dir_handle {
+                Some(dir) => (dir.as_raw_fd(), Some(&pin.leaf_name)),
+                None => (pin._handle.as_raw_fd(), None),
+            };
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let fd = unsafe { libc::fcntl(pin_fd, libc::F_DUPFD, 3) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let mut spelling = PathBuf::from(format!("/proc/self/fd/{fd}"));
+            if let Some(leaf) = leaf {
+                spelling.push(leaf);
+            }
+            return Ok((spelling, Some(file)));
+        }
+        Ok((self.path.clone(), None))
+    }
+
+    /// Move `fd` inside `cmd` so the exec descriptor stays open until
+    /// the command is dropped — the `pre_exec` closure owns it: the fd
+    /// is open in the parent when `spawn` forks, inherited by the
+    /// child at `execve`, and non-CLOEXEC so it survives exec for an
+    /// interpreter re-open. For a *script* exec (dir-fd spelling) the
+    /// closure also re-proves the leaf name in the pinned directory
+    /// still names the validated object — `fstatat` on the dir fd,
+    /// syscalls and field compares only, so the closure stays
+    /// async-signal-safe — and a same-dir swap landing inside the
+    /// residual window fails closed rather than exec'ing the
+    /// replacement. Leaf-fd execs (binaries) skip the check: the fd
+    /// itself names the object, there is no lookup to re-verify.
+    #[cfg(target_os = "linux")]
+    fn bind_exec_fd(cmd: &mut std::process::Command, fd: std::fs::File, pin: &DriverPin) {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let dirfd = fd.as_raw_fd();
+        let leaf_check = pin.dir_handle.is_some().then(|| {
+            let name = std::ffi::CString::new(pin.leaf_name.as_encoded_bytes())
+                .expect("leaf name cannot contain NUL");
+            let (mtime_s, mtime_ns) = pin
+                .modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| (d.as_secs() as i64, d.subsec_nanos() as i64))
+                .unwrap_or_default();
+            (
+                name,
+                pin.identity.device,
+                pin.identity.index,
+                pin.len,
+                mtime_s,
+                mtime_ns,
+                pin.changed,
+            )
+        });
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            cmd.pre_exec(move || {
+                if let Some((name, dev, ino, len, mt_s, mt_ns, (ct_s, ct_ns))) = &leaf_check {
+                    let mut st = std::mem::zeroed::<libc::stat>();
+                    let rc = libc::fstatat(dirfd, name.as_ptr(), &mut st, 0);
+                    if rc != 0
+                        || st.st_dev != *dev
+                        || st.st_ino != *ino
+                        || st.st_size as u64 != *len
+                        || st.st_mtime != *mt_s
+                        || st.st_mtime_nsec != *mt_ns
+                        || st.st_ctime != *ct_s
+                        || st.st_ctime_nsec != *ct_ns
+                    {
+                        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                    }
+                }
+                let _fd = &fd;
+                Ok(())
+            });
+        }
+    }
+
+    /// Keep argv[0] the canonical spelling — the fd spelling is an exec
+    /// detail, not the identity the child should see.
+    #[cfg(target_os = "linux")]
+    fn apply_argv0(&self, cmd: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        cmd.arg0(&self.path);
+    }
+
+    /// Attach the exec descriptor and the argv[0] fixup for the exec
+    /// spelling — a no-op off Linux, where `exec_fd` is always `None`.
+    #[cfg(target_os = "linux")]
+    fn finish_command(
+        &self,
+        mut cmd: std::process::Command,
+        exec_fd: Option<std::fs::File>,
+    ) -> std::process::Command {
+        if let (Some(fd), Some(pin)) = (exec_fd, self.pin.as_ref()) {
+            Self::bind_exec_fd(&mut cmd, fd, pin);
+            self.apply_argv0(&mut cmd);
+        }
+        cmd
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn finish_command(
+        &self,
+        cmd: std::process::Command,
+        _exec_fd: Option<std::fs::File>,
+    ) -> std::process::Command {
+        cmd
+    }
+
+    /// `verify`, then construct the spawnable command on the bound
+    /// object — shared by [`tokio_command`](Self::tokio_command) and
+    /// [`std_command`](Self::std_command). The returned command owns
+    /// its exec descriptor, so the pinned object stays reachable until
+    /// `spawn`/`output` completes even if this `BoundDriver` is
+    /// dropped first.
+    fn driver_command(&self) -> std::io::Result<std::process::Command> {
+        self.verify()?;
+        let (program, exec_fd) = self.exec_program()?;
+        Ok(self.finish_command(std::process::Command::new(program), exec_fd))
+    }
+
     /// `verify`, then build the spawnable async command on the bound
-    /// path — the only way engine code may construct a driver
+    /// object — the only way engine code may construct a driver
     /// `Command`.
     pub fn tokio_command(&self) -> std::io::Result<tokio::process::Command> {
-        self.verify()?;
-        Ok(tokio::process::Command::new(&self.path))
+        Ok(tokio::process::Command::from(self.driver_command()?))
     }
 
     /// [`tokio_command`](Self::tokio_command) for blocking spawns.
     pub fn std_command(&self) -> std::io::Result<std::process::Command> {
-        self.verify()?;
-        Ok(std::process::Command::new(&self.path))
+        self.driver_command()
     }
 
     /// An unbound spelling for engine tests that never spawn — `verify`
@@ -419,15 +579,21 @@ impl BoundDriver {
         let modified = md
             .modified()
             .map_err(|e| format!("'{}' has no mtime: {e}", canon.display()))?;
+        #[cfg(target_os = "linux")]
+        let (dir_handle, leaf_name) = script_dir_pin(&canon, &file)?;
         Ok(Self {
             spelling: canon.to_string_lossy().into_owned(),
-            path: canon,
+            path: canon.clone(),
             pin: Some(DriverPin {
                 identity,
                 len: md.len(),
                 modified,
                 #[cfg(unix)]
                 changed: pin_change_time(&md),
+                #[cfg(target_os = "linux")]
+                dir_handle,
+                #[cfg(target_os = "linux")]
+                leaf_name,
                 _handle: file,
             }),
         })
@@ -468,6 +634,69 @@ fn open_driver_pin(path: &Path) -> std::io::Result<(std::fs::File, crate::fspriv
     let file = std::fs::OpenOptions::new().read(true).open(path)?;
     let identity = crate::fspriv::file_identity(&file)?;
     Ok((file, identity))
+}
+
+/// Pin the resolved driver's *parent directory* — a script's exec
+/// spelling resolves the leaf inside this object, so an ancestor swap
+/// cannot redirect the spawn and the child's `$0` keeps a usable,
+/// bound dirname. `O_PATH` asks for no access at all — an
+/// `O_RDONLY`-or-better open would refuse a search-only (`--x`)
+/// directory, while the path-reference fd still works as the exec
+/// spelling's dirfd and for `fstatat`. `O_NOFOLLOW` is belt and
+/// suspenders: the canonical spelling's parent is already link-free,
+/// a planted link would fail `ELOOP` rather than be traversed.
+#[cfg(target_os = "linux")]
+fn open_dir_pin(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("'{}' has no parent directory", path.display()),
+        )
+    })?;
+    // `.read(true)` only satisfies `OpenOptions`' requirement that an
+    // access mode be set — `O_RDONLY` contributes zero flag bits and
+    // the kernel ignores access mode entirely under `O_PATH`, so no
+    // read permission is demanded on the directory.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+}
+
+/// Probe the pinned leaf and pin its parent directory when the leaf
+/// is a `#!` script — the script exec spelling needs a usable `$0`
+/// dirname (see [`BoundDriver::exec_program`]); binaries exec the
+/// leaf descriptor itself and need no dir pin.
+#[cfg(target_os = "linux")]
+fn script_dir_pin(
+    canon: &Path,
+    file: &std::fs::File,
+) -> Result<(Option<std::fs::File>, std::ffi::OsString), String> {
+    use std::os::unix::fs::FileExt;
+    let leaf_name = leaf_name_of(canon)?;
+    let mut magic = [0u8; 2];
+    file.read_at(&mut magic, 0)
+        .map_err(|e| format!("'{}' cannot be probed: {e}", canon.display()))?;
+    let dir = if magic == *b"#!" {
+        Some(
+            open_dir_pin(canon)
+                .map_err(|e| format!("'{}' parent cannot be pinned: {e}", canon.display()))?,
+        )
+    } else {
+        None
+    };
+    Ok((dir, leaf_name))
+}
+
+/// The leaf entry name of a resolved driver — the final component the
+/// dir-pinned exec spelling appends. A canonical file path always has
+/// one (only `/` lacks it, and `/` is not a regular file).
+#[cfg(target_os = "linux")]
+fn leaf_name_of(path: &Path) -> Result<std::ffi::OsString, String> {
+    path.file_name()
+        .map(|n| n.to_os_string())
+        .ok_or_else(|| format!("'{}' has no leaf name", path.display()))
 }
 
 /// Whether the ambient temp hierarchy can host a Caller-class fixture
@@ -524,15 +753,21 @@ pub(crate) fn bind_driver(path: &Path, trust: DriverTrust) -> Result<BoundDriver
     let modified = md
         .modified()
         .map_err(|e| format!("'{}' has no mtime: {e}", canon.display()))?;
+    #[cfg(target_os = "linux")]
+    let (dir_handle, leaf_name) = script_dir_pin(&canon, &file)?;
     Ok(BoundDriver {
         spelling: canon.to_string_lossy().into_owned(),
-        path: canon,
+        path: canon.clone(),
         pin: Some(DriverPin {
             identity,
             len: md.len(),
             modified,
             #[cfg(unix)]
             changed: pin_change_time(&md),
+            #[cfg(target_os = "linux")]
+            dir_handle,
+            #[cfg(target_os = "linux")]
+            leaf_name,
             _handle: file,
         }),
     })
@@ -697,8 +932,7 @@ mod tests {
         if !ambient_temp_passes_caller("trusted-path") {
             return;
         }
-        let dir = crate::fspriv::create_private_tempdir("trusted-path")
-            .expect("private tempdir");
+        let dir = crate::fspriv::create_private_tempdir("trusted-path").expect("private tempdir");
         let exe = dir.join("tool");
         write_executable(&exe);
         assert!(
@@ -723,8 +957,7 @@ mod tests {
         if !ambient_temp_passes_caller("trusted-path") {
             return;
         }
-        let dir = crate::fspriv::create_private_tempdir("trusted-path")
-            .expect("private tempdir");
+        let dir = crate::fspriv::create_private_tempdir("trusted-path").expect("private tempdir");
         let exe = dir.join("tool");
         write_executable(&exe);
         let bound = bind_driver(&exe, DriverTrust::Caller)
@@ -950,6 +1183,138 @@ mod tests {
         std::fs::write(&sibling, b"x").unwrap();
         std::fs::rename(&sibling, dir.path().join("other2")).unwrap();
         assert!(bound.verify().is_ok());
+    }
+
+    /// Linux: `verify` narrows the substitution window to the gap
+    /// between the identity re-check and `execve`; the spawned child
+    /// execs the leaf *inside a pinned parent-directory descriptor*
+    /// (`/proc/self/fd/N/<leaf>`) and the `pre_exec` hook re-proves
+    /// that name still names the validated object. A swap landing
+    /// after the command is built therefore fails the spawn closed —
+    /// it can never run the replacement.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_spawn_execs_pinned_object_across_a_swap() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"#!/bin/sh\necho pinned\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bound = BoundDriver::bind_for_test(&exe).unwrap();
+        // The command is built — verification passed — then the
+        // path's object is swapped: the residual window the finding
+        // names.
+        let mut cmd = bound.std_command().unwrap();
+        assert!(
+            cmd.get_program()
+                .to_string_lossy()
+                .starts_with("/proc/self/fd/"),
+            "linux spawn must exec through the pinned descriptor, not the path"
+        );
+        let swapped = dir.path().join("tool.old");
+        std::fs::rename(&exe, &swapped).unwrap();
+        std::fs::write(&exe, b"#!/bin/sh\necho swapped\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The path re-check fails closed for a swap that has already
+        // landed — commands refuse rather than run either object.
+        assert!(bound.std_command().is_err());
+        assert!(bound.tokio_command().is_err());
+        // And the already-built command cannot be redirected either:
+        // the pre-exec fstatat inside the pinned directory sees the
+        // leaf no longer names the pinned inode and aborts the spawn.
+        assert!(
+            cmd.output().is_err(),
+            "a swapped leaf must fail the pre-exec identity check"
+        );
+    }
+
+    /// The exec descriptor is owned by the returned command: dropping
+    /// the `BoundDriver` closes its pin handles, but the command's
+    /// non-CLOEXEC dup still resolves the pinned directory — the
+    /// pinned script runs, and the shebang interpreter's own re-open
+    /// of the `$0` spelling lands on the same bound object.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_command_outlives_the_binding() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"#!/bin/sh\necho pinned\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cmd = {
+            let bound = BoundDriver::bind_for_test(&exe).unwrap();
+            bound.std_command().unwrap()
+            // `bound` drops here — leaf and directory pin handles close.
+        };
+        let out = cmd.output().unwrap();
+        assert_eq!(out.stdout, b"pinned\n");
+    }
+
+    /// A `#!` driver's `$0` stays usable: `dirname "$0"` resolves the
+    /// pinned directory, so a script loading a sibling file finds it
+    /// inside the bound object — no reopening by an unverified path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_shebang_resolves_siblings_through_the_pinned_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"#!/bin/sh\ncat \"$(dirname \"$0\")/lib.txt\"\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.path().join("lib.txt"), b"sibling-data\n").unwrap();
+        let bound = BoundDriver::bind_for_test(&exe).unwrap();
+        let out = bound.std_command().unwrap().output().unwrap();
+        assert_eq!(
+            out.stdout, b"sibling-data\n",
+            "sibling lookup through $0 must land inside the pinned dir: {out:?}"
+        );
+    }
+
+    /// A non-`#!` leaf has no `dirname` requirement: its exec
+    /// spelling is the pinned leaf descriptor itself — a bare
+    /// `/proc/self/fd/N` with no trailing name — so no directory
+    /// lookup remains in the exec at all and there is no residual
+    /// leaf-swap window to check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_binary_execs_the_leaf_descriptor() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"\x7fELF-not-actually-loadable").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bound = BoundDriver::bind_for_test(&exe).unwrap();
+        let (program, fd) = bound.exec_program().unwrap();
+        assert!(fd.is_some());
+        let spelling = program.to_string_lossy();
+        assert!(
+            spelling
+                .strip_prefix("/proc/self/fd/")
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())),
+            "binary exec must be the bare pinned-fd spelling, got {spelling:?}"
+        );
+    }
+
+    /// A search-only (`--x`) parent still pins: `O_PATH` asks for no
+    /// access bits, and the script exec spelling still resolves
+    /// through the descriptor — an `O_RDONLY` open would have failed
+    /// `EACCES` here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_script_under_search_only_dir_binds_and_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let exe = sub.join("tool");
+        std::fs::write(&exe, b"#!/bin/sh\necho pinned\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let bound = BoundDriver::bind_for_test(&exe).unwrap();
+        let out = bound.std_command().unwrap().output().unwrap();
+        assert_eq!(out.stdout, b"pinned\n");
+        // Restore writability so the tempdir cleanup can remove `sub`.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// `for_test` constructs an unbound spelling — `verify` is a no-op

@@ -63,6 +63,22 @@ impl Drop for SdGuard {
     }
 }
 
+/// A `FindFirstFileW` search handle — `FindClose`d on every exit path
+/// so an early return or unwind cannot leak the search.
+#[cfg(windows)]
+struct FindGuard(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for FindGuard {
+    fn drop(&mut self) {
+        use windows::Win32::Storage::FileSystem::FindClose;
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            let _ = FindClose(self.0);
+        }
+    }
+}
+
 /// ACE header type byte for an access-allowed ACE (`winnt.h`).
 #[cfg(windows)]
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -259,6 +275,20 @@ pub(crate) fn dacl_has_untrusted_grant(
             GetAce(dacl, i, &mut ace).map_err(|e| io::Error::other(format!("GetAce: {e}")))?;
         }
         let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+        // GetAce's contract places the ACE inside `dacl`'s buffer —
+        // verify the pointer before any dereference: an ACE that
+        // cannot be read cannot be proven narrow, so fail toward
+        // "untrusted grant possible" the way a null DACL does.
+        let acl_end = dacl.cast::<u8>().wrapping_add(info.AclBytesInUse as usize);
+        if ace.is_null()
+            || ace.cast::<u8>() < dacl.cast::<u8>()
+            || ace
+                .cast::<u8>()
+                .wrapping_add(size_of::<ACCESS_ALLOWED_ACE>())
+                > acl_end
+        {
+            return Ok(true);
+        }
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let ace_type = unsafe { (*ace).Header.AceType };
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -581,24 +611,24 @@ pub(crate) fn literal_normalized_path(path: &Path) -> PathBuf {
     on_disk_component_names(&spelled)
 }
 
-/// Windows: fold each existing component of `path` to its on-disk
-/// directory-entry name — the same names a `FILE_NAME_NORMALIZED`
-/// handle path reports — so an 8.3 (`RUNNER~1`) or case-only variant
-/// of the spelled chain still compares equal to the open handle's
-/// real path. `FindFirstFileW` reads the entry in its parent without
-/// traversing it, so a junction keeps its own name here while the
-/// handle path shows the reparse target — the substitution proof is
-/// preserved. Components that do not resolve (absent leaf, remote
-/// share) keep their spelled form.
+/// The on-disk directory-entry name for `path`'s final component —
+/// `None` when the entry cannot be queried or the spelled name is a
+/// pattern rather than a real name. `FindFirstFileW` reads the entry
+/// in its parent without traversing it, so a junction keeps its own
+/// name here while an open handle's path shows the reparse target.
+/// The returned handle is validated (`Err` on `INVALID_HANDLE_VALUE`)
+/// and the search handle is [`FindGuard`]ed so `FindClose` runs on
+/// every exit; `cFileName` is bounded by its NUL terminator or the
+/// fixed field length, and an empty name resolves to `None`.
 #[cfg(windows)]
-fn on_disk_component_names(path: &Path) -> PathBuf {
+pub(crate) fn on_disk_entry_name(path: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
-    use std::path::Component;
-    use windows::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    use windows::Win32::Storage::FileSystem::{FindFirstFileW, WIN32_FIND_DATAW};
     use windows::core::HSTRING;
 
     // FindFirstFileW pattern metacharacters — none can appear in a real
-    // on-disk name.
+    // on-disk name, so a spelled component containing one is a pattern
+    // that would fold to an unrelated entry: refuse it.
     const WILDCARDS: [u16; 5] = [
         b'*' as u16,
         b'?' as u16,
@@ -606,41 +636,49 @@ fn on_disk_component_names(path: &Path) -> PathBuf {
         b'>' as u16,
         b'"' as u16,
     ];
+    let name = path.file_name()?;
+    if name.encode_wide().any(|c| WILDCARDS.contains(&c)) {
+        return None;
+    }
+    let mut data = WIN32_FIND_DATAW::default();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let handle = unsafe { FindFirstFileW(&HSTRING::from(path.as_os_str()), &mut data) }.ok()?;
+    let _guard = FindGuard(handle);
+    let end = data
+        .cFileName
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(data.cFileName.len());
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&data.cFileName[..end]))
+}
+
+/// Windows: fold each existing component of `path` to its on-disk
+/// directory-entry name — the same names a `FILE_NAME_NORMALIZED`
+/// handle path reports — so an 8.3 (`RUNNER~1`) or case-only variant
+/// of the spelled chain still compares equal to the open handle's
+/// real path. [`on_disk_entry_name`] reads each entry in its parent
+/// without traversing it, so a junction keeps its own name here while
+/// the handle path shows the reparse target — the substitution proof
+/// is preserved. Components that do not resolve (absent leaf, remote
+/// share, wildcard-shaped spelling) keep their spelled form.
+#[cfg(windows)]
+fn on_disk_component_names(path: &Path) -> PathBuf {
+    use std::path::Component;
+
     let mut out = PathBuf::new();
     for comp in path.components() {
         out.push(comp.as_os_str());
         if !matches!(comp, Component::Normal(_)) {
             continue;
         }
-        // A spelled component carrying wildcard characters is not an
-        // on-disk name, but FindFirstFileW would treat it as a pattern
-        // and fold to an unrelated entry — keep the spelling.
-        if comp
-            .as_os_str()
-            .encode_wide()
-            .any(|c| WILDCARDS.contains(&c))
-        {
-            continue;
-        }
         // Query the parent dir for this entry's on-disk name; a miss
         // keeps the spelled component.
-        let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
-        let Ok(handle) = (unsafe { FindFirstFileW(&HSTRING::from(out.as_os_str()), &mut data) })
-        else {
-            continue;
-        };
-        unsafe {
-            let _ = FindClose(handle);
+        if let Some(name) = on_disk_entry_name(&out) {
+            out.set_file_name(name);
         }
-        let end = data
-            .cFileName
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(data.cFileName.len());
-        if end == 0 {
-            continue;
-        }
-        out.set_file_name(String::from_utf16_lossy(&data.cFileName[..end]));
     }
     out
 }

@@ -178,19 +178,22 @@ impl PinnedDir {
 }
 
 /// Refuse `dir` when its parent directory lets a lower-trust principal
-/// replace the entry: a group- or world-writable parent without the
-/// sticky bit allows anyone in that set to rename the pinned object
-/// away and substitute another (a symlink, or a directory staging a
-/// different path) between validation and mount. A sticky
-/// world-writable parent (`/tmp`) constrains renames to the entry's
-/// owner and is acceptable. Unix only — the Windows check inspects the
-/// parent DACL instead.
+/// replace the entry: an ancestor owned by a uid that is neither root
+/// nor the caller is replaceable by that foreign principal outright;
+/// and a group- or world-writable parent without the sticky bit allows
+/// anyone in that set to rename the pinned object away and substitute
+/// another (a symlink, or a directory staging a different path)
+/// between validation and mount. A sticky world-writable parent
+/// (`/tmp`) constrains renames to the entry's owner and is acceptable.
+/// Unix only — the Windows check inspects the parent DACL instead.
 #[cfg(unix)]
 pub fn require_parent_write_restricted(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     // Every ancestor matters, not just the immediate parent: renaming a
     // grandparent's child re-resolves the whole path to a different
     // object. `/` and other sticky/root-owned levels pass through.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let euid = unsafe { libc::geteuid() };
     let mut ancestor = dir.parent();
     while let Some(parent) = ancestor {
         let meta = match fs::metadata(parent) {
@@ -203,6 +206,19 @@ pub fn require_parent_write_restricted(dir: &Path) -> io::Result<()> {
             }
             Err(e) => return Err(e),
         };
+        // A foreign uid owns the entry's slot in its parent — that
+        // principal can rename or rewrite it regardless of mode bits.
+        if meta.uid() != 0 && meta.uid() != euid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing '{}': ancestor '{}' is owned by a foreign principal — \
+                     another user could replace the directory",
+                    dir.display(),
+                    parent.display()
+                ),
+            ));
+        }
         let mode = meta.mode() & 0o1777;
         let shared_write = mode & 0o022 != 0;
         let sticky = mode & 0o1000 != 0;
