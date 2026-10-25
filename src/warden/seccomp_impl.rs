@@ -617,6 +617,18 @@ pub fn policy_allows_execve(policy: &Policy) -> bool {
             .any(|nr| denied_nrs.contains(nr))
 }
 
+/// True when `syscalls.denied` resolves onto execve's syscall number —
+/// an explicit verdict the startup injection must not overrule
+/// (`allowed_syscall_names` refuses to inject a denied nr, so the
+/// child's spawn exec would fail at runtime regardless of what
+/// `sandbox.allow_degraded` tolerates).
+pub(crate) fn execve_denied(policy: &Policy) -> bool {
+    let denied_nrs = denied_syscall_numbers(policy);
+    syscall_numbers("execve")
+        .iter()
+        .any(|nr| denied_nrs.contains(nr))
+}
+
 /// Spawning a child requires either an explicit execve allowance or
 /// `sandbox.allow_degraded` (which leaves leftover execve in the
 /// inherited filter).
@@ -629,6 +641,18 @@ pub fn policy_allows_execve(policy: &Policy) -> bool {
 pub fn require_execve_allowance(policy: &Policy) -> Result<(), WardenError> {
     if policy_allows_execve(policy) {
         return Ok(());
+    }
+    // A declared `deny` is a verdict, not a missing grant: the spawn
+    // filter cannot inject a denied nr, so execve stays denied and the
+    // child's startup exec would fail at runtime — `allow_degraded`
+    // only tolerates a grant the policy never made.
+    if execve_denied(policy) {
+        return Err(WardenError::sandbox_setup(
+            crate::error::SandboxStage::Policy,
+            "syscalls.denied covers execve — the spawn filter cannot inject a denied \
+             syscall, so the child's startup exec would be refused at runtime; remove \
+             the 'deny' entry or grant execve in syscalls.allowed",
+        ));
     }
     if policy.sandbox.allow_degraded {
         tracing::warn!(

@@ -252,6 +252,35 @@ fn denied_alias_closes_the_shared_syscall_number() {
 }
 
 #[test]
+fn execve_deny_refuses_spawn_even_under_allow_degraded() {
+    // The degraded fallback tolerates a *missing* execve grant only:
+    // an explicit `deny` resolves onto execve's nr, the startup filter
+    // refuses to inject it, and the child's exec would fail at runtime
+    // — so the spawn check must refuse first.
+    let mut policy = Policy::default();
+    policy.syscalls.denied = vec!["execve".to_string()];
+    policy.sandbox.allow_degraded = true;
+    assert!(execve_denied(&policy));
+    assert!(
+        require_execve_allowance(&policy).is_err(),
+        "an explicit execve denial must refuse even with allow_degraded"
+    );
+
+    // A denied alias sharing execve's nr is the same verdict.
+    policy.syscalls.allowed = vec!["execve".to_string()];
+    assert!(
+        require_execve_allowance(&policy).is_err(),
+        "allow+deny still resolves to a denial (deny-wins)"
+    );
+
+    // The fallback still covers a merely missing grant.
+    policy.syscalls.allowed.clear();
+    policy.syscalls.denied.clear();
+    assert!(!execve_denied(&policy));
+    assert!(require_execve_allowance(&policy).is_ok());
+}
+
+#[test]
 fn io_uring_grants_are_surfaced_as_dangerous() {
     let mut policy = Policy::default();
     policy.syscalls.allowed = ["io_uring_setup", "io_uring_enter", "io_uring_register"]

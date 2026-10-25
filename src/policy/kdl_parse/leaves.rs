@@ -768,6 +768,12 @@ pub(crate) fn parse_syscall_allows(
         }
     }
 
+    // Deny-wins inside a single document too: a name spelled on both
+    // sides stays denied — the merge-time prune only repairs a list an
+    // overlay *added*, so the parsed policy must never carry the same
+    // name in both lists.
+    allowed.retain(|s| !denied.contains(s));
+
     Ok(SyscallPolicy { allowed, denied })
 }
 

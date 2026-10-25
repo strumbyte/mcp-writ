@@ -253,16 +253,19 @@ fn apply_overrides_from_doc(
                         policy.syscalls.denied.push(s.clone());
                     }
                 }
-                let denied_now = policy.syscalls.denied.clone();
-                prune_covered(
-                    &mut policy.syscalls.allowed,
-                    |s| denied_now.contains(s),
-                    prov,
-                    "defaults.syscalls",
-                    path,
-                    line,
-                );
             }
+            // Deny-wins against the accumulated deny list even when
+            // this block added no `deny` itself — an `allow` here can
+            // re-declare a name an earlier layer already denies.
+            let denied_now = policy.syscalls.denied.clone();
+            prune_covered(
+                &mut policy.syscalls.allowed,
+                |s| denied_now.contains(s),
+                prov,
+                "defaults.syscalls",
+                path,
+                line,
+            );
         }
         // Node presence in a matching `when` block marks the contract
         // declared; the declared contents — restriction posture, the

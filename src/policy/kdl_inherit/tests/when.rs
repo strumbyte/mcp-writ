@@ -804,6 +804,42 @@ fn test_when_tool_syscalls_is_validation_error() {
     load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
 }
 
+// A matching `when` `allow` cannot re-grant a syscall the accumulated
+// deny side already covers — the deny-wins prune runs even when the
+// block declares no `deny` of its own.
+#[test]
+fn test_when_syscall_allow_cannot_revive_denied() {
+    let dir = make_test_dir("when_sc_allow_vs_deny");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "read"
+                    deny "ptrace"
+                }
+            }
+            when environment="production" {
+                defaults {
+                    syscalls {
+                        allow "ptrace"
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap();
+    assert_eq!(policy.syscalls.denied, vec!["ptrace"]);
+    assert!(
+        !policy.syscalls.allowed.contains(&"ptrace".to_string()),
+        "the when-allow must not re-grant a denied syscall: {:?}",
+        policy.syscalls.allowed
+    );
+}
+
 #[test]
 fn test_when_multiple_blocks_only_matching_applied() {
     let dir = make_test_dir("when_multi");

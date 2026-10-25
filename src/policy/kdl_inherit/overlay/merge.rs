@@ -221,17 +221,20 @@ pub(in crate::policy::kdl_inherit) fn merge_into_policy(
                 base.syscalls.denied.push(s.clone());
             }
         }
-        // Deny-wins: a syscall denied at any layer leaves the allow side.
-        let denied_now = base.syscalls.denied.clone();
-        prune_covered(
-            &mut base.syscalls.allowed,
-            |s| denied_now.contains(s),
-            prov,
-            "defaults.syscalls",
-            sc_origin.0,
-            sc_origin.1,
-        );
     }
+    // Deny-wins: a syscall denied at any layer leaves the allow side.
+    // The prune runs against the accumulated deny list even when the
+    // overlay added no `deny` itself — an overlay `allow` can
+    // re-declare a name the base already denies.
+    let denied_now = base.syscalls.denied.clone();
+    prune_covered(
+        &mut base.syscalls.allowed,
+        |s| denied_now.contains(s),
+        prov,
+        "defaults.syscalls",
+        sc_origin.0,
+        sc_origin.1,
+    );
 
     // environment: an `environment` node declared on the overlay's side —
     // in this document's `defaults` or resolved from one of its `when`

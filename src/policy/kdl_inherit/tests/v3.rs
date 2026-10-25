@@ -267,6 +267,75 @@ fn test_v3_syscall_deny_emit_round_trip() {
     assert!(!reparsed.syscalls.allowed.contains(&"execve".to_string()));
 }
 
+// An overlay `allow` cannot re-grant a name the accumulated deny side
+// already covers — the deny-wins prune must run even when the child
+// adds no `deny` of its own.
+#[test]
+fn test_v3_child_allow_cannot_revive_base_denied_syscall() {
+    let dir = make_test_dir("v3_sc_allow_vs_deny");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "read"
+                    deny "ptrace"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "openat"
+                    allow "ptrace"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
+    assert_eq!(policy.syscalls.denied, vec!["ptrace"]);
+    assert!(
+        !policy.syscalls.allowed.contains(&"ptrace".to_string())
+            && policy.syscalls.allowed.contains(&"openat".to_string()),
+        "deny-wins must prune the re-declared allow: {:?}",
+        policy.syscalls.allowed
+    );
+}
+
+// A single document spelling a name on both sides parses with the
+// deny intact and the allow pruned — the composition-time prune only
+// repairs a list an overlay *added*.
+#[test]
+fn test_v3_same_doc_allow_deny_prunes_allow() {
+    let policy = parse_kdl_policy(
+        r#"
+            policy version=3
+            defaults {
+                syscalls {
+                    allow "read"
+                    deny "read"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(policy.syscalls.denied, vec!["read"]);
+    assert!(
+        policy.syscalls.allowed.is_empty(),
+        "deny-wins applies inside one document: {:?}",
+        policy.syscalls.allowed
+    );
+}
+
 // ── multiple profiles ───────────────────────────────────────────────
 
 #[test]
