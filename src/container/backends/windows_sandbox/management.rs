@@ -24,7 +24,7 @@ pub(super) async fn cli() -> Result<crate::trusted_path::BoundDriver, String> {
         let path = PathBuf::from(raw);
         // The override substitutes the trusted-path resolution — bound
         // under the caller class (a fixture spelling), so an
-        // env-planted path in a broadly writable location refuses.
+        // env-planted path a different principal could replace refuses.
         let trust = crate::trusted_path::driver_trust(Some("MCP_WRIT_WSB_EXE"));
         return crate::trusted_path::bind_driver(&path, trust).map_err(|e| {
             format!(
@@ -465,8 +465,15 @@ mod tests {
             std::env::set_var("MCP_WRIT_WSB_EXE", "wsb.exe");
         }
         assert!(cli().await.is_err());
-        let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("wsb.exe");
+        // Caller-class resolution walks every ancestor, so a host
+        // whose shared temp hierarchy grants replace rights to other
+        // named principals refuses the whole tree — skip there rather
+        // than assert an impossible pass.
+        if !crate::trusted_path::ambient_temp_passes_caller("wsb-override") {
+            return;
+        }
+        let dir = crate::fspriv::create_private_tempdir("wsb-override").unwrap();
+        let exe = dir.join("wsb.exe");
         std::fs::write(&exe, b"x").unwrap();
         #[cfg(unix)]
         {
@@ -489,6 +496,7 @@ mod tests {
         unsafe {
             std::env::remove_var("MCP_WRIT_WSB_EXE");
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

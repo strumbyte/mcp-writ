@@ -168,14 +168,12 @@ fn image_build_args_place_no_cache_before_context() {
 
 /// A stub CLI printing `body`'s command output — `.cmd` on Windows
 /// (std spawns batch files through cmd.exe), a shell script
-/// elsewhere.
+/// elsewhere. The stub must live under an owner-only directory: an
+/// ambient temp dir can inherit write grants to other named
+/// principals, and the Caller-class override path resolution refuses
+/// those — exactly as it refuses them for real operator overrides.
 fn cli_stub(body: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
-        .join(format!(
-            "mcp_writ_cli_stub_{}",
-            uuid::Uuid::now_v7().simple()
-        ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::fspriv::create_private_tempdir("cli-stub").unwrap();
     #[cfg(windows)]
     let (name, script) = ("stub.cmd", format!("{body}\r\n"));
     #[cfg(not(windows))]
@@ -246,6 +244,9 @@ fn wslc_stub(version: &str) -> std::path::PathBuf {
 #[test]
 fn resolve_engine_wslc_resolves_the_validated_line() {
     let _env = crate::warden::lock_process_env();
+    if !crate::trusted_path::ambient_temp_passes_caller("wslc-engine") {
+        return;
+    }
     let stub = wslc_stub("3.0.1.0");
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
@@ -271,6 +272,9 @@ fn resolve_engine_wslc_resolves_the_validated_line() {
 #[test]
 fn resolve_engine_wslc_refuses_an_unvalidated_version() {
     let _env = crate::warden::lock_process_env();
+    if !crate::trusted_path::ambient_temp_passes_caller("wslc-engine") {
+        return;
+    }
     for version in ["2.9.3.0", "3.1.0.0", "4.0.0.0", "3.0.0.0"] {
         let stub = wslc_stub(version);
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage

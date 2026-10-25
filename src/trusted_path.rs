@@ -62,8 +62,7 @@ impl DriverTrust {
 /// otherwise.
 pub(crate) fn driver_trust(override_env: Option<&str>) -> DriverTrust {
     let caller = override_env.is_some_and(|e| std::env::var_os(e).is_some())
-        || std::env::var_os(ALLOW_REPLACEABLE_DRIVERS_ENV)
-            .is_some_and(|v| !v.is_empty() && v != "0");
+        || std::env::var_os(ALLOW_REPLACEABLE_DRIVERS_ENV).is_some_and(|v| v == "1");
     if caller {
         DriverTrust::Caller
     } else {
@@ -161,12 +160,15 @@ fn check_driver_candidate(
 /// The leaf is judged by `leaf_md`, which callers sourcing from an open
 /// handle bind to the pinned object rather than the spelling.
 ///
-/// `Admin`: the owner must be root; no component may be
-/// world-writable; group-write counts only when it names a group the
-/// caller is *not* in — a caller's own group lets the caller's
-/// (potentially compromised) tooling rewrite the driver, so
-/// `root:<caller-group> g+w` fails while the admin-group convention
-/// (`root:staff`, Debian's `root:adm`) passes for non-members.
+/// `Admin`: the owner must be root and no component may be writable
+/// by group or other — group membership cannot *prove* administrator
+/// provenance (group-file member lists miss primary-gid memberships
+/// and NSS enumeration is routinely disabled), so `root:staff` /
+/// `root:adm` style conventions are refused rather than trusted: any
+/// member of a non-root-writable group could substitute the driver.
+/// Same posture `sudo` applies to group-writable commands, and the
+/// same result the Windows walk reaches by flagging every non-admin
+/// trustee.
 ///
 /// `Caller` (fixture/unsafe class): a component is a gap when it cannot
 /// be inspected, is owned by neither the caller nor root, or is
@@ -204,9 +206,7 @@ fn unix_component_gap(md: &std::fs::Metadata, leaf: bool, trust: DriverTrust) ->
     let owner = md.uid();
     let mode = md.mode();
     match trust {
-        DriverTrust::Admin => {
-            owner != 0 || mode & 0o002 != 0 || (mode & 0o020 != 0 && caller_in_group(md.gid()))
-        }
+        DriverTrust::Admin => owner != 0 || mode & 0o022 != 0,
         DriverTrust::Caller => {
             if owner != euid && owner != 0 {
                 return true;
@@ -216,24 +216,6 @@ fn unix_component_gap(md: &std::fs::Metadata, leaf: bool, trust: DriverTrust) ->
             world_writable && (leaf || !sticky)
         }
     }
-}
-
-/// True when the process's egid or supplementary groups include `gid`.
-#[cfg(unix)]
-fn caller_in_group(gid: u32) -> bool {
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    if unsafe { libc::getegid() } == gid {
-        return true;
-    }
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if n <= 0 {
-        return false;
-    }
-    let mut buf = vec![0 as libc::gid_t; n as usize];
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let got = unsafe { libc::getgroups(n, buf.as_mut_ptr()) };
-    got > 0 && buf[..got as usize].contains(&gid)
 }
 
 /// Windows gap check mirroring the Unix walk: the first component —
@@ -308,7 +290,9 @@ fn driver_replacement_gap(
 /// of running with launcher privileges. The retained pin handle also
 /// denies share-write/share-delete on Windows while the binding lives,
 /// and on every platform holds `(dev, ino)`-level identity plus
-/// size+mtime as the swap detectors.
+/// size+mtime as the swap detectors — on Unix also the inode change
+/// time, which `utimens` cannot restore, so a rewrite that preserves
+/// size and mtime is still caught.
 #[derive(Debug)]
 pub struct BoundDriver {
     /// Canonical absolute spelling — the `Command` program and the path
@@ -327,9 +311,25 @@ struct DriverPin {
     identity: crate::fspriv::FileIdentity,
     len: u64,
     modified: std::time::SystemTime,
+    /// Unix only: `(st_ctime, st_ctime_nsec)` — kernel-maintained inode
+    /// change time that no userspace call can restore, so it catches
+    /// both in-place rewrites and metadata touch-ups (chmod/chown)
+    /// that preserve mtime. Windows needs no equivalent: the pin
+    /// handle's share mode already denies write/delete for the
+    /// binding's lifetime.
+    #[cfg(unix)]
+    changed: (i64, i64),
     /// Retained open handle — the pinned object cannot be deleted or
     /// rewritten out from under verification while the binding lives.
     _handle: std::fs::File,
+}
+
+/// The `(ctime, ctime_nsec)` pair a unix `Metadata` reports — the
+/// detector [`BoundDriver::verify`] adds on top of size+mtime.
+#[cfg(unix)]
+fn pin_change_time(md: &std::fs::Metadata) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    (md.ctime(), md.ctime_nsec())
 }
 
 impl BoundDriver {
@@ -349,7 +349,8 @@ impl BoundDriver {
     /// spawn so a replacement planted after resolution fails closed.
     /// File identity alone misses an in-place rewrite that preserves
     /// `(dev, ino)`, so size+mtime ride along as the byte-level swap
-    /// detectors.
+    /// detectors — and on unix ctime too, closing the "restore size and
+    /// mtime" gap that the size/mtime pair alone leaves open.
     pub fn verify(&self) -> std::io::Result<()> {
         let Some(pin) = &self.pin else {
             return Ok(());
@@ -364,6 +365,8 @@ impl BoundDriver {
         let same = identity == pin.identity
             && md.len() == pin.len
             && md.modified().ok() == Some(pin.modified);
+        #[cfg(unix)]
+        let same = same && pin_change_time(&md) == pin.changed;
         if !same {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -423,6 +426,8 @@ impl BoundDriver {
                 identity,
                 len: md.len(),
                 modified,
+                #[cfg(unix)]
+                changed: pin_change_time(&md),
                 _handle: file,
             }),
         })
@@ -465,6 +470,41 @@ fn open_driver_pin(path: &Path) -> std::io::Result<(std::fs::File, crate::fspriv
     Ok((file, identity))
 }
 
+/// Whether the ambient temp hierarchy can host a Caller-class fixture
+/// at all — probes the path the tests then stage into. A host whose
+/// shared temp grants replace rights to other named principals
+/// (sandboxed agent hosts are one example) refuses every path under
+/// it, and that refusal *is* the contract; tests asserting Caller
+/// acceptance gate on this so they skip honestly instead of failing.
+#[cfg(test)]
+pub(crate) fn ambient_temp_passes_caller(label: &str) -> bool {
+    let Some(dir) = crate::fspriv::create_private_tempdir(label).ok() else {
+        return false;
+    };
+    let probe = dir.join("probe");
+    let ok = std::fs::write(&probe, b"x").is_ok()
+        && {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).is_ok()
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+        && validate_driver_path(&probe).is_ok();
+    let _ = std::fs::remove_dir_all(&dir);
+    if !ok {
+        eprintln!(
+            "ambient temp hierarchy fails the Caller contract — a shared \
+             temp dir is replaceable by other named principals"
+        );
+    }
+    ok
+}
+
 /// Validate `path` and bind the validated object to a [`BoundDriver`]
 /// — the entry point engine resolution uses when it already holds a
 /// candidate spelling (a discovered install root or an override).
@@ -491,6 +531,8 @@ pub(crate) fn bind_driver(path: &Path, trust: DriverTrust) -> Result<BoundDriver
             identity,
             len: md.len(),
             modified,
+            #[cfg(unix)]
+            changed: pin_change_time(&md),
             _handle: file,
         }),
     })
@@ -644,10 +686,20 @@ mod tests {
     /// provenance driver resolution must refuse. (On Windows the same
     /// two classes apply: caller-owned leaf + caller-owned ancestors
     /// pass `Caller`, fail `Admin`.)
+    ///
+    /// The fixture dir uses `create_private_tempdir` so the leaf's own
+    /// DACL is owner-only; hosts whose *ambient* temp hierarchy grants
+    /// replace rights to other named principals refuse the whole tree
+    /// — the contract working — so the assertion gates on the ambient
+    /// probe.
     #[test]
     fn caller_owned_path_trust_split() {
-        let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("tool");
+        if !ambient_temp_passes_caller("trusted-path") {
+            return;
+        }
+        let dir = crate::fspriv::create_private_tempdir("trusted-path")
+            .expect("private tempdir");
+        let exe = dir.join("tool");
         write_executable(&exe);
         assert!(
             validate_driver_path(&exe).is_ok(),
@@ -659,6 +711,32 @@ mod tests {
                 "caller-owned file must fail the Admin class"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The production `bind_driver` path applies the same class split,
+    /// reading the leaf's owner/DACL through the *open pin handle* —
+    /// the object validated is the object retained. Same ambient
+    /// gating as [`caller_owned_path_trust_split`].
+    #[test]
+    fn bind_driver_caller_class_split() {
+        if !ambient_temp_passes_caller("trusted-path") {
+            return;
+        }
+        let dir = crate::fspriv::create_private_tempdir("trusted-path")
+            .expect("private tempdir");
+        let exe = dir.join("tool");
+        write_executable(&exe);
+        let bound = bind_driver(&exe, DriverTrust::Caller)
+            .expect("caller-owned file must bind under the Caller class");
+        assert!(bound.verify().is_ok());
+        if !crate::fspriv::running_as_root() {
+            assert!(
+                bind_driver(&exe, DriverTrust::Admin).is_err(),
+                "caller-owned file must not bind under the Admin class"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The admin class rejects a caller-managed component even when the

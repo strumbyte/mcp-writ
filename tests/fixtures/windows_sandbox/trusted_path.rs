@@ -8,12 +8,28 @@
 // itself and a wrong answer just skips the rule into `agent.log`.
 
 use std::path::PathBuf;
+use std::process::Command as StdCommand;
+
+/// Stand-in for the shipped `BoundDriver`: the validated spelling plus
+/// the only API the agent consumes (`std_command` — the real one also
+/// re-verifies the pinned file identity, which a std-only fixture
+/// cannot do; the guest-side netsh is best-effort, so an honest
+/// unverified spawn matches the stand-in contract).
+pub(crate) struct BoundDriver {
+    path: PathBuf,
+}
+
+impl BoundDriver {
+    pub(crate) fn std_command(&self) -> std::io::Result<StdCommand> {
+        Ok(StdCommand::new(&self.path))
+    }
+}
 
 /// `rel` is the System32-relative spelling (`"netsh.exe"`); `Some` only
 /// when the resolved file exists. Same signature as the shipped
-/// `trusted_path::system32_exe`.
-pub(crate) fn system32_exe(rel: &str) -> Option<PathBuf> {
+/// `trusted_path::system32_exe` — a bound driver handle, not a bare path.
+pub(crate) fn system32_exe(rel: &str) -> Option<BoundDriver> {
     let root = std::env::var_os("SystemRoot")?;
     let candidate = PathBuf::from(root).join("System32").join(rel);
-    candidate.is_file().then_some(candidate)
+    candidate.is_file().then_some(BoundDriver { path: candidate })
 }

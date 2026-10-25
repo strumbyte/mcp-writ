@@ -1,13 +1,14 @@
 // std-only stand-in for `src/container/engine.rs`'s
-// `bounded_cli_output` inside the plain-rustc fixture crate: the
+// `bounded_driver_output` inside the plain-rustc fixture crate: the
 // shipped engine pulls in the whole container backend graph, which the
 // rustc fixture build cannot see. Same contract for the agent's
 // best-effort `netsh` leg — bounded wait, concurrent pipe drains so a
 // flooded stderr cannot deadlock the probe, capped output, killed and
 // reaped on timeout, CREATE_NO_WINDOW so the console-attached agent
-// never pops a window.
+// never pops a window. The stand-in `BoundDriver` performs no identity
+// re-verification (no windows crates here); the shipped one does.
 
-use std::process::{Command as StdCommand, Output, Stdio};
+use std::process::{Output, Stdio};
 
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -28,11 +29,14 @@ fn drain_pipe(
     rx
 }
 
-pub(crate) fn bounded_cli_output(
-    prog: &str,
+/// [`bounded_driver_output`] on a bound driver — same signature as the
+/// shipped helper; `std_command` is where the real identity
+/// re-verification lives (the fixture stand-in just builds the command).
+pub(crate) fn bounded_driver_output(
+    driver: &crate::trusted_path::BoundDriver,
     args: &[&str],
 ) -> std::io::Result<Output> {
-    let mut cmd = StdCommand::new(prog);
+    let mut cmd = driver.std_command()?;
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

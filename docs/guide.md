@@ -315,16 +315,27 @@ attests an isolation boundary is resolved once, to a trusted absolute
 path, before any subprocess runs. `docker`/`podman`/`buildah`/Apple's
 `container` resolve through PATH exactly once — under *administrator
 provenance*: every component of the resolved path must be replaceable
-only by an administrator principal (root-owned and not caller-writable
-on Unix; owned by SYSTEM/Administrators/TrustedInstaller with no DACL
-grant that hands an untrusted trustee write, delete, or ACL control on
-Windows). A hit the caller itself can rewrite — including one the
-caller merely owns — refuses instead of becoming the driver, and never
-falls through to a later PATH entry of the same name: the shadow is
-the attack, not a miss. Resolution binds the validated *object*, not
-just the spelling: the canonical path is pinned by file identity plus
-size/mtime (and on Windows by a share-read-only handle held for the
-binding's lifetime), and that identity is re-verified immediately
+only by an administrator principal (on Unix root-owned and writable
+by neither group nor other — group membership cannot prove
+administrator provenance, so `root:staff`-style conventions are
+refused rather than trusted; on Windows owned by
+SYSTEM/Administrators/TrustedInstaller with no DACL
+grant that hands an untrusted trustee write, delete, or ACL control —
+any *named* non-administrative trustee counts). A hit the caller itself
+can rewrite — including one the caller merely owns — refuses instead
+of becoming the driver, and never falls through to a later PATH entry
+of the same name: the shadow is the attack, not a miss. This is a
+deliberate break from PATH conventions: engines installed to
+caller-owned prefixes (Homebrew, `~/.local/bin`, cargo/pipx shims, a
+Docker Desktop `docker` symlink into `~/.docker`) are not usable as
+isolation drivers by default. Resolution binds the validated *object*,
+not just the spelling: the canonical path is pinned by file identity
+plus size/mtime — on Unix also the inode change time, which no
+userspace call can restore, so a rewrite preserving size and mtime is
+still caught — and on Windows by a share-read-only handle held for the
+binding's lifetime (which also means the bound driver file cannot be
+replaced or deleted while the launcher lives — a driver upgrade lands
+only after the process exits). That identity is re-verified immediately
 before every spawn, so a driver swapped or rewritten between
 resolution and a probe, build, launch, monitor, or teardown step fails
 closed rather than executing under the resolved name. Windows OS
@@ -341,11 +352,13 @@ long-lived driver. The `MCP_WRIT_*_EXE` fixture overrides must name an
 absolute existing file and still pass the same replacement-gap checks
 under the caller class (the setter already controls its own files); an
 invalid or relative override reads as *absent*, never a fall-through.
-`MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS=1` downgrades driver resolution to
-the caller class for test rigs and developer installs that run engines
-from user-owned prefixes — a production launch must never set it,
-since it re-opens exactly the pre-containment substitution this
-hardening closes.
+For a developer install the per-driver override is the preferred
+escape — it trusts exactly the spelled binary and nothing else.
+`MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS=1` is the coarser opt-out: it
+downgrades *every* driver resolution to the caller class for test rigs
+and installs that run engines from user-owned prefixes — a production
+launch must never set it, since it re-opens exactly the
+pre-containment substitution this hardening closes.
 
 **Machine-readable matrix.** `mcp-writ capability-matrix` prints the
 same claims as JSON — one row per sandbox mechanism with its egress-layer

@@ -38,7 +38,7 @@ use tokio::io::AsyncReadExt;
 /// Bound on each diagnostic subprocess — a wedged CLI must not stall
 /// `plan`.
 /// `pub(crate)` so the engine layer's synchronous CLI probes
-/// (`engine::bounded_cli_output`) share the same 5 s budget.
+/// (`engine::bounded_driver_output`) share the same 5 s budget.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-stream output cap — version/listing output is small; a flood
 /// stays bounded.
@@ -789,8 +789,15 @@ mod tests {
     #[test]
     fn find_wslc_resolves_the_install_dir() {
         let _env = crate::warden::lock_process_env();
-        let pf = tempfile::tempdir().unwrap();
-        let wsl_dir = pf.path().join("WSL");
+        // Caller-class resolution walks every ancestor, so a host
+        // whose shared temp hierarchy grants replace rights to other
+        // named principals refuses the whole tree — skip there rather
+        // than assert an impossible pass.
+        if !crate::trusted_path::ambient_temp_passes_caller("wsl-probe") {
+            return;
+        }
+        let pf = crate::fspriv::create_private_tempdir("wsl-probe").unwrap();
+        let wsl_dir = pf.join("WSL");
         std::fs::create_dir_all(&wsl_dir).unwrap();
         let exe = wsl_dir.join("wslc.exe");
         std::fs::write(&exe, b"x").unwrap();
@@ -804,7 +811,7 @@ mod tests {
         let old_pf = std::env::var_os("ProgramFiles");
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
-            std::env::set_var("ProgramFiles", pf.path());
+            std::env::set_var("ProgramFiles", &pf);
             std::env::set_var(crate::trusted_path::ALLOW_REPLACEABLE_DRIVERS_ENV, "1");
         }
         // Binding returns the canonical spelling — tempdirs may sit
@@ -821,6 +828,7 @@ mod tests {
                 None => std::env::remove_var("ProgramFiles"),
             }
         }
+        let _ = std::fs::remove_dir_all(&pf);
     }
 
     #[test]
