@@ -272,6 +272,15 @@ pub(super) async fn udp_task(
                         loop {
                             let n = match reply_sock.recv(&mut buf).await {
                                 Ok(n) => n,
+                                // ICMP port-unreachable for a sent
+                                // datagram surfaces as ECONNREFUSED on
+                                // the connected socket — ordinary UDP
+                                // loss, not a dead socket. Keep the
+                                // pump alive for replies that arrive
+                                // after the refusal.
+                                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                                    continue;
+                                }
                                 Err(_) => return,
                             };
                             let pkt = craft_udp_packet(rdst, rdport, wsrc, wsport, &buf[..n]);

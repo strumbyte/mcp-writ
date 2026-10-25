@@ -232,9 +232,29 @@ fn await_ready(sock: &mut std::fs::File) -> Result<std::fs::File, String> {
         return Err("READY arrived without the TUN fd".to_string());
     }
     // SAFETY: `cmsg_hdr` is the non-null first header inside the live
-    // `cmsg` buffer; CMSG_DATA points at the RawFd payload just
-    // received. The Vec<u8> backing has alignment 1, so read_unaligned
-    // covers the cmsghdr alignment the buffer itself cannot guarantee.
+    // `cmsg` buffer — CMSG_FIRSTHDR only returns non-null when
+    // msg_controllen covers a full cmsghdr, so the read is in-bounds;
+    // read_unaligned covers the alignment Vec<u8> cannot guarantee.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let hdr = unsafe { std::ptr::read_unaligned(cmsg_hdr) };
+    // Refuse anything but a complete SCM_RIGHTS fd pass: a wrong
+    // level/type, a payload shorter than RawFd, or a declared length
+    // beyond what the kernel delivered would read unwritten bytes
+    // where the descriptor sits.
+    // SAFETY: CMSG_LEN is pure size arithmetic on the length argument
+    // — it dereferences nothing.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let fd_payload = unsafe { libc::CMSG_LEN(fd_size as u32) } as usize;
+    if hdr.cmsg_level != libc::SOL_SOCKET
+        || hdr.cmsg_type != libc::SCM_RIGHTS
+        || hdr.cmsg_len < fd_payload
+        || hdr.cmsg_len > msg.msg_controllen
+    {
+        return Err("READY ancillary data is not a complete SCM_RIGHTS fd".to_string());
+    }
+    // SAFETY: the header just validated declares a full-RawFd payload
+    // inside the received control region, so CMSG_DATA names readable
+    // bytes; read_unaligned covers the Vec<u8> buffer's alignment 1.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg_hdr) as *const RawFd) };
     // SAFETY: `fd` is the descriptor SCM_RIGHTS just delivered — a new
