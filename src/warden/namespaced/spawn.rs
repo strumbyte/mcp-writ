@@ -184,14 +184,22 @@ fn await_ready(sock: &mut std::fs::File) -> Result<std::fs::File, String> {
         iov_len: data.len(),
     };
     let fd_size = std::mem::size_of::<RawFd>();
+    // SAFETY: CMSG_SPACE is pure size arithmetic on the length argument
+    // — it dereferences nothing.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut cmsg = vec![0u8; unsafe { libc::CMSG_SPACE(fd_size as u32) } as usize];
+    // SAFETY: `msghdr` is a POD struct of pointers and scalars, so the
+    // all-zero bit pattern is the valid "unset" value; the fields the
+    // kernel reads are assigned immediately below.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg.as_mut_ptr() as *mut _;
     msg.msg_controllen = cmsg.len();
+    // SAFETY: `msg` is fully initialized — `iov` names the writable
+    // 512-byte `data` and msg_control the CMSG_SPACE-sized `cmsg` — so
+    // recvmsg writes stay inside live buffers.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) };
     if n < 0 {
@@ -215,13 +223,42 @@ fn await_ready(sock: &mut std::fs::File) -> Result<std::fs::File, String> {
     if msg.msg_flags & libc::MSG_CTRUNC != 0 {
         return Err("READY ancillary data truncated — TUN fd not received".to_string());
     }
+    // SAFETY: `msg` still describes the message just received (control
+    // buffer and controllen updated by the kernel); a null return is
+    // handled on the next line, and MSG_CTRUNC was refused above.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let cmsg_hdr = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg_hdr.is_null() {
         return Err("READY arrived without the TUN fd".to_string());
     }
+    // SAFETY: `cmsg_hdr` is the non-null first header inside the live
+    // `cmsg` buffer — CMSG_FIRSTHDR only returns non-null when
+    // msg_controllen covers a full cmsghdr, so the read is in-bounds;
+    // read_unaligned covers the alignment Vec<u8> cannot guarantee.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let hdr = unsafe { std::ptr::read_unaligned(cmsg_hdr) };
+    // Refuse anything but a complete SCM_RIGHTS fd pass: a wrong
+    // level/type, a payload shorter than RawFd, or a declared length
+    // beyond what the kernel delivered would read unwritten bytes
+    // where the descriptor sits.
+    // SAFETY: CMSG_LEN is pure size arithmetic on the length argument
+    // — it dereferences nothing.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let fd_payload = unsafe { libc::CMSG_LEN(fd_size as u32) } as usize;
+    if hdr.cmsg_level != libc::SOL_SOCKET
+        || hdr.cmsg_type != libc::SCM_RIGHTS
+        || hdr.cmsg_len < fd_payload
+        || hdr.cmsg_len > msg.msg_controllen
+    {
+        return Err("READY ancillary data is not a complete SCM_RIGHTS fd".to_string());
+    }
+    // SAFETY: the header just validated declares a full-RawFd payload
+    // inside the received control region, so CMSG_DATA names readable
+    // bytes; read_unaligned covers the Vec<u8> buffer's alignment 1.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg_hdr) as *const RawFd) };
+    // SAFETY: `fd` is the descriptor SCM_RIGHTS just delivered — a new
+    // fd owned by this process, wrapped into File exactly once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let tun = unsafe { std::fs::File::from_raw_fd(fd) };
     set_nonblocking(tun.as_raw_fd()).map_err(|e| format!("tun nonblocking failed: {e}"))?;
@@ -357,15 +394,24 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            // SAFETY: the spawn failed, so no child inherited
+            // `child_sock` — both socketpair ends are still owned by
+            // this process and each is closed once.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::close(child_sock) };
+            // SAFETY: `parent_sock` is this process's live socketpair
+            // end, closed once on this error path.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::close(parent_sock) };
             return Err(format!("init spawn failed: {e}"));
         }
     };
+    // SAFETY: the spawned child holds `child_sock` through its inherited
+    // (non-CLOEXEC) copy; the parent's copy is closed exactly once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(child_sock) };
+    // SAFETY: `parent_sock` is this process's still-open socketpair end,
+    // owned and not yet wrapped — `File` takes ownership once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut sock = unsafe { std::fs::File::from_raw_fd(parent_sock) };
 
@@ -381,6 +427,10 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
             // never materialized must not reach the group call.
             let pid = child.id() as i32;
             if pid > 0 {
+                // SAFETY: scalar arguments; the negative pid names the
+                // child's dedicated process group
+                // (`apply_unix_process_group`), and the `pid > 0` guard
+                // keeps a null handle from reaching kill(0).
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
@@ -418,15 +468,24 @@ pub fn spawn_namespaced_child_tokio(cfg: &SpawnConfig) -> Result<NamespacedChild
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            // SAFETY: the spawn failed, so no child inherited
+            // `child_sock` — both socketpair ends are still owned by
+            // this process and each is closed once.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::close(child_sock) };
+            // SAFETY: `parent_sock` is this process's live socketpair
+            // end, closed once on this error path.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::close(parent_sock) };
             return Err(format!("init spawn failed: {e}"));
         }
     };
+    // SAFETY: the spawned child holds `child_sock` through its inherited
+    // (non-CLOEXEC) copy; the parent's copy is closed exactly once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(child_sock) };
+    // SAFETY: `parent_sock` is this process's still-open socketpair end,
+    // owned and not yet wrapped — `File` takes ownership once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut sock = unsafe { std::fs::File::from_raw_fd(parent_sock) };
 
@@ -444,6 +503,9 @@ pub fn spawn_namespaced_child_tokio(cfg: &SpawnConfig) -> Result<NamespacedChild
             // pid. `start_kill` below still reaches the child itself.
             let pid = child.id().unwrap_or(0) as i32;
             if pid > 0 {
+                // SAFETY: scalar arguments; the negative pid names the
+                // child's dedicated process group, and the `pid > 0`
+                // guard keeps a null handle from reaching kill(0).
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
@@ -464,6 +526,8 @@ pub fn spawn_namespaced_child_tokio(cfg: &SpawnConfig) -> Result<NamespacedChild
 pub(crate) fn policy_memfd(policy: &crate::policy::Policy) -> io::Result<std::fs::File> {
     use std::io::{Seek, Write};
     const MFD_ALLOW_SEALING: u32 = 0x0002;
+    // SAFETY: the name is a NUL-terminated static C string and the flag
+    // a scalar — memfd_create takes no writable pointers.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe {
         libc::syscall(
@@ -475,6 +539,8 @@ pub(crate) fn policy_memfd(policy: &crate::policy::Policy) -> io::Result<std::fs
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: `fd` is the fresh memfd descriptor returned above — owned
+    // by this process, not aliased, wrapped into File exactly once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
     let kdl = crate::policy::kdl_emit::to_kdl(policy);
@@ -484,6 +550,8 @@ pub(crate) fn policy_memfd(policy: &crate::policy::Policy) -> io::Result<std::fs
     // sealing changes. An init that inherits the fd reads exactly
     // the bytes written here.
     let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: `fd` is the live memfd owned by `f`; F_ADD_SEALS takes
+    // scalar arguments and touches no user memory.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
         return Err(io::Error::last_os_error());
@@ -502,10 +570,14 @@ fn skip_sandbox_requested() -> bool {
 fn socketpair() -> Result<(RawFd, RawFd), String> {
     let mut pair = [0i32; 2];
     // No SOCK_CLOEXEC on the child end — it must live through exec.
+    // SAFETY: `pair` is a valid, writable `[c_int; 2]` — exactly the
+    // two-fd array socketpair(2) fills.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, pair.as_mut_ptr()) } < 0 {
         return Err(format!("socketpair failed: {}", io::Error::last_os_error()));
     }
+    // SAFETY: `pair[0]` is a live descriptor the socketpair just
+    // returned; F_SETFD takes scalar arguments.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::fcntl(pair[0], libc::F_SETFD, libc::FD_CLOEXEC);
@@ -515,6 +587,8 @@ fn socketpair() -> Result<(RawFd, RawFd), String> {
 }
 
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fd` is the caller's live descriptor; F_GETFL/F_SETFL take
+    // scalar arguments and touch no user memory — a bad fd fails EBADF.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
@@ -531,6 +605,9 @@ fn set_sock_timeout(fd: RawFd, secs: u64) -> io::Result<()> {
         tv_sec: secs as _,
         tv_usec: 0,
     };
+    // SAFETY: `tv` is an initialized timeval and the call passes its
+    // exact size; `fd` is the caller's live descriptor — a bad fd fails
+    // EBADF rather than touching memory.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::setsockopt(

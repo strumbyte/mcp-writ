@@ -384,6 +384,9 @@ fn kill_init_group(pid: i32, cg: &Option<super::super::cgroup::LifetimeCgroup>) 
     // `kill(0)` signals *this* process's own group — a pid that never
     // materialized must not reach the group call.
     if pid > 0 {
+        // SAFETY: scalar arguments; the negative pid names the init
+        // child's dedicated process group, and the `pid > 0` guard
+        // keeps a null handle from reaching kill(0).
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     }

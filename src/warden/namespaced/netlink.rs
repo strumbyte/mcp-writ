@@ -69,15 +69,24 @@ impl Msg {
 }
 
 fn nl_send(req: &[u8]) -> io::Result<()> {
+    // SAFETY: scalar-only syscall — a refused family/protocol reports an
+    // errno rather than producing UB.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe { libc::socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     let res = (|| {
+        // SAFETY: `sockaddr_nl` is a POD struct of scalars, so the
+        // all-zero bit pattern is valid; nl_family is assigned before
+        // the address is handed to the kernel.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         addr.nl_family = AF_NETLINK as u16;
+        // SAFETY: `req` is a readable byte slice for `req.len()`; `fd`
+        // is the live netlink socket opened above; `addr` is an
+        // initialized sockaddr_nl passed with its exact size — the
+        // layout sendto expects for AF_NETLINK.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe {
             libc::sendto(
@@ -95,6 +104,8 @@ fn nl_send(req: &[u8]) -> io::Result<()> {
         // Await the ACK: NLMSG_ERROR with error==0 is success; a
         // negative error is the kernel's errno for the request.
         let mut buf = [0u8; 4096];
+        // SAFETY: `buf` is a writable 4096-byte buffer that outlives the
+        // call and `fd` is the live netlink socket.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if n < 0 {
@@ -113,6 +124,8 @@ fn nl_send(req: &[u8]) -> io::Result<()> {
         }
         Ok(())
     })();
+    // SAFETY: `fd` is still owned — it was opened above and never
+    // wrapped — so it is closed exactly once here.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(fd) };
     res
@@ -121,6 +134,7 @@ fn nl_send(req: &[u8]) -> io::Result<()> {
 fn if_nametoindex(name: &str) -> io::Result<u32> {
     let c = std::ffi::CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name contains NUL"))?;
+    // SAFETY: `c` is a NUL-terminated CString alive for the call.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
     if idx == 0 {
