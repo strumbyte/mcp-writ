@@ -289,14 +289,19 @@ fn driver_replacement_gap(
 /// of running with launcher privileges. On Linux the spawn execs a
 /// `/proc/self/fd` spelling of the pin — the leaf descriptor itself
 /// for binaries (fully object-bound, no name lookup), and for `#!`
-/// scripts a non-CLOEXEC dup of the pin's *parent-directory* handle
-/// joined with the leaf name, so `$0` keeps a usable, bound dirname
-/// for sibling loads; the leaf inside the pinned dir is re-verified
-/// pre-exec. The exec descriptor is owned by the returned `Command`,
-/// so a substitution landing inside the residual verify→execve
-/// window fails closed rather than running the replacement. The
-/// retained pin handle also denies share-write/share-delete on
-/// Windows while the binding lives,
+/// scripts a `F_DUPFD_CLOEXEC` dup of the pin's *parent-directory*
+/// handle joined with the leaf name, so `$0` keeps a usable, bound
+/// dirname for sibling loads. A script's leaf is necessarily resolved
+/// by name — the kernel passes the spelling string to the
+/// interpreter, which re-opens it — so no spelling can be fully
+/// object-bound while `$0` stays usable; the pre-exec `fstatat`
+/// re-check *narrows* that verify→exec window, and the pinned
+/// directory's own write restriction (which the Admin ancestor rules
+/// already enforce) is what keeps an unauthorized swap out entirely.
+/// The exec descriptor is owned by the returned `Command`, so it
+/// stays open and un-reused through the spawn. The retained pin
+/// handle also denies share-write/share-delete on Windows while the
+/// binding lives,
 /// and on every platform holds `(dev, ino)`-level identity plus
 /// size+mtime as the swap detectors — on Unix also the inode change
 /// time, which `utimens` cannot restore, so a rewrite that preserves
@@ -405,14 +410,16 @@ impl BoundDriver {
     /// pinned directory object (the leaf name is re-verified pre-exec,
     /// see [`bind_exec_fd`]). Anything else execs a dup of the *leaf
     /// descriptor itself* — `/proc/self/fd/N` — fully object-bound,
-    /// no name lookup remains. Dup clears CLOEXEC, so the descriptor
-    /// survives `execve` for the interpreter's re-open too.
-    /// [`finish_command`] parks the dup inside the returned command so
-    /// it cannot be closed or its number reused while the command
-    /// exists. Other platforms spawn the canonical path — Windows
-    /// cannot be swapped while the pin's share mode lives, and unixes
-    /// without fd-exec keep `verify`'s residual window, the narrowest
-    /// portable bound.
+    /// no name lookup remains. The dup is `F_DUPFD_CLOEXEC`: it stays
+    /// close-on-exec in the parent — so no concurrent spawn inherits
+    /// it — and [`bind_exec_fd`] clears the flag in the child only
+    /// when an interpreter needs to re-open the spelling; a binary's
+    /// fd resolves at `execve` and closes itself. [`finish_command`]
+    /// parks the dup inside the returned command so it cannot be
+    /// closed or its number reused while the command exists. Other
+    /// platforms spawn the canonical path — Windows cannot be swapped
+    /// while the pin's share mode lives, and unixes without fd-exec
+    /// keep `verify`'s residual window, the narrowest portable bound.
     fn exec_program(&self) -> std::io::Result<(PathBuf, Option<std::fs::File>)> {
         #[cfg(target_os = "linux")]
         if let Some(pin) = &self.pin {
@@ -422,7 +429,7 @@ impl BoundDriver {
                 None => (pin._handle.as_raw_fd(), None),
             };
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let fd = unsafe { libc::fcntl(pin_fd, libc::F_DUPFD, 3) };
+            let fd = unsafe { libc::fcntl(pin_fd, libc::F_DUPFD_CLOEXEC, 3) };
             if fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -439,16 +446,23 @@ impl BoundDriver {
 
     /// Move `fd` inside `cmd` so the exec descriptor stays open until
     /// the command is dropped — the `pre_exec` closure owns it: the fd
-    /// is open in the parent when `spawn` forks, inherited by the
-    /// child at `execve`, and non-CLOEXEC so it survives exec for an
-    /// interpreter re-open. For a *script* exec (dir-fd spelling) the
-    /// closure also re-proves the leaf name in the pinned directory
-    /// still names the validated object — `fstatat` on the dir fd,
-    /// syscalls and field compares only, so the closure stays
-    /// async-signal-safe — and a same-dir swap landing inside the
-    /// residual window fails closed rather than exec'ing the
-    /// replacement. Leaf-fd execs (binaries) skip the check: the fd
-    /// itself names the object, there is no lookup to re-verify.
+    /// is open in the parent when `spawn` forks and is inherited by
+    /// the child. It stays CLOEXEC (see `exec_program`), so a binary's
+    /// fd closes itself at `execve`; only for a *script* exec does the
+    /// closure clear `FD_CLOEXEC` — in the child, after fork — so the
+    /// interpreter can re-open the `$0` spelling, and the fd never
+    /// becomes inheritable in the parent. For a script the closure
+    /// also re-proves the leaf name in the pinned directory still
+    /// names the validated object — `fstatat` on the dir fd, syscalls
+    /// and field compares only, so the closure stays
+    /// async-signal-safe. The check *narrows* — it does not close —
+    /// the verify→execve window: a same-dir leaf swap needs write
+    /// access on the pinned directory itself, which the ancestor rules
+    /// already deny a Caller-class principal, so the residual race is
+    /// outside the Admin threat model; a swap that has already landed
+    /// still fails closed here rather than exec'ing the replacement.
+    /// Leaf-fd execs (binaries) skip the check: the fd itself names
+    /// the object, there is no lookup to re-verify.
     #[cfg(target_os = "linux")]
     fn bind_exec_fd(cmd: &mut std::process::Command, fd: std::fs::File, pin: &DriverPin) {
         use std::os::unix::io::AsRawFd;
@@ -489,6 +503,14 @@ impl BoundDriver {
                         || st.st_ctime_nsec != *ct_ns
                     {
                         return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                    }
+                    // The `#!` interpreter re-opens the `$0` spelling
+                    // in the exec'd image — clear CLOEXEC only here,
+                    // in the forked child, so the descriptor survives
+                    // `execve` for that re-open without ever being
+                    // inheritable in the parent.
+                    if libc::fcntl(dirfd, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
                 }
                 let _fd = &fd;
