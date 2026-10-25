@@ -86,6 +86,9 @@ fn errno() -> i32 {
 /// handshake. The socket is a connected SOCK_SEQPACKET pair, so the
 /// two calls are byte-for-byte equivalent here.
 fn send(sock: RawFd, msg: &[u8]) {
+    // SAFETY: `msg` is a shared slice, so `as_ptr()`/`len()` describe a
+    // readable buffer for the whole call; a bad `sock` fd fails EBADF
+    // without touching memory.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::write(sock, msg.as_ptr() as *const libc::c_void, msg.len());
@@ -123,8 +126,15 @@ fn send_ready_with_fd(sock: RawFd, fd: RawFd) -> std::io::Result<()> {
         msg_controllen: std::mem::size_of_val(&cmsg_buf),
         msg_flags: 0,
     };
+    // SAFETY: `msg` is an initialized msghdr whose msg_control names the
+    // two-cmsghdr `cmsg_buf`, so msg_controllen ≥ sizeof(cmsghdr) and
+    // CMSG_FIRSTHDR returns an in-bounds, aligned, non-null header.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    // SAFETY: `cmsg` points into the live `cmsg_buf` per above; the
+    // CMSG_LEN(sizeof(RawFd)) payload fits the control storage, so
+    // CMSG_DATA is in-bounds for the copy, and `&fd` is a readable
+    // sizeof(RawFd)-byte source.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
@@ -136,8 +146,13 @@ fn send_ready_with_fd(sock: RawFd, fd: RawFd) -> std::io::Result<()> {
             std::mem::size_of::<RawFd>(),
         );
     }
+    // SAFETY: `cmsg` still points at the header in `cmsg_buf` initialized
+    // above, so reading its cmsg_len is in-bounds.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     msg.msg_controllen = unsafe { (*cmsg).cmsg_len };
+    // SAFETY: every pointer `msg` carries is valid for the call — `iov`
+    // covers the 5-byte READY literal and msg_control the initialized
+    // cmsghdr plus RawFd payload written above.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::sendmsg(sock, &msg, 0) } < 0 {
         return Err(std::io::Error::last_os_error());
@@ -165,6 +180,8 @@ fn write_id_maps_for(pid: i32, euid: u32, egid: u32) -> std::io::Result<()> {
 /// would also work; pipes keep the read/write directions obvious.
 fn pipe_pair() -> std::io::Result<(RawFd, RawFd)> {
     let mut p = [0i32; 2];
+    // SAFETY: `p` is a valid, writable `[c_int; 2]` — exactly the two-fd
+    // array `pipe(2)` fills.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::pipe(p.as_mut_ptr()) } < 0 {
         Err(std::io::Error::last_os_error())
@@ -174,6 +191,8 @@ fn pipe_pair() -> std::io::Result<(RawFd, RawFd)> {
 }
 
 fn pipe_write(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: the 1-byte string literal is a readable buffer; a bad `fd`
+    // fails EBADF without touching memory.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::write(fd, b"1".as_ptr() as *const libc::c_void, 1) } != 1 {
         Err(std::io::Error::last_os_error())
@@ -186,6 +205,8 @@ fn pipe_write(fd: RawFd) -> std::io::Result<()> {
 /// distinguish by context.
 fn pipe_read(fd: RawFd) -> std::io::Result<()> {
     let mut b = [0u8; 1];
+    // SAFETY: `b` is a writable 1-byte buffer that outlives the call; a
+    // bad `fd` fails EBADF without touching memory.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
     if n == 1 {
@@ -201,20 +222,29 @@ fn pipe_read(fd: RawFd) -> std::io::Result<()> {
 }
 
 fn create_tun() -> std::io::Result<RawFd> {
+    // SAFETY: `c"/dev/net/tun"` is a NUL-terminated static C string;
+    // open(2) takes no other pointers.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: `ifreq` is a POD union, so the all-zero bit pattern is a
+    // valid value; the flag and name fields are filled before use.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     ifr.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as i16;
     for (slot, &b) in ifr.ifr_name.iter_mut().zip(IFNAME.iter()) {
         *slot = b as libc::c_char;
     }
+    // SAFETY: `fd` is the live `/dev/net/tun` descriptor opened above and
+    // `&ifr` points at an initialized `ifreq` — the request-argument
+    // layout TUNSETIFF requires.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::ioctl(fd, libc::TUNSETIFF, &ifr) } < 0 {
         let e = std::io::Error::last_os_error();
+        // SAFETY: `fd` is still owned here — the failed ioctl transfers
+        // nothing — so it is closed exactly once on this error path.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(fd) };
         return Err(e);
@@ -264,6 +294,9 @@ fn redirect_resolv_conf(target: &std::path::Path, contents: &str) -> std::io::Re
         return std::fs::write(target, contents);
     }
     let ctmp = CString::new("/tmp").unwrap();
+    // SAFETY: every pointer is a NUL-terminated C string that outlives the
+    // call — `ctmp` is a live CString, the literals are 'static, and
+    // `mode=1777` is a valid tmpfs mount-data string.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::mount(
@@ -281,6 +314,8 @@ fn redirect_resolv_conf(target: &std::path::Path, contents: &str) -> std::io::Re
     std::fs::write(src, contents)?;
     let csrc = CString::new(src).unwrap();
     let cdst = CString::new("/etc/resolv.conf").unwrap();
+    // SAFETY: `csrc`/`cdst` are NUL-terminated CStrings alive for the call;
+    // MS_BIND permits null fstype and data.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::mount(
@@ -328,6 +363,8 @@ pub(crate) fn ipv6_stack_present() -> bool {
     // family registration alone (no transport module needed) and
     // `SOCK_CLOEXEC` keeps the probe fd out of any exec'd image for
     // its brief lifetime.
+    // SAFETY: scalar-only syscall — an unsupported family reports
+    // EAFNOSUPPORT, it cannot produce UB.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -336,6 +373,9 @@ pub(crate) fn ipv6_stack_present() -> bool {
     // Ownership passes to File the moment the descriptor exists —
     // drop runs close(2) on every exit path, so no success path can
     // leak it.
+    // SAFETY: `fd` is the fresh descriptor socket() returned above —
+    // owned by this process, not aliased anywhere, and wrapped exactly
+    // once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let _probe = unsafe { std::fs::File::from_raw_fd(fd) };
     true
@@ -356,6 +396,8 @@ pub(crate) fn ipv6_stack_present() -> bool {
 /// host IPC sockets still reachable — that is the channel this mount
 /// exists to sever.
 fn hide_host_ipc_sockets() -> std::io::Result<()> {
+    // SAFETY: all pointer arguments are NUL-terminated static C strings
+    // and `mode=755` is a valid tmpfs mount-data string.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::mount(
@@ -459,6 +501,8 @@ fn pin_entrypoint_mount() -> std::io::Result<()> {
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o400))?;
     let src = CString::new(staged.as_str()).map_err(std::io::Error::other)?;
     let dst = CString::new(target.as_os_str().as_encoded_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: `src`/`dst` are NUL-terminated CStrings alive for the call;
+    // MS_BIND permits null fstype and data.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::mount(
@@ -477,6 +521,8 @@ fn pin_entrypoint_mount() -> std::io::Result<()> {
     // without this the workload could chmod the staged file and
     // rewrite the "pinned" bytes under its entrypoint path. `MS_BIND`
     // must ride the remount flags or the kernel ignores the ro bit.
+    // SAFETY: `dst` is a NUL-terminated CString alive for the call; a
+    // remount takes null source/fstype/data.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::mount(
@@ -508,6 +554,10 @@ fn scrub_env_and_fds(extra_keep: &[i32]) {
     let mut keep = keep_fds_from_env();
     keep.extend_from_slice(extra_keep);
     for var in super::init_env::ALL {
+        // SAFETY: single-threaded context — this runs in the pidns-init
+        // child after fork() (only the calling thread survives), and the
+        // init helper was dispatched before the tokio runtime started, so
+        // no other thread can observe a torn environment.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::remove_var(var) };
     }
@@ -525,6 +575,10 @@ fn scrub_env_and_fds(extra_keep: &[i32]) {
         })
         .unwrap_or_default();
     for fd in fds {
+        // SAFETY: each number came from /proc/self/fd minus the keep
+        // list, so it names an open descriptor of this process; the list
+        // is fixed before the loop so nothing can be closed twice or
+        // recycled mid-scrub.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(fd) };
     }
@@ -612,6 +666,8 @@ fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
     // parent would never see EOF and would misread the launch — so a
     // failure here is reported like any other exec-stage failure.
     scrub_env_and_fds(&[sock]);
+    // SAFETY: `sock` is the live handshake descriptor kept through the
+    // scrub; F_SETFD takes scalar arguments and touches no user memory.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::fcntl(sock, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         send_err(sock, STAGE_EXEC, errno());
@@ -622,6 +678,10 @@ fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
         .map(|a| a.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect();
+    // SAFETY: `exe` is a NUL-terminated CString and `c_argv` a
+    // null-terminated pointer vector whose entries point into the live
+    // `argv` CStrings — execvp either replaces the image or returns,
+    // never outliving those buffers.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::execvp(exe.as_ptr(), c_argv.as_ptr());
@@ -660,8 +720,10 @@ pub(crate) fn init_main() -> i32 {
         .collect();
     // The exec'd image is `resolved`; argv[0] keeps the caller's
     // spelling (same contract as `run`).
+    // SAFETY: argument-free query — no pointers, no writable state.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let euid = unsafe { libc::geteuid() };
+    // SAFETY: argument-free query — no pointers, no writable state.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let egid = unsafe { libc::getegid() };
 
@@ -671,10 +733,12 @@ pub(crate) fn init_main() -> i32 {
     // pdeathsig, and so on down to the pidns init — the whole
     // namespaced subtree disappears instead of leaking an
     // unsupervised workload. `PR_SET_PDEATHSIG` survives `execve`.
+    // SAFETY: scalar-only prctl — no pointer arguments.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
     }
+    // SAFETY: argument-free query — no pointers, no writable state.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::getppid() } == 1 {
         // Supervisor already gone (race between spawn and prctl).
@@ -702,6 +766,9 @@ pub(crate) fn init_main() -> i32 {
         Ok(p) => p,
         Err(e) => bail!("fork-pipe", e.raw_os_error().unwrap_or(-1)),
     };
+    // SAFETY: the init helper runs before the tokio runtime starts, so
+    // the process is single-threaded and the child inherits no
+    // foreign-held lock — post-fork Rust allocation stays sound.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -709,6 +776,9 @@ pub(crate) fn init_main() -> i32 {
     }
     if pid > 0 {
         // ---- init parent: map writer + exit-status forwarder ------
+        // SAFETY: both pipe ends are open descriptors owned by this
+        // process; each is closed exactly once here (the grandchild
+        // closes its own copies).
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::close(c2p_w);
@@ -728,6 +798,8 @@ pub(crate) fn init_main() -> i32 {
         // Release the grandchild either way: on a map failure it must
         // wake up to die rather than hang on the pipe.
         let _ = pipe_write(p2c_w);
+        // SAFETY: the two pipe ends and `sock` are open descriptors
+        // owned by this process, each closed exactly once.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::close(c2p_r);
@@ -735,6 +807,8 @@ pub(crate) fn init_main() -> i32 {
             libc::close(sock);
         }
         if !mapped {
+            // SAFETY: scalar arguments; `pid` is the still-running
+            // grandchild forked above.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
@@ -743,6 +817,8 @@ pub(crate) fn init_main() -> i32 {
         // plain exit code.
         let mut status = 0i32;
         loop {
+            // SAFETY: `&mut status` is a valid, writable c_int and `pid`
+            // is this process's unreaped child.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let r = unsafe { libc::waitpid(pid, &mut status, 0) };
             if r == pid {
@@ -754,6 +830,10 @@ pub(crate) fn init_main() -> i32 {
         }
         if libc::WIFSIGNALED(status) {
             let sig = libc::WTERMSIG(status);
+            // SAFETY: scalar arguments; SIG_DFL is a valid handler
+            // constant and `sig` is the signal that killed the child —
+            // re-raised on this single-threaded process to forward the
+            // death semantics.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::signal(sig, libc::SIG_DFL);
@@ -769,10 +849,13 @@ pub(crate) fn init_main() -> i32 {
     // Teardown cascade, link 2: die with the init parent. Set before
     // unshare — the value is preserved across execve, so even the
     // final workload image keeps it pointed at its supervisor chain.
+    // SAFETY: scalar-only prctl — no pointer arguments.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
     }
+    // SAFETY: the two pipe ends are open descriptors owned by this
+    // (grandchild) process, each closed exactly once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::close(c2p_r);
@@ -782,6 +865,8 @@ pub(crate) fn init_main() -> i32 {
     // new pid namespace, hiding the supervisor from the workload —
     // without it a workload could `kill` the parent (same mapped uid)
     // and silence the audit path while still holding its stdio.
+    // SAFETY: scalar flag bitmask, no pointers; a refused combination
+    // returns EINVAL rather than producing UB.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::unshare(
@@ -796,6 +881,8 @@ pub(crate) fn init_main() -> i32 {
         // Init parent gone — no map writer means no launch.
         return 97;
     }
+    // SAFETY: the two pipe ends are open descriptors owned by this
+    // (grandchild) process, each closed exactly once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::close(c2p_w);
@@ -832,6 +919,8 @@ pub(crate) fn init_main() -> i32 {
     // back into the host's peer group and fail EPERM (or worse,
     // succeed and leak). Detach first: the mountns contract is a
     // private view.
+    // SAFETY: the only pointer is a NUL-terminated static C string; a
+    // propagation-type mount takes null source/fstype/data.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe {
         libc::mount(
@@ -876,12 +965,16 @@ pub(crate) fn init_main() -> i32 {
         send_err(sock, STAGE_TUN, e.raw_os_error().unwrap_or(-1));
         return 97;
     }
+    // SAFETY: `tun` is still owned by this process — SCM_RIGHTS handed
+    // the parent a duplicate — so it is closed exactly once here.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(tun) };
 
     // Wait for GO — the parent only sends it once the proxy task is
     // running, so a dead parent means no egress anyway (fail-closed).
     let mut go = [0u8; 1];
+    // SAFETY: `go` is a writable 1-byte buffer that outlives the call
+    // and `sock` is the live handshake descriptor.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let n = unsafe { libc::recv(sock, go.as_mut_ptr() as *mut _, 1, 0) };
     if n != 1 || go[0] != b'G' {
@@ -894,6 +987,8 @@ pub(crate) fn init_main() -> i32 {
     // init (pid 1) — every descendant stays inside the isolation and
     // dies with it — while this process stays in the ancestor pidns to
     // forward the exit status exactly like the init parent does for it.
+    // SAFETY: still single-threaded (no runtime ever started in the
+    // init helper), so the child inherits no foreign-held lock.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let wpid = unsafe { libc::fork() };
     if wpid < 0 {
@@ -903,6 +998,7 @@ pub(crate) fn init_main() -> i32 {
     if wpid == 0 {
         // Teardown cascade, link 3: the pidns init dies with the
         // grandchild, taking the whole inner namespace with it.
+        // SAFETY: scalar-only prctl — no pointer arguments.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
@@ -912,6 +1008,8 @@ pub(crate) fn init_main() -> i32 {
         // on the host's /proc it could enumerate the supervisor by
         // number and signal it (same mapped uid). Failure is fatal:
         // the monitor-isolation contract would be silently broken.
+        // SAFETY: all pointer arguments are NUL-terminated static C
+        // strings; proc takes no mount data.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe {
             libc::mount(
@@ -928,12 +1026,16 @@ pub(crate) fn init_main() -> i32 {
         }
         finish_with_sandbox(sock, &resolved, &c_argv);
     }
+    // SAFETY: `sock` is owned by this (grandchild) process — the pidns
+    // child's copy diverged at fork — so it is closed exactly once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::close(sock);
     }
     let mut status = 0i32;
     loop {
+        // SAFETY: `&mut status` is a valid, writable c_int and `wpid`
+        // is this process's unreaped child.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let r = unsafe { libc::waitpid(wpid, &mut status, 0) };
         if r == wpid || (r < 0 && errno() != libc::EINTR) {
@@ -942,6 +1044,10 @@ pub(crate) fn init_main() -> i32 {
     }
     if libc::WIFSIGNALED(status) {
         let sig = libc::WTERMSIG(status);
+        // SAFETY: scalar arguments; SIG_DFL is a valid handler constant
+        // and `sig` is the signal that killed the pidns init — re-raised
+        // on this single-threaded process to forward the death
+        // semantics.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::signal(sig, libc::SIG_DFL);

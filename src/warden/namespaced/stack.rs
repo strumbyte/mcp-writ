@@ -836,6 +836,10 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                 };
                 match guard.try_io(|fd| {
                     use std::os::unix::io::AsRawFd;
+                    // SAFETY: `buf` is a writable 64KiB Vec that outlives
+                    // the call and `fd` is the live TUN descriptor the
+                    // AsyncFd registration guards for the duration of
+                    // try_io.
                     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     let n = unsafe {
                         libc::read(
@@ -922,6 +926,10 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                     };
                     match guard.try_io(|fd| {
                         use std::os::unix::io::AsRawFd;
+                        // SAFETY: `frame[written..]` is a readable slice —
+                        // `written < frame.len()` per the loop guard — and
+                        // `fd` is the live TUN descriptor held by the
+                        // AsyncFd for the duration of try_io.
                         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                         let n = unsafe {
                             libc::write(
@@ -1738,6 +1746,8 @@ async fn stack_loop(
 }
 
 fn set_nonblocking(fd: i32) {
+    // SAFETY: `fd` is the caller's live descriptor; F_GETFL/F_SETFL take
+    // scalar arguments and touch no user memory — a bad fd fails EBADF.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);

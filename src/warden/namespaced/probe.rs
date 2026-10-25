@@ -178,6 +178,9 @@ fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
             r.failed_stage = Some($stage.to_string());
             r.detail = Some($e.to_string());
             let body = report_text(&r);
+            // SAFETY: `body`'s as_ptr()/len() describe a readable String
+            // buffer that outlives the call; `report_fd` is the live
+            // write end handed in by the caller. `_exit` never returns.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::write(report_fd, body.as_ptr() as *const _, body.len());
@@ -188,6 +191,8 @@ fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
 
     // Same single unshare call init's grandchild makes — success
     // implies all three namespaces were granted together.
+    // SAFETY: scalar flag bitmask, no pointers; a refused combination
+    // returns EINVAL rather than producing UB.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWNS) } < 0 {
         fail!("unshare", std::io::Error::last_os_error());
@@ -197,31 +202,44 @@ fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
     r.mountns = true;
 
     // Tell the parent "unshared" and wait for the map write.
+    // SAFETY: the 1-byte literal is a readable buffer; a bad `sync_w`
+    // fails EBADF without touching memory.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::write(sync_w, b"1".as_ptr() as *const _, 1) } != 1 {
         fail!("fork", std::io::Error::last_os_error());
     }
     let mut b = [0u8; 1];
+    // SAFETY: `b` is a writable 1-byte buffer that outlives the call; a
+    // bad `sync_r` fails EBADF without touching memory.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::read(sync_r, b.as_mut_ptr() as *mut _, 1) } != 1 {
         fail!("idmap", "parent map-write never arrived".to_string());
     }
 
     // TUN inside the fresh netns.
+    // SAFETY: `c"/dev/net/tun"` is a NUL-terminated static C string;
+    // open(2) takes no other pointers.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let tun = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR) };
     if tun < 0 {
         fail!("tun", std::io::Error::last_os_error());
     }
+    // SAFETY: `ifreq` is a POD union, so the all-zero bit pattern is a
+    // valid value; the flag and name fields are filled before use.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     ifr.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as i16;
     for (slot, &b) in ifr.ifr_name.iter_mut().zip(b"egress0".iter()) {
         *slot = b as libc::c_char;
     }
+    // SAFETY: `tun` is the live `/dev/net/tun` descriptor opened above
+    // and `&ifr` points at an initialized `ifreq` — the request-argument
+    // layout TUNSETIFF requires.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::ioctl(tun, libc::TUNSETIFF, &ifr) } < 0 {
         let e = std::io::Error::last_os_error();
+        // SAFETY: `tun` is still owned — the failed ioctl transfers
+        // nothing — so it is closed exactly once on this error path.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(tun) };
         fail!("tun", e);
@@ -259,13 +277,36 @@ fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
         }
         r.ipv6 = true;
     }
+    // SAFETY: `tun` is still owned by this process — it was opened above
+    // and never wrapped — so it is closed exactly once here.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(tun) };
     let body = report_text(&r);
+    // SAFETY: `body`'s as_ptr()/len() describe a readable String buffer
+    // that outlives the call; `report_fd` is the live write end handed
+    // in by the caller. `_exit` never returns.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::write(report_fd, body.as_ptr() as *const _, body.len());
         libc::_exit(0);
+    }
+}
+
+/// Uniform report for a setup stage that failed before any namespace
+/// work ran — pipe creation or the fork itself.
+fn failed_probe(stage: &str, detail: String) -> ProbeReport {
+    ProbeReport {
+        userns: false,
+        netns: false,
+        mountns: false,
+        id_map: false,
+        tun: false,
+        loopback_up: false,
+        route: false,
+        ipv6_stack: false,
+        ipv6: false,
+        failed_stage: Some(stage.to_string()),
+        detail: Some(detail),
     }
 }
 
@@ -278,15 +319,44 @@ fn probe_in_place() -> ProbeReport {
     let mut sync_a = [0i32; 2]; // grandchild → parent: "unshared"
     let mut sync_b = [0i32; 2]; // parent → grandchild: "mapped"
     let mut report_p = [0i32; 2];
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe {
-        libc::pipe(sync_a.as_mut_ptr());
-        libc::pipe(sync_b.as_mut_ptr());
-        libc::pipe(report_p.as_mut_ptr());
+    // A failed pipe() leaves its slots at the zero initializer — fd 0 —
+    // so every call is checked before the fork and the failure path
+    // closes only the ends a successful call actually wrote.
+    let mut created = 0usize;
+    let mut pipe_err = None;
+    for pair in [&mut sync_a, &mut sync_b, &mut report_p] {
+        // SAFETY: `pair` is a valid, writable `[c_int; 2]` — exactly the
+        // two-fd output pipe(2) writes; the result is checked here, so a
+        // failed call's placeholder slots are never used.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if unsafe { libc::pipe(pair.as_mut_ptr()) } < 0 {
+            pipe_err = Some(std::io::Error::last_os_error());
+            break;
+        }
+        created += 1;
     }
+    if let Some(e) = pipe_err {
+        // SAFETY: `take(created)` reaches only the ends a successful
+        // pipe() wrote — open descriptors owned by this process, each
+        // closed once. Uncreated slots still hold fd-0 placeholders and
+        // are never closed.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            for pair in [&sync_a, &sync_b, &report_p].iter().take(created) {
+                libc::close(pair[0]);
+                libc::close(pair[1]);
+            }
+        }
+        return failed_probe("pipe", e.to_string());
+    }
+    // SAFETY: the probe helper runs before the tokio runtime starts, so
+    // the process is single-threaded and the child inherits no
+    // foreign-held lock — post-fork Rust allocation stays sound.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     if pid == 0 {
+        // SAFETY: the three pipe ends are open descriptors owned by this
+        // (grandchild) process, each closed exactly once.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::close(sync_a[0]);
@@ -296,20 +366,22 @@ fn probe_in_place() -> ProbeReport {
         probe_grandchild(sync_b[0], sync_a[1], report_p[1]);
     }
     if pid < 0 {
-        return ProbeReport {
-            userns: false,
-            netns: false,
-            mountns: false,
-            id_map: false,
-            tun: false,
-            loopback_up: false,
-            route: false,
-            ipv6_stack: false,
-            ipv6: false,
-            failed_stage: Some("fork".to_string()),
-            detail: Some(std::io::Error::last_os_error().to_string()),
-        };
+        // Capture the fork errno before the closes — a failed close
+        // could overwrite it.
+        let fork_err = std::io::Error::last_os_error();
+        // SAFETY: all six ends are open descriptors owned by this
+        // process — the three pipes verified above — each closed once.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            for pair in [&sync_a, &sync_b, &report_p] {
+                libc::close(pair[0]);
+                libc::close(pair[1]);
+            }
+        }
+        return failed_probe("fork", fork_err.to_string());
     }
+    // SAFETY: the three pipe ends are open descriptors owned by this
+    // (probe parent) process, each closed exactly once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::close(sync_a[1]);
@@ -319,13 +391,18 @@ fn probe_in_place() -> ProbeReport {
 
     // Wait for "unshared", then write the grandchild's maps.
     let mut b = [0u8; 1];
+    // SAFETY: `b` is a writable 1-byte buffer that outlives the call;
+    // `sync_a[0]` is this process's open read end.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let got = unsafe { libc::read(sync_a[0], b.as_mut_ptr() as *mut _, 1) } == 1;
     let mut id_map = false;
     let mut map_err = None;
     if got {
+        // SAFETY: argument-free queries — no pointers, no writable
+        // state.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let euid = unsafe { libc::geteuid() };
+        // SAFETY: argument-free query — no pointers, no writable state.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let egid = unsafe { libc::getegid() };
         match (|| -> std::io::Result<()> {
@@ -338,6 +415,8 @@ fn probe_in_place() -> ProbeReport {
             Err(e) => map_err = Some(e.to_string()),
         }
     }
+    // SAFETY: the 1-byte literal is a readable buffer and both pipe ends
+    // are open descriptors owned by this process, each closed once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::write(sync_b[1], b"1".as_ptr() as *const _, 1);
@@ -349,6 +428,10 @@ fn probe_in_place() -> ProbeReport {
     let mut body = String::new();
     {
         use std::io::Read;
+        // SAFETY: `report_p[0]` is a descriptor the pipe() above
+        // verifiably created — an open fd owned by this process and not
+        // yet wrapped — `File` takes ownership once and its drop
+        // performs the only close.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let mut f = unsafe { std::fs::File::from_raw_fd(report_p[0]) };
         let _ = f.read_to_string(&mut body);
@@ -372,6 +455,8 @@ fn probe_in_place() -> ProbeReport {
         r.detail = Some(map_err.unwrap_or_else(|| "map write failed".to_string()));
     }
     let mut status = 0i32;
+    // SAFETY: `&mut status` is a valid, writable c_int and `pid` is this
+    // process's unreaped child.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::waitpid(pid, &mut status, 0);

@@ -104,10 +104,17 @@ pub fn report_json(
     stats: Option<&ProxyStats>,
     sandbox_applied: Option<bool>,
 ) -> String {
+    // SAFETY: `utsname` is a POD struct of char arrays, so the all-zero
+    // bit pattern is valid.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut uname_buf: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: `&mut uname_buf` is a valid, writable utsname — the exact
+    // output layout uname(2) fills.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let kernel = if unsafe { libc::uname(&mut uname_buf) } == 0 {
+        // SAFETY: reached only after a successful uname(), so `release`
+        // holds a NUL-terminated kernel string inside `uname_buf` —
+        // CStr::from_ptr reads within that live buffer.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::ffi::CStr::from_ptr(uname_buf.release.as_ptr())

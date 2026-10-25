@@ -52,6 +52,10 @@
 //! the socket → the parent refuses the launch; there is no fallback to
 //! a natively networked child.
 
+// PR-29: boundary module — every `unsafe` block must carry a `// SAFETY:`
+// note stating the invariant the block relies on.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 mod init;
 pub(crate) mod launch;
 pub(crate) mod nat;
