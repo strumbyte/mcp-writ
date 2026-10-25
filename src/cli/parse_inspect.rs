@@ -69,7 +69,7 @@ pub(super) fn parse_inspect_args(
         .finish()
         .map_err(|e| CliError::Parse(format!("{e:?}")))?
     {
-        return Ok(CliOutput::Info(help.to_string()));
+        return Ok(CliOutput::Info(help));
     }
 
     let binary_path = if binary_arg.is_present() {

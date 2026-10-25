@@ -1174,7 +1174,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **完了条件:** 各サブコマンドの `--help` に兄弟サブコマンドが出ず、自身のオプション・位置引数・使用例が出る。トップレベルの `--help` は不変。→ 充足（2026-10-26）: 全 15 サブコマンドが自身の Usage のみを出し、トップレベルは従来どおり 15 件を列挙
 
-**移行・戻し方:** 解析結果（`CliOutput`）は変えない。help の文面だけの変更。
+**移行・戻し方:** 有効な呼び出しの解析結果（`CliOutput`）は変えない。help の文面だけの変更。→ 追記（2026-10-26・レビュー対応）: 逐次 dispatch 化で「後に登録された兄弟名と同じ2番目トークン」の扱いだけ変わった — 旧実装は兄弟の `cmd().take()` がそのトークンを黙って消費（`run plan` は `plan` を捨てて run 実行、`capability-matrix check` は成功、`inspect check` は「binary path 必須」エラー）していたが、新実装では各 parser が通常解釈する（`run plan` → `unexpected argument 'plan'`、`capability-matrix run-image` → `unexpected argument`、`inspect policy` → `policy` を `<binary>` 位置引数として受理、`check run` / `plan run` / `policy run` → `invalid_input` 記録の invalid 結果）。`test_second_token_sibling_names_reach_the_parser` で固定。
 
 <a id="pr-31"></a>
 

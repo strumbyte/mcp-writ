@@ -1592,3 +1592,75 @@ fn test_top_level_help_keeps_commands_section() {
         );
     }
 }
+
+#[test]
+fn test_every_subcommand_help_shows_only_itself() {
+    // Regression pin for the sequential dispatch: whatever the cmd's
+    // registration position, its help must scope to its own entries.
+    // `policy` is the worst case — all 14 siblings are logged as
+    // non-present `Cmd` entries before it.
+    for &cmd in ALL_SUBCOMMANDS {
+        for flag in ["--help", "-h"] {
+            let help = unwrap_help(parse_from(args(&format!("mcp-writ {cmd} {flag}"))));
+            assert!(
+                help.contains(&format!("... {cmd}")),
+                "{cmd} {flag} must render {cmd}'s own usage line: {help}"
+            );
+            assert_no_sibling_commands(&help, cmd);
+        }
+    }
+}
+
+#[test]
+fn test_second_token_sibling_names_reach_the_parser() {
+    // With sequential dispatch, a second token colliding with a
+    // later-registered subcommand name is no longer consumed by that
+    // sibling's `cmd().take()`: parsers without a positional reject it,
+    // parsers with one accept it as their operand.
+    for argv in ["mcp-writ run plan", "mcp-writ capability-matrix run-image"] {
+        let second = argv.split_whitespace().nth(2).unwrap();
+        let err = parse_from(args(argv)).unwrap_err();
+        assert!(
+            matches!(err, CliError::Parse(_)),
+            "{argv} must be a parse error: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&format!("unexpected argument '{second}'")),
+            "{argv} must name the stray token: {err}"
+        );
+    }
+
+    // `plan`/`check` record the stray argument in `invalid_input`
+    // rather than returning a parse error.
+    for argv in ["mcp-writ check run", "mcp-writ plan run"] {
+        let invalid = match parse_from(args(argv)).expect("should parse") {
+            CliOutput::Check(a) => a.invalid_input,
+            CliOutput::Plan(a) => a.invalid_input,
+            other => panic!("{argv}: expected Check or Plan, got {other:?}"),
+        };
+        assert!(
+            invalid
+                .as_deref()
+                .is_some_and(|m| m.contains("unexpected argument 'run'")),
+            "{argv} must record the stray token in invalid_input: {invalid:?}"
+        );
+    }
+
+    // Parsers taking a positional consume the sibling name as the
+    // operand — previously it was swallowed by the sibling's cmd take.
+    match parse_from(args("mcp-writ inspect policy")) {
+        Ok(CliOutput::Inspect(a)) => assert_eq!(a.binary_path, PathBuf::from("policy")),
+        other => panic!("expected Inspect, got {other:?}"),
+    }
+    match parse_from(args("mcp-writ policy run")) {
+        Ok(CliOutput::PolicyResolve(a)) => assert!(
+            a.invalid_input
+                .as_deref()
+                .is_some_and(|m| m.contains("unknown policy action 'run'")),
+            "policy's invalid_input must name the unknown action: {:?}",
+            a.invalid_input
+        ),
+        other => panic!("expected PolicyResolve, got {other:?}"),
+    }
+}

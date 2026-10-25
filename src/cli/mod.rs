@@ -584,7 +584,7 @@ pub(crate) const QUICKSTART_FLOW: &str = "\nExample:
 /// Expected syntax:
 /// ```text
 ///   mcp-writ run [--transport <type>] [--policy <path>] [-v] [--dry-run] [--audit-log <path>] -- <command> [args...]
-///   mcp-writ inspect <binary> [--format human|json|kdl] [--output <path>] [-v]
+///   mcp-writ inspect [<binary>] [--format human|json|kdl] [--output <path>] [-v]
 ///   mcp-writ inspect [OPTIONS] -- <command> [args...]
 ///   mcp-writ generate-policy [--binary <path>] [--output <path>] [-v] -- <mcp-server-command>
 /// ```
@@ -669,7 +669,7 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
             .finish()
             .map_err(|e| CliError::Parse(format!("{e:?}")))?
         {
-            return Ok(CliOutput::Info(help.to_string()));
+            return Ok(CliOutput::Info(help));
         }
         if !command.is_empty() {
             return Err(CliError::Parse(
@@ -759,7 +759,7 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .finish()
         .map_err(|e| CliError::Parse(format!("{e:?}")))?
     {
-        return Ok(CliOutput::Info(help.to_string()));
+        return Ok(CliOutput::Info(help));
     }
     Err(CliError::MissingSubcommand)
 }

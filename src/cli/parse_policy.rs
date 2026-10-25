@@ -119,7 +119,7 @@ pub(super) fn parse_policy_args(
     }
 
     match raw.finish() {
-        Ok(Some(help)) => return Ok(CliOutput::Info(help.to_string())),
+        Ok(Some(help)) => return Ok(CliOutput::Info(help)),
         Ok(None) => {}
         Err(e) => {
             return Ok(invalid_args(args, format!("unrecognized arguments: {e:?}")));

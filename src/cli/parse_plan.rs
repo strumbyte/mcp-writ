@@ -231,7 +231,7 @@ pub(super) fn parse_plan_args(
     // machine-readable `invalid` result, not a usage error. `--help`
     // still produces help text.
     match raw.finish() {
-        Ok(Some(help)) => return Ok(CliOutput::Info(help.to_string())),
+        Ok(Some(help)) => return Ok(CliOutput::Info(help)),
         Ok(None) => {}
         Err(e) => {
             return Ok(invalid_args(args, format!("unrecognized arguments: {e:?}")));
