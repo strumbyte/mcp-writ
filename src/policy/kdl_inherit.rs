@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use kdl::KdlDocument;
 
 use super::Policy;
-use super::kdl_parse::{parse_kdl_policy_with_profiles, parse_profiles};
+use super::kdl_parse::{parse_kdl_policy_with_profiles, parse_profiles, parse_version};
 use super::merge::PolicyLayer;
 use super::provenance::{LoadDiagnostics, Provenance};
 use crate::error::PolicyError;
@@ -38,6 +38,10 @@ struct LoadCx<'a> {
     warnings: &'a mut Vec<super::provenance::LoadWarning>,
     prov: &'a mut Provenance,
     profile_files: &'a mut HashMap<String, PathBuf>,
+    /// Composition-semantics override — `policy resolve --version-diff`
+    /// simulates the same documents under another rules version. `None`
+    /// means each document merges under its own declared version.
+    rules: Option<u32>,
 }
 
 /// Internal recursive loader that handles extends, include, and when directives
@@ -49,6 +53,20 @@ pub(crate) fn load_kdl_policy_internal(
     path: &Path,
     visited: &mut HashSet<PathBuf>,
     env: &str,
+) -> Result<(Policy, LoadDiagnostics), PolicyError> {
+    load_kdl_policy_internal_rules(path, visited, env, None)
+}
+
+/// Same load as [`load_kdl_policy_internal`], but every merge runs
+/// under `rules` — the composition-semantics version override used by
+/// `policy resolve --version-diff` to replay the same documents under
+/// v2 versus v3 rules. The declaration grammar still follows each
+/// file's own `policy version=`, so v3 syntax parses in both passes.
+pub(crate) fn load_kdl_policy_internal_rules(
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    env: &str,
+    rules: Option<u32>,
 ) -> Result<(Policy, LoadDiagnostics), PolicyError> {
     let mut profiles = HashMap::new();
     let mut profile_files = HashMap::new();
@@ -62,6 +80,7 @@ pub(crate) fn load_kdl_policy_internal(
             warnings: &mut diagnostics.warnings,
             prov: &mut prov,
             profile_files: &mut profile_files,
+            rules,
         };
         load_kdl_policy_recursive_with_decl(path, visited, env, &mut cx, &mut budget, 0)?
     };
@@ -208,7 +227,19 @@ fn load_kdl_policy_subtree(
         pending.absorb(inc_pending);
         let posture = base_established.then(|| SecurityPosture::capture(&policy));
         let had_listen = policy.network.inbound.allow_listen;
-        merge_into_policy(&mut policy, &included, &inc_decl, &inc_path, cx.prov);
+        // The incoming document's own declared version selects how its
+        // declarations compose — a v3 child's rules union, a v2 child's
+        // replace. The `rules` override replays all of them under the
+        // simulated version.
+        let inc_rules = cx.rules.unwrap_or(included.version);
+        merge_into_policy(
+            &mut policy,
+            &included,
+            &inc_decl,
+            &inc_path,
+            cx.prov,
+            inc_rules,
+        );
         if let Some(posture) = posture {
             for weakened in posture.weakened(&policy) {
                 pending.push_weakened(&inc_path, weakened);
@@ -222,7 +253,11 @@ fn load_kdl_policy_subtree(
     }
 
     // ── Step 3: Parse current document ────────────────────────────
-    let doc_profiles = parse_profiles(&doc)?;
+    // The declared version gates this file's grammar (multi-profile
+    // references, `replace`, defaults-level syscall `deny`); `rules`
+    // overrides only the merge semantics.
+    let declared_version = parse_version(&doc)?;
+    let doc_profiles = parse_profiles(&doc, declared_version)?;
     // A profile redefinition replaces the earlier layer wholesale —
     // record it so the effective policy can name both writers.
     for name in doc_profiles.keys() {
@@ -255,8 +290,13 @@ fn load_kdl_policy_subtree(
     cx.profiles.extend(doc_profiles);
 
     let mut schema_sources = Vec::new();
-    let this_policy =
-        parse_kdl_policy_with_profiles(&content, cx.profiles, Some(base_dir), &mut schema_sources)?;
+    let this_policy = parse_kdl_policy_with_profiles(
+        &content,
+        cx.profiles,
+        Some(base_dir),
+        &mut schema_sources,
+        cx.rules,
+    )?;
     for source in schema_sources {
         cx.prov.record_source(source);
     }
@@ -279,7 +319,7 @@ fn load_kdl_policy_subtree(
         this_policy.version,
         cx.warnings,
     )?;
-    let doc_decl = OverlayDecl::for_doc(&doc, path, &content);
+    let doc_decl = OverlayDecl::for_doc(&doc, path, &content, this_policy.version);
 
     // If this file has an extends, merge current on top of base+includes.
     // Otherwise, current IS the base.
@@ -291,7 +331,15 @@ fn load_kdl_policy_subtree(
     {
         let posture = SecurityPosture::capture(&policy);
         let had_listen = policy.network.inbound.allow_listen;
-        merge_into_policy(&mut policy, &this_policy, &doc_decl, path, cx.prov);
+        let doc_rules = cx.rules.unwrap_or(this_policy.version);
+        merge_into_policy(
+            &mut policy,
+            &this_policy,
+            &doc_decl,
+            path,
+            cx.prov,
+            doc_rules,
+        );
         for weakened in posture.weakened(&policy) {
             pending.push_weakened(path, weakened);
         }
@@ -304,13 +352,15 @@ fn load_kdl_policy_subtree(
         // The provenance log still needs this file's writes, so run the
         // same merge against a discarded seed.
         let mut sink = Policy::default();
-        merge_into_policy(&mut sink, &this_policy, &doc_decl, path, cx.prov);
+        let doc_rules = cx.rules.unwrap_or(this_policy.version);
+        merge_into_policy(&mut sink, &this_policy, &doc_decl, path, cx.prov, doc_rules);
         policy = this_policy;
     }
     decl.merge(&doc_decl);
 
     // ── Step 4: Process `when environment="xxx" { ... }` ──────────
     let posture = SecurityPosture::capture(&policy);
+    let when_rules = cx.rules.unwrap_or(policy.version);
     let when_decl = apply_when_overrides(
         &doc,
         &mut policy,
@@ -321,11 +371,18 @@ fn load_kdl_policy_subtree(
         &content,
         &mut pending,
         cx.prov,
+        when_rules,
     )?;
     for weakened in posture.weakened(&policy) {
         pending.push_weakened(path, weakened);
     }
     decl.merge(&when_decl);
+    // The decl a caller reuses as `inc_decl` may carry only this
+    // file's own `replace` intent: deeper ancestors' and included
+    // files' flags were consumed by their own merges inside this
+    // subtree, and re-exporting one would re-fire that narrowing at
+    // an includer's boundary against grants it never declared against.
+    decl.retain_own_replace_flags(&doc_decl, &when_decl);
     rematerialize_inherited_defaults(&mut policy, cx.prov, path);
 
     Ok((policy, decl, pending))

@@ -66,15 +66,29 @@ pub fn compile_seccomp_for_spawn(policy: &Policy) -> Result<BpfProgram, WardenEr
 }
 
 /// The normalized syscall name list for one filter: the policy's
-/// `syscalls.allowed` plus the startup `execve`/`execveat` the spawn
-/// filter needs when `allow_startup_exec` is set. Both the BPF rule
-/// build and the report's syscall grant entries derive from this list,
-/// so the two cannot diverge.
+/// `syscalls.allowed` minus `syscalls.denied` (the v3 defaults-level
+/// deny — union semantics make it the only narrowing spelling, so
+/// deny-wins applies before any grant is derived) plus the startup
+/// `execve`/`execveat` the spawn filter needs when `allow_startup_exec`
+/// is set. Both the BPF rule build and the report's syscall grant
+/// entries derive from this list, so the two cannot diverge.
 fn allowed_syscall_names(policy: &Policy, allow_startup_exec: bool) -> Vec<String> {
-    let mut allowed_syscalls: Vec<String> = policy.syscalls.allowed.clone();
+    let mut allowed_syscalls: Vec<String> = policy
+        .syscalls
+        .allowed
+        .iter()
+        .filter(|s| !policy.syscalls.denied.contains(*s))
+        .cloned()
+        .collect();
     if allow_startup_exec {
+        let denied_nrs = denied_syscall_numbers(policy);
+        // execve and execveat are distinct numbers — a deny on one
+        // must not suppress the other's startup injection.
         for required in ["execve", "execveat"] {
-            if !allowed_syscalls.iter().any(|s| s == required) {
+            let denied = syscall_numbers(required)
+                .iter()
+                .any(|nr| denied_nrs.contains(nr));
+            if !denied && !allowed_syscalls.iter().any(|s| s == required) {
                 allowed_syscalls.push(required.to_string());
             }
         }
@@ -94,6 +108,7 @@ pub fn syscall_grant_intents(
     let mut grants = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let allowed = allowed_syscall_names(policy, allow_startup_exec);
+    let denied_nrs = denied_syscall_numbers(policy);
     // An explicit "clone" entry makes the SYS_clone rule unconditional
     // (see collect_syscall_rules), so a fork/vfork grant does not pin
     // its flag word in that case.
@@ -108,12 +123,24 @@ pub fn syscall_grant_intents(
         } else {
             GrantOrigin::Policy
         };
-        if syscall_numbers(&name).is_empty() {
+        let nrs = syscall_numbers(&name);
+        if nrs.is_empty() {
             grants.push(ProcessGrant {
                 subject: GrantSubject::Syscall { name },
                 origin,
                 state: ControlState::Skipped,
                 reason: Some("no syscall mapping on this architecture".to_string()),
+            });
+            continue;
+        }
+        if nrs.iter().all(|nr| denied_nrs.contains(nr)) {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Syscall { name },
+                origin,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "every syscall number this name maps to is denied by policy".to_string(),
+                ),
             });
             continue;
         }
@@ -248,7 +275,9 @@ fn compile_seccomp_inner(
 ) -> Result<BpfProgram, WardenError> {
     let allowed_syscalls = allowed_syscall_names(policy, allow_startup_exec);
 
-    // Translate policy syscall names to numeric rules.
+    // Translate policy syscall names to numeric rules, dropping any nr a
+    // denied name resolves to — aliases share numbers (`deny "fork"` and
+    // `allow "clone"` both reach SYS_clone).
     let rules = collect_syscall_rules(policy, &allowed_syscalls, namespaced)?;
 
     // Step 3: Determine target architecture.
@@ -279,6 +308,20 @@ fn compile_seccomp_inner(
     Ok(program)
 }
 
+/// Every syscall number a `deny` name resolves to on this architecture.
+/// The name-level prune in `allowed_syscall_names` cannot see that a
+/// denied name and an allowed alias share a number (`deny "fork"` vs
+/// `allow "clone"` — both reach SYS_clone), so the rule build and the
+/// grant report apply deny-wins a second time on the resolved numbers.
+fn denied_syscall_numbers(policy: &Policy) -> std::collections::HashSet<i64> {
+    policy
+        .syscalls
+        .denied
+        .iter()
+        .flat_map(|name| syscall_numbers(name))
+        .collect()
+}
+
 /// Build the syscall-nr → rules map for a set of allowed policy names.
 ///
 /// Each nr maps to a vector of or-bound rules; an empty vector means the
@@ -289,6 +332,7 @@ fn collect_syscall_rules(
     namespaced: bool,
 ) -> Result<BTreeMap<i64, Vec<SeccompRule>>, WardenError> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    let denied_nrs = denied_syscall_numbers(policy);
 
     for name in allowed_syscalls {
         if DANGEROUS_SYSCALLS.contains(&name.as_str()) {
@@ -303,6 +347,12 @@ fn collect_syscall_rules(
             continue;
         }
         for nr in nrs {
+            // Deny-wins by number: a denied name's nr is unreachable
+            // through an allowed alias as well (`deny "fork"` closes
+            // the SYS_clone an `allow "clone"` would grant).
+            if denied_nrs.contains(&nr) {
+                continue;
+            }
             // socket() carries the AF_UNIX/deny-all boundary on the
             // native route *and* the TUN boundary on the namespaced
             // route:
@@ -551,11 +601,32 @@ fn collect_syscall_rules(
 }
 
 pub fn policy_allows_execve(policy: &Policy) -> bool {
-    policy
-        .syscalls
-        .allowed
+    // The spawn entrypoint issues `execve` on every supported libc —
+    // `std::process::Command` exec's through execvpe and the
+    // namespaced init through execvp, both of which land on SYS_execve
+    // on glibc and musl; nothing on the spawn path calls `execveat`
+    // (only `fexecve` would). An `execveat`-only grant therefore
+    // cannot carry the spawn: letting it pass this check would build
+    // a filter that blocks the child's startup exec at runtime.
+    // Deny-wins by resolved number — a denied alias sharing execve's
+    // nr closes it too.
+    let denied_nrs = denied_syscall_numbers(policy);
+    policy.syscalls.allowed.iter().any(|s| s == "execve")
+        && !syscall_numbers("execve")
+            .iter()
+            .any(|nr| denied_nrs.contains(nr))
+}
+
+/// True when `syscalls.denied` resolves onto execve's syscall number —
+/// an explicit verdict the startup injection must not overrule
+/// (`allowed_syscall_names` refuses to inject a denied nr, so the
+/// child's spawn exec would fail at runtime regardless of what
+/// `sandbox.allow_degraded` tolerates).
+pub(crate) fn execve_denied(policy: &Policy) -> bool {
+    let denied_nrs = denied_syscall_numbers(policy);
+    syscall_numbers("execve")
         .iter()
-        .any(|s| s == "execve" || s == "execveat")
+        .any(|nr| denied_nrs.contains(nr))
 }
 
 /// Spawning a child requires either an explicit execve allowance or
@@ -571,6 +642,18 @@ pub fn require_execve_allowance(policy: &Policy) -> Result<(), WardenError> {
     if policy_allows_execve(policy) {
         return Ok(());
     }
+    // A declared `deny` is a verdict, not a missing grant: the spawn
+    // filter cannot inject a denied nr, so execve stays denied and the
+    // child's startup exec would fail at runtime — `allow_degraded`
+    // only tolerates a grant the policy never made.
+    if execve_denied(policy) {
+        return Err(WardenError::sandbox_setup(
+            crate::error::SandboxStage::Policy,
+            "syscalls.denied covers execve — the spawn filter cannot inject a denied \
+             syscall, so the child's startup exec would be refused at runtime; remove \
+             the 'deny' entry or grant execve in syscalls.allowed",
+        ));
+    }
     if policy.sandbox.allow_degraded {
         tracing::warn!(
             "syscalls.allowed does not include execve; spawn filter will leave execve \
@@ -579,8 +662,10 @@ pub fn require_execve_allowance(policy: &Policy) -> Result<(), WardenError> {
         return Ok(());
     }
     let mut msg = String::from(
-        "syscalls.allowed must include execve (or execveat) to spawn a child process, \
-         or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter",
+        "syscalls.allowed must include execve to spawn a child process — the spawn \
+         entrypoint issues execve (execveat is a different syscall and cannot carry \
+         it) — or set sandbox.allow_degraded=#true to accept leftover execve in the \
+         inherited filter",
     );
     if let Some(detail) = execve_provenance_detail(policy) {
         msg.push_str(&detail);
@@ -592,9 +677,9 @@ pub fn require_execve_allowance(policy: &Policy) -> Result<(), WardenError> {
 }
 
 /// The provenance clause for the execve refusal — who wrote the
-/// effective `defaults.syscalls`, and who lost `execve`/`execveat`
-/// along the way. `None` for a policy without load provenance
-/// (directly built or JSON-loaded) or when the records say nothing.
+/// effective `defaults.syscalls`, and who lost `execve` along the
+/// way. `None` for a policy without load provenance (directly built
+/// or JSON-loaded) or when the records say nothing.
 pub(crate) fn execve_provenance_detail(policy: &Policy) -> Option<String> {
     let prov = policy.provenance.as_deref()?;
     let mut out = String::new();
@@ -606,14 +691,12 @@ pub(crate) fn execve_provenance_detail(policy: &Policy) -> Option<String> {
         }
         out.push('\'');
     }
-    for item in ["execve", "execveat"] {
-        for (contributor, replacer) in prov.dropped_from("defaults.syscalls", item) {
-            out.push_str(&format!(
-                "; '{}' replaced '{item}' declared by '{}'",
-                replacer.display(),
-                contributor.display()
-            ));
-        }
+    for (contributor, replacer) in prov.dropped_from("defaults.syscalls", "execve") {
+        out.push_str(&format!(
+            "; '{}' replaced 'execve' declared by '{}'",
+            replacer.display(),
+            contributor.display()
+        ));
     }
     (!out.is_empty()).then_some(out)
 }

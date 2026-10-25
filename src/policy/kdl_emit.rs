@@ -130,13 +130,26 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
         out.push_str("    }\n");
     }
 
-    if !policy.syscalls.allowed.is_empty() {
+    if !policy.syscalls.allowed.is_empty() || !policy.syscalls.denied.is_empty() {
         out.push_str("    syscalls {\n");
-        out.push_str("        allow");
-        for sc in &policy.syscalls.allowed {
-            out.push_str(&format!(" \"{}\"", escape_kdl(sc)));
+        if !policy.syscalls.allowed.is_empty() {
+            out.push_str("        allow");
+            for sc in &policy.syscalls.allowed {
+                out.push_str(&format!(" \"{}\"", escape_kdl(sc)));
+            }
+            out.push('\n');
         }
-        out.push_str("\n    }\n");
+        // `deny` is a `policy version=3` declaration — only a v3
+        // effective policy can carry it, and the emitted header keeps
+        // that version, so the document re-parses.
+        if !policy.syscalls.denied.is_empty() {
+            out.push_str("        deny");
+            for sc in &policy.syscalls.denied {
+                out.push_str(&format!(" \"{}\"", escape_kdl(sc)));
+            }
+            out.push('\n');
+        }
+        out.push_str("    }\n");
     }
 
     let has_net = !policy.network.outbound.allowed.is_empty()
@@ -352,14 +365,22 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
             if has_children {
                 tool_line.push_str(" {\n");
                 if emit_fs && let Some(ref fs) = tool.fs {
-                    tool_line.push_str("        filesystem {\n");
+                    // Under v3 `allow none=#true` parses only beside
+                    // `replace=#true` (`check_none_needs_replace`) — the
+                    // marker must ride the block or the export cannot
+                    // be reloaded.
+                    let fs_allow_none = fs.allow_specified
+                        && fs.read_only_paths.is_empty()
+                        && fs.read_write_paths.is_empty();
+                    if fs_allow_none && policy.version >= 3 {
+                        tool_line.push_str("        filesystem replace=#true {\n");
+                    } else {
+                        tool_line.push_str("        filesystem {\n");
+                    }
                     if let Some(required) = fs.require_path {
                         tool_line.push_str(&format!("            require-path #{required}\n"));
                     }
-                    if fs.allow_specified
-                        && fs.read_only_paths.is_empty()
-                        && fs.read_write_paths.is_empty()
-                    {
+                    if fs_allow_none {
                         tool_line.push_str("            allow none=#true\n");
                     }
                     for p in &fs.read_only_paths {
@@ -398,12 +419,18 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
                     tool_line.push_str("        }\n");
                 }
                 if emit_net && let Some(ref net) = tool.network {
-                    tool_line.push_str("        network {\n");
-                    if net.allow_specified
+                    // Same v3 rule as `filesystem`: `allow none=#true`
+                    // requires `replace=#true` on the block to reload.
+                    let net_allow_none = net.allow_specified
                         && net.allowed_hosts.is_empty()
                         && net.allowed_cidrs.is_empty()
-                        && !net.egress_rule_set().iter().any(|r| r.allow)
-                    {
+                        && !net.egress_rule_set().iter().any(|r| r.allow);
+                    if net_allow_none && policy.version >= 3 {
+                        tool_line.push_str("        network replace=#true {\n");
+                    } else {
+                        tool_line.push_str("        network {\n");
+                    }
+                    if net_allow_none {
                         tool_line.push_str("            allow none=#true\n");
                     }
                     let mut rules = net.egress_rule_set();
@@ -599,6 +626,12 @@ fn normalized_for_export(policy: &Policy) -> Policy {
         tool.syscalls_explicit = false;
         tool.environment_explicit = false;
         tool.process_explicit = false;
+        // `*_replace` records the v3 declaration-site merge mode — the
+        // serialized effective policy has no layers left to replace, so
+        // the flags do not round-trip and are normalized out.
+        tool.fs_replace = false;
+        tool.network_replace = false;
+        tool.syscalls_replace = false;
         if let Some(ref mut fs) = tool.fs {
             // `to_kdl` emits read allows before write allows, so the
             // source's mixed-mode declaration order survives only per
@@ -889,6 +922,67 @@ mod to_kdl_tests {
             crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
         assert!(reparsed.tools[0].network_explicit);
         crate::policy::validator::validate_policy(&reparsed).expect("to_kdl output validates");
+        assert!(policies_equivalent_for_export(&policy, &reparsed));
+    }
+
+    #[test]
+    fn v3_allow_none_emits_replace_marker_and_round_trips() {
+        // Under v3 `allow none=#true` parses only beside
+        // `replace=#true` (`check_none_needs_replace`) — the marker
+        // must ride the emitted block or the export cannot be
+        // reloaded.
+        let kdl = r#"
+            policy version=3
+            server "svc" {
+                tool "locked_down" {
+                    filesystem replace=#true {
+                        allow none=#true
+                    }
+                    network replace=#true {
+                        allow none=#true
+                    }
+                }
+            }
+        "#;
+        let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
+        let emitted = policy.to_kdl();
+        assert!(
+            emitted.contains("filesystem replace=#true {"),
+            "v3 fs none emission must carry the replace marker: {emitted}"
+        );
+        assert!(
+            emitted.contains("network replace=#true {"),
+            "v3 network none emission must carry the replace marker: {emitted}"
+        );
+        let reparsed =
+            crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
+        crate::policy::validator::validate_policy(&reparsed).expect("to_kdl output validates");
+        assert!(policies_equivalent_for_export(&policy, &reparsed));
+    }
+
+    #[test]
+    fn v2_allow_none_emits_no_replace_marker() {
+        // `replace` is a v3-only property — a v2 export must keep the
+        // bare `none` spelling it parsed.
+        let kdl = r#"
+            policy version=2
+            server "svc" {
+                tool "locked_down" {
+                    filesystem {
+                        allow none=#true
+                    }
+                }
+            }
+        "#;
+        let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
+        let emitted = policy.to_kdl();
+        assert!(emitted.contains("allow none=#true"), "got: {emitted}");
+        assert!(
+            !emitted.contains("replace=#true"),
+            "v2 output must not emit a v3 marker: {emitted}"
+        );
+        let reparsed =
+            crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
         assert!(policies_equivalent_for_export(&policy, &reparsed));
     }
 

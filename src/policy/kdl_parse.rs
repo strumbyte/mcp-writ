@@ -24,7 +24,7 @@ pub(crate) use leaves::{
 };
 pub(crate) use mcp_rules::parse_server_mcp_rules;
 pub(crate) use servers::{
-    parse_server_hashes, parse_servers, parse_tools_list_hashes, resolve_tool_profile_name,
+    parse_server_hashes, parse_servers, parse_tools_list_hashes, resolve_tool_profile_names,
 };
 
 /// Parse KDL content string into a Policy struct.
@@ -32,21 +32,26 @@ pub fn parse_kdl_policy(content: &str) -> Result<Policy, PolicyError> {
     let doc: KdlDocument = content
         .parse()
         .map_err(|e: kdl::KdlError| PolicyError::KdlParse(e.to_string()))?;
-    let profiles = parse_profiles(&doc)?;
+    let version = parse_version(&doc)?;
+    let profiles = parse_profiles(&doc, version)?;
     // No `base_dir` means `@file` references stay unresolved — nothing
     // is read, nothing to record.
     let mut schema_sources = Vec::new();
-    parse_kdl_policy_with_profiles(content, &profiles, None, &mut schema_sources)
+    parse_kdl_policy_with_profiles(content, &profiles, None, &mut schema_sources, None)
 }
 
 /// Parse KDL content string with existing profiles and base directory.
 /// `schema_sources` collects every `@file` document the parse read —
-/// the caller records them as protected policy sources.
+/// the caller records them as protected policy sources. `rules`
+/// overrides the composition-semantics version the layer merges run
+/// under (`None` = the document's declared version); the declaration
+/// grammar always follows the declared version.
 pub fn parse_kdl_policy_with_profiles(
     content: &str,
     profiles: &HashMap<String, PolicyLayer>,
     base_dir: Option<&Path>,
     schema_sources: &mut Vec<std::path::PathBuf>,
+    rules: Option<u32>,
 ) -> Result<Policy, PolicyError> {
     let doc: KdlDocument = content
         .parse()
@@ -54,16 +59,18 @@ pub fn parse_kdl_policy_with_profiles(
 
     let version = parse_version(&doc)?;
     let transport = parse_transport(&doc);
-    let defaults = parse_defaults(&doc)?;
+    let defaults = parse_defaults(&doc, version)?;
     let logging = parse_logging(&doc)?;
     let sandbox = parse_sandbox(&doc)?;
     let defaults_layer = defaults_to_layer(&defaults);
+    let rules = rules.unwrap_or(version);
     let tools = parse_servers(
         &doc,
         &defaults_layer,
         profiles,
         base_dir,
         version,
+        rules,
         schema_sources,
     )?;
     let mcp_rules = parse_server_mcp_rules(&doc, version, false)?;
@@ -121,9 +128,64 @@ pub(crate) struct Defaults {
     pub(crate) syscalls: SyscallPolicy,
     pub(crate) network: NetworkPolicy,
     pub(crate) environment: EnvironmentPolicy,
+    /// `policy version=3`: `replace=#true` on the `defaults` sub-blocks —
+    /// the same flag an inner layer can carry, so a composed document's
+    /// defaults layer composes with the same rules a profile does.
+    pub(crate) fs_replace: bool,
+    pub(crate) syscalls_replace: bool,
+    pub(crate) network_replace: bool,
 }
 
-fn parse_version(doc: &KdlDocument) -> Result<u32, PolicyError> {
+/// `replace=#true` on a `filesystem`/`syscalls`/`network` block is a
+/// `policy version=3` declaration. Under v2 the strict schema rejects
+/// the property before parsing; under v1 permissive parsing ignores it.
+/// This check is the fallback for paths that skip the schema pass.
+pub(crate) fn parse_replace_flag(
+    node: &kdl::KdlNode,
+    context: &str,
+    version: u32,
+) -> Result<bool, PolicyError> {
+    let Some(val) = node.get("replace") else {
+        return Ok(false);
+    };
+    if version == 2 {
+        return Err(PolicyError::KdlParse(format!(
+            "'replace' on '{context}' requires 'policy version=3'"
+        )));
+    }
+    if version < 2 {
+        // v1 is permissive — an unrecognized property is ignored.
+        return Ok(false);
+    }
+    val.as_bool().ok_or_else(|| {
+        PolicyError::KdlParse(format!(
+            "'replace' on '{context}' must be a boolean (#true or #false)"
+        ))
+    })
+}
+
+/// An `allow none=#true` declaration parses as `allow_specified` with
+/// empty allow lists. Under v3 union semantics that spelling would merge
+/// as a no-op — the narrowed scope the author asked for silently widens
+/// back to the inherited grants — so it must opt into replacement
+/// explicitly with `replace=#true` on the block.
+pub(crate) fn check_none_needs_replace(
+    allow_specified: bool,
+    has_allow_values: bool,
+    replace: bool,
+    context: &str,
+    version: u32,
+) -> Result<(), PolicyError> {
+    if version >= 3 && allow_specified && !has_allow_values && !replace {
+        return Err(PolicyError::KdlParse(format!(
+            "'allow none=#true' in '{context}' requires 'replace=#true' under policy version 3 — \
+             without it the narrowed allow list would union with the inherited grants"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_version(doc: &KdlDocument) -> Result<u32, PolicyError> {
     let node = doc
         .get("policy")
         .ok_or_else(|| PolicyError::KdlParse("missing 'policy' node".into()))?;
@@ -167,7 +229,7 @@ fn parse_transport(doc: &KdlDocument) -> TransportConfig {
     TransportConfig { type_, listen_addr }
 }
 
-fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
+fn parse_defaults(doc: &KdlDocument, version: u32) -> Result<Defaults, PolicyError> {
     let Some(node) = unique_child(doc, "defaults", "the policy document")? else {
         return Ok(Defaults::default());
     };
@@ -179,7 +241,9 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
         }
     };
 
+    let mut fs_replace = false;
     let fs = if let Some(n) = unique_child(children, "filesystem", "'defaults'")? {
+        fs_replace = parse_replace_flag(n, "defaults.filesystem", version)?;
         if let Some(c) = n.children() {
             parse_fs_allows(c)?
         } else {
@@ -189,9 +253,11 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
         FsPolicy::default()
     };
 
+    let mut syscalls_replace = false;
     let syscalls = if let Some(n) = unique_child(children, "syscalls", "'defaults'")? {
+        syscalls_replace = parse_replace_flag(n, "defaults.syscalls", version)?;
         if let Some(c) = n.children() {
-            parse_syscall_allows(c)?
+            parse_syscall_allows(c, version)?
         } else {
             SyscallPolicy::default()
         }
@@ -199,7 +265,9 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
         SyscallPolicy::default()
     };
 
+    let mut network_replace = false;
     let network = if let Some(n) = unique_child(children, "network", "'defaults'")? {
+        network_replace = parse_replace_flag(n, "defaults.network", version)?;
         if let Some(c) = n.children() {
             parse_network_rules(c)?
         } else {
@@ -226,6 +294,9 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
         syscalls,
         network,
         environment,
+        fs_replace,
+        syscalls_replace,
+        network_replace,
     })
 }
 
@@ -495,10 +566,11 @@ pub(crate) fn defaults_to_layer(defaults: &Defaults) -> PolicyLayer {
         None
     };
 
-    let syscalls = if !defaults.syscalls.allowed.is_empty() {
+    let syscalls = if !defaults.syscalls.allowed.is_empty() || !defaults.syscalls.denied.is_empty()
+    {
         Some(ToolSyscallPolicy {
             allowed: defaults.syscalls.allowed.clone(),
-            denied: Vec::new(),
+            denied: defaults.syscalls.denied.clone(),
         })
     } else {
         None
@@ -550,10 +622,17 @@ pub(crate) fn defaults_to_layer(defaults: &Defaults) -> PolicyLayer {
         syscalls,
         network,
         environment_explicit: false,
+        fs_replace: defaults.fs_replace,
+        syscalls_replace: defaults.syscalls_replace,
+        network_replace: defaults.network_replace,
     }
 }
 
-fn parse_layer_children(children: &KdlDocument, context: &str) -> Result<PolicyLayer, PolicyError> {
+fn parse_layer_children(
+    children: &KdlDocument,
+    context: &str,
+    version: u32,
+) -> Result<PolicyLayer, PolicyError> {
     // `environment` is a launch-level contract (`defaults.environment`) —
     // inside a profile or server-defaults layer it has no effect, so it is
     // rejected here instead of drifting to a tool-level check later.
@@ -563,9 +642,19 @@ fn parse_layer_children(children: &KdlDocument, context: &str) -> Result<PolicyL
         ));
     }
 
+    let mut fs_replace = false;
     let fs = if let Some(n) = unique_child(children, "filesystem", context)? {
+        fs_replace = parse_replace_flag(n, &format!("{context}.filesystem"), version)?;
         if let Some(c) = n.children() {
-            Some(parse_tool_fs(c)?)
+            let policy = parse_tool_fs(c)?;
+            check_none_needs_replace(
+                policy.allow_specified,
+                !policy.allowed_paths.is_empty(),
+                fs_replace,
+                &format!("{context}.filesystem"),
+                version,
+            )?;
+            Some(policy)
         } else {
             None
         }
@@ -573,7 +662,9 @@ fn parse_layer_children(children: &KdlDocument, context: &str) -> Result<PolicyL
         None
     };
 
+    let mut syscalls_replace = false;
     let syscalls = if let Some(n) = unique_child(children, "syscalls", context)? {
+        syscalls_replace = parse_replace_flag(n, &format!("{context}.syscalls"), version)?;
         if let Some(c) = n.children() {
             Some(parse_tool_syscalls(c)?)
         } else {
@@ -583,9 +674,21 @@ fn parse_layer_children(children: &KdlDocument, context: &str) -> Result<PolicyL
         None
     };
 
+    let mut network_replace = false;
     let network = if let Some(n) = unique_child(children, "network", context)? {
+        network_replace = parse_replace_flag(n, &format!("{context}.network"), version)?;
         if let Some(c) = n.children() {
-            Some(parse_tool_network(c)?)
+            let policy = parse_tool_network(c)?;
+            check_none_needs_replace(
+                policy.allow_specified,
+                !policy.allowed_hosts.is_empty()
+                    || !policy.allowed_cidrs.is_empty()
+                    || policy.egress_rules.iter().any(|r| r.allow),
+                network_replace,
+                &format!("{context}.network"),
+                version,
+            )?;
+            Some(policy)
         } else {
             None
         }
@@ -600,11 +703,15 @@ fn parse_layer_children(children: &KdlDocument, context: &str) -> Result<PolicyL
         network,
         // Rejected above — `environment` cannot appear in a layer block.
         environment_explicit: false,
+        fs_replace,
+        syscalls_replace,
+        network_replace,
     })
 }
 
 pub(crate) fn parse_profiles(
     doc: &KdlDocument,
+    version: u32,
 ) -> Result<HashMap<String, PolicyLayer>, PolicyError> {
     let mut profiles = HashMap::new();
 
@@ -622,7 +729,7 @@ pub(crate) fn parse_profiles(
             .to_string();
 
         let layer = if let Some(children) = node.children() {
-            parse_layer_children(children, &format!("profile '{name}'"))?
+            parse_layer_children(children, &format!("profile '{name}'"), version)?
         } else {
             PolicyLayer::default()
         };
@@ -677,14 +784,15 @@ pub(crate) fn resolve_tool_args_schema(
     }
 }
 
-/// Strict `tool` node shape required by `policy version=2` (KDL schema v2).
+/// Strict `tool` node shape required by `policy version>=2` (KDL schema
+/// v2/v3 share the closed grammar).
 ///
-/// v2 is a closed schema: a `tool` entry accepts exactly one positional
-/// name argument, only the documented properties, and only the documented
-/// child nodes. Unknown members are load errors — unknown methods
-/// (`mcp`), unknown fields, and malformed shapes never pass silently.
-/// `environment` stays accepted here so `environment_explicit` can flag
-/// it and the validator reject it like an inline v1 declaration.
+/// A `tool` entry accepts exactly one positional name argument, only the
+/// documented properties, and only the documented child nodes. Unknown
+/// members are load errors — unknown methods (`mcp`), unknown fields,
+/// and malformed shapes never pass silently. `environment` stays
+/// accepted here so `environment_explicit` can flag it and the validator
+/// reject it like an inline v1 declaration.
 pub(crate) fn validate_tool_shape_v2(
     node: &kdl::KdlNode,
     tool_name: &str,

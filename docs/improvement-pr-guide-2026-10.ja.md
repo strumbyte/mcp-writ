@@ -1095,10 +1095,10 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] `policy version=3` で、syscalls・network も和集合にし、置き換えたいときだけ `replace=#true` を書く形にする。
-- [ ] syscalls を和集合にすると、狭める手段が無くなる。defaults の階層に `deny` を設ける。
-- [ ] 複数の profile を、和集合として合成する。profile とツール自身の記述も足し算にする。
-- [ ] v2 から v3 への変換で合成結果が変わる箇所を、`policy resolve` の差分で示す。
+- [x] `policy version=3` で、syscalls・network も和集合にし、置き換えたいときだけ `replace=#true` を書く形にする。
+- [x] syscalls を和集合にすると、狭める手段が無くなる。defaults の階層に `deny` を設ける。
+- [x] 複数の profile を、和集合として合成する。profile とツール自身の記述も足し算にする。
+- [x] v2 から v3 への変換で合成結果が変わる箇所を、`policy resolve` の差分で示す。— `policy resolve --version-diff` が宣言規則ともう一方の規則で再解決し、動く実効フィールドを列挙する。
 
 **検証:** T-BASE、T-POLICY、T-DOC。同じポリシーを v2 と v3 で読み、差が仕様どおりであることを確かめる。
 

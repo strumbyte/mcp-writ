@@ -66,12 +66,22 @@ pub(crate) fn os_controls(
         {
             // The plan models the same gate `run` applies at spawn
             // (`require_execve_allowance`): an effective `syscalls.allowed`
-            // without execve/execveat fails the launch — so a `plan`
+            // without a usable execve fails the launch — so a `plan`
             // that said `ready` for a launch `run` would refuse is
             // reported `failed`, with the file that wrote the list.
             let mut c = planned("os.syscalls", ControlLayer::Os, "seccomp");
             if !super::super::seccomp_impl::policy_allows_execve(policy) {
-                if policy.sandbox.allow_degraded {
+                if super::super::seccomp_impl::execve_denied(policy) {
+                    // `require_execve_allowance` refuses before the
+                    // degraded fallback — a declared deny is not a
+                    // missing grant.
+                    c.state = ControlState::Failed;
+                    c.reason = Some(
+                        "syscalls.denied covers execve — the spawn filter will refuse \
+                         the child's startup exec"
+                            .to_string(),
+                    );
+                } else if policy.sandbox.allow_degraded {
                     c.reason = Some(
                         "sandbox.allow_degraded=#true: leftover execve stays available \
                          after spawn"
@@ -80,7 +90,7 @@ pub(crate) fn os_controls(
                 } else {
                     c.state = ControlState::Failed;
                     let mut reason = String::from(
-                        "syscalls.allowed must include execve (or execveat) to spawn a \
+                        "syscalls.allowed must include execve to spawn a \
                          child process, or set sandbox.allow_degraded=#true",
                     );
                     if let Some(detail) =

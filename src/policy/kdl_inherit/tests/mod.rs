@@ -66,4 +66,5 @@ mod mcp;
 mod merge;
 mod provenance;
 mod review;
+mod v3;
 mod when;

@@ -100,6 +100,10 @@ struct Check<'a> {
     file: &'a Path,
     content: &'a str,
     strict: bool,
+    /// The document's declared `policy version=` — `replace=#true` on
+    /// `filesystem`/`syscalls`/`network` blocks and multi-name
+    /// `profile`/`profiles` references are v3 declarations.
+    version: u32,
     warnings: &'a mut Vec<LoadWarning>,
 }
 
@@ -140,6 +144,7 @@ pub(crate) fn check_doc_schema(
         file: path,
         content,
         strict: version >= 2,
+        version,
         warnings,
     };
     let mut singletons: HashMap<String, usize> = HashMap::new();
@@ -407,9 +412,24 @@ fn check_defaults_node(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyE
     Ok(())
 }
 
+/// A `replace` property on a `filesystem`/`syscalls`/`network` block is
+/// a `policy version=3` declaration — under v2 it is an unknown member
+/// (a strict error), under v1 a warning. Other properties on these
+/// blocks keep their existing behavior.
+fn check_block_props(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyError> {
+    if cx.version < 3 && node.get("replace").is_some() {
+        cx.finding(
+            node,
+            "'replace' is a policy version=3 property — it is ignored here".to_string(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Duplicate `allow`/`deny`/`require-path`/`secret-overlay` entries in a
 /// `filesystem` block — the parser already rejects unknown members.
 fn check_fs_entries(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyError> {
+    check_block_props(cx, node)?;
     let Some(children) = node.children() else {
         return Ok(());
     };
@@ -445,6 +465,7 @@ fn check_fs_entries(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyErro
 /// value (the same keying `check_fs_entries`/`check_network_entries`
 /// use).
 fn check_list_entries(cx: &mut Check<'_>, node: &KdlNode, ctx: &str) -> Result<(), PolicyError> {
+    check_block_props(cx, node)?;
     let Some(children) = node.children() else {
         return Ok(());
     };
@@ -471,6 +492,7 @@ fn check_list_entries(cx: &mut Check<'_>, node: &KdlNode, ctx: &str) -> Result<(
 /// Duplicate destination declarations in a `network` block —
 /// `allow host=`/`cidr=`/`unix=` spelled identically twice.
 fn check_network_entries(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyError> {
+    check_block_props(cx, node)?;
     let Some(children) = node.children() else {
         return Ok(());
     };
@@ -687,7 +709,7 @@ fn check_tool_node(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyError
         // `environment` is rejected by the validator outright, and
         // `process`/`deputy` carry their own parse-time validation.
         match name.as_str() {
-            "profile" | "profiles" => check_profile_ref(cx, child)?,
+            "profile" | "profiles" => check_profile_ref(cx, child, cx.version)?,
             "filesystem" => check_fs_entries(cx, child)?,
             "syscalls" => check_list_entries(cx, child, "syscalls")?,
             "network" => check_network_entries(cx, child)?,
@@ -698,26 +720,26 @@ fn check_tool_node(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyError
 }
 
 /// A `profile "name"` / `profiles "name"` reference on a tool takes
-/// exactly one string argument — no properties, no children.
-fn check_profile_ref(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyError> {
+/// string arguments — exactly one before `policy version=3`, several
+/// (composing in declaration order) from v3 on. No properties, no
+/// children.
+fn check_profile_ref(cx: &mut Check<'_>, node: &KdlNode, version: u32) -> Result<(), PolicyError> {
     let name = node.name().value();
     let args: Vec<_> = node
         .entries()
         .iter()
         .filter(|e| e.name().is_none())
         .collect();
-    if args.len() > 1 {
+    if args.len() > 1 && version < 3 {
         cx.finding(
             node,
             format!("'{name}' takes exactly one profile name — extra arguments are ignored"),
         )?;
     }
-    if let Some(first) = args.first()
-        && first.value().as_string().is_none()
-    {
+    if args.iter().any(|e| e.value().as_string().is_none()) {
         cx.finding(
             node,
-            format!("'{name}' argument must be a string profile name"),
+            format!("'{name}' arguments must be string profile names"),
         )?;
     }
     for entry in node.entries() {

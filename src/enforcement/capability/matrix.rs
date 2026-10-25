@@ -119,8 +119,8 @@ pub const LINUX_NATIVE: MechanismCapability = MechanismCapability {
              Auditor-checked",
     refuse: &[
         "a `deny` beneath an allowed fs parent — rejected at policy load",
-        "the syscall allowlist omits execve/execveat — the spawn refuses unless \
-         `sandbox allow_degraded`",
+        "the syscall allowlist omits a usable execve (execveat cannot carry the \
+         spawn) — the spawn refuses unless `sandbox allow_degraded`",
         "the Landlock ruleset reports NotEnforced/PartiallyEnforced — refused \
          unless `sandbox allow_degraded`",
         "the command does not resolve or the sandbox apply fails — the spawn \

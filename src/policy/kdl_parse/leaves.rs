@@ -722,35 +722,59 @@ pub(crate) fn parse_tool_network(doc: &KdlDocument) -> Result<ToolNetworkPolicy,
     })
 }
 
-/// Parse syscall allow nodes into SyscallPolicy.
-pub(crate) fn parse_syscall_allows(doc: &KdlDocument) -> Result<SyscallPolicy, PolicyError> {
+/// Parse syscall allow/deny nodes into SyscallPolicy (defaults level).
+/// `deny` is a `policy version=3` declaration — under union semantics it
+/// is the only way a document narrows an inherited syscall grant, so
+/// earlier versions reject it rather than silently drop the narrowing.
+pub(crate) fn parse_syscall_allows(
+    doc: &KdlDocument,
+    version: u32,
+) -> Result<SyscallPolicy, PolicyError> {
     let mut allowed = Vec::new();
+    let mut denied = Vec::new();
 
     for node in doc.nodes() {
         let name = node.name().to_string();
-        if name != "allow" {
-            return Err(PolicyError::KdlParse(format!(
-                "unexpected node '{name}' in syscalls block; expected 'allow'"
-            )));
-        }
+        let target = match name.as_str() {
+            "allow" => &mut allowed,
+            "deny" => {
+                if version < 3 {
+                    return Err(PolicyError::KdlParse(
+                        "'deny' in 'defaults.syscalls' requires 'policy version=3'".into(),
+                    ));
+                }
+                &mut denied
+            }
+            _ => {
+                return Err(PolicyError::KdlParse(format!(
+                    "unexpected node '{name}' in syscalls block; expected 'allow' or 'deny'"
+                )));
+            }
+        };
         for entry in node.entries() {
             if let Some(prop_name) = entry.name() {
                 return Err(PolicyError::KdlParse(format!(
-                    "unexpected property '{}' on 'allow' node in syscalls",
+                    "unexpected property '{}' on '{name}' node in syscalls",
                     prop_name.value()
                 )));
             }
             let s = entry.value().as_string().ok_or_else(|| {
                 PolicyError::KdlParse(format!(
-                    "syscall entry in 'allow' must be a string, got {:?}",
+                    "syscall entry in '{name}' must be a string, got {:?}",
                     entry.value()
                 ))
             })?;
-            allowed.push(s.to_string());
+            target.push(s.to_string());
         }
     }
 
-    Ok(SyscallPolicy { allowed })
+    // Deny-wins inside a single document too: a name spelled on both
+    // sides stays denied — the merge-time prune only repairs a list an
+    // overlay *added*, so the parsed policy must never carry the same
+    // name in both lists.
+    allowed.retain(|s| !denied.contains(s));
+
+    Ok(SyscallPolicy { allowed, denied })
 }
 
 /// The `proto=`/`port=` qualifiers on an `allow`/`deny` network node.

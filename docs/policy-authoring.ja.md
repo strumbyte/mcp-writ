@@ -262,7 +262,7 @@ Windows と macOS の OS 用ファイル権限はグローバル設定からの�
 | `defaults.filesystem` allow | `extends`/`include` では**和集合** — 条件に合った `when` ブロックは allow 側全体を**置換** |
 | `defaults.filesystem` deny | 和集合。allow パスを包含する deny はその allow を取り除く |
 | `defaults.filesystem` `secret-overlay` | 設定（`filesystem` 自体が宣言された場合のみ） |
-| `defaults.syscalls` allow | **置換** — 後の allow リストが先行するリスト全体を捨てる（`defaults.syscalls` 内で `deny` は不正な構文） |
+| `defaults.syscalls` allow | **置換** — 後の allow リストが先行するリスト全体を捨てる（v1/v2 では `defaults.syscalls` 内で `deny` は不正な構文） |
 | `defaults.environment` | 置換 — `restrict`・`inherit-parent`・allow リストが一体で移る |
 | `defaults.network` allow（`host=`/`cidr=`/rules） | **置換** — allow が 1 つでも宣言されると先行する allow 側全体を置き換える |
 | `defaults.network` deny | 和集合。deny 優先がそれを包含する allow を取り除く |
@@ -279,6 +279,38 @@ Windows と macOS の OS 用ファイル権限はグローバル設定からの�
 
 最も誤解されやすい帰結は 2 つです。`defaults.syscalls` の allow と `defaults.network` の allow は追記ではなく*置換*です — syscall を 3 つ足すだけの子ファイルでも、親が許可した全項目（起動に必要な `execve`/`execveat` を含む）を黙って捨てます。後のファイルが継承済み項目を置換したときはローダーが警告します（「child.kdl が base.kdl の N 件を置換」）。`MCP_WRIT_REPLACE_MODE=refuse`（別名 `strict`）は警告を読み込みエラーに変え、`off` は黙らせます。変更を採用する前に [`mcp-writ policy resolve`](guide.ja.md#416-policy--合成ポリシーの検査) で実効ポリシーと各フィールドを書いたファイル・行を確認してください。
 
+#### `policy version=3` — 既定は追加、置換は明示
+
+バージョン 3 が変えるのは合成の規則であり、各ブロックの文法ではありません。上の表で**置換**となっている allow リストは、`policy version=3` ではすべて**和集合**になります。置き換えたい宣言だけが、ブロックに `replace=#true` を書きます:
+
+```kdl
+policy version=3
+
+defaults {
+    syscalls {
+        allow "read" "execve"
+        deny "io_uring_setup"          // v3: 和集合化した allow を狭める唯一の手段
+    }
+    network replace=#true {           // v2 式の置換へ明示的に戻す
+        allow host="api.example.com"
+    }
+}
+```
+
+| フィールド | v3 での後の宣言に対する規則 |
+|---|---|
+| すべての allow 側 — `defaults.syscalls`、`defaults.network`、tool `filesystem`/`network`/`syscalls`、profile と `server-defaults` の各層、`extends`/`include`/`when` のマージ | **和集合**。ブロックに `replace=#true` を書くと蓄積済みの allow 側を置換する（空リストへの置換も可） |
+| すべての deny 側 | どのバージョンでも和集合。deny 優先がそれを包含する allow を取り除く |
+| `defaults.syscalls` の `deny` | **v3 の新機能** — 祖先が許可した syscall を外す唯一の手段。項目は蓄積し、allow 側とマージされる場所すべてで allow を取り除きます。seccomp フィルタは拒否名を決して許可しません |
+| `allow none=#true` | v3 では同じブロックに `replace=#true` の併記が必須 — 単独の `none` は継承済み許可と和集合して消去にならないため、読み込み時に拒否されます |
+| `defaults.environment`、`defaults.network` の posture/`inbound`、`secret-overlay`、`logging`、`sandbox`、`transport`、tool `side_effect`/`args_schema`/`input_responses`/`deputy`/`process`、tool `deny` | 変更なし — 上の表どおりの設定／固定の意味 |
+
+`replace=#false` や省略は追加動作のままです。このプロパティは v3 の宣言です — v2 の文書に書くと拒否され、v1/v2 しか読めない旧版バイナリに v3 の文書を渡してもバージョン検証で拒否されます。v2 の規則で黙って読まれることはありません。
+
+v3 ではツールの各層が `defaults → profile(複数可) → server-defaults → tool` の順に加算的に合成されます。各層の allow 側は蓄積済みの集合に追加され、その層のブロックが `replace=#true` を持つときだけ、それ以前を消去します。
+
+v2 の文書を移行するには `policy version` を `3` に上げてから `mcp-writ policy resolve --policy <file> --version-diff` を実行してください — 同じ文書を両方の規則バージョンで解決し、動く実効フィールドをすべて列挙するため、v2 の暗黙の置換が捨てていた許可を、挙動が変わる前に確認できます。差分で意図した絞り込みが見えた箇所には `replace=#true` を、継承した syscall を外したい箇所には `deny` を追加します。
+
 `profile` はトップレベルで宣言する、名前付きの再利用可能なツール層です:
 
 ```kdl
@@ -294,7 +326,7 @@ server "files" {
 }
 ```
 
-各参照はプロファイル名をちょうど 1 つ取ります — `profile "a" "b"` や子ノードへの余分な引数・属性は曖昧であり、スキーマ v2 では読み込み時に拒否、v1 では警告されます。プロパティ形式と子ノード形式の併用、`profile` と `profiles` の兄弟併記は常にエラーです。存在しないプロファイル名の参照も読み込みに失敗します。
+v1/v2 では各参照はプロファイル名をちょうど 1 つ取ります — `profile "a" "b"` や子ノードへの余分な引数・属性は曖昧であり、スキーマ v2 では読み込み時に拒否、v1 では警告されます。`policy version=3` では子ノード形式に複数の名前を書け、その層は宣言順に和集合として合成されます（`profile "a" "b"` は `a`、続いて `b` を適用）。プロパティ形式と子ノード形式の併用、`profile` と `profiles` の兄弟併記は常にエラーです。存在しないプロファイル名の参照も読み込みに失敗します。
 
 <a id="linux-read-only"></a>
 
@@ -342,7 +374,7 @@ logging level="info" fail_closed=#true
 `mode="write"` は読み書き、省略時の `mode="read"` は読み取り用です。
 `side_effect="read_only"` は設定の整合性を検査し、ホスト／URL 引数も拒否しますが、サーバー内部の処理が本当に読み取りだけかを証明するものではありません。
 
-Linux の通常起動には `execve` または `execveat` の許可が必要です。その許可は子プロセスにも残るため、`exec_shell` の RPC 拒否とは区別します。
+Linux の通常起動には `execve` の許可が必要です（起動エントリポイントが発行するのは `execve` であり、`execveat` では肩代わりできません）。その許可は子プロセスにも残るため、`exec_shell` の RPC 拒否とは区別します。
 インタープリターで起動する場合は、その実行ファイル・標準ライブラリ・依存パッケージにも読み取り権限が必要です。例の `/opt/mcp-server/**` だけでは、別の場所にある Python や Node の実行環境を許可したことにはなりません。
 ネイティブ ELF / Mach-O の syscall 候補は `mcp-writ inspect --format json /opt/mcp-server/my-mcp-server` で調べられます。実行経路や動的ライブラリのすべてを静的解析だけで網羅できるわけではないため、通常起動で確認します。
 

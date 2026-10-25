@@ -294,7 +294,7 @@ The same order applies when whole documents compose. `extends` merges a base fil
 | `defaults.filesystem` allow | **Union** across `extends`/`include` merges — a matching `when` block **replaces** the whole allow side |
 | `defaults.filesystem` deny | Union; a deny covering an allow path prunes that allow |
 | `defaults.filesystem` `secret-overlay` | Set (only when `filesystem` itself is declared) |
-| `defaults.syscalls` allow | **Replace** — a later allow list discards the entire earlier list (`deny` is not valid inside `defaults.syscalls`) |
+| `defaults.syscalls` allow | **Replace** — a later allow list discards the entire earlier list (`deny` is not valid inside `defaults.syscalls` under v1/v2) |
 | `defaults.environment` | Replace — `restrict`, `inherit-parent`, and the allow list move together |
 | `defaults.network` allow (`host=`/`cidr=`/rules) | **Replace** — any declared allow replaces the whole earlier allow side |
 | `defaults.network` deny | Union; deny precedence prunes covering allows |
@@ -311,6 +311,38 @@ The same order applies when whole documents compose. `extends` merges a base fil
 
 Two consequences surprise people most: `defaults.syscalls` allow and `defaults.network` allow are *replaced*, not appended — a child file that adds three syscalls silently drops everything the parent allowed, including the `execve`/`execveat` startup allowance. The loader warns whenever a later file replaces inherited entries ("Warning: child.kdl:4: replaced 3 'defaults.syscalls' entries declared by 'base.kdl'"); `MCP_WRIT_REPLACE_MODE=refuse` (alias `strict`) turns the warning into a load error and `off` silences it. Use [`mcp-writ policy resolve`](guide.md#416-policy--composed-policy-inspection) to print the effective policy plus the file and line that set each field before adopting a change.
 
+#### `policy version=3` — additive by default, replace is explicit
+
+Version 3 changes the *rules* of composition, not the grammar of the individual blocks. Every allow list above that reads **Replace** becomes **Union** under `policy version=3`; a later declaration that wants replacement writes `replace=#true` on its block:
+
+```kdl
+policy version=3
+
+defaults {
+    syscalls {
+        allow "read" "execve"
+        deny "io_uring_setup"          // v3: the only way to narrow a unioned allow list
+    }
+    network replace=#true {           // opt back into v2-style replacement
+        allow host="api.example.com"
+    }
+}
+```
+
+| Field | v3 rule on a later declaration |
+|---|---|
+| any allow side — `defaults.syscalls`, `defaults.network`, tool `filesystem`/`network`/`syscalls`, profile and `server-defaults` layers, `extends`/`include`/`when` merges | **Union**; `replace=#true` on the block replaces the accumulated allow side (including with an empty list) |
+| every deny side | Union in every version; deny-wins prunes covering allows |
+| `defaults.syscalls` `deny` | **New in v3** — the only way to remove a syscall an ancestor allowed; entries accumulate and are pruned from the allow side wherever the two merge, and the seccomp filter never grants a denied name |
+| `allow none=#true` | Under v3 it must pair with `replace=#true` on the same block — a bare `none` would union into the inherited grants instead of clearing them, so the load refuses it |
+| `defaults.environment`, `defaults.network` posture/`inbound`, `secret-overlay`, `logging`, `sandbox`, `transport`, tool `side_effect`/`args_schema`/`input_responses`/`deputy`/`process`, tool `deny` | Unchanged — Set/sticky semantics as in the table above |
+
+`replace=#false` or omitting the property keeps the additive behavior. The property is a v3 declaration: a v2 document that writes it is rejected, and a v3 document fed to a v1/v2-only binary is rejected by the version check — never silently read under v2 rules.
+
+Under v3 a tool's layers compose additively in order: `defaults → profile(s) → server-defaults → tool`. Each layer's allow side adds to the accumulated set unless that layer's block carries `replace=#true`, which clears what came before it.
+
+Migrating a v2 document: bump `policy version` to `3`, then run `mcp-writ policy resolve --policy <file> --version-diff` — it resolves the same documents under both rules versions and lists every effective field that moves, so the allowances v2's implicit replacement used to drop are visible before they change behavior. Add `replace=#true` where the diff shows a narrowing you meant to keep, and add `deny` entries where an inherited syscall must be removed.
+
 A `profile` is a named, reusable tool layer declared at top level:
 
 ```kdl
@@ -326,7 +358,7 @@ server "files" {
 }
 ```
 
-Each reference takes exactly one profile name — `profile "a" "b"` or extra arguments/properties on the child are ambiguous: schema v2 rejects them at load, v1 warns. Mixing the property and child forms, or declaring both `profile` and `profiles` siblings, is always an error. An unknown profile name fails the load.
+Each reference takes exactly one profile name under v1/v2 — `profile "a" "b"` or extra arguments/properties on the child are ambiguous: schema v2 rejects them at load, v1 warns. Under `policy version=3` the child form takes several names and their layers compose as a union in declaration order (`profile "a" "b"` applies `a`, then `b`). Mixing the property and child forms, or declaring both `profile` and `profiles` siblings, is always an error. An unknown profile name fails the load.
 
 <a id="linux-read-only"></a>
 
@@ -374,7 +406,7 @@ logging level="info" fail_closed=#true
 `mode="write"` means read/write; the default `mode="read"` is for reading.
 `side_effect="read_only"` checks configuration consistency and rejects host/URL arguments. It does not prove that the server's implementation only reads data.
 
-Normal Linux startup requires an explicit `execve` or `execveat` allowance. That permission remains in the child process, so distinguish it from denying the `exec_shell` RPC tool.
+Normal Linux startup requires an explicit `execve` allowance — the spawn entrypoint issues `execve` and `execveat` cannot carry it. That permission remains in the child process, so distinguish it from denying the `exec_shell` RPC tool.
 An interpreter also needs read access to its executable, standard library, and dependencies. Allowing `/opt/mcp-server/**` alone does not grant access to a Python or Node installation elsewhere.
 For a native ELF or Mach-O binary, inspect syscall candidates with `mcp-writ inspect --format json /opt/mcp-server/my-mcp-server`. Static inspection cannot cover every execution path or dynamic library, so verify with a normal run.
 
