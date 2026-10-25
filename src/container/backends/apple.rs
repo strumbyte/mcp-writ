@@ -95,25 +95,24 @@ pub(crate) const APPLE_CAPABILITIES: BackendCapabilities = BackendCapabilities {
 /// `inspect::parse_inspect_json`), and `info` is
 /// `container system status --format json`.
 pub struct AppleContainerEngine {
-    /// The validated canonical path bound at
-    /// [`AppleContainerEngine::resolve`] — every subprocess this
-    /// driver spawns names this exact binary so a mutable-PATH or
-    /// writable-directory substitution can never slip a replacement
-    /// under the resolved identity.
-    exe: String,
+    /// The driver bound at [`AppleContainerEngine::resolve`] — the
+    /// validated canonical path *plus* the pinned file identity. Every
+    /// subprocess re-verifies that identity before spawning, so a
+    /// binary replaced after resolution fails closed rather than
+    /// running under the resolved name.
+    exe: crate::trusted_path::BoundDriver,
 }
 
 impl AppleContainerEngine {
-    /// Resolve `container` on PATH once to a validated canonical path —
-    /// the only moment PATH is consulted. A hit in a location a
-    /// different user could rewrite refuses rather than falling
-    /// through: the same-name shadow is the substitution this
-    /// resolution exists to close.
+    /// Resolve `container` to a bound executable — the one moment PATH
+    /// is consulted, under the administrator provenance class: a hit
+    /// in a caller-managed directory refuses rather than falling
+    /// through (the same-name shadow is the substitution this
+    /// resolution exists to close), and `MCP_WRIT_CONTAINER_EXE`
+    /// supplies an explicit path instead.
     pub fn resolve() -> Result<Self, EngineError> {
         let exe = crate::trusted_path::resolve_cli(APPLE_CLI).map_err(EngineError::NotAvailable)?;
-        Ok(Self {
-            exe: exe.to_string_lossy().into_owned(),
-        })
+        Ok(Self { exe })
     }
 }
 
@@ -202,12 +201,17 @@ pub(crate) fn run_options(spec: &LaunchSpec) -> Vec<String> {
 /// `IsolationKind::AppleContainer` over the `container` CLI driver —
 /// one Virtualization.framework Linux VM per launched unit.
 pub struct AppleContainerBackend {
-    engine: Box<dyn ContainerEngine>,
+    /// Shared with the launch handle so its `kill`/`rm`/`inspect`
+    /// lifecycle commands also spawn through the bound, identity-
+    /// re-verified driver — never a bare program spelling.
+    engine: std::sync::Arc<dyn ContainerEngine>,
 }
 
 impl AppleContainerBackend {
     pub fn new(engine: Box<dyn ContainerEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine: engine.into(),
+        }
     }
 }
 
@@ -376,9 +380,9 @@ fn kernel_detail(props_json: &str) -> Option<(String, String)> {
 }
 
 /// `container system property list --format json` — the substrate's own
-/// configuration record (guest kernel, VM defaults).
-async fn system_properties(exe: String) -> Result<String, EngineError> {
-    let mut cmd = tokio::process::Command::new(exe);
+/// configuration record (guest kernel, VM defaults). `cmd` arrives
+/// already bound and identity-verified by `driver_command`.
+async fn system_properties(mut cmd: tokio::process::Command) -> Result<String, EngineError> {
     cmd.args(["system", "property", "list", "--format", "json"]);
     // A caller timeout drops this future — the spawned CLI must die
     // with it rather than leaking as an orphan.
@@ -408,11 +412,13 @@ async fn system_properties(exe: String) -> Result<String, EngineError> {
 /// refused prerequisite; a launch never proceeds on an unverified
 /// apple stack, and never degrades to another backend.
 pub(crate) async fn probe(engine: &dyn ContainerEngine) -> Result<String, ApplePrereqFailure> {
-    probe_with(
-        engine,
-        Box::pin(system_properties(engine.program().to_string())),
-    )
-    .await
+    let properties = match engine.driver_command() {
+        Ok(cmd) => {
+            Box::pin(system_properties(cmd)) as BoxFuture<'static, Result<String, EngineError>>
+        }
+        Err(e) => Box::pin(async move { Err(e.into()) }),
+    };
+    probe_with(engine, properties).await
 }
 
 /// [`probe`] with the properties read injected — tests exercise the
@@ -599,7 +605,15 @@ impl ContainerEngine for AppleContainerEngine {
     }
 
     fn program(&self) -> &str {
-        &self.exe
+        self.exe.program()
+    }
+
+    fn driver_command(&self) -> std::io::Result<tokio::process::Command> {
+        self.exe.tokio_command()
+    }
+
+    fn driver_std_command(&self) -> std::io::Result<std::process::Command> {
+        self.exe.std_command()
     }
 
     /// The apple substrate is a launch runtime, not a builder — the
@@ -625,7 +639,7 @@ impl ContainerEngine for AppleContainerEngine {
 
     fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(async move {
-            let mut cmd = tokio::process::Command::new(&self.exe);
+            let mut cmd = self.exe.tokio_command()?;
             cmd.args(["image", "inspect", image]);
             // A caller timeout drops this future — the spawned CLI must
             // die with it rather than leaking as an orphan.
@@ -674,7 +688,7 @@ impl ContainerEngine for AppleContainerEngine {
     /// `engine_info_os("container", …)` reads.
     fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(async move {
-            let mut cmd = tokio::process::Command::new(&self.exe);
+            let mut cmd = self.exe.tokio_command()?;
             cmd.args(["system", "status", "--format", "json"]);
             // A caller timeout drops this future — the spawned CLI must
             // die with it rather than leaking as an orphan.
@@ -701,7 +715,7 @@ impl ContainerEngine for AppleContainerEngine {
         Box::pin(async move {
             let option_owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
             let argv = apple_run_args(&option_owned, image);
-            let mut cmd = tokio::process::Command::new(&self.exe);
+            let mut cmd = self.exe.tokio_command()?;
             cmd.args(&argv);
             if stdin_pipe {
                 cmd.stdin(std::process::Stdio::piped());
@@ -716,7 +730,7 @@ impl ContainerEngine for AppleContainerEngine {
     }
 
     fn is_available(&self) -> bool {
-        crate::container::engine::bounded_cli_output(&self.exe, &["--version"])
+        crate::container::engine::bounded_driver_output(&self.exe, &["--version"])
             .map(|o| {
                 o.status.success() && crate::container::engine::version_answers_as(&o, APPLE_CLI)
             })
@@ -802,12 +816,11 @@ impl IsolationBackend for AppleContainerBackend {
             Ok(Box::new(
                 EngineRunHandle::attach(
                     child,
-                    // `program()` is the resolved CLI path the engine
-                    // itself spawns — `name()` would re-resolve
-                    // `container` through PATH on every lifecycle
-                    // command (`kill`/`rm`/`inspect`), and a PATH entry
-                    // swapped in after launch would answer teardown.
-                    self.engine.program(),
+                    // The shared engine — the handle's lifecycle
+                    // commands (`kill`/`rm`/`inspect`) spawn through
+                    // the bound, identity-verified driver, so a CLI
+                    // replaced after launch can never answer teardown.
+                    self.engine.clone(),
                     spec.unit_id_file.clone(),
                     spec.unit_name.clone(),
                 )

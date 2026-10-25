@@ -224,32 +224,35 @@ pub fn require_parent_write_restricted(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// True when `dir`'s DACL hands a broad trustee the rights to replace a
-/// child entry — exposed for the driver-validation walk in
+/// True when `dir`'s DACL hands an untrusted trustee the rights to
+/// replace a child entry — exposed for the driver-validation walk in
 /// `trusted_path`, which applies the same check to every ancestor of a
-/// candidate executable.
+/// candidate executable. `caller_ok` selects the trust class: driver
+/// resolution under administrator-only provenance passes `false` so a
+/// grant to the invoking user counts as replaceable too.
 #[cfg(windows)]
-pub(crate) fn dir_dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
-    dacl_grants_replace_rights(dir)
+pub(crate) fn dir_dacl_grants_replace_rights(dir: &Path, caller_ok: bool) -> io::Result<bool> {
+    dacl_grants_replace_rights(dir, caller_ok)
 }
 
 /// Windows: refuse `dir` when any existing ancestor's DACL grants
-/// write/delete access to a broad well-known principal (Everyone,
-/// Anonymous, Authenticated Users, BUILTIN\Users, INTERACTIVE, NETWORK)
-/// — any such grant lets a lower-trust session rename a directory in
-/// the chain or plant a replacement beneath it. Absence of a DACL
-/// (null DACL) means unrestricted access and is refused outright.
+/// write/delete access to an untrusted principal — any trustee outside
+/// the current user and the administrator set (SYSTEM, Administrators,
+/// TrustedInstaller, and owner-delegating placeholders). Any such
+/// grant lets a lower-trust session rename a directory in the chain or
+/// plant a replacement beneath it. Absence of a DACL (null DACL) means
+/// unrestricted access and is refused outright.
 #[cfg(windows)]
 pub fn require_parent_write_restricted(dir: &Path) -> io::Result<()> {
     let mut ancestor = dir.parent();
     while let Some(parent) = ancestor {
-        match dacl_grants_replace_rights(parent) {
+        match dacl_grants_replace_rights(parent, true) {
             Ok(true) => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
-                        "refusing '{}': ancestor '{}' grants replace access to a \
-                         broad principal — another session could swap it out",
+                        "refusing '{}': ancestor '{}' grants replace access to an \
+                         untrusted principal — another session could swap it out",
                         dir.display(),
                         parent.display()
                     ),
@@ -286,7 +289,7 @@ pub fn dir_shared_writable(dir: &Path) -> io::Result<bool> {
 
 #[cfg(windows)]
 pub fn dir_shared_writable(dir: &Path) -> io::Result<bool> {
-    dacl_grants_replace_rights(dir)
+    dacl_grants_replace_rights(dir, true)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -349,43 +352,141 @@ impl Drop for SdGuard {
     }
 }
 
-/// Walk `path`'s DACL for access-allowed ACEs that hand a broad trustee
-/// (Everyone, Anonymous, Authenticated Users, BUILTIN\Users,
-/// INTERACTIVE, NETWORK) any right in `rights`. A null DACL pointer
-/// means unrestricted access — fail toward "broad grant possible"
-/// rather than declaring the object safe.
+/// ACE header type byte for an access-allowed ACE (`winnt.h`).
 #[cfg(windows)]
-fn dacl_grants_broad(path: &Path, rights: u32) -> io::Result<bool> {
-    use std::ffi::c_void;
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+/// Conditional allow-ACE — same layout as the plain allow-ACE, but
+/// the grant is gated on a condition evaluated against the caller's
+/// token at access time (`winnt.h` `ACCESS_ALLOWED_CALLBACK_ACE_TYPE`).
+#[cfg(windows)]
+const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 0x09;
+/// Allow-ACE variants whose layout moves the trustee SID off the
+/// plain-ACE offset (`winnt.h`): compound (0x04), object (0x05),
+/// callback-object (0x0B).
+#[cfg(windows)]
+const ACCESS_ALLOWED_COMPOUND_ACE_TYPE: u8 = 0x04;
+#[cfg(windows)]
+const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 0x05;
+#[cfg(windows)]
+const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 0x0B;
+/// `AceFlags` bit marking an ACE that never applies to the object
+/// itself (`winnt.h` `INHERIT_ONLY_ACE`) — it exists only to be
+/// inherited by children, so it cannot grant rights on this object.
+/// `0x10` is `INHERITED_ACE` — a different flag, and one that must
+/// NOT be skipped: a non-inherit-only ACE that arrived by
+/// inheritance still governs access to this object.
+#[cfg(windows)]
+const INHERIT_ONLY_ACE: u8 = 0x08;
 
-    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+/// True when `sid` names an administrative principal: SYSTEM, the
+/// Administrators group, or TrustedInstaller — the authorities a
+/// stock install entrusts with `C:\Windows`/`C:\Program Files`.
+#[cfg(windows)]
+fn sid_is_admin_principal(sid: windows::Win32::Security::PSID) -> bool {
     use windows::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-        DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, IsWellKnownSid, PSID,
-        WinAnonymousSid, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinInteractiveSid,
-        WinNetworkSid, WinWorldSid,
+        IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
+
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe {
+        IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
+            || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
+    } {
+        return true;
+    }
+    sid_is_trusted_installer(sid)
+}
+
+/// True when `sid` names a principal whose dangerous-rights grants a
+/// driver path may carry: an administrative principal, or the
+/// owner-delegating placeholders CREATOR OWNER and OWNER RIGHTS —
+/// their grants resolve to the object's owner, which the caller
+/// separately requires to be a trusted principal. With `caller_ok` the
+/// invoking user also counts (driver paths the caller may already
+/// control); administrator-only resolution passes `false`.
+#[cfg(windows)]
+fn trustee_sid_is_trusted(
+    sid: windows::Win32::Security::PSID,
+    caller_ok: bool,
+) -> io::Result<bool> {
+    use windows::Win32::Security::{IsWellKnownSid, WinCreatorOwnerSid};
+
+    if sid_is_admin_principal(sid) {
+        return Ok(true);
+    }
+    // CREATOR OWNER (well-known) and OWNER RIGHTS (S-1-3-4, not in the
+    // enum) delegate to the object's owner — trusted only because the
+    // owner check separately requires a trusted principal.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { IsWellKnownSid(sid, WinCreatorOwnerSid).as_bool() } || sid_is_string(sid, "S-1-3-4")
+    {
+        return Ok(true);
+    }
+    if caller_ok {
+        return sid_is_current_user(sid);
+    }
+    Ok(false)
+}
+
+/// True when `sid` equals the SID spelled `sddl` — for principals the
+/// `WELL_KNOWN_SID_TYPE` enum does not name (TrustedInstaller, OWNER
+/// RIGHTS), so the comparison SID is built from its string form.
+#[cfg(windows)]
+fn sid_is_string(sid: windows::Win32::Security::PSID, sddl: &str) -> bool {
+    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows::Win32::Security::{EqualSid, PSID};
     use windows::core::HSTRING;
 
-    /// ACE header type byte for an access-allowed ACE (`winnt.h`).
-    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-    /// Conditional allow-ACE — same layout as the plain allow-ACE, but
-    /// the grant is gated on a condition evaluated against the caller's
-    /// token at access time (`winnt.h` `ACCESS_ALLOWED_CALLBACK_ACE_TYPE`).
-    const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 0x09;
-    /// Allow-ACE variants whose layout moves the trustee SID off the
-    /// plain-ACE offset (`winnt.h`): compound (0x04), object (0x05),
-    /// callback-object (0x0B).
-    const ACCESS_ALLOWED_COMPOUND_ACE_TYPE: u8 = 0x04;
-    const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 0x05;
-    const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 0x0B;
-    /// `AceFlags` bit marking an ACE that never applies to the object
-    /// itself (`winnt.h` `INHERIT_ONLY_ACE`) — it exists only to be
-    /// inherited by children, so it cannot grant rights on this object.
-    /// `0x10` is `INHERITED_ACE` — a different flag, and one that must
-    /// NOT be skipped: a non-inherit-only ACE that arrived by
-    /// inheritance still governs access to this object.
-    const INHERIT_ONLY_ACE: u8 = 0x08;
+    let mut other = PSID(std::ptr::null_mut());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { ConvertStringSidToSidW(&HSTRING::from(sddl), &mut other) }.is_ok() {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let equal = unsafe { EqualSid(sid, other).map(|_| true).unwrap_or(false) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            let _ = windows::Win32::Foundation::LocalFree(Some(
+                windows::Win32::Foundation::HLOCAL(other.0),
+            ));
+        }
+        return equal;
+    }
+    false
+}
+
+/// NT SERVICE\TrustedInstaller — not a WELL_KNOWN_SID_TYPE, so the
+/// comparison SID is built from its string form.
+#[cfg(windows)]
+fn sid_is_trusted_installer(sid: windows::Win32::Security::PSID) -> bool {
+    sid_is_string(
+        sid,
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+    )
+}
+
+/// True when `sid` is the process token's user SID.
+#[cfg(windows)]
+fn sid_is_current_user(sid: windows::Win32::Security::PSID) -> io::Result<bool> {
+    use windows::Win32::Security::{EqualSid, TOKEN_USER};
+
+    let user = process_user_sid()?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    Ok(unsafe { EqualSid(sid, user_sid).map(|_| true).unwrap_or(false) })
+}
+
+/// Walk `path`'s DACL for access-allowed ACEs that hand an *untrusted*
+/// trustee any right in `rights` — every trustee outside the
+/// administrator/owner set (and the caller, when `caller_ok`). Named
+/// users and custom groups count: a grant to a specific non-admin
+/// account is as much a replacement right as one to Everyone. A null
+/// DACL pointer means unrestricted access — fail toward "untrusted
+/// grant possible" rather than declaring the object safe.
+#[cfg(windows)]
+fn dacl_grants_untrusted(path: &Path, rights: u32, caller_ok: bool) -> io::Result<bool> {
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{ACL, DACL_SECURITY_INFORMATION};
+    use windows::core::HSTRING;
 
     let name = security_lookup_name(path);
     let mut dacl: *mut ACL = std::ptr::null_mut();
@@ -406,9 +507,25 @@ fn dacl_grants_broad(path: &Path, rights: u32) -> io::Result<bool> {
     };
     status.ok().map_err(|e| named_security_err(e, path))?;
     let _sd_guard = SdGuard(sd.0);
+    dacl_has_untrusted_grant(dacl, rights, caller_ok)
+}
 
-    // A null DACL pointer = unrestricted access — fail toward "broad
-    // write possible" rather than declaring the parent safe.
+/// The ACE walk shared by the path and handle DACL variants — a null
+/// `dacl` is unrestricted access and answers `true` rather than
+/// declaring the object safe.
+#[cfg(windows)]
+fn dacl_has_untrusted_grant(
+    dacl: *mut windows::Win32::Security::ACL,
+    rights: u32,
+    caller_ok: bool,
+) -> io::Result<bool> {
+    use std::ffi::c_void;
+
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation, GetAce, GetAclInformation,
+        PSID,
+    };
+
     if dacl.is_null() {
         return Ok(true);
     }
@@ -424,14 +541,6 @@ fn dacl_grants_broad(path: &Path, rights: u32) -> io::Result<bool> {
     }
     .map_err(|e| io::Error::other(format!("GetAclInformation: {e}")))?;
 
-    let broad = [
-        WinWorldSid,
-        WinAnonymousSid,
-        WinAuthenticatedUserSid,
-        WinBuiltinUsersSid,
-        WinInteractiveSid,
-        WinNetworkSid,
-    ];
     for i in 0..info.AceCount {
         let mut ace: *mut c_void = std::ptr::null_mut();
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -456,22 +565,19 @@ fn dacl_grants_broad(path: &Path, rights: u32) -> io::Result<bool> {
             // The plain allow-ACE and the callback variant share this
             // layout. A callback ACE's grant condition is evaluated
             // against the caller's token at access time and cannot be
-            // proven statically, so an applicable callback grant to a
-            // broad trustee counts as broad access.
+            // proven statically, so an applicable callback grant to an
+            // untrusted trustee counts as untrusted access.
             ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => {
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let sid = unsafe { PSID(&raw const (*ace).SidStart as *mut c_void) };
-                for kind in broad {
-                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                    if unsafe { IsWellKnownSid(sid, kind).as_bool() } {
-                        return Ok(true);
-                    }
+                if !trustee_sid_is_trusted(sid, caller_ok)? {
+                    return Ok(true);
                 }
             }
             // Compound, object, and callback-object allow-ACEs move the
             // SID off the plain-ACE offset, so the trustee cannot be
             // inspected — a rights-bearing allow-ACE that cannot be
-            // proven narrow fails toward "broad access possible".
+            // proven narrow fails toward "untrusted access possible".
             ACCESS_ALLOWED_COMPOUND_ACE_TYPE
             | ACCESS_ALLOWED_OBJECT_ACE_TYPE
             | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => return Ok(true),
@@ -481,48 +587,100 @@ fn dacl_grants_broad(path: &Path, rights: u32) -> io::Result<bool> {
     Ok(false)
 }
 
-/// Walk `dir`'s DACL for allow-ACEs that hand a broad trustee the
+/// `GetSecurityInfo`-based variant of [`dacl_grants_untrusted`] on an
+/// *open* handle — the DACL inspected is the pinned object's own, not
+/// whatever the path happens to name when the caller gets to it.
+#[cfg(windows)]
+fn handle_dacl_grants_untrusted(file: &fs::File, rights: u32, caller_ok: bool) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows::Win32::Security::{ACL, DACL_SECURITY_INFORMATION};
+
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd = windows::Win32::Security::PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        GetSecurityInfo(
+            HANDLE(file.as_raw_handle()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut sd),
+        )
+    }
+    .ok()
+    .map_err(|e| io::Error::other(format!("GetSecurityInfo: {e}")))?;
+    let _sd_guard = SdGuard(sd.0);
+    dacl_has_untrusted_grant(dacl, rights, caller_ok)
+}
+
+/// Walk `dir`'s DACL for allow-ACEs that hand an untrusted trustee the
 /// rights needed to *replace* a child entry — delete/delete-child or
 /// ACL/ownership control. Add-only rights (FILE_ADD_FILE,
 /// FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA) are deliberately absent:
 /// they let a principal plant a sibling, not retarget an existing
 /// component, and drive roots grant them to Authenticated Users —
 /// counting them would refuse every path on the volume.
+/// The rights mask [`dacl_grants_replace_rights`] checks on a
+/// directory: the rights needed to *replace* a child entry —
+/// delete/delete-child or ACL/ownership control. Add-only rights
+/// (FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA) are
+/// deliberately absent: they let a principal plant a sibling, not
+/// retarget an existing component, and drive roots grant them to
+/// Authenticated Users — counting them would refuse every path on the
+/// volume.
 #[cfg(windows)]
-fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
+fn dir_replace_rights() -> u32 {
     use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
     use windows::Win32::Storage::FileSystem::{DELETE, FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER};
 
-    const REPLACE_RIGHTS: u32 = DELETE.0
-        | FILE_DELETE_CHILD.0
-        | WRITE_DAC.0
-        | WRITE_OWNER.0
-        | GENERIC_WRITE.0
-        | GENERIC_ALL.0;
-    dacl_grants_broad(dir, REPLACE_RIGHTS)
+    DELETE.0 | FILE_DELETE_CHILD.0 | WRITE_DAC.0 | WRITE_OWNER.0 | GENERIC_WRITE.0 | GENERIC_ALL.0
 }
 
-/// File-leaf variant of [`dacl_grants_replace_rights`]: a broad trustee
-/// holding any of these rights on an *executable* can rewrite or replace
-/// the image itself — FILE_WRITE_DATA/APPEND cover content mutation,
-/// DELETE covers remove-and-recreate, and WRITE_DAC/WRITE_OWNER hand
-/// over the file's own protection. Used by `trusted_path`'s driver
-/// validation on the resolved leaf (ancestors take the directory mask).
 #[cfg(windows)]
-pub(crate) fn dacl_grants_file_write(path: &Path) -> io::Result<bool> {
+fn dacl_grants_replace_rights(dir: &Path, caller_ok: bool) -> io::Result<bool> {
+    dacl_grants_untrusted(dir, dir_replace_rights(), caller_ok)
+}
+
+/// The rights mask [`dacl_grants_file_write`] and its handle variant
+/// check: an untrusted trustee holding any of these on an *executable*
+/// can rewrite or replace the image itself — FILE_WRITE_DATA/APPEND
+/// cover content mutation, DELETE covers remove-and-recreate, and
+/// WRITE_DAC/WRITE_OWNER hand over the file's own protection.
+#[cfg(windows)]
+fn file_write_rights() -> u32 {
     use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
     use windows::Win32::Storage::FileSystem::{
         DELETE, FILE_APPEND_DATA, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
     };
 
-    const WRITE_RIGHTS: u32 = DELETE.0
+    DELETE.0
         | FILE_WRITE_DATA.0
         | FILE_APPEND_DATA.0
         | WRITE_DAC.0
         | WRITE_OWNER.0
         | GENERIC_WRITE.0
-        | GENERIC_ALL.0;
-    dacl_grants_broad(path, WRITE_RIGHTS)
+        | GENERIC_ALL.0
+}
+
+/// File-leaf variant of [`dacl_grants_replace_rights`]. Used by
+/// `trusted_path`'s driver validation on the resolved leaf (ancestors
+/// take the directory mask).
+#[cfg(windows)]
+pub(crate) fn dacl_grants_file_write(path: &Path, caller_ok: bool) -> io::Result<bool> {
+    dacl_grants_untrusted(path, file_write_rights(), caller_ok)
+}
+
+/// [`dacl_grants_file_write`] on an open handle — the pinned object's
+/// own DACL, bound to the object rather than the path spelling.
+#[cfg(windows)]
+pub(crate) fn handle_dacl_grants_file_write(file: &fs::File, caller_ok: bool) -> io::Result<bool> {
+    handle_dacl_grants_untrusted(file, file_write_rights(), caller_ok)
 }
 
 /// The owner SID the process token reports for the current user —
@@ -564,62 +722,29 @@ fn process_user_sid() -> io::Result<Vec<usize>> {
 }
 
 /// True when `sid` names a principal allowed to own a security-boundary
-/// object: the current user (it already controls the account's own
-/// files), SYSTEM, the Administrators group, or TrustedInstaller — the
-/// service that owns `C:\Windows`/`C:\Program Files` content on a stock
-/// install. Any *other* owner is a foreign principal that retains
-/// implicit control (WRITE_DAC) over the object.
+/// object: an administrative principal always; the current user only
+/// when `caller_ok` (it already controls the account's own files). Any
+/// *other* owner is a foreign principal that retains implicit control
+/// (WRITE_DAC) over the object.
 #[cfg(windows)]
-fn owner_sid_is_trusted(sid: windows::Win32::Security::PSID) -> io::Result<bool> {
-    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
-    use windows::Win32::Security::{
-        EqualSid, IsWellKnownSid, TOKEN_USER, WinBuiltinAdministratorsSid, WinLocalSystemSid,
-    };
-    use windows::core::HSTRING;
-
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    if unsafe {
-        IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
-            || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
-    } {
+fn owner_sid_is_trusted(sid: windows::Win32::Security::PSID, caller_ok: bool) -> io::Result<bool> {
+    if sid_is_admin_principal(sid) {
         return Ok(true);
     }
-    // NT SERVICE\TrustedInstaller — not a WELL_KNOWN_SID_TYPE, so the
-    // SID is built from its string form.
-    let mut ti = windows::Win32::Security::PSID(std::ptr::null_mut());
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    if unsafe {
-        ConvertStringSidToSidW(
-            &HSTRING::from("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"),
-            &mut ti,
-        )
-        .is_ok()
-    } {
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let equal = unsafe { EqualSid(sid, ti).map(|_| true).unwrap_or(false) };
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            let _ = windows::Win32::Foundation::LocalFree(Some(
-                windows::Win32::Foundation::HLOCAL(ti.0),
-            ));
-        }
-        if equal {
-            return Ok(true);
-        }
+    if caller_ok {
+        return sid_is_current_user(sid);
     }
-    let user = process_user_sid()?;
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    Ok(unsafe { EqualSid(sid, user_sid).map(|_| true).unwrap_or(false) })
+    Ok(false)
 }
 
 /// Owner check on an *open* handle (`GetSecurityInfo` — no path
 /// re-resolution): true when the object's owner SID is a trusted
 /// principal per [`owner_sid_is_trusted`]. The audit sink applies this
-/// to refuse an existing sink a foreign user still controls.
+/// to refuse an existing sink a foreign user still controls; driver
+/// binding passes `caller_ok = false` so a caller-owned executable is
+/// not administrator provenance.
 #[cfg(windows)]
-pub(crate) fn handle_owner_is_trusted(file: &fs::File) -> io::Result<bool> {
+pub(crate) fn handle_owner_is_trusted(file: &fs::File, caller_ok: bool) -> io::Result<bool> {
     use std::os::windows::io::AsRawHandle;
 
     use windows::Win32::Foundation::HANDLE;
@@ -647,14 +772,14 @@ pub(crate) fn handle_owner_is_trusted(file: &fs::File) -> io::Result<bool> {
     if owner.0.is_null() {
         return Ok(false);
     }
-    owner_sid_is_trusted(owner)
+    owner_sid_is_trusted(owner, caller_ok)
 }
 
 /// Path-based variant of [`handle_owner_is_trusted`] for validation-time
 /// checks where no handle exists yet (`trusted_path` driver candidates —
 /// the canonical path is fixed and race-free for this purpose).
 #[cfg(windows)]
-pub(crate) fn path_owner_is_trusted(path: &Path) -> io::Result<bool> {
+pub(crate) fn path_owner_is_trusted(path: &Path, caller_ok: bool) -> io::Result<bool> {
     use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSID};
     use windows::core::HSTRING;
@@ -680,7 +805,7 @@ pub(crate) fn path_owner_is_trusted(path: &Path) -> io::Result<bool> {
     if owner.0.is_null() {
         return Ok(false);
     }
-    owner_sid_is_trusted(owner)
+    owner_sid_is_trusted(owner, caller_ok)
 }
 
 /// Windows: every existing ancestor of `path` must be a real directory
@@ -1963,9 +2088,122 @@ mod tests {
             return;
         }
         assert!(
-            matches!(dacl_grants_replace_rights(&root), Ok(false)),
+            matches!(dacl_grants_replace_rights(&root, true), Ok(false)),
             "drive root's inherit-only Authenticated Users ACE must be skipped: {:?}",
-            dacl_grants_replace_rights(&root)
+            dacl_grants_replace_rights(&root, true)
         );
+    }
+
+    /// Evaluate `dacl_has_untrusted_grant` on a DACL spelled in SDDL —
+    /// `ConvertStringSecurityDescriptorToSecurityDescriptorW` builds a
+    /// real descriptor in memory, so trustee-matrix tests need no file
+    /// mutation and no machine-specific accounts.
+    #[cfg(windows)]
+    fn sddl_untrusted_grant(sddl: &str, rights: u32, caller_ok: bool) -> bool {
+        use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+        use windows::Win32::Security::{ACL, GetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR};
+        use windows::core::HSTRING;
+
+        let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &HSTRING::from(sddl),
+                1, // SDDL_REVISION_1
+                &mut sd,
+                None,
+            )
+        }
+        .unwrap_or_else(|e| panic!("SDDL '{sddl}' must parse: {e}"));
+        let _sd = SdGuard(sd.0);
+        let mut present = windows::core::BOOL(0);
+        let mut defaulted = windows::core::BOOL(0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) }
+            .unwrap_or_else(|e| panic!("GetSecurityDescriptorDacl: {e}"));
+        assert!(present.as_bool(), "test SDDL must carry a DACL");
+        dacl_has_untrusted_grant(dacl, rights, caller_ok)
+            .expect("the SDDL fixture's ACEs are all inspectable")
+    }
+
+    /// The process token's user SID as an SDDL string — the fixture for
+    /// grants to the caller itself.
+    #[cfg(windows)]
+    fn current_user_sddl() -> String {
+        use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows::Win32::Security::TOKEN_USER;
+
+        let user = process_user_sid().expect("process user SID");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut text = windows::core::PWSTR::null();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { ConvertSidToStringSidW(sid, &mut text) }
+            .unwrap_or_else(|e| panic!("ConvertSidToStringSidW: {e}"));
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let s = unsafe { text.to_string() }.expect("SID text");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            let _ = windows::Win32::Foundation::LocalFree(Some(
+                windows::Win32::Foundation::HLOCAL(text.0.cast()),
+            ));
+        }
+        s
+    }
+
+    /// The finding-2 matrix, evaluated on real DACLs built from SDDL:
+    /// every allow-ACE trustee carrying dangerous rights must be a
+    /// trusted principal — administrators, TrustedInstaller, or the
+    /// owner-delegating placeholders (and the caller under the caller
+    /// class). A grant to any *named* non-administrative trustee —
+    /// user or group — flags the object replaceable under either
+    /// class: exactly the gap the old broad-SID check missed.
+    #[cfg(windows)]
+    #[test]
+    fn dacl_trustee_matrix_flags_named_principals() {
+        let file_rights = file_write_rights();
+        // Administrators and SYSTEM are the trusted class.
+        assert!(!sddl_untrusted_grant("D:(A;;FA;;;BA)", file_rights, false));
+        assert!(!sddl_untrusted_grant("D:(A;;FA;;;SY)", file_rights, false));
+        // TrustedInstaller's well-known string SID is trusted too.
+        assert!(!sddl_untrusted_grant(
+            "D:(A;;FA;;;S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464)",
+            file_rights,
+            false
+        ));
+        // Owner-delegating placeholders resolve to the (separately
+        // verified) owner — not an untrusted grant.
+        assert!(!sddl_untrusted_grant("D:(A;;FA;;;CO)", file_rights, false));
+        assert!(!sddl_untrusted_grant("D:(A;;FA;;;OW)", file_rights, false));
+        // The caller counts only under the caller class — administrator
+        // provenance flags a grant to the invoking user itself.
+        let caller = current_user_sddl();
+        let caller_dacl = format!("D:(A;;FA;;;{caller})");
+        assert!(!sddl_untrusted_grant(&caller_dacl, file_rights, true));
+        assert!(sddl_untrusted_grant(&caller_dacl, file_rights, false));
+        // Named non-administrative trustees — a specific domain-style
+        // user and the local Guests group — carry write rights: the
+        // scan's exact miss, flagged under both classes.
+        let named_user = "D:(A;;GW;;;S-1-5-21-1000-1000-1000-1001)";
+        assert!(sddl_untrusted_grant(named_user, file_rights, true));
+        assert!(sddl_untrusted_grant(named_user, file_rights, false));
+        let guests = "D:(A;;GW;;;BG)";
+        assert!(sddl_untrusted_grant(guests, file_rights, true));
+        assert!(sddl_untrusted_grant(guests, file_rights, false));
+        // A named group holding full access on a directory is the
+        // ancestor-replacement right — flagged too.
+        let dir_rights = dir_replace_rights();
+        let guests_dir = "D:(A;;FA;;;BG)";
+        assert!(sddl_untrusted_grant(guests_dir, dir_rights, true));
+        // Read-only grants to untrusted trustees carry no replacement
+        // right and stay unflagged.
+        assert!(!sddl_untrusted_grant("D:(A;;GR;;;BG)", file_rights, false));
+        // A mixed DACL: one untrusted grant among trusted ones flags.
+        assert!(sddl_untrusted_grant(
+            "D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;GW;;;BG)",
+            file_rights,
+            false
+        ));
     }
 }

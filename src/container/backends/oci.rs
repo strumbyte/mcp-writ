@@ -35,12 +35,17 @@ pub(crate) const OCI_CAPABILITIES: BackendCapabilities = BackendCapabilities {
 
 /// `IsolationKind::Container` over a resolved container engine.
 pub struct OciBackend {
-    engine: Box<dyn ContainerEngine>,
+    /// Shared with the launch handle so its `kill`/`rm`/`inspect`
+    /// lifecycle commands also spawn through the bound, identity-
+    /// re-verified driver — never a bare program spelling.
+    engine: std::sync::Arc<dyn ContainerEngine>,
 }
 
 impl OciBackend {
     pub fn new(engine: Box<dyn ContainerEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine: engine.into(),
+        }
     }
 }
 
@@ -136,7 +141,7 @@ impl IsolationBackend for OciBackend {
             let child = self.engine.run(image, &option_refs, true).await?;
             let mut handle = EngineRunHandle::attach(
                 child,
-                self.engine.program(),
+                self.engine.clone(),
                 spec.unit_id_file.clone(),
                 spec.unit_name.clone(),
             )
@@ -272,10 +277,11 @@ const UNIT_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// `WSLC_E_CONTAINER_NOT_FOUND`).
 pub(crate) struct EngineRunHandle {
     child: tokio::process::Child,
-    /// The program the engine's lifecycle commands (`kill`, `rm`)
-    /// spawn — `engine.program()`, a resolved path when the CLI is not
-    /// on PATH (wslc.exe).
-    engine_cli: String,
+    /// The engine the lifecycle commands (`kill`, `rm`, `inspect`)
+    /// spawn — an `Arc` so the handle's later teardowns still go
+    /// through the bound driver's identity re-verification rather than
+    /// reopening a stale program spelling.
+    engine: std::sync::Arc<dyn ContainerEngine>,
     cid_path: Option<PathBuf>,
     unit_id: Option<String>,
     /// The caller-generated `--name` — known before launch, so teardown
@@ -302,13 +308,13 @@ impl EngineRunHandle {
     /// stalling the launch.
     pub(crate) async fn attach(
         child: tokio::process::Child,
-        engine_cli: &str,
+        engine: std::sync::Arc<dyn ContainerEngine>,
         cid_path: Option<PathBuf>,
         unit_name: Option<String>,
     ) -> Self {
         let mut handle = Self {
             child,
-            engine_cli: engine_cli.to_string(),
+            engine,
             cid_path,
             unit_id: None,
             unit_name,
@@ -374,32 +380,38 @@ impl EngineRunHandle {
     async fn confirm_removed(&self, id: &str) -> Result<(), BackendError> {
         let deadline = std::time::Instant::now() + REMOVAL_CONFIRM_TIMEOUT;
         loop {
-            let mut cmd = tokio::process::Command::new(&self.engine_cli);
-            cmd.args(["inspect", id]);
-            let inspect = crate::container::engine::bounded_cmd_output(&mut cmd, false);
-            let unconfirmed = match tokio::time::timeout(INSPECT_TIMEOUT, inspect).await {
-                // Only a not-found answer proves the unit is gone.
-                Ok(Ok(out))
-                    if !out.status.success()
-                        && crate::container::common::inspect_error_is_absent(
-                            &String::from_utf8_lossy(&out.stderr),
-                        ) =>
-                {
-                    return Ok(());
+            let unconfirmed = match self.engine.driver_command() {
+                // A driver whose identity no longer verifies cannot
+                // answer inspect at all — the unit stays unconfirmed.
+                Err(e) => Some(format!("inspect failed to run: {e}")),
+                Ok(mut cmd) => {
+                    cmd.args(["inspect", id]);
+                    let inspect = crate::container::engine::bounded_cmd_output(&mut cmd, false);
+                    match tokio::time::timeout(INSPECT_TIMEOUT, inspect).await {
+                        // Only a not-found answer proves the unit is gone.
+                        Ok(Ok(out))
+                            if !out.status.success()
+                                && crate::container::common::inspect_error_is_absent(
+                                    &String::from_utf8_lossy(&out.stderr),
+                                ) =>
+                        {
+                            return Ok(());
+                        }
+                        Ok(Ok(out)) if !out.status.success() => {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            let stderr = stderr.trim();
+                            Some(if stderr.is_empty() {
+                                "inspect exited non-zero".to_string()
+                            } else {
+                                stderr.to_string()
+                            })
+                        }
+                        // Still resolvable — removal has not landed yet.
+                        Ok(Ok(_)) => None,
+                        Ok(Err(e)) => Some(format!("inspect failed to run: {e}")),
+                        Err(_) => Some("inspect timed out".to_string()),
+                    }
                 }
-                Ok(Ok(out)) if !out.status.success() => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let stderr = stderr.trim();
-                    Some(if stderr.is_empty() {
-                        "inspect exited non-zero".to_string()
-                    } else {
-                        stderr.to_string()
-                    })
-                }
-                // Still resolvable — removal has not landed yet.
-                Ok(Ok(_)) => None,
-                Ok(Err(e)) => Some(format!("inspect failed to run: {e}")),
-                Err(_) => Some("inspect timed out".to_string()),
             };
             if std::time::Instant::now() >= deadline {
                 return Err(BackendError::CleanupFailed(match unconfirmed {
@@ -420,8 +432,13 @@ impl EngineRunHandle {
     /// so the caller keeps waiting instead of trusting an unanswerable
     /// signal — the opposite polarity of `unit_resolvable_blocking`,
     /// which must assume the unit lives on doubt.
-    fn unit_present_blocking(id: &str, engine_cli: &str) -> bool {
-        let Ok(mut inspect) = std::process::Command::new(engine_cli)
+    fn unit_present_blocking(id: &str, engine: &dyn ContainerEngine) -> bool {
+        // An unverifiable or unspawnable driver answers `false` — the
+        // caller keeps waiting rather than trusting a substitute.
+        let Ok(mut cmd) = engine.driver_std_command() else {
+            return false;
+        };
+        let Ok(mut inspect) = cmd
             .args(["inspect", id])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -452,8 +469,13 @@ impl EngineRunHandle {
     /// unit still resolves. An unanswerable inspect is treated as
     /// "still present" (conservative — the dropped handle reports the
     /// leak rather than claiming teardown).
-    fn unit_resolvable_blocking(id: &str, engine_cli: &str) -> bool {
-        let Ok(mut inspect) = std::process::Command::new(engine_cli)
+    fn unit_resolvable_blocking(id: &str, engine: &dyn ContainerEngine) -> bool {
+        // An unverifiable or unspawnable driver proves nothing — the
+        // conservative answer is "still present".
+        let Ok(mut cmd) = engine.driver_std_command() else {
+            return true;
+        };
+        let Ok(mut inspect) = cmd
             .args(["inspect", id])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -524,7 +546,7 @@ impl IsolationHandle for EngineRunHandle {
                 break;
             }
             if let Some(name) = &self.unit_name
-                && Self::unit_present_blocking(name, &self.engine_cli)
+                && Self::unit_present_blocking(name, &*self.engine)
             {
                 break;
             }
@@ -573,8 +595,8 @@ impl IsolationHandle for EngineRunHandle {
             // failures never gate: the hard stop always follows.
             if let Some(signal) = self.graceful_signal
                 && let Some(unit) = self.unit_identity()
+                && let Ok(mut cmd) = self.engine.driver_command()
             {
-                let mut cmd = tokio::process::Command::new(&self.engine_cli);
                 cmd.args(["kill", "-s", signal, &unit]);
                 let sig = crate::container::engine::bounded_cmd_output(&mut cmd, false);
                 let _ = tokio::time::timeout(RM_TIMEOUT, sig).await;
@@ -616,10 +638,14 @@ impl IsolationHandle for EngineRunHandle {
             };
             // Bound the wait on the engine CLI — a timed-out `rm`
             // keeps running detached, so the unit is still released.
-            let mut cmd = tokio::process::Command::new(&self.engine_cli);
-            cmd.args(["rm", "-f", &id]);
-            let rm = crate::container::engine::bounded_cmd_output(&mut cmd, false);
-            let _ = tokio::time::timeout(RM_TIMEOUT, rm).await;
+            // An unverifiable driver cannot run the removal; the
+            // confirm below then fails closed rather than trusting a
+            // substitute.
+            if let Ok(mut cmd) = self.engine.driver_command() {
+                cmd.args(["rm", "-f", &id]);
+                let rm = crate::container::engine::bounded_cmd_output(&mut cmd, false);
+                let _ = tokio::time::timeout(RM_TIMEOUT, rm).await;
+            }
             // Removal is only reported once `inspect` stops resolving
             // the unit — a still-resolvable id is a cleanup failure the
             // caller hears about, and `cleaned` stays false so `Drop`
@@ -663,14 +689,25 @@ impl Drop for EngineRunHandle {
             );
         }
         if let Some(id) = id {
-            let Ok(mut rm) = std::process::Command::new(&self.engine_cli)
-                .args(["rm", "-f", &id])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            else {
-                return;
+            let mut rm = match self.engine.driver_std_command().and_then(|mut c| {
+                c.args(["rm", "-f", &id])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                c.spawn()
+            }) {
+                Ok(rm) => rm,
+                // A failed bound-driver verification means the resolved
+                // executable no longer names the validated object — the
+                // unit leaks, but retrying through an unverified
+                // spelling would run a substituted binary instead.
+                Err(e) => {
+                    tracing::warn!(
+                        "container unit {id} teardown skipped — driver \
+                         command failed verification or spawn: {e}"
+                    );
+                    return;
+                }
             };
             let deadline = std::time::Instant::now() + RM_TIMEOUT;
             loop {
@@ -688,7 +725,7 @@ impl Drop for EngineRunHandle {
             // unit is the resource leak the caller was trying to avoid,
             // so surface it rather than claiming silent success.
             for _ in 0..4 {
-                if !Self::unit_resolvable_blocking(&id, &self.engine_cli) {
+                if !Self::unit_resolvable_blocking(&id, &*self.engine) {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));

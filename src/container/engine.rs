@@ -91,8 +91,29 @@ pub trait ContainerEngine: Send + Sync {
     /// `wslc.exe` lives in the WSL install dir, not on PATH, so the
     /// wslc engine carries its resolved full path while the recorded
     /// identity stays `wslc`.
+    ///
+    /// Display/argv spelling only — spawning goes through
+    /// [`driver_command`](Self::driver_command) so the bound file
+    /// identity is re-verified first; a `program()` string carried to
+    /// `Command::new` elsewhere would reopen the path unchecked.
     fn program(&self) -> &str {
         self.name()
+    }
+
+    /// A spawnable command on this engine's bound driver —
+    /// `BoundDriver` re-verifies the file identity at construction, so
+    /// a CLI replaced since resolution fails closed here instead of
+    /// executing with launcher privileges. Backends that must spawn
+    /// the engine CLI directly (monitoring, attestation, teardown)
+    /// use this — never `Command::new(engine.program())`. The default
+    /// implementation serves test engines, which carry no pin.
+    fn driver_command(&self) -> std::io::Result<tokio::process::Command> {
+        Ok(tokio::process::Command::new(self.program()))
+    }
+
+    /// [`driver_command`](Self::driver_command) for blocking spawns.
+    fn driver_std_command(&self) -> std::io::Result<StdCommand> {
+        Ok(StdCommand::new(self.program()))
     }
 
     /// The unit-level signal this substrate prefers for Ctrl-C
@@ -289,7 +310,7 @@ pub(crate) fn container_run_args_ext(
 
 /// Shared implementation for `ContainerEngine::run` used by Docker and Podman.
 fn spawn_container_run<'a>(
-    engine_cmd: &'a str,
+    driver: &'a crate::trusted_path::BoundDriver,
     image: &'a str,
     options: &'a [&'a str],
     stdin_pipe: bool,
@@ -297,7 +318,10 @@ fn spawn_container_run<'a>(
     Box::pin(async move {
         let option_owned: Vec<String> = options.iter().map(|s| (*s).to_string()).collect();
         let args = container_run_args(&option_owned, image);
-        let mut cmd = tokio::process::Command::new(engine_cmd);
+        // `tokio_command` re-verifies the bound identity at spawn — a
+        // driver swapped since resolution refuses instead of launching
+        // the workload under a substituted binary.
+        let mut cmd = driver.tokio_command()?;
         cmd.args(&args);
         if stdin_pipe {
             cmd.stdin(std::process::Stdio::piped());
@@ -434,8 +458,11 @@ pub(crate) async fn bounded_cmd_output(
 /// template — a bare `json` keyword is rejected as "invalid format".
 /// Callers parse the result with [`engine_info_os`] or kata's runtime
 /// probe, so a plain-text `info` answer is unusable here.
-async fn run_info(engine_cmd: &str, format: Option<&str>) -> Result<String, EngineError> {
-    let mut cmd = tokio::process::Command::new(engine_cmd);
+async fn run_info(
+    driver: &crate::trusted_path::BoundDriver,
+    format: Option<&str>,
+) -> Result<String, EngineError> {
+    let mut cmd = driver.tokio_command()?;
     cmd.arg("info");
     if let Some(format) = format {
         cmd.args(["--format", format]);
@@ -448,7 +475,7 @@ async fn run_info(engine_cmd: &str, format: Option<&str>) -> Result<String, Engi
     if !output.status.success() || !text.trim_start().starts_with('{') {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         return Err(EngineError::CommandFailed {
-            engine: engine_cmd.into(),
+            engine: driver.program().into(),
             message: if stderr.trim().is_empty() {
                 text.trim().to_string()
             } else {
@@ -489,13 +516,17 @@ fn image_build_args(
 }
 
 /// `<cli> <args…>` shared by the engine `build`/`tag`/`remove_image`
-/// implementations — `cli` is the spawned program (a resolved path
-/// when the binary is not on PATH), `name` the engine identity error
-/// text reports. A nonzero exit is `CommandFailed` quoting stderr;
-/// engines whose CLI can exit 0 on a failed command (wslc) are the
-/// caller's problem — verify with `inspect`.
-async fn run_cli_args<S: AsRef<str>>(cli: &str, name: &str, args: &[S]) -> Result<(), EngineError> {
-    let mut cmd = tokio::process::Command::new(cli);
+/// implementations — `cli` is the bound driver (identity re-verified
+/// inside `tokio_command`), `name` the engine identity error text
+/// reports. A nonzero exit is `CommandFailed` quoting stderr; engines
+/// whose CLI can exit 0 on a failed command (wslc) are the caller's
+/// problem — verify with `inspect`.
+async fn run_cli_args<S: AsRef<str>>(
+    cli: &crate::trusted_path::BoundDriver,
+    name: &str,
+    args: &[S],
+) -> Result<(), EngineError> {
+    let mut cmd = cli.tokio_command()?;
     cmd.args(args.iter().map(|a| a.as_ref()));
     // Tail-bounded drains — a build flood cannot grow memory, and the
     // failure text a nonzero exit quotes is at the stream's end.
@@ -512,7 +543,7 @@ async fn run_cli_args<S: AsRef<str>>(cli: &str, name: &str, args: &[S]) -> Resul
 /// `<cli> <subcmd> -f <dockerfile> -t <tag> --network=none [--no-cache] <ctx>`
 /// shared by the engine `build` implementations.
 async fn run_image_build(
-    cli: &str,
+    cli: &crate::trusted_path::BoundDriver,
     name: &str,
     subcmd: &str,
     dockerfile_path: &str,
@@ -573,11 +604,31 @@ fn drain_pipe(
 /// while the child runs; on timeout the child is killed and reaped;
 /// on exit the collected output is received within the same deadline —
 /// a descendant holding a pipe open can never park the probe.
+/// Raw-spelling variant retained for the probe-machinery tests;
+/// production callers spawn through [`bounded_driver_output`].
+#[cfg(test)]
 pub(crate) fn bounded_cli_output(
     prog: &str,
     args: &[&str],
 ) -> std::io::Result<std::process::Output> {
-    let mut cmd = StdCommand::new(prog);
+    bounded_cli_output_cmd(StdCommand::new(prog), args)
+}
+
+/// [`bounded_cli_output`] on a bound driver — `std_command` re-verifies
+/// the pinned file identity first, so an executable replaced since
+/// resolution fails closed before spawn rather than answering the
+/// probe as a substitute.
+pub(crate) fn bounded_driver_output(
+    driver: &crate::trusted_path::BoundDriver,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    bounded_cli_output_cmd(driver.std_command()?, args)
+}
+
+fn bounded_cli_output_cmd(
+    mut cmd: StdCommand,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
     cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

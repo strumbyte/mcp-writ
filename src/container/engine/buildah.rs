@@ -3,29 +3,30 @@
 //! launch has no container execution dialect here).
 
 use super::{
-    BoxFuture, ContainerEngine, EngineError, bounded_cli_output, bounded_cmd_output,
+    BoxFuture, ContainerEngine, EngineError, bounded_cmd_output, bounded_driver_output,
     confirm_image_removed, run_cli_args, run_image_build, run_info,
 };
+use crate::trusted_path::BoundDriver;
 
 pub struct BuildahEngine {
-    /// The validated canonical path bound at [`BuildahEngine::resolve`]
-    /// — every subprocess this engine spawns names this exact binary so
-    /// a mutable-PATH or writable-directory substitution can never slip
-    /// a replacement under the resolved identity.
-    exe: String,
+    /// The driver bound at [`BuildahEngine::resolve`] — the validated
+    /// canonical path *plus* the pinned file identity. Every
+    /// subprocess re-verifies that identity before spawning, so a
+    /// binary replaced after resolution fails closed rather than
+    /// running under the resolved name.
+    exe: BoundDriver,
 }
 
 impl BuildahEngine {
-    /// Resolve `buildah` on PATH once to a validated canonical path —
-    /// the only moment PATH is consulted. A hit in a location a
-    /// different user could rewrite refuses rather than falling
-    /// through: the same-name shadow is the substitution this
-    /// resolution exists to close.
+    /// Resolve `buildah` to a bound executable — the one moment PATH is
+    /// consulted, under the administrator provenance class: a hit in
+    /// a caller-managed directory refuses rather than falling
+    /// through (the same-name shadow is the substitution this
+    /// resolution exists to close), and `MCP_WRIT_BUILDAH_EXE`
+    /// supplies an explicit path instead.
     pub fn resolve() -> Result<Self, EngineError> {
         let exe = crate::trusted_path::resolve_cli("buildah").map_err(EngineError::NotAvailable)?;
-        Ok(Self {
-            exe: exe.to_string_lossy().into_owned(),
-        })
+        Ok(Self { exe })
     }
 
     /// A test stand-in with a caller-chosen program spelling — never
@@ -33,7 +34,7 @@ impl BuildahEngine {
     #[cfg(test)]
     pub(crate) fn for_test(exe: &str) -> Self {
         Self {
-            exe: exe.to_string(),
+            exe: BoundDriver::for_test(exe),
         }
     }
 }
@@ -44,7 +45,15 @@ impl ContainerEngine for BuildahEngine {
     }
 
     fn program(&self) -> &str {
-        &self.exe
+        self.exe.program()
+    }
+
+    fn driver_command(&self) -> std::io::Result<tokio::process::Command> {
+        self.exe.tokio_command()
+    }
+
+    fn driver_std_command(&self) -> std::io::Result<std::process::Command> {
+        self.exe.std_command()
     }
 
     fn build<'a>(
@@ -70,7 +79,7 @@ impl ContainerEngine for BuildahEngine {
 
     fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(async move {
-            let mut cmd = tokio::process::Command::new(&self.exe);
+            let mut cmd = self.exe.tokio_command()?;
             cmd.args(["inspect", "--type=image", image]);
             let output = bounded_cmd_output(&mut cmd, true).await?;
             if !output.status.success() {
@@ -117,7 +126,7 @@ impl ContainerEngine for BuildahEngine {
     }
 
     fn is_available(&self) -> bool {
-        bounded_cli_output(&self.exe, &["--version"])
+        bounded_driver_output(&self.exe, &["--version"])
             .map(|o| o.status.success() && super::version_answers_as(&o, "buildah"))
             .unwrap_or(false)
     }

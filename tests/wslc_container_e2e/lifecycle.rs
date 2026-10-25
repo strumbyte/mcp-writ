@@ -6,7 +6,6 @@ use std::process::Stdio;
 use std::time::Instant;
 
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
 use crate::common;
@@ -49,7 +48,7 @@ async fn wslc_stop_terminates_and_cleans_up() {
     let dirs = blocking(session_dirs).await;
     let name = format!("mcp-writ-wslc-stop-{}", std::process::id());
     let launch_id = uuid::Uuid::now_v7().to_string();
-    let mut child = Command::new(wslc_prog())
+    let mut child = wslc_tokio()
         .args(session_run_args(
             &dirs, &launch_id, &contract, &name, &secure,
         ))
@@ -84,8 +83,8 @@ async fn wslc_stop_terminates_and_cleans_up() {
     let unit_id = blocking({
         let name = name.clone();
         move || {
-            run_cli(
-                wslc_prog(),
+            run_command(
+                wslc_cmd(),
                 &["inspect", &name, "--format", "json"],
                 CLI_TIMEOUT_SECS,
             )
@@ -168,7 +167,7 @@ async fn wslc_cli_death_and_launch_failure() {
 
     // ── CLI death mid-session ──────────────────────────────────────
     let name = format!("mcp-writ-wslc-clideath-{}", std::process::id());
-    let mut child = Command::new(wslc_prog())
+    let mut child = wslc_tokio()
         .args([
             "run",
             "-i",
@@ -384,7 +383,7 @@ async fn wslc_perf_stats() {
     let mut entered = false;
     if seeded {
         let t = Instant::now();
-        let mut enter = Command::new(wslc_prog())
+        let mut enter = wslc_tokio()
             .args([
                 "system",
                 "session",
@@ -548,7 +547,7 @@ async fn wslc_storage_layout() {
     let seeded = blocking(move || seed_session_store(&seed_dir)).await;
     let before = dir_listing(&storage);
     let mut enter = seeded.then(|| {
-        Command::new(wslc_prog())
+        wslc_tokio()
             .args([
                 "system",
                 "session",

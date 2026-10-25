@@ -770,7 +770,14 @@ impl AppContainerSandbox {
                 "CheckNetIsolation.exe not found in System32".to_string(),
             )
         })?;
-        let output = std::process::Command::new(tool)
+        let output = tool
+            .std_command()
+            .map_err(|e| {
+                WardenError::sandbox_setup(
+                    SandboxStage::Apply,
+                    format!("CheckNetIsolation.exe re-verification failed: {e}"),
+                )
+            })?
             .args(["LoopbackExempt", "-a", &format!("-n={}", self.profile_name)])
             .output()
             .map_err(|e| {

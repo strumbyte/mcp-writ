@@ -312,20 +312,40 @@ kata|apple-container|hyperv|windows-sandbox`, or an OCI container on
 
 **Driver and helper resolution.** Every executable that prepares or
 attests an isolation boundary is resolved once, to a trusted absolute
-path, before any subprocess runs: `docker`/`podman`/`buildah`/Apple's
-`container` resolve through PATH exactly once into a canonical path —
-a hit in a directory a different user could rewrite refuses instead of
-becoming the driver, and the bound path (never the bare name) serves
-every later probe, build, launch, and teardown. Windows OS helpers are
-resolved by their system-directory spelling only — `wsl`/`wslc`/`wsb`
-under `%ProgramFiles%\WSL`, the Store package location, or `System32`
-(`tasklist.exe`, `sc.exe`, `netsh.exe`, `powershell.exe`,
-`CheckNetIsolation.exe`) — never PATH or the current directory, since
-a shadow binary found through caller-mutable search order would run
-with the launcher's full host authority before any sandbox exists.
-The `MCP_WRIT_*_EXE` fixture overrides must name an absolute existing
-file; an invalid or relative override reads as *absent*, never a
-fall-through.
+path, before any subprocess runs. `docker`/`podman`/`buildah`/Apple's
+`container` resolve through PATH exactly once — under *administrator
+provenance*: every component of the resolved path must be replaceable
+only by an administrator principal (root-owned and not caller-writable
+on Unix; owned by SYSTEM/Administrators/TrustedInstaller with no DACL
+grant that hands an untrusted trustee write, delete, or ACL control on
+Windows). A hit the caller itself can rewrite — including one the
+caller merely owns — refuses instead of becoming the driver, and never
+falls through to a later PATH entry of the same name: the shadow is
+the attack, not a miss. Resolution binds the validated *object*, not
+just the spelling: the canonical path is pinned by file identity plus
+size/mtime (and on Windows by a share-read-only handle held for the
+binding's lifetime), and that identity is re-verified immediately
+before every spawn, so a driver swapped or rewritten between
+resolution and a probe, build, launch, monitor, or teardown step fails
+closed rather than executing under the resolved name. Windows OS
+helpers are bound the same way and resolved by their system-directory
+spelling only —
+`wsl`/`wslc`/`wsb` under `%ProgramFiles%\WSL`, the Store package
+location, or `System32` (`tasklist.exe`, `sc.exe`, `netsh.exe`,
+`powershell.exe`, `CheckNetIsolation.exe`) — never PATH or the current
+directory, since a shadow binary found through caller-mutable search
+order would run with the launcher's full host authority before any
+sandbox exists; every helper spawn re-verifies the pinned object first,
+so a one-shot helper carries the same fail-closed contract as a
+long-lived driver. The `MCP_WRIT_*_EXE` fixture overrides must name an
+absolute existing file and still pass the same replacement-gap checks
+under the caller class (the setter already controls its own files); an
+invalid or relative override reads as *absent*, never a fall-through.
+`MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS=1` downgrades driver resolution to
+the caller class for test rigs and developer installs that run engines
+from user-owned prefixes — a production launch must never set it,
+since it re-opens exactly the pre-containment substitution this
+hardening closes.
 
 **Machine-readable matrix.** `mcp-writ capability-matrix` prints the
 same claims as JSON — one row per sandbox mechanism with its egress-layer

@@ -442,12 +442,17 @@ fn is_available_does_not_panic() {
 
 // -- Trusted driver resolution (F5/F6) --------------------------------------
 
-/// A PATH-hit driver binds once, to a canonical absolute path — the
-/// resolved engine's  is that path, never the bare name a
-/// later PATH mutation could re-resolve to a different binary.
+/// A caller-owned PATH hit is not administrator provenance — the
+/// default `Admin` class refuses it outright, before the binary ever
+/// executes (the scan's exact scenario: a fake driver in a
+/// caller-writable dir must never run as the isolation boundary's
+/// setup tool). The explicit unsafe opt-out restores the
+/// pre-hardening `Caller` class and binds the hit, and an explicit
+/// `MCP_WRIT_<NAME>_EXE` override binds under the caller class too —
+/// both are operator intent, never ambient PATH behavior.
 #[cfg(unix)]
 #[test]
-fn resolve_binds_the_first_path_hit_as_an_absolute_path() {
+fn resolve_cli_refuses_a_caller_managed_path_hit_by_default() {
     use std::os::unix::fs::PermissionsExt;
     let _env = crate::warden::lock_process_env();
     let dir = tempfile::tempdir().unwrap();
@@ -461,14 +466,58 @@ fn resolve_binds_the_first_path_hit_as_an_absolute_path() {
     unsafe {
         std::env::set_var("PATH", std::env::join_paths(&split).unwrap());
     }
-    let resolved = crate::trusted_path::resolve_cli("mcpwrit-fake-docker");
+    let result = crate::trusted_path::resolve_cli("mcpwrit-fake-docker");
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         std::env::set_var("PATH", &old_path);
     }
-    let resolved = resolved.expect("a caller-owned PATH hit resolves");
-    assert_eq!(resolved, exe.canonicalize().unwrap());
-    assert!(resolved.is_absolute());
+    if !crate::fspriv::running_as_root() {
+        result.expect_err("a caller-owned PATH hit must refuse under Admin");
+    }
+    // Under euid 0 the outcome is environment-dependent: the caller-owned
+    // leaf is root-owned, but an ancestor like a world-writable /tmp is
+    // still an Admin gap — so no assertion is meaningful for root.
+    // The unsafe development opt-out binds the same hit under the
+    // caller class — never silently, always the operator's choice.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        std::env::set_var(crate::trusted_path::ALLOW_REPLACEABLE_DRIVERS_ENV, "1");
+        std::env::set_var("PATH", std::env::join_paths(&split).unwrap());
+    }
+    let resolved = crate::trusted_path::resolve_cli("mcpwrit-fake-docker");
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        std::env::remove_var(crate::trusted_path::ALLOW_REPLACEABLE_DRIVERS_ENV);
+        std::env::set_var("PATH", &old_path);
+    }
+    let bound = resolved.expect("the unsafe opt-out binds a caller-managed hit");
+    assert_eq!(bound.path(), exe.canonicalize().unwrap().as_path());
+    assert!(bound.path().is_absolute());
+}
+
+/// An explicit `MCP_WRIT_<NAME>_EXE` override supplies the driver path
+/// — it replaces PATH resolution entirely and binds under the caller
+/// class (the setter already controls the process's files).
+#[cfg(unix)]
+#[test]
+fn resolve_cli_binds_the_explicit_override_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env = crate::warden::lock_process_env();
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("mcpwrit-override-tool");
+    std::fs::write(&exe, "#!/bin/sh\necho fake\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        std::env::set_var("MCP_WRIT_MCPWRIT-OVERRIDE-TOOL_EXE", &exe);
+    }
+    let resolved = crate::trusted_path::resolve_cli("mcpwrit-override-tool");
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        std::env::remove_var("MCP_WRIT_MCPWRIT-OVERRIDE-TOOL_EXE");
+    }
+    let bound = resolved.expect("an explicit override path binds");
+    assert_eq!(bound.path(), exe.canonicalize().unwrap().as_path());
 }
 
 /// The same-name shadow is the attack: a  in a world-writable
