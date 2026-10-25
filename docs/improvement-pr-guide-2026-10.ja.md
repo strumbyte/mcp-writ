@@ -6,13 +6,15 @@
 
 方針更新: 2026-10-16 — 外部レビュー対応（改善計画 §8）として PR-17〜29 を追加する。PR-17〜22 を v0.5+ の到達条件に加える。PR-17 以降の事実・行番号は `9203e2c` のコード読解で照合した（ビルド・テストは未実行）。
 
+方針更新: 2026-10-26 — 実運用検証フィードバック対応（改善計画 §9）として PR-30〜36 を追加する。v0.5.0 のタグは止めず、次版の範囲とする。PR-30 以降の事実・行番号は `41d23e3` のコード読解で照合し、PR-30 の事象のみ Windows ホストのデバッグビルド（`cargo build --locked`）で `run --help` / `generate-policy --help` を実行して再現した（テストは未実行）。
+
 状態: **計画のみ**。各PRの実装・環境更新・コミット・ブランチ作成・push・GitHub PR作成は、別途指示があるまで行いません。以下の共通手順にある実装・PR操作は、将来の実装着手時の手順です。
 
 [改善計画](improvement-plan-2026-10.ja.md)を目的・範囲・ロードマップの正とし、本書をPR単位の作業順序の正とします。基準コミットは `562ea185`（v0.2.0 tip）。対象箇所が基準から変わった場合は、本書の事実・依存・試験を更新します。
 
 本書のPR番号は本計画内の番号です。旧手順書 [archive/implementation-pr-guide.ja.md](archive/implementation-pr-guide.ja.md) のPR-01〜32とは無関係です。
 
-ロードマップ対応: PR-01〜08 が v0.3（§2 全部＋§1.1／§1.2／§1.3(a)／§1.6／§2.5）、PR-09〜13 が v0.4（§1.3(c)／§1.3(b)／§1.5／§3.3 Windows／§3.1）、PR-14〜16 が v0.5+（§5.1-5.2／netns 本番化／§1.7 継続評価）に対応します。PR-17〜29 は外部レビュー対応（§8）で、P0 の PR-17〜22 は v0.5+ に必須、P1 の PR-23〜26 は v0.5+ に含める範囲をリリース時に判断（PR-16 の残存限界を解消する PR-26a はリリース前対応として含める）、P2 の PR-27〜29 は次版以降です。各リリースでバージョンを上げる条件と手順は、作業の流れの中のリリース節（[v0.3.0](#release-v0-3)／[v0.4.0](#release-v0-4)／[v0.5+](#release-v0-5)）に記載します — その時点で確認するものなので、先読みは不要です。
+ロードマップ対応: PR-01〜08 が v0.3（§2 全部＋§1.1／§1.2／§1.3(a)／§1.6／§2.5）、PR-09〜13 が v0.4（§1.3(c)／§1.3(b)／§1.5／§3.3 Windows／§3.1）、PR-14〜16 が v0.5+（§5.1-5.2／netns 本番化／§1.7 継続評価）に対応します。PR-17〜29 は外部レビュー対応（§8）で、P0 の PR-17〜22 は v0.5+ に必須、P1 の PR-23〜26 は v0.5+ に含める範囲をリリース時に判断（PR-16 の残存限界を解消する PR-26a はリリース前対応として含める）、P2 の PR-27〜29 は次版以降です。PR-30〜36 は実運用検証フィードバック対応（§9）で、すべて次版以降（v0.5.0 のタグは止めない）です。各リリースでバージョンを上げる条件と手順は、作業の流れの中のリリース節（[v0.3.0](#release-v0-3)／[v0.4.0](#release-v0-4)／[v0.5+](#release-v0-5)）に記載します — その時点で確認するものなので、先読みは不要です。
 
 ## 共通手順
 
@@ -117,6 +119,13 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 - [PR-27 監査ログの再オープンと、容量が尽きたときの扱い](#pr-27)
 - [PR-28 ポリシー v3 — 既定は追加、置換は明示、複数 profile](#pr-28)
 - [PR-29 unsafe の Safety 注記と lint](#pr-29)
+- [PR-30 サブコマンドの `--help` を当該サブコマンドの内容にする](#pr-30)
+- [PR-31 `check` の REVIEW 案内と、ディスパッチャ型ドラフトの冒頭説明](#pr-31)
+- [PR-32 生成ドラフトへのランタイム既定の投入（インタプリタの読み取り許可・環境変数の雛形）](#pr-32)
+- [PR-33 許可リストの環境変数の実在診断](#pr-33)
+- [PR-34 `tools_list.filtered` の outcome と、outcome 値域の文書化](#pr-34)
+- [PR-35 原因の切り分けに使う理由文とヒント（init-order・namespaced の環境制約）](#pr-35)
+- [PR-36 `check` のポリシー版移行情報](#pr-36)
 
 外部レビュー対応（PR-17〜29）の依存と順序は次のとおりです。
 
@@ -138,6 +147,20 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 | PR-29 | P2 | PR-18・PR-26 の後 | `src/warden` |
 
 PR-17 を最初に実施し、後続 PR の検証結果を信頼できるものにします。PR-18〜22 は変更先が分かれているので並行できます。ただし PR-18 で追加する UNIX ソケットの opt-in 属性は `overlay.rs` で PR-19 と重なるため、PR-19 を先にマージします。
+
+実運用検証フィードバック対応（PR-30〜36、改善計画 §9）の依存と順序は次のとおりです。
+
+| PR | 優先度 | 依存・順序 | 主な変更先 |
+|---|---|---|---|
+| PR-30 | P1 | 最初に実施（範囲が小さく、初めての利用者の体験に直接効く） | `src/cli/mod.rs`、`src/cli/parse_*.rs`、`src/cli/tests_parse.rs`、README 英日 |
+| PR-31 | P1 | なし | `src/legislator/policy_generator.rs`、`src/policy/review.rs`、`src/commands/check.rs`、`src/enforcement/check.rs`、guide 英日 |
+| PR-32 | P2 | PR-31 の後（`policy_generator.rs` が重なる）。D-7 の判断で着手を決める | `src/legislator/policy_generator.rs`、`src/legislator/source_bind/workload.rs`、`examples/policies/runtime` |
+| PR-33 | P1 | なし | `src/warden/env.rs`、`src/warden/plan/mod.rs`、`src/runtime/launch.rs`、guide 英日 |
+| PR-34 | P1 | なし。D-9 の判断で値を確定する | `src/auditor/proxy_tools_list.rs`、guide 英日、`docs/archive/migration.{md,ja.md}` |
+| PR-35 | P1 | なし。D-10 の判断でプローブ項目の追加を決める | `src/policy/mcp.rs`、`src/auditor/proxy_c2s/forward.rs`、`src/warden/namespaced/{spawn,probe,report}.rs`、`src/warden/select.rs`、guide 英日 |
+| PR-36 | P2 | PR-31 の後（`check.rs` が重なる） | `src/commands/check.rs`、`src/commands/policy_resolve.rs`、`src/enforcement/check.rs`、guide 英日 |
+
+PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が分かれているので並行できます。PR-32 と PR-36 は PR-31 と変更先が重なるため、PR-31 のマージ後に着手します。
 
 <a id="pr-01"></a>
 
@@ -1126,6 +1149,178 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 **完了条件:** lint の対象にしたモジュールで、注記の無い unsafe ブロックが無い。→ `warden::namespaced` で充足。残りの warden モジュールへの段階展開は本PRのスコープ外（完了条件は対象モジュールに限る記述どおり）
 
 **移行・戻し方:** 挙動は変えない。→ 実際、差分はコメント・属性と probe.rs 失敗パスの防御的修正のみ — 成功経路の挙動は不変
+
+<a id="pr-30"></a>
+
+### PR-30 サブコマンドの `--help` を当該サブコマンドの内容にする
+
+対応論点: §9 V-1。直接依存: なし。着手・公開条件: P1 — 次版。範囲が小さく初めての利用者の体験に直接効くため、§9 の中で最初に実施する。
+
+**目的:** 各サブコマンドの `--help` が、そのサブコマンド自身の Usage・オプション・位置引数・使用例を示すようにする。トップレベルの `--help` は従来どおり全サブコマンドを列挙する。
+
+**再現（2026-10-26・Windows ホスト・`41d23e3` のデバッグビルド）:** `mcp-writ run --help` は `Usage: mcp-writ ... run [OPTIONS] <COMMAND>` の後に `Commands:` として `plan`〜`policy` の 14 件を列挙し、その後ろに `run` のオプションを出す。`generate-policy --help` も同様に、後から登録された `capability-matrix`〜`policy` を列挙する。原因は [cli/mod.rs](../src/cli/mod.rs) `608-690` 行が全サブコマンドの `noargs::cmd(..).take()` を dispatch の前に無条件で実行していること — noargs は一致した cmd の後にログへ残った `Cmd` エントリを「Commands:」として描画する。`-- <command>` は noargs に渡す前に `parse_from` が分割している（`mod.rs:582-587`）ため、help のどこにも出ない。
+
+**主な変更先:** [cli/mod.rs](../src/cli/mod.rs)（dispatch）、[parse_run.rs](../src/cli/parse_run.rs)・[parse_gen_policy.rs](../src/cli/parse_gen_policy.rs)・[parse_check.rs](../src/cli/parse_check.rs)・[parse_plan.rs](../src/cli/parse_plan.rs)・[parse_inspect.rs](../src/cli/parse_inspect.rs)（位置引数の説明と使用例）、[tests_parse.rs](../src/cli/tests_parse.rs)、README 英日（サブコマンド表の例を help と揃える場合）
+
+**タスク**
+
+- [ ] 修正前に失敗する再現試験を書く: `run --help` の出力に `Commands:` と兄弟サブコマンド名（`plan`、`run-image`、`policy` など）が含まれないこと、Usage 行が `run` 自身の形（`mcp-writ run [OPTIONS] -- <command> [args...]`）であること。`generate-policy --help`・`check --help`・`plan --help`・`inspect --help` も同様。トップレベル `--help`（`test_help_includes_all_subcommands`）と `capability-matrix --help`（`test_capability_matrix_help`）は現状維持を対で固定する。
+- [ ] `parse_from` の dispatch を「`cmd().take()` して一致したら即 dispatch」の逐次形に改める。一致した時点で残りの `cmd()` を登録しないので、noargs のログに後続の `Cmd` が残らず「Commands:」が消える。`mcp-writ --help`（どれも一致しない）は全部登録されるため従来どおり。`capability-matrix` の特例（`finish()` の command check が最後に take した cmd を見る N-01 回避、`mod.rs:632-640`・`716-740`）は、一致した cmd が常に最後の take になるため不要になる — 特例を外しても bare 起動と `--help` の試験が通ることを確認し、通らなければ特例を残す。
+- [ ] `-- <command> [args...]` を help に出す。`parse_from` は noargs より前に `--` で分割しているため noargs は `command` を知らない。`run`・`plan`・`generate-policy`・`check`・`inspect` の各 parser で help 用に位置引数の説明（noargs の `arg(..)` と `.doc()`、または `app_description` 末尾の Usage 補足）を登録し、値の取り込みは従来どおり分割済みの `command` を使う（解析結果は変えない）。どの描画にするかは noargs 0.4.3 の `arg().example()` の出力を見て担当PRで決める。
+- [ ] `run` と `generate-policy` の help 末尾に最小の流れを載せる（noargs の `.example()` による「Example:」節、または doc 末尾の固定文）。quickstart と同じ順にする: `generate-policy --live-discovery --output draft.kdl -- node server.js` → ドラフトをレビュー → `plan --policy draft.kdl -- node server.js` → `run --policy draft.kdl --dry-run --audit-log audit.jsonl -- node server.js` → `run --policy draft.kdl --audit-log audit.jsonl --report report.json -- node server.js`。
+- [ ] 既存のコマンド名・フラグ名・短縮名は変えない。`run --help` に `--policy`・`--audit-log`・`--report`・`--dry-run`、`generate-policy --help` に `--live-discovery`・`--static-only`・`--output` の説明が出ることを試験で固定する（レポートの受け入れ条件）。
+
+**検証:** T-BASE（`tests_parse.rs` は lib テスト）。加えて `tests/containerize_e2e.rs:221`・`tests/wrap_image_e2e.rs:94` の `--help` 試験、`tests/capability_matrix.rs` が通ること。
+
+**完了条件:** 各サブコマンドの `--help` に兄弟サブコマンドが出ず、自身のオプション・位置引数・使用例が出る。トップレベルの `--help` は不変。
+
+**移行・戻し方:** 解析結果（`CliOutput`）は変えない。help の文面だけの変更。
+
+<a id="pr-31"></a>
+
+### PR-31 `check` の REVIEW 案内と、ディスパッチャ型ドラフトの冒頭説明
+
+対応論点: §9 V-2b・V-2c（改善案 2 の第 2・3 段）。直接依存: なし。着手・公開条件: P1 — 次版。
+
+**目的:** 未解決の REVIEW 項目ごとに「なぜ判断が要るか」と「代表的な解消方法」を `check` が示す。ディスパッチャ型サーバーのドラフト冒頭で、静的に結び付かない理由と運用者が引き受ける確認事項を具体的に書く。`check` の判定（`status`・終了コード）と、ドラフトの KDL としての意味は変えない。
+
+**主な変更先:** [policy_generator.rs](../src/legislator/policy_generator.rs)（マーカー文面・冒頭 NOTE）、[policy/review.rs](../src/policy/review.rs)（種別台帳）、[commands/check.rs](../src/commands/check.rs)、[enforcement/check.rs](../src/enforcement/check.rs)（`ReviewMarkerRecord`）、guide 英日 §4.3・§4.15、policy-authoring 英日
+
+**タスク**
+
+- [ ] REVIEW マーカーの種別台帳を 1 箇所に置く（例: `policy::review::MarkerKind`）。現行テンプレートから起こす種別: `unbound-tool`（根拠なしで `deny=#true` 出力、`policy_generator.rs:261`・`334`・`366`）、`blocked-capability`（検出したが excess として遮断）、`schema-unsupported`（`args_schema` 省略、`145`）、`hash-pin-host`（ハッシュは生成ホストのもの、`424`）、`regenerate-on-update`（`427`）、`unbound-workload`（`unbound_reasons`、`445`）、`syscall-analysis`（`569`・`575`）、`syscall-blocked`（`653`・`665`）、`baseline-dropped`（`708`）、`interpreter-baseline`（`712`）、`non-linux-abi`（`718`）、`network-outbound`（`763`）、`datagram`（`784`）、`header`（`// REVIEW all entries before deploying`）、`custom`（一致なし）。各種別に `why`（判断が必要な理由）と `how`（代表的な解消方法。guide の節への参照を含めてよい）の固定文を持たせる。
+- [ ] 分類は `check` 側でマーカー本文の先頭一致で行うが、既知の種別を示す型トークンが一致した直後に明示的な区切り（行末・`:`・空白）がある場合に限りその種別とし、既知の接頭辞で始まるだけのカスタム文は `custom` に留める（`review.rs:130-140` が `REVIEW` トークンに `:`・空白の区切りを要求するのと同じ規則）。生成側も同じ台帳の文面でマーカーを出す。`// REVIEW:` の書式は変えない（走査規則を維持）。ユニットテストで、生成側の全テンプレートが意図した種別（`custom` 以外）に分類されること、および既知の文面の接頭辞で始まるカスタム文が `custom` のままであることを固定し、文面の変更が分類から漏れないようにする。
+- [ ] `check` の JSON の `review_markers[]` に `kind`・`why`・`how` を追加する。`schema_version` は `"1"` のまま（メンバー追加は互換、読み手は未知メンバーを許容する既存の規約）。guide §4.15 の Result JSON の説明に追記する。
+- [ ] stderr の要約は、マーカーごとに `file:line: text` の次行に `why` と `how` を出す。同じ種別が多数あるときは種別ごとに件数と案内を 1 回にまとめる（表示上限の扱いは担当PRで決める）。全体の remediation（`check.rs:644-650`）は「種別ごとの次の判断」の列挙に置き換え、未解決項目ごとに次に何を決めればよいかが読めるようにする。
+- [ ] ディスパッチャ型の冒頭 NOTE（`policy_generator.rs:83-88`）を具体化する: (1) ツール名が文字列リテラルとしてハンドラに結び付いていないため、能力分析（syscall・文字列・マニフェスト）をツール単位に対応付けられず `allowed`/`blocked` の判定を立てられない、(2) そのため許可判断はツール単位で運用者が行う — 必要なツールだけ `deny=#true` を外す、(3) 整合性の拠り所は `tools-list-hash` pin — `--live-discovery` で取得した一覧の digest が pin され、以後 `check`/`run` が一覧の変化を検知する。サーバー更新時は別ファイルに再生成して差分レビュー、(4) guide の該当節（Case C・§8.2）への参照。英日 guide §4.3 にも同じ説明を置く。
+- [ ] 全件 deny でない（部分的に根拠なし）ドラフトでも、根拠なしツールの件数を冒頭に出す（現状は全件のときだけ NOTE）。
+
+**検証:** T-BASE、T-POLICY（`tests/policy_check_e2e.rs`）、T-DOC。REVIEW 種別ごとの fixture ポリシーで JSON の `kind`/`why`/`how` と stderr を固定し、`check` の `status`・終了コードが変わらないことを既存の `policy_check_e2e` で確認する。
+
+**完了条件:** `check` の出力から、未解決項目ごとに必要な判断と解消方法が読める。全件 deny ドラフトの冒頭だけで、ディスパッチャ型の事情と次の手順が分かる。
+
+**移行・戻し方:** JSON はメンバー追加のみ。生成ドラフトはコメントの変更のみで、KDL の意味は変わらない。
+
+<a id="pr-32"></a>
+
+### PR-32 生成ドラフトへのランタイム既定の投入（インタプリタの読み取り許可・環境変数の雛形）
+
+対応論点: §9 V-2a（改善案 2 の第 1 段）。直接依存: PR-31（`policy_generator.rs` が重なる）。着手・公開条件: P2 — 次版以降。D-7 の判断で着手を決める。
+
+**目的:** インタプリタ実行のサーバーで、生成ドラフトから「動くポリシー」までの手作業を減らす。既定で出す内容は、起動 argv から解決した事実に根拠を持つものに限り、ネットワーク宛先と環境変数の値は推定しない。
+
+**前提（HEAD）:** `examples/policies/runtime/{node,python}.kdl` が雛形で、PR-21 以降の `generate-policy` は検出したインタプリタ（`WorkloadHashes.interpreter`）の seccomp ベースラインを同ファイルから無条件で投入する（`policy_generator.rs:511-535`・`668-700`）。`build_fs_section`（`470-508`）は二進の文字列分析由来のパス（`/usr/lib`・`/etc/ssl`・`/etc/pki`・`/lib`）しか出さず、`node.kdl` のコメントが「host policy が付けるべき」と列挙する読み取り先（実行ファイルのディレクトリと親、パッケージツリー、データディレクトリ）は出ない。`environment` ブロックは出ない。
+
+**主な変更先:** [policy_generator.rs](../src/legislator/policy_generator.rs)（`build_fs_section`、新 `build_environment_section`）、[source_bind/workload.rs](../src/legislator/source_bind/workload.rs)（`WorkloadHashes` に解決済みパス）、`examples/policies/runtime/*.kdl` の注記、guide 英日 §4.3、policy-authoring 英日
+
+**タスク**
+
+- [ ] `WorkloadHashes` に、解決済みのインタプリタ実行ファイルのパスとペイロード（entrypoint）のパスを載せる（hash line が持つ `target=` と同じ値を使う）。
+- [ ] `build_fs_section` にインタプリタ由来の読み取り許可を投入する: 実行ファイルのディレクトリとその親（インストール prefix）、ペイロードを含むパッケージツリー（Node: entrypoint から上に辿った最寄りの `node_modules` の親、または `package.json` のあるディレクトリ。Python: entrypoint のディレクトリと venv / `site-packages` の prefix）。各行に `// seeded from resolved interpreter: <path>` の由来コメントと REVIEW を付け、`runtime/node.kdl` のコメントが列挙する項目を網羅する。既存の文字列分析由来の行と二重にしない。D-7 の推奨どおりフラグ gate は設けない（代替案を採る場合は `--runtime-baseline <node|python>` を追加し、未指定時の出力を現状と同一に保つ）。
+- [ ] `environment` ブロックの雛形を、コメントアウトした候補として出す（例: `// environment { allow "NODE_EXTRA_CA_CERTS" "SSL_CERT_FILE" "HTTPS_PROXY" "NO_PROXY" }` と `// REVIEW: enable only the names this server reads`）。有効な KDL としては投入しない（fail-closed を保つ）。候補はランタイム別の固定リストに限り、親環境を走査して名前を集めることはしない。
+- [ ] 雛形を適用しない経路（native バイナリ、分類不能な起動）の出力が現状と同一であることを snapshot 試験で固定する。
+
+**検証:** T-BASE、T-POLICY、`tests/self_test.rs`、`tests/real_servers_e2e.rs`（Node / Python 系サーバーで、生成直後のドラフト＋最小の手編集で enforced run が起動すること）。
+
+**完了条件:** インタプリタ実行のサーバーで、生成ドラフトの syscall・ファイル読み取りが不足して起動拒否にならない。雛形を適用しない経路の出力は不変。
+
+**移行・戻し方:** 生成側のみの変更。追加した読み取り許可は由来コメント付きで、運用者が削れる。
+
+<a id="pr-33"></a>
+
+### PR-33 許可リストの環境変数の実在診断
+
+対応論点: §9 V-3（改善案 3）。直接依存: なし。着手・公開条件: P1 — 次版。D-8 のとおり欠落で起動を失敗させるオプションは設けない。
+
+**目的:** 許可リストに入れた環境変数が親環境に存在したか、値がパスを指す場合にそのパスが実在したかを、plan・起動レポート・監査に名前で残す。値は残さない。起動は止めない。
+
+**主な変更先:** [warden/env.rs](../src/warden/env.rs)、`src/warden/mod.rs`（`SpawnOptions` / spawn 結果）、[warden/plan/mod.rs](../src/warden/plan/mod.rs)（`launch.env` の理由文と観測）、[runtime/launch.rs](../src/runtime/launch.rs)（`server.connected` の details、stderr 警告）、[enforcement/model.rs](../src/enforcement/model.rs)（観測の構造化フィールドが必要な場合）、guide 英日 §4.8・監査スキーマ、`tests/environment_e2e.rs`、`tests/plan_report_e2e`
+
+**タスク**
+
+- [ ] `spawn_env_pairs`（`env.rs:188-200`）が、許可名ごとの状態を返す構造を足す（例: `EnvContractReport { present: Vec<String>, missing: Vec<String>, path_missing: Vec<String> }`）。値は構造に入れない。
+- [ ] 値がパスらしい変数の実在確認: 値が単一の絶対パス（PATH 区切りを含まない）のとき `metadata()` で存在を確認し、無ければ `path_missing` に名前を入れる。記録するのは名前と有無だけで、値・パス文字列は記録しない。対象を全許可名にするか名前規則（`*_FILE`・`*_CERTS`・`*_BUNDLE`・`*_PATH` など）に限るかは担当PRで決める（既定は全許可名、単一絶対パスの値に限る）。
+- [ ] plan の `launch.env` の理由文（`plan/mod.rs:255-279`）を「base set + N allowlisted name(s): K present, M missing (missing: A, B; path missing: C)」の形にする。present/missing の結果は plan 実行時点の親環境のスナップショットであり、`plan` と `run` は別プロセスで動き得るため実起動時の環境とは異なりうる。実起動時の状態は起動レポート側の観測が反映する。
+- [ ] 起動レポートの `launch.env` 観測（`plan/mod.rs:388-410`）に同じ内容を載せ、`server.connected` の details に `env_missing=A,B env_path_missing=C` を加える（`runtime/launch.rs:861-865` の `env=inherit-parent` と同じ位置。名前はポリシー検証済みのため追加のエンコードは不要だが、`encode_audit_field_value` を通すかは PR-23 の規約に合わせて担当PRで決める）。
+- [ ] 起動時に stderr へ 1 行の警告を出す（`warning: allowlisted environment variable(s) not set in the parent environment: A, B`）。`--report` と JSONL が同じ事実を指すことを照合する（「PRを閉じるとき」の規則）。
+- [ ] guide 英日に「欠落は観測として残し、起動は止めない。厳格運用が必要なら CI で `plan` の `launch.env` を検査する」と書く（D-8）。
+
+**検証:** T-BASE、T-NATIVE（`environment_e2e`・`diagnostics_e2e`・`plan_report_e2e`）。許可名を意図的に欠いた起動で、plan・report・`server.connected` の 3 面に名前が残り、値が残らないことを fixture で固定する（値に秘密らしい文字列を入れ、report と audit に現れないことを assert する）。
+
+**完了条件:** 許可リストの変数を意図的に欠いた起動で、レポートにその変数が欠けていたことが記録される。変数の値はレポートにも監査にも記録されない。
+
+**移行・戻し方:** 観測の追加のみ。起動判定と子環境の中身は変えない。
+
+<a id="pr-34"></a>
+
+### PR-34 `tools_list.filtered` の outcome と、outcome 値域の文書化
+
+対応論点: §9 V-4（改善案 4）。直接依存: なし。着手・公開条件: P1 — 次版。D-9 の判断で値を確定する。
+
+**目的:** 執行が設計どおりに働いた出来事が監査で `failure` に数えられないようにする。本物の検証失敗（ハッシュ不一致、blocked な `tools_list.verified`）は `failure` のまま。
+
+**主な変更先:** [proxy_tools_list.rs](../src/auditor/proxy_tools_list.rs)（`862-871` と同ファイルの tests）、`tests/tool_enforcement_e2e.rs`、`tests/real_servers_e2e.rs`、guide 英日（監査スキーマの `outcome` 行、`tools_list.filtered` の段落、outcome の値域表）、`docs/archive/migration.{md,ja.md}`
+
+**タスク**
+
+- [ ] D-9 の推奨に従い、`tools_list.filtered` の outcome を `success` にする（通常実行: `action=denied`、`--dry-run`: `action=observed`）。severity・details は変えない。
+- [ ] outcome の値域（`success` / `failure` / `unknown`）と各イベントでの意味を guide 英日の監査スキーマ節に表で固定する: `failure` は「要求された操作が完了しなかった」（`tool_call.denied`、`mcp_message.denied`、`hash.mismatch`、blocked な `tools_list.verified`、`sandbox.*_denied` など）、`success` は「操作が完了した」（`tool_call.allowed`、`tools_list.filtered` = 整形済み応答の送達 など）、`unknown` は観測不能。監視側への指針として「拒否の検出は `action=denied` で行い、`outcome=failure` を異常の指標にしない」を書く。
+- [ ] 新値 `enforced` は追加しない（D-9 の代替案 (a)）。追加する判断になった場合は `Outcome` の列挙（[audit_log/event.rs](../src/audit_log/event.rs) `151-165`）と JSON の値域（`guide.md:2521`）を同時に更新する。
+- [ ] 既存試験（`proxy_tools_list.rs:1358-1520`、`tool_enforcement_e2e.rs:1360`・`1537`、`real_servers_e2e.rs:1305`）の期待値を更新し、blocked な `tools_list.verified` が `failure` のままであることを対で固定する。
+- [ ] PR-23 の `version=` → `revision=` と同様に、`docs/archive/migration.{md,ja.md}` に「`tools_list.filtered` の outcome が `failure` → `success`」を監査スキーマの表記変更として記録し、リリースノートに引き継ぐ。
+
+**検証:** T-BASE、T-PROTOCOL。
+
+**完了条件:** 許可ツールだけを残すフィルタリングの監査が `outcome=success` になり、ハッシュ不一致などの検証失敗は `failure` のまま。outcome の値域と割当が文書から読める。
+
+**移行・戻し方:** 値の変更は 1 イベント種別のみ。`outcome=failure` で拒否を数えていた消費者は `action=denied` へ切り替える（移行ガイドに記載）。
+
+<a id="pr-35"></a>
+
+### PR-35 原因の切り分けに使う理由文とヒント（init-order・namespaced の環境制約）
+
+対応論点: §9 V-5a・V-5b（改善案 5）。直接依存: なし（`select.rs` は PR-26a 以降変更なし）。着手・公開条件: P1 — 次版。D-10 の判断でプローブ項目の追加を決める。
+
+**目的:** 拒否・失敗の判定は変えず、原因の切り分けに使える一文を加える。あわせて、起動前プローブが検査しない環境制約（proc の再マウント）を検査対象に加え、`auto` が設計表どおりに native へ回れるようにする（D-10）。
+
+**主な変更先:** [policy/mcp.rs](../src/policy/mcp.rs)（`DenyReason` の説明文）、[proxy_c2s/forward.rs](../src/auditor/proxy_c2s/forward.rs)（クライアント向けエラー文、`238`・`775`）、[proxy_s2c.rs](../src/auditor/proxy_s2c.rs)（`452` 付近の S2C 側 init-order）、[namespaced/spawn.rs](../src/warden/namespaced/spawn.rs)（`ERR <stage>` のヒント）、[namespaced/probe.rs](../src/warden/namespaced/probe.rs)・[namespaced/report.rs](../src/warden/namespaced/report.rs)・[warden/select.rs](../src/warden/select.rs)（D-10）、guide 英日（§7 障害切り分け表、§4.11）、`tests/mcp_wire_e2e`、`tests/linux_mechanism_e2e.rs`
+
+**タスク**
+
+- [ ] `DenyReason::InitOrder` の理由文を、期待する順序を含む形にする: `request denied (init-order): "<method>" arrived before the session was initialized — send initialize, wait for its result, send notifications/initialized, then other requests`。`DenyReason` に固定文を返す `explain()` を足し、forward.rs の `request denied ({reason})` で理由コードの後ろに付ける。監査の `reason=init-order` と details は変えない。stderr にも 1 行出すかは担当PRで決める（要求ごとに出ると多いので、セッションごと初回のみが候補）。S2C 側の init-order も同じ文面にする。
+- [ ] 他の `DenyReason` にも同じ仕組みで短い説明を付けられるようにする。今回は init-order だけ文面を書く（`unsupported-version`・`frame-too-large` は既に文面がある）。
+- [ ] namespaced の `ERR <stage> errno=N`（`spawn.rs:121-122`・`215-217`）を解釈し、既知の組合せにヒントを付ける: `proc-mount` + EPERM → 「新しい user+pid 名前空間で proc を再マウントするには、現在の `/proc` が完全に見えている必要がある。コンテナや入れ子のユーザー名前空間の内側（`/proc` の一部がマスクされた環境）ではカーネルが EPERM で拒むため、製品の不具合ではなく環境側の制約。このホストでは `--linux-mechanism native` を使う」。`uid_map`・`unshare` + EPERM → 既存の WSL2 / sysctl の説明（`init.rs:170`）を同じ形式で出す。ステージ名と errno はそのまま残す。
+- [ ] D-10: 起動前プローブに `proc_mount` を加える。`probe_grandchild`（`probe.rs:160-205`）で `unshare` の後、init と同じ `MS_REC|MS_PRIVATE` の処理に続けて `mount("proc", "/proc", "proc", 0, NULL)` を試し、失敗を `failed_stage=proc_mount` として報告する（プローブは自分の mountns を持つので host の `/proc` には影響しない）。`ProbeReport.missing()` に `proc_mount` を加え、`select.rs` の `requires`、`report.rs` の JSON（`missing` の列挙）、guide の `plan.mechanism` の説明（`guide.md:829`）に反映する。`auto` は namespaced 不可として native（要求を満たす場合）へ回り、`namespaced` 明示指定は拒否 — いずれも理由に `proc_mount` が出る。
+- [ ] guide 英日の障害切り分け表（§7「How do I tell whether a failure came from …」）に init-order と proc-mount の行を足す。
+
+**検証:** T-BASE、T-PROTOCOL、`tests/mcp_wire_e2e`（init-order の文面）、`tests/linux_mechanism_e2e.rs`（WSL2 実機で `proc_mount=true` の既存レグが通ること。`proc_mount=false` は fixture の probe 結果で選択を固定する）。入れ子のユーザー名前空間での実機再現はレポート側の環境に依るため、再現できなければ未確認と記録する。
+
+**完了条件:** 再現手順どおりに操作したときに新しい理由文とヒントが出る。判定（拒否・選択）は D-10 の `auto` → native の経路以外は変わらない。
+
+**移行・戻し方:** 文面の追加のみ。D-10 はプローブ項目の追加で、従来「起動時に失敗していた」環境が「選択時に native へ回る」ようになる — Linux の方式選択の設計表の規定どおりで、`namespaced` 明示指定の拒否は変えない。
+
+<a id="pr-36"></a>
+
+### PR-36 `check` のポリシー版移行情報
+
+対応論点: §9 V-6（改善案 6）。直接依存: PR-31（`check.rs` が重なる）、PR-28（`--version-diff`、マージ済み）。着手・公開条件: P2 — 次版以降。
+
+**目的:** version 1 / 2 のポリシーを `check` したとき、version 3 で合成結果が変わる箇所の有無を情報として出す。移行の強制や自動書き換えはしない。
+
+**主な変更先:** [commands/policy_resolve.rs](../src/commands/policy_resolve.rs)（`compute_version_diff` / `VersionDiff` の共有化、`200-330`）、[commands/check.rs](../src/commands/check.rs)、[enforcement/check.rs](../src/enforcement/check.rs)（`CheckReport` に `migration`）、guide 英日 §4.15、`tests/policy_check_e2e.rs`
+
+**タスク**
+
+- [ ] `compute_version_diff` / `VersionDiff` を `check` から呼べる場所に移す（`commands` 内の共有モジュール、または `policy::version_diff`）。T-LAYER の依存方向を確認する。
+- [ ] `check` で bound policy の `version < 3` のとき、v3 で再解決した差分を `migration` オブジェクトとして JSON に載せる: `{declared_version, candidate_version: 3, status: "unchanged" | "fields_differ" | "simulation_failed", fields: [{field, declared, simulated}], reason}`。`status`・`reason_code`・終了コードは変えない（`warnings` と同じ情報扱い）。version 3 のポリシーでは `migration` を `null` にする。
+- [ ] stderr に情報行を 1 つ出す: `info: policy version 2 — N field(s) would compose differently under version 3 (see policy resolve --version-diff)`、差が無ければ `… composes identically under version 3`。
+- [ ] guide 英日 §4.15 に `migration` の説明と「移行は任意。`policy resolve --version-diff` で差分を確認してから `policy version=3` に書き換える」を追記する。
+
+**検証:** T-BASE、T-POLICY（`policy_check_e2e` に v2 ポリシーの `migration` 出力と、`status` 不変の対を追加）。
+
+**完了条件:** version 2 のポリシーに対する `check` の出力に移行に関する情報が含まれ、ポリシーの読み込みと執行の結果が変わらない。
+
+**移行・戻し方:** JSON のメンバー追加のみ。
 
 ## 実装結果として残す記録
 

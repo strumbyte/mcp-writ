@@ -336,7 +336,7 @@ PartiallyEnforced/NotEnforced）、適用 controls 数、スキップした gran
 | **v0.3** | §2 全部（監査完全性）+ §1.1 スキーマ + §1.2 DNS ゲート単体 + §1.3(a) IP 層 PoC + §1.6 emit 経路 + §2.5 PSEC JSONL |
 | **v0.4** | §1.3(c) netns プロキシ PoC（TCP/UDP 宛先制御・DNS ゲート強制・迂回/障害試験）+ §1.3(b) eBPF opt-in + §1.5 macOS プロキシ経路 + §3.3 Windows 既定化/ARM64 + §3.1 capability matrix |
 | **v0.5+** | §5.1-5.2 ポリシー運用 + netns プロキシの本番化・能力に応じた方式選択（native は要求を満たす場合のみ）+ §1.7 残存リスクの継続評価 + §8 の P0（必須）・P1（含める範囲はリリース時に判断） |
-| **次版以降** | §8 の P2（監査ログの再オープン・ポリシー v3・unsafe 注記） |
+| **次版以降** | §8 の P2（監査ログの再オープン・ポリシー v3・unsafe 注記）+ §9 実運用検証フィードバック（PR-30〜36。v0.5.0 のタグは止めない） |
 
 ## 7. 非目標（継続）
 
@@ -588,3 +588,42 @@ merge #67）のコードと照合して計画化したもの。PR 単位の作�
 - D-4: **推奨案を採用**。PR-23 で `2025-06-18` は非対応のまま診断のみを改善（`unsupported-version` で fail-closed、3 面の診断に交渉版と対応版を記録）。版の追加は閉じたメソッド台帳への追加として別途判断する。
 - D-5: **推奨案を採用**。PR-24 の継承警告と `policy resolve` を運用し、その結果を見てから PR-28（`policy version=3`）の着手を判断する。v0.5 では着手しない。
 - D-6: **代替案を採用**。PR-22 のコーパス（公式 7 件 + playwright / chrome-devtools の計 9 サーバー・109 ツール）で全 CC 規則がクリーンだったため、ツール単位の免除は実装しない（`--fail-on` の全体設定のみ）。将来ツール単位の扱いを導入する場合は、ボルトオン型の免除ではなくツール単位の許可モデルへの再設計として検討する（リリースオーナー判断）。
+
+## 9. 実運用検証フィードバック対応（2026-10-26 追加）
+
+2026-10-26 に受け取った実運用検証レポートの改善案 6 件を、HEAD `41d23e3`（PR-82〜85 のマージ後、0.5.0）のコードと照合して計画化したもの。レポートの検証範囲は、`41d23e3` からビルドした 0.5.0 を Node.js 製の実在 MCP サーバー（複数ファイルの ESM 構成、ツール 12 件）に対して、ポリシー生成 → dry-run → Landlock＋seccomp の enforced run → 許可ツール 1 件の実呼び出しまで通したもの。PR 単位の作業は [PR別実装手順書](improvement-pr-guide-2026-10.ja.md) の PR-30〜36。
+
+- 照合はコード読解と、Windows ホストでの `cargo build --locked` ＋ `mcp-writ run --help` / `mcp-writ generate-policy --help` の実行による。実行で再現したのは改善案 1 のみで、テストは未実行。
+- namespaced 経路はレポート側でも未検証（検証環境が入れ子のユーザー名前空間の中にあった）。本節は namespaced 経路のデータプレーンの実装変更を含まない。ただし改善案 5 の環境制約ヒントに付随して、起動前プローブの検査項目追加（D-10）を判断事項として挙げる。
+- fail-closed の原則（決めていないことは通さない、失敗時は安全側に倒れる）を利便性のために崩す変更は含めない。各 PR の「移行・戻し方」で、その PR が計画する変更の範囲外では既定の出力・判定が変わらないことを完了条件に含める。計画された変更自体（help 出力・`launch.env` の観測・outcome 値・方式選択など）は、その PR の完了条件に照らして検証する。
+- 優先度は §8.1 の基準に従う。いずれも v0.5.0 のタグ前には必須としない（§6 の「次版以降」）。
+
+### 9.1 照合結果
+
+| ID | 改善案（レポート） | HEAD での判定 | 優先度 | PR |
+|---|---|---|---|---|
+| V-1 | サブコマンドの `--help` が、そのサブコマンドのオプションではなく兄弟サブコマンドの一覧を示す（改善案 1） | **確認（再現済み）**。原因は [cli/mod.rs](../src/cli/mod.rs) `608-690` 行が 15 個の `noargs::cmd(..).take()` を dispatch の前に無条件で実行していること。noargs は一致した cmd より後にログに残った `Cmd` を「Commands:」として描画し、Usage も `mcp-writ ... run [OPTIONS] <COMMAND>` になる。当該サブコマンドのオプション自体は Commands の後ろに出ている（`tests_parse.rs:155` の `--fail-on` 検査が通る理由）が、`-- <command>` の位置引数は Usage にも Arguments にも出ない | P1 | PR-30 |
+| V-2a | ランタイム別の雛形を生成ドラフトの選択肢として同梱する（改善案 2-1） | **一部実装済み**。`examples/policies/runtime/{node,python}.kdl` が雛形で、PR-21 以降の `generate-policy` は検出したインタプリタの seccomp ベースラインを同ファイルから自動投入する（[policy_generator.rs](../src/legislator/policy_generator.rs) `511-535`・`668-700`）。残る空白は、インタプリタ実行に必要なファイル読み取り（解決済みの interpreter prefix・パッケージツリー）と、環境変数の許可リストの雛形。ネットワーク宛先は推定しない（設計） | P2 | PR-32 |
+| V-2b | `check` の未解決 REVIEW 項目に「判断が必要な理由」と「代表的な解消方法」を付ける（改善案 2-2） | **確認**。`check` は `review_markers[]` に file/line/text を列挙し、remediation は全体で 1 行（[check.rs](../src/commands/check.rs) `644-650`）。マーカー文は `policy_generator.rs` の固定テンプレート（約 15 種）から出るので、種別の分類と案内文の対応表を生成側と check 側で共有できる | P1 | PR-31 |
+| V-2c | ディスパッチャ型サーバーの説明をドラフト冒頭で具体化する（改善案 2-3） | **一部実装済み**。全件 deny のときの NOTE（`policy_generator.rs:83-88`）はあるが、静的に結び付けられない理由と、運用者が引き受ける確認事項（`tools-list-hash` pin を整合性の拠り所にする、live discovery の再実行、ツール単位の許可判断）は書いていない。部分的に根拠なしのドラフトでは件数も出ない | P1 | PR-31 |
+| V-3 | 許可リストの環境変数の実在を起動時に診断する（改善案 3） | **確認**。[warden/env.rs](../src/warden/env.rs) `188-200` は親環境に無い名前を黙ってスキップし、plan の `launch.env` は件数のみ（[warden/plan/mod.rs](../src/warden/plan/mod.rs) `255-279`）、`server.connected` の details は `env=inherit-parent` の有無のみ（[runtime/launch.rs](../src/runtime/launch.rs) `861-865`）。欠落した名前はどこにも残らない | P1 | PR-33 |
+| V-4 | `tools_list.filtered` の outcome が `failure` で記録される（改善案 4） | **確認（設計どおり）**。[proxy_tools_list.rs](../src/auditor/proxy_tools_list.rs) `862-871` が `tool_call.denied` と同じ規約で `Outcome::Failure` を付け、guide 英日（`guide.md:2586-2597`、`guide.ja.md:1589`）がその理由を明記している。ただし `tool_call.denied` が要求自体をエラーで拒むのに対し、`tools_list.filtered` は `tools/list` 要求が成功して整形済みの応答が届いている点で事情が異なり、監視側が failure を異常に数えるという指摘は妥当 | P1 | PR-34 |
+| V-5a | init-order 拒否の理由文に期待する順序を含める（改善案 5-1） | **確認**。クライアントには `request denied (init-order)` だけが返る（[proxy_c2s/forward.rs](../src/auditor/proxy_c2s/forward.rs) `238`・`775`）。期待順序（initialize → initialized 通知 → 通常要求）は guide の障害切り分け表にも無い | P1 | PR-35 |
+| V-5b | namespaced 初期化の `/proc` マウント EPERM に環境制約のヒントを付ける（改善案 5-2） | **確認**。[namespaced/init.rs](../src/warden/namespaced/init.rs) `1006-1026` は `ERR proc-mount errno=1` を返し、[spawn.rs](../src/warden/namespaced/spawn.rs) `121-122` がそれを `init post-GO failure: ERR proc-mount errno=1` として伝えるだけ。起動前プローブ（[probe.rs](../src/warden/namespaced/probe.rs) `160-205`）は `unshare` と TUN までしか検査せず proc の再マウント可否を見ないため、`auto` は namespaced を選んだ後に起動拒否になり native へ回らない（**新規**。方式選択の設計表では「namespaced が利用不可なら native」） | P1 | PR-35 |
+| V-6 | version 2 ポリシーの移行判断材料を `check` が出す（改善案 6） | **確認**。PR-28 の `policy resolve --version-diff`（[policy_resolve.rs](../src/commands/policy_resolve.rs) `279-330`）が同じ計算を持つが、`check` からは呼ばれない。`check` は `policy.version` を audit context として JSON に載せるだけ | P2 | PR-36 |
+
+レポートの受け入れ条件との差分:
+
+- V-2a は「雛形の明示指定」ではなく、起動 argv から解決した事実（インタプリタの prefix・パッケージツリー）に根拠を持つ読み取り許可だけを投入し、環境変数はコメントアウトした候補に留める（D-7）。宛先・値を推定しない点は同じ。
+- V-3 の「欠落を失敗にするオプション」は今回設けない（D-8）。
+- V-4 は新しい outcome 値（`enforced`）を足さず、`tools_list.filtered` の outcome を `success` に改めて値域と割当を文書化する（D-9）。
+- V-5b は表示の改善に加えて、起動前プローブに proc 再マウント可否を加える（D-10）。これは `auto` の選択結果を変える（従来は起動時に失敗していた環境で native を選ぶ）ため、判断事項として分ける。
+
+### 9.2 判断事項
+
+| ID | 論点 | 推奨 | 代替 |
+|---|---|---|---|
+| D-7 | ドラフトへのインタプリタ用ファイル読み取り許可の自動投入をフラグで gate するか | gate しない。解決済みの interpreter prefix とパッケージツリーは起動 argv から得た事実で、PR-21 が無条件で投入する syscall ベースラインと同じ根拠を持つ。投入した行には由来コメントと REVIEW を付け、運用者が削れるようにする | `--runtime-baseline <node\|python>` の明示指定時のみ投入し、未指定時の出力は現状と同一に保つ |
+| D-8 | 許可リストの環境変数が親環境に無いときに起動を失敗させるオプションを設けるか | 今回は設けない。欠落は plan・report・監査に名前で残し、値は残さない。厳格運用が必要なら CI で `plan` の `launch.env` を検査する。必要になった時点で `environment { require "NAME" }` のようなポリシー属性として別途設計する | `run --strict-env` を追加する |
+| D-9 | `tools_list.filtered` の outcome | `success` に改める（action は `denied` / dry-run は `observed` のまま）。`tools/list` 要求は成功して応答が届いているので、「outcome は要求された操作の結果」という現行の規約と整合する。要求をエラーで拒む `tool_call.denied`・`mcp_message.denied` と、`hash.mismatch`・`tools_list.verified` の blocked は `failure` のまま。outcome の値域と各イベントの割当を guide に表で固定し、「拒否の検出は `action=denied` で行う」を監視側の指針として書く | (a) 新値 `enforced` を追加する — 値域が広がり、`failure` で拒否を数えていた消費者の移行コストは同じ。(b) 全拒否イベントの outcome を「執行の成否」に再定義する — OCSF の status に近いが、`tool_call.denied` など複数イベントの破壊的変更になる |
+| D-10 | namespaced の起動前プローブに proc 再マウント可否を加えるか | 加える。プローブは新しい mountns の中で init と同じ手順で `mount("proc", ...)` を試し、失敗を `missing: ["proc_mount"]` として報告する。`auto` は方式選択の設計表どおり native（要求を満たす場合）へ回り、理由が plan / report に残る。`namespaced` 明示指定は従来どおり拒否 | プローブは変えず、起動失敗時のヒントだけを出す |
