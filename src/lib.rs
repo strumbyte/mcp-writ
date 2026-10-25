@@ -24,7 +24,7 @@ pub mod termutil;
 #[cfg(test)]
 mod testutil;
 pub mod tool_def;
-mod trusted_path;
+pub mod trusted_path;
 pub mod verifier;
 pub mod warden;
 pub mod workload;

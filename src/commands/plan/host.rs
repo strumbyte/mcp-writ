@@ -187,10 +187,10 @@ pub(super) async fn wslc_environment_checks() -> Vec<PlanCheck> {
     // wsl.cli — presence tier.
     let wsl = windows_probe::find_wsl();
     match &wsl {
-        Some(path) => checks.push(check(
+        Some(exe) => checks.push(check(
             "wsl.cli",
             PlanCheckStatus::Pass,
-            Some(format!("wsl.exe resolved at {}", path.display())),
+            Some(format!("wsl.exe resolved at {}", exe.path().display())),
         )),
         None => checks.push(failing_check(
             "wsl.cli",
@@ -401,14 +401,14 @@ pub(super) async fn wslc_environment_checks() -> Vec<PlanCheck> {
                         format!(
                             "wslc.exe resolved at {} but `--version` produced no \
                              output — the entity is present but unverified",
-                            exe.display()
+                            exe.path().display()
                         ),
                         "verify the wslc.exe install answers --version".to_string(),
                     ));
                 } else {
                     let detail = format!(
                         "wslc.exe resolved at {} — version: {}",
-                        exe.display(),
+                        exe.path().display(),
                         crate::container::windows_probe::abbreviate(first, 120)
                     );
                     // The launch path pins the validated 3.0.x line — an
@@ -453,7 +453,7 @@ pub(super) async fn wslc_environment_checks() -> Vec<PlanCheck> {
                 "wslc.cli",
                 format!(
                     "wslc.exe resolved at {} but `--version` failed: {error}",
-                    exe.display()
+                    exe.path().display()
                 ),
                 "verify the wslc.exe install — a binary that cannot report its \
                  version is not a usable contract"

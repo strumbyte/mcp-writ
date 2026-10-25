@@ -1,9 +1,10 @@
 //! WslcEngine — WSL Containers (`wslc.exe`) on a Windows host.
 
 use super::{
-    BoxFuture, ContainerEngine, EngineError, bounded_cli_output, bounded_cmd_output,
+    BoxFuture, ContainerEngine, EngineError, bounded_cmd_output, bounded_driver_output,
     container_run_args_ext, run_cli_args, run_image_build, run_info,
 };
+use crate::trusted_path::BoundDriver;
 
 /// The WSL Containers engine — the `wslc.exe` CLI shipped inside Store
 /// WSL (the substrate PR-28 validated and PR-29 wires into the launch
@@ -43,16 +44,18 @@ use super::{
 /// request, and the validated line (wslc 3.0.x ≥ 3.0.1) is pinned at
 /// resolve — anything else refuses.
 pub struct WslcEngine {
-    /// The resolved `wslc.exe`, spawned by full path.
-    exe: String,
+    /// The resolved `wslc.exe` bound by path *and* file identity —
+    /// every spawn re-verifies the pin so a binary replaced after
+    /// resolution fails closed.
+    exe: BoundDriver,
 }
 
 impl WslcEngine {
-    /// Resolve `wslc.exe` (fixture override → PATH → the WSL install
-    /// dir) and pin it to the validated 3.0.x line. An absent binary,
-    /// an unanswerable `--version`, and a version off the validated
-    /// line each refuse distinctly — never a silent substitute for
-    /// another engine.
+    /// Resolve `wslc.exe` (fixture override → the WSL install dir —
+    /// never PATH) and pin it to the validated 3.0.x line. An absent
+    /// binary, an unanswerable `--version`, and a version off the
+    /// validated line each refuse distinctly — never a silent
+    /// substitute for another engine.
     pub fn new() -> Result<Self, EngineError> {
         use crate::container::windows_probe as probe;
         let exe = probe::find_wslc().ok_or_else(|| {
@@ -63,9 +66,7 @@ impl WslcEngine {
                     .to_string(),
             )
         })?;
-        let engine = Self {
-            exe: exe.to_string_lossy().into_owned(),
-        };
+        let engine = Self { exe };
         let version = engine.probe_version()?;
         if !probe::wslc_version_supported(version) {
             let m = probe::WSLC_VALIDATED_MAJOR;
@@ -87,17 +88,19 @@ impl WslcEngine {
     #[cfg(test)]
     pub(crate) fn for_test(exe: &str) -> Self {
         Self {
-            exe: exe.to_string(),
+            exe: BoundDriver::for_test(exe),
         }
     }
 
     /// `wslc --version` → `(major, minor, patch)`. A bounded sync
     /// probe — `resolve_engine`/`is_available` are sync callers, and a
     /// wedged CLI is killed rather than stalling the launch; the
-    /// answer is a local version string (no session contact).
+    /// answer is a local version string (no session contact). The
+    /// bound identity is re-verified inside `bounded_driver_output`
+    /// before the probe spawns.
     fn probe_version(&self) -> Result<(u64, u64, u64), EngineError> {
         use crate::container::windows_probe as probe;
-        let output = bounded_cli_output(&self.exe, &["--version"]).map_err(|e| {
+        let output = bounded_driver_output(&self.exe, &["--version"]).map_err(|e| {
             EngineError::CommandFailed {
                 engine: "wslc".into(),
                 message: format!("`--version` probe failed: {e}"),
@@ -129,11 +132,14 @@ impl WslcEngine {
     /// Whether `wslc system session list` already shows the CLI-owned
     /// session (`wslc-cli-*`) `wslc run` auto-creates — the bounded
     /// read-only probe; a failed probe reads as absent, since warming
-    /// is cheap and hides nothing.
+    /// is cheap and hides nothing. A replaced binary counts as absent:
+    /// `run_probe` re-verifies the pin, and the follow-up `system
+    /// session run` fails its own re-verification instead of executing
+    /// the substitute.
     async fn default_session_listed(&self) -> bool {
         matches!(
             crate::container::windows_probe::run_probe(
-                std::path::Path::new(&self.exe),
+                &self.exe,
                 &["system", "session", "list"]
             )
             .await,
@@ -162,7 +168,7 @@ impl WslcEngine {
         // command runs in the session VM's own rootfs, where
         // `/bin/true` always exists; a timed-out client is killed by
         // kill_on_drop, and no unit exists to outlive it.
-        let mut warm_cmd = tokio::process::Command::new(&self.exe);
+        let mut warm_cmd = self.exe.tokio_command()?;
         warm_cmd.args(["system", "session", "run", "/bin/true"]);
         let warm = bounded_cmd_output(&mut warm_cmd, false);
         let output = tokio::time::timeout(std::time::Duration::from_secs(60), warm)
@@ -201,7 +207,15 @@ impl ContainerEngine for WslcEngine {
     }
 
     fn program(&self) -> &str {
-        &self.exe
+        self.exe.program()
+    }
+
+    fn driver_command(&self) -> std::io::Result<tokio::process::Command> {
+        self.exe.tokio_command()
+    }
+
+    fn driver_std_command(&self) -> std::io::Result<std::process::Command> {
+        self.exe.std_command()
     }
 
     fn interrupt_signal(&self) -> Option<&'static str> {
@@ -239,7 +253,7 @@ impl ContainerEngine for WslcEngine {
 
     fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(async move {
-            let mut cmd = tokio::process::Command::new(&self.exe);
+            let mut cmd = self.exe.tokio_command()?;
             cmd.args(["image", "inspect", image]);
             // Bounded drains keep an engine flood from growing
             // memory; kill_on_drop rides inside the helper.
@@ -311,7 +325,7 @@ impl ContainerEngine for WslcEngine {
                 ));
             }
             let run_args = container_run_args_ext(&prefix, &options, image);
-            let mut cmd = tokio::process::Command::new(&self.exe);
+            let mut cmd = self.exe.tokio_command()?;
             cmd.args(&run_args);
             if stdin_pipe {
                 cmd.stdin(std::process::Stdio::piped());

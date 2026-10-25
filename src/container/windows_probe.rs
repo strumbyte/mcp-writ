@@ -29,7 +29,7 @@
 //! alias, which names Apple's substrate driver and must not be
 //! conflated with it.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -38,7 +38,7 @@ use tokio::io::AsyncReadExt;
 /// Bound on each diagnostic subprocess — a wedged CLI must not stall
 /// `plan`.
 /// `pub(crate)` so the engine layer's synchronous CLI probes
-/// (`engine::bounded_cli_output`) share the same 5 s budget.
+/// (`engine::bounded_driver_output`) share the same 5 s budget.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-stream output cap — version/listing output is small; a flood
 /// stays bounded.
@@ -76,44 +76,54 @@ pub enum ProbeOutcome {
 }
 
 /// A diagnostics override resolves only through the same contract a
-/// trusted driver resolution does — absolute, canonical, regular, and
-/// replaceable by no untrusted principal ([`validate_driver_path`]).
-/// The environment variable authenticates *intent* (someone set it),
-/// not *the target*: an arbitrary planted path is reported absent,
-/// never run.
-fn override_exe(env_var: &str) -> Option<PathBuf> {
+/// trusted driver resolution does — validated and *bound* under the
+/// caller class (the setter already controls the process's own
+/// files). The environment variable authenticates *intent* (someone
+/// set it), not *the target*: an arbitrary planted path is reported
+/// absent, never run.
+fn override_exe(env_var: &str) -> Option<crate::trusted_path::BoundDriver> {
     let path = PathBuf::from(std::env::var_os(env_var)?);
-    crate::trusted_path::validate_driver_path(&path).ok()
+    crate::trusted_path::bind_driver(&path, crate::trusted_path::DriverTrust::Caller).ok()
 }
 
-/// Resolve an OS-owned probe helper to a trusted absolute path: the
-/// diagnostics override when set, else the first of `candidates` that
-/// validates — admin-writable install roots and `System32` spellings
-/// only, never PATH or the current directory. A helper found through
-/// caller-mutable search order would run with the launcher's host
-/// authority before any sandbox exists, so a PATH shadow is worth
-/// less than an honest *absent*: the presence tier means a resolved
-/// entity at a location a non-admin user cannot rewrite.
-fn helper_exe(env_var: &str, candidates: Vec<PathBuf>) -> Option<PathBuf> {
+/// Resolve an OS-owned probe helper to a *bound* trusted executable:
+/// the diagnostics override when set, else the first of `candidates`
+/// that binds *under the administrator provenance class* —
+/// admin-writable install roots and `System32` spellings only, never
+/// PATH or the current directory. A helper found through
+/// caller-mutable search order (or merely owned by the caller) would
+/// run with the launcher's host authority before any sandbox exists,
+/// so a caller-managed shadow is worth less than an honest *absent*:
+/// the presence tier means a resolved entity at a location a non-admin
+/// principal cannot rewrite — and the [`BoundDriver`] pin re-verifies
+/// that object at every probe spawn, so a helper swapped between
+/// resolution and spawn is a `Failed`, not a substitute answer.
+fn helper_exe(env_var: &str, candidates: Vec<PathBuf>) -> Option<crate::trusted_path::BoundDriver> {
     if std::env::var_os(env_var).is_some() {
         return override_exe(env_var);
     }
+    // Discovered install-root/System32 spellings need administrator
+    // provenance; the unsafe opt-out (fixture rigs, developer
+    // installs) downgrades to the caller class here too, so a staged
+    // caller-owned install root exercises the same resolution logic.
+    let trust = crate::trusted_path::driver_trust(None);
     candidates
         .into_iter()
-        .find_map(|p| crate::trusted_path::validate_driver_path(&p).ok())
+        .find_map(|p| crate::trusted_path::bind_driver(&p, trust).ok())
 }
 
-/// The `wsl.exe` binary — `MCP_WRIT_WSL_EXE` overrides for fixtures;
-/// otherwise the Store-WSL install root then `System32`. PATH is never
-/// consulted: the `%LOCALAPPDATA%\WindowsApps` app-execution alias
-/// that puts `wsl.exe` on PATH is per-user-writable, which is exactly
-/// the substitution this resolution refuses.
-pub fn find_wsl() -> Option<PathBuf> {
+/// The `wsl.exe` binary, bound — `MCP_WRIT_WSL_EXE` overrides for
+/// fixtures; otherwise the Store-WSL install root then `System32`.
+/// PATH is never consulted: the `%LOCALAPPDATA%\WindowsApps`
+/// app-execution alias that puts `wsl.exe` on PATH is per-user-
+/// writable, which is exactly the substitution this resolution
+/// refuses.
+pub fn find_wsl() -> Option<crate::trusted_path::BoundDriver> {
     helper_exe(
         WSL_EXE_ENV,
         [
             crate::trusted_path::wsl_install_dir().map(|d| d.join("wsl.exe")),
-            crate::trusted_path::system32_exe("wsl.exe"),
+            crate::trusted_path::system32_path("wsl.exe"),
         ]
         .into_iter()
         .flatten()
@@ -121,13 +131,13 @@ pub fn find_wsl() -> Option<PathBuf> {
     )
 }
 
-/// The `wslc.exe` binary — `MCP_WRIT_WSLC_EXE` overrides for fixtures;
-/// otherwise the Store-WSL install dir only — a stock payload drops
-/// `wslc.exe` under `%ProgramFiles%\WSL` without exporting it to PATH,
-/// and a PATH-visible `wslc.exe` is not a stock artifact to trust.
-/// The `container` alias is never tried: that name is Apple's
-/// substrate driver, not WSL Containers.
-pub fn find_wslc() -> Option<PathBuf> {
+/// The `wslc.exe` binary, bound — `MCP_WRIT_WSLC_EXE` overrides for
+/// fixtures; otherwise the Store-WSL install dir only — a stock
+/// payload drops `wslc.exe` under `%ProgramFiles%\WSL` without
+/// exporting it to PATH, and a PATH-visible `wslc.exe` is not a stock
+/// artifact to trust. The `container` alias is never tried: that name
+/// is Apple's substrate driver, not WSL Containers.
+pub fn find_wslc() -> Option<crate::trusted_path::BoundDriver> {
     helper_exe(
         WSLC_EXE_ENV,
         crate::trusted_path::wsl_install_dir()
@@ -174,20 +184,20 @@ pub fn wslc_version_supported(v: (u64, u64, u64)) -> bool {
 /// `wsl.exe --version` — the product/kernel version contract. Inbox
 /// WSL exits non-zero on `--version`: a `Failed`, not an `Absent` —
 /// presence of the binary and the version contract stay separate.
-pub async fn wsl_version(exe: &Path) -> ProbeOutcome {
+pub async fn wsl_version(exe: &crate::trusted_path::BoundDriver) -> ProbeOutcome {
     run_probe(exe, &["--version"]).await
 }
 
 /// `wsl.exe -l -v` — the registered distros and each one's WSL-1/2
 /// mode. Read-only: it lists registrations without launching anything.
-pub async fn wsl_distros(exe: &Path) -> ProbeOutcome {
+pub async fn wsl_distros(exe: &crate::trusted_path::BoundDriver) -> ProbeOutcome {
     run_probe(exe, &["-l", "-v"]).await
 }
 
 /// `wslc.exe --version` — the WSL Containers CLI's self-reported
 /// version. An answered CLI is still only the presence/version tier —
 /// the runtime contract stays unprobed.
-pub async fn wslc_version(exe: &Path) -> ProbeOutcome {
+pub async fn wslc_version(exe: &crate::trusted_path::BoundDriver) -> ProbeOutcome {
     run_probe(exe, &["--version"]).await
 }
 
@@ -197,7 +207,7 @@ pub async fn wslc_version(exe: &Path) -> ProbeOutcome {
 pub async fn wsb_store_version() -> ProbeOutcome {
     let Some(exe) = helper_exe(
         PWSH_EXE_ENV,
-        crate::trusted_path::system32_exe("WindowsPowerShell/v1.0/powershell.exe")
+        crate::trusted_path::system32_path("WindowsPowerShell/v1.0/powershell.exe")
             .into_iter()
             .collect(),
     ) else {
@@ -222,7 +232,7 @@ pub async fn wsb_store_version() -> ProbeOutcome {
 pub async fn host_edition() -> ProbeOutcome {
     let Some(exe) = helper_exe(
         REG_EXE_ENV,
-        crate::trusted_path::system32_exe("reg.exe")
+        crate::trusted_path::system32_path("reg.exe")
             .into_iter()
             .collect(),
     ) else {
@@ -243,8 +253,20 @@ pub async fn host_edition() -> ProbeOutcome {
 /// decoder still accepts the UTF-16 replies other builds emit.
 /// `pub(crate)` so the wslc engine's session-list probe shares the
 /// same bounded-read contract instead of re-implementing it.
-pub(crate) async fn run_probe(exe: &Path, args: &[&str]) -> ProbeOutcome {
-    let mut command = tokio::process::Command::new(exe);
+///
+/// The bound driver's identity is re-verified before spawn — a helper
+/// swapped or rewritten between resolution and this call is a
+/// `Failed`, never a substitute answer.
+pub(crate) async fn run_probe(
+    exe: &crate::trusted_path::BoundDriver,
+    args: &[&str],
+) -> ProbeOutcome {
+    let mut command = match exe.tokio_command() {
+        Ok(command) => command,
+        Err(e) => {
+            return ProbeOutcome::Failed(format!("driver re-verification failed: {e}"));
+        }
+    };
     command
         .args(args)
         .stdin(Stdio::null())
@@ -760,12 +782,22 @@ mod tests {
 
     /// The admin-writable install dir is the trusted spelling — a
     /// `wslc.exe` under `%ProgramFiles%\WSL` resolves without a PATH
-    /// lookup.
+    /// lookup. The fixture install root is caller-owned by
+    /// construction (a tempdir cannot fabricate admin provenance), so
+    /// the resolution runs under the unsafe opt-out's caller class —
+    /// the same downgrade a developer install uses.
     #[test]
     fn find_wslc_resolves_the_install_dir() {
         let _env = crate::warden::lock_process_env();
-        let pf = tempfile::tempdir().unwrap();
-        let wsl_dir = pf.path().join("WSL");
+        // Caller-class resolution walks every ancestor, so a host
+        // whose shared temp hierarchy grants replace rights to other
+        // named principals refuses the whole tree — skip there rather
+        // than assert an impossible pass.
+        if !crate::trusted_path::ambient_temp_passes_caller("wsl-probe") {
+            return;
+        }
+        let pf = crate::fspriv::create_private_tempdir("wsl-probe").unwrap();
+        let wsl_dir = pf.join("WSL");
         std::fs::create_dir_all(&wsl_dir).unwrap();
         let exe = wsl_dir.join("wslc.exe");
         std::fs::write(&exe, b"x").unwrap();
@@ -779,21 +811,24 @@ mod tests {
         let old_pf = std::env::var_os("ProgramFiles");
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
-            std::env::set_var("ProgramFiles", pf.path());
+            std::env::set_var("ProgramFiles", &pf);
+            std::env::set_var(crate::trusted_path::ALLOW_REPLACEABLE_DRIVERS_ENV, "1");
         }
-        // Validation returns the canonical spelling — tempdirs may sit
+        // Binding returns the canonical spelling — tempdirs may sit
         // behind a symlinked component (macOS /var → /private/var).
         assert_eq!(
-            find_wslc().as_deref(),
-            Some(exe.canonicalize().unwrap().as_path())
+            find_wslc().map(|b| b.path().to_path_buf()),
+            Some(exe.canonicalize().unwrap())
         );
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
+            std::env::remove_var(crate::trusted_path::ALLOW_REPLACEABLE_DRIVERS_ENV);
             match old_pf {
                 Some(v) => std::env::set_var("ProgramFiles", v),
                 None => std::env::remove_var("ProgramFiles"),
             }
         }
+        let _ = std::fs::remove_dir_all(&pf);
     }
 
     #[test]

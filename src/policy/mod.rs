@@ -678,10 +678,11 @@ impl Policy {
                 } else {
                     base_dir.join(file_path)
                 };
-                let content = crate::fspriv::read_bounded_text(&resolved, MAX_SCHEMA_FILE_BYTES)
-                    .map_err(|e| {
-                        format!("failed to read schema file '{}': {e}", resolved.display())
-                    })?;
+                let content =
+                    crate::fspriv::read_text_bounded_follow_links(&resolved, MAX_SCHEMA_FILE_BYTES)
+                        .map_err(|e| {
+                            format!("failed to read schema file '{}': {e}", resolved.display())
+                        })?;
                 tool.args_schema = Some(content);
             }
         }

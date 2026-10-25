@@ -105,12 +105,17 @@ pub(crate) const HYPERV_CAPABILITIES: BackendCapabilities = BackendCapabilities 
 
 /// `IsolationKind::HyperV` over a Windows docker engine.
 pub struct HypervBackend {
-    engine: Box<dyn ContainerEngine>,
+    /// Shared with the launch handle so its `kill`/`rm`/`inspect`
+    /// lifecycle commands also spawn through the bound, identity-
+    /// re-verified driver — never a bare program spelling.
+    engine: std::sync::Arc<dyn ContainerEngine>,
 }
 
 impl HypervBackend {
     pub fn new(engine: Box<dyn ContainerEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine: engine.into(),
+        }
     }
 }
 
@@ -279,11 +284,12 @@ pub(crate) fn image_version_check(
 /// the detail line only; the exit status — not localized output text —
 /// is what decides presence.
 async fn service_state(name: &str) -> Option<String> {
-    // `sc.exe` is resolved from System32 by absolute spelling — never
+    // `sc.exe` is resolved from System32 as a bound driver — never
     // PATH: a shadow service-control binary would answer (or drive)
-    // the daemon-presence probe with the launcher's host authority.
+    // the daemon-presence probe with the launcher's host authority,
+    // and `tokio_command` re-verifies the pin before spawn.
     let sc = crate::trusted_path::system32_exe("sc.exe")?;
-    let mut cmd = tokio::process::Command::new(sc);
+    let mut cmd = sc.tokio_command().ok()?;
     cmd.args(["query", name]);
     let out = tokio::time::timeout(
         SC_TIMEOUT,
@@ -607,7 +613,7 @@ impl IsolationBackend for HypervBackend {
             let child = self.engine.run(image, &option_refs, true).await?;
             let mut handle = EngineRunHandle::attach(
                 child,
-                self.engine.program(),
+                self.engine.clone(),
                 spec.unit_id_file.clone(),
                 spec.unit_name.clone(),
             )
@@ -631,9 +637,10 @@ impl IsolationBackend for HypervBackend {
             // process isolation on an engine that silently ignored the
             // flag) refuses here, before the workload is trusted.
             let verify = tokio::time::timeout(VERIFY_TIMEOUT, async {
-                // The resolved engine path, never the bare name — the
-                // applied-isolation read is part of the launch proof.
-                let mut cmd = tokio::process::Command::new(self.engine.program());
+                // The bound, identity-verified driver — never a bare
+                // program spelling — runs the applied-isolation read
+                // that is part of the launch proof.
+                let mut cmd = self.engine.driver_command()?;
                 cmd.args(["inspect", "--format", "{{.HostConfig.Isolation}}", &unit_id]);
                 crate::container::engine::bounded_cmd_output(&mut cmd, true).await
             })

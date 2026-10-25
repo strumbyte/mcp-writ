@@ -1,5 +1,5 @@
 //! ID-based Windows Sandbox management. Never infer ownership from PIDs.
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -9,27 +9,33 @@ use tokio::process::Command;
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTPUT_CAP: u64 = 64 * 1024;
 
-/// The `wsb.exe` management CLI resolved to a trusted absolute path —
+/// The `wsb.exe` management CLI resolved to a *bound* trusted path —
 /// the fixture override, `System32`, then the Windows Sandbox Store
 /// package's `InstallLocation` (queried through System32 PowerShell,
 /// bounded). Never PATH: a shadow `wsb.exe` found through
 /// caller-mutable search order would drive environment start/stop with
-/// the launcher's host authority before any sandbox exists.
-pub(super) async fn cli() -> Result<PathBuf, String> {
+/// the launcher's host authority before any sandbox exists. The
+/// returned [`BoundDriver`] pins the validated object's file identity —
+/// every `start`/`list`/`stop`/`connect` re-verifies it at spawn, so a
+/// `wsb.exe` swapped mid-session fails closed instead of driving the
+/// environment as a substitute.
+pub(super) async fn cli() -> Result<crate::trusted_path::BoundDriver, String> {
     if let Some(raw) = std::env::var_os("MCP_WRIT_WSB_EXE") {
         let path = PathBuf::from(raw);
-        // The override substitutes the trusted-path resolution — the
-        // same owner/DACL contract a driver candidate must pass, so an
-        // env-planted path in a broadly writable location refuses.
-        return crate::trusted_path::validate_driver_path(&path).map_err(|e| {
+        // The override substitutes the trusted-path resolution — bound
+        // under the caller class (a fixture spelling), so an
+        // env-planted path a different principal could replace refuses.
+        let trust = crate::trusted_path::driver_trust(Some("MCP_WRIT_WSB_EXE"));
+        return crate::trusted_path::bind_driver(&path, trust).map_err(|e| {
             format!(
                 "MCP_WRIT_WSB_EXE '{}' is not a trusted executable: {e}",
                 crate::termutil::sanitize_for_terminal(&path.display().to_string())
             )
         });
     }
-    if let Some(p) = crate::trusted_path::system32_exe("wsb.exe") {
-        return Ok(p);
+    let trust = crate::trusted_path::driver_trust(None);
+    if let Some(bound) = crate::trusted_path::system32_exe("wsb.exe") {
+        return Ok(bound);
     }
     let Some(ps) = crate::trusted_path::system32_exe("WindowsPowerShell/v1.0/powershell.exe")
     else {
@@ -64,7 +70,11 @@ pub(super) async fn cli() -> Result<PathBuf, String> {
                 ))
             } else {
                 let loc = install_dir.join("wsb.exe");
-                crate::trusted_path::validate_driver_path(&loc).map_err(|e| {
+                // The Store package location is system data — it must
+                // satisfy administrator provenance, not the caller
+                // class an explicit fixture override uses. Binding
+                // validates and pins the object in one step.
+                crate::trusted_path::bind_driver(&loc, trust).map_err(|e| {
                     format!(
                         "wsb.exe at package location '{}' is not a trusted executable: {e}",
                         crate::termutil::sanitize_for_terminal(&loc.display().to_string())
@@ -132,8 +142,18 @@ async fn bounded_output(command: &mut Command, timeout: Duration) -> Result<Vec<
     Ok(out)
 }
 
-pub(super) async fn call(cli: &Path, args: &[&str]) -> Result<String, String> {
-    output(Command::new(cli).args(args), CALL_TIMEOUT).await
+/// `wsb args` on the bound CLI — `tokio_command` re-verifies the pinned
+/// file identity first, so a `wsb.exe` swapped between resolution and
+/// this call fails closed rather than managing the environment as a
+/// substitute.
+pub(super) async fn call(
+    cli: &crate::trusted_path::BoundDriver,
+    args: &[&str],
+) -> Result<String, String> {
+    let mut cmd = cli
+        .tokio_command()
+        .map_err(|e| format!("wsb.exe re-verification: {e}"))?;
+    output(cmd.args(args), CALL_TIMEOUT).await
 }
 
 pub(super) fn listed_ids(text: &str) -> Result<Vec<uuid::Uuid>, String> {
@@ -157,11 +177,11 @@ pub(super) fn listed_ids(text: &str) -> Result<Vec<uuid::Uuid>, String> {
 async fn has_client() -> Result<bool, String> {
     let tasklist = crate::trusted_path::system32_exe("tasklist.exe")
         .ok_or("tasklist.exe not found in System32")?;
-    let bytes = bounded_output(
-        Command::new(tasklist).args(["/FI", "IMAGENAME eq WindowsSandbox*", "/FO", "CSV", "/NH"]),
-        CALL_TIMEOUT,
-    )
-    .await?;
+    let mut cmd = tasklist
+        .tokio_command()
+        .map_err(|e| format!("tasklist.exe re-verification: {e}"))?;
+    cmd.args(["/FI", "IMAGENAME eq WindowsSandbox*", "/FO", "CSV", "/NH"]);
+    let bytes = bounded_output(&mut cmd, CALL_TIMEOUT).await?;
     // tasklist uses the console code page for the localized no-match message.
     // Match only the ASCII executable column; wsb JSON remains strict UTF-8.
     let text = String::from_utf8_lossy(&bytes);
@@ -181,16 +201,24 @@ pub async fn prerequisites() -> Result<String, String> {
     if !cfg!(all(windows, target_arch = "x86_64")) {
         return Err("windows-sandbox requires a Windows x86-64 host".into());
     }
-    let system = PathBuf::from(std::env::var_os("SystemRoot").ok_or("SystemRoot is missing")?);
-    if !system.join("System32/WindowsSandbox.exe").is_file() {
+    // The feature-present check uses the kernel-reported System32
+    // (`GetSystemDirectoryW`), never `%SystemRoot%` — a caller-mutable
+    // env var must not decide whether the sandbox feature exists.
+    if crate::trusted_path::system32_exe("WindowsSandbox.exe").is_none() {
         return Err("enable Containers-DisposableClientVM, reboot, and update Windows Sandbox from the Store".into());
     }
     // Session 0 (services) cannot provide the accepted interactive guest logon.
     let powershell = crate::trusted_path::system32_exe("WindowsPowerShell/v1.0/powershell.exe")
         .ok_or("powershell.exe not found in System32")?;
-    let session = output(Command::new(powershell).args(["-NoProfile", "-NonInteractive", "-Command",
+    let mut cmd = powershell
+        .tokio_command()
+        .map_err(|e| format!("powershell.exe re-verification: {e}"))?;
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command",
         "if (-not [Environment]::UserInteractive -or [Diagnostics.Process]::GetCurrentProcess().SessionId -eq 0) { exit 1 }; (Get-NetIPAddress -InterfaceAlias 'vEthernet (Default Switch)' -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1).IPAddress"
-    ]), CALL_TIMEOUT).await.map_err(|e| format!("interactive logon and Default Switch IPv4 required: {e}"))?;
+    ]);
+    let session = output(&mut cmd, CALL_TIMEOUT)
+        .await
+        .map_err(|e| format!("interactive logon and Default Switch IPv4 required: {e}"))?;
     let ip = session
         .trim()
         .parse::<std::net::Ipv4Addr>()
@@ -228,9 +256,10 @@ fn supported_version(text: &str) -> bool {
 
 /// A guard is armed before start, so failed/partial starts stop the reserved ID.
 pub(super) struct OwnedSandbox {
-    /// The resolved `wsb.exe` — bound once at `start`, reused for every
-    /// later `list`/`stop`/`connect` this sandbox performs.
-    pub(super) cli: PathBuf,
+    /// The resolved `wsb.exe` — bound once at `start` (path + file
+    /// identity), re-verified at every later `list`/`stop`/`connect`
+    /// this sandbox performs.
+    pub(super) cli: crate::trusted_path::BoundDriver,
     pub(super) id: String,
     active: bool,
     client: Option<tokio::process::Child>,
@@ -291,8 +320,12 @@ impl OwnedSandbox {
         if !ids.contains(&id) {
             return Err("wsb did not create the requested owned ID".into());
         }
+        let mut connect = self
+            .cli
+            .tokio_command()
+            .map_err(|e| format!("wsb.exe re-verification: {e}"))?;
         self.client = Some(
-            Command::new(&self.cli)
+            connect
                 .args(["connect", "--id", &self.id])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -338,7 +371,17 @@ impl Drop for OwnedSandbox {
         }
         // Last-resort bounded stop for cancellation/panic. Explicit cleanup is
         // awaited and reported; this guard never kills a process by name.
-        let mut command = std::process::Command::new(&self.cli);
+        // The stop still runs through the bound driver: a `wsb.exe`
+        // swapped out from under the session fails verification and is
+        // reported unconfirmed rather than executed.
+        let Ok(mut command) = self.cli.std_command() else {
+            eprintln!(
+                "cleanup unconfirmed for owned Sandbox {}; wsb.exe could not be re-verified — \
+                 run wsb stop --id {}",
+                self.id, self.id
+            );
+            return;
+        };
         command
             .args(["stop", "--id", &self.id, "--raw"])
             .stdin(Stdio::null())
@@ -422,8 +465,15 @@ mod tests {
             std::env::set_var("MCP_WRIT_WSB_EXE", "wsb.exe");
         }
         assert!(cli().await.is_err());
-        let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("wsb.exe");
+        // Caller-class resolution walks every ancestor, so a host
+        // whose shared temp hierarchy grants replace rights to other
+        // named principals refuses the whole tree — skip there rather
+        // than assert an impossible pass.
+        if !crate::trusted_path::ambient_temp_passes_caller("wsb-override") {
+            return;
+        }
+        let dir = crate::fspriv::create_private_tempdir("wsb-override").unwrap();
+        let exe = dir.join("wsb.exe");
         std::fs::write(&exe, b"x").unwrap();
         #[cfg(unix)]
         {
@@ -436,16 +486,17 @@ mod tests {
         unsafe {
             std::env::set_var("MCP_WRIT_WSB_EXE", &exe);
         }
-        // Driver validation returns the canonical spelling — tempdirs
-        // may live behind a symlinked component (macOS /var → /private/var).
+        // Binding returns the canonical spelling — tempdirs may live
+        // behind a symlinked component (macOS /var → /private/var).
         assert_eq!(
-            cli().await.as_deref().ok(),
-            Some(exe.canonicalize().unwrap().as_path())
+            cli().await.ok().map(|b| b.path().to_path_buf()),
+            Some(exe.canonicalize().unwrap())
         );
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var("MCP_WRIT_WSB_EXE");
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]
@@ -486,7 +537,7 @@ mod tests {
             std::fs::write(dir.path().join("ids.txt"), initial).unwrap();
             let lock = std::fs::File::create(dir.path().join("lock")).unwrap();
             let mut owned = OwnedSandbox {
-                cli,
+                cli: crate::trusted_path::BoundDriver::bind_for_test(&cli).unwrap(),
                 id: id.clone(),
                 active: false,
                 client: None,

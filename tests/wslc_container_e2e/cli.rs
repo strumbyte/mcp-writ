@@ -25,7 +25,7 @@ async fn wslc_environment_record() {
     let info = wslc_info_json().await.unwrap_or_else(|| "null".into());
     let sessions = session_list_raw().await;
     let distros = blocking(|| {
-        run_cli(wsl_prog(), &["-l", "-v"], CLI_TIMEOUT_SECS)
+        run_command(wsl_cmd(), &["-l", "-v"], CLI_TIMEOUT_SECS)
             .map(|o| decode_cli(&o.stdout))
             .unwrap_or_default()
     })

@@ -4,7 +4,6 @@
 use std::process::Stdio;
 
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
 use crate::common;
@@ -40,7 +39,7 @@ async fn wslc_session_model() {
 
     let before = session_list_raw().await;
     let distros_before = blocking(|| {
-        run_cli(wsl_prog(), &["-l", "-v"], CLI_TIMEOUT_SECS)
+        run_command(wsl_cmd(), &["-l", "-v"], CLI_TIMEOUT_SECS)
             .map(|o| decode_cli(&o.stdout))
             .unwrap_or_default()
     })
@@ -92,7 +91,7 @@ async fn wslc_session_model() {
     let seed_dir = storage.clone();
     let seeded = blocking(move || seed_session_store(&seed_dir)).await;
     let mut enter = seeded.then(|| {
-        Command::new(wslc_prog())
+        wslc_tokio()
             .args([
                 "system",
                 "session",
@@ -153,7 +152,7 @@ async fn wslc_session_model() {
     }
 
     let distros_after = blocking(|| {
-        run_cli(wsl_prog(), &["-l", "-v"], CLI_TIMEOUT_SECS)
+        run_command(wsl_cmd(), &["-l", "-v"], CLI_TIMEOUT_SECS)
             .map(|o| decode_cli(&o.stdout))
             .unwrap_or_default()
     })
@@ -651,7 +650,7 @@ async fn wslc_network_semantics() {
         "net-listen".to_string(),
         "8080".to_string(),
     ];
-    let mut pub_child = Command::new(wslc_prog())
+    let mut pub_child = wslc_tokio()
         .args(&pub_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

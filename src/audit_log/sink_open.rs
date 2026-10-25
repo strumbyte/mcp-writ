@@ -269,7 +269,7 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
     // implicit WRITE_DAC control over the audit record — only an owner
     // the logging identity itself (or SYSTEM/Administrators) represents
     // is trusted.
-    if !crate::fspriv::handle_owner_is_trusted(&file)? {
+    if !crate::fspriv::handle_owner_is_trusted(&file, true)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(

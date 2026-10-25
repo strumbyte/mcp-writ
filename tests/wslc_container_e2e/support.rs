@@ -76,7 +76,17 @@ pub fn decode_cli(bytes: &[u8]) -> String {
 /// a wedged CLI is reported, not waited on (the cleanup script's
 /// `probe()` convention expressed in-process).
 pub fn run_cli(prog: &str, args: &[&str], secs: u64) -> Option<std::process::Output> {
-    let mut child = StdCommand::new(prog)
+    run_command(StdCommand::new(prog), args, secs)
+}
+
+/// [`run_cli`] over a prebuilt command — the same bounded spawn
+/// contract, but the caller controls the program spelling. Driver
+/// invocations build through [`wsl_cmd`]/[`wslc_cmd`], whose bound
+/// driver re-verifies the file identity at construction: a CLI swapped
+/// mid-suite fails the spawn instead of answering as the resolved
+/// binary.
+pub fn run_command(mut cmd: StdCommand, args: &[&str], secs: u64) -> Option<std::process::Output> {
+    let mut child = cmd
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -117,33 +127,52 @@ pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
     }
 }
 
-/// The wslc CLI to invoke, resolved once with the product's own
-/// precedence: `MCP_WRIT_WSLC_EXE` (the override `WslcEngine` honors)
-/// The same resolver the product uses — `windows_probe::find_wsl`:
-/// `MCP_WRIT_WSL_EXE` or the Store-WSL install dir / `System32`, never
-/// PATH.
-pub fn wsl_prog() -> &'static str {
-    static PROG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PROG.get_or_init(|| {
-        windows_probe::find_wsl()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "wsl.exe".into())
-    })
+/// The `wsl.exe` driver the product resolves — `windows_probe::find_wsl`
+/// (`MCP_WRIT_WSL_EXE` or the Store-WSL install dir / `System32`, never
+/// PATH) retained as a bound object so every spawn re-verifies it.
+fn wsl_driver() -> Option<&'static mcp_writ::trusted_path::BoundDriver> {
+    static DRV: OnceLock<Option<mcp_writ::trusted_path::BoundDriver>> = OnceLock::new();
+    DRV.get_or_init(windows_probe::find_wsl).as_ref()
 }
 
-/// The same resolver the product uses — `windows_probe::find_wslc`:
-/// `MCP_WRIT_WSLC_EXE` or the stock install dir `C:\Program Files\WSL\
-/// wslc.exe`, never PATH. The stock install does not export PATH and a
-/// PATH-only `wslc` is deliberately not a trusted driver: long-lived
-/// `Command` spawns must go through this too, so the suite measures the
-/// same host the product resolves.
-pub fn wslc_prog() -> &'static str {
-    static PROG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PROG.get_or_init(|| {
-        windows_probe::find_wslc()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "wslc".into())
-    })
+/// The `wslc.exe` driver the product resolves —
+/// `windows_probe::find_wslc` (`MCP_WRIT_WSLC_EXE` or the stock install
+/// dir `C:\Program Files\WSL\wslc.exe`, never PATH) retained as a bound
+/// object. The stock install does not export PATH and a PATH-only
+/// `wslc` is deliberately not a trusted driver.
+fn wslc_driver() -> Option<&'static mcp_writ::trusted_path::BoundDriver> {
+    static DRV: OnceLock<Option<mcp_writ::trusted_path::BoundDriver>> = OnceLock::new();
+    DRV.get_or_init(windows_probe::find_wslc).as_ref()
+}
+
+/// A spawnable blocking command on the resolved `wsl.exe` — the bound
+/// driver re-verifies identity at construction. Panics when trusted
+/// resolution found nothing: a bare-name spawn would exercise a
+/// PATH-resolved binary the product deliberately does not trust, so
+/// the suite fails instead of measuring a different host —
+/// `check_prereqs` reports the absence first as a skip reason.
+pub fn wsl_cmd() -> StdCommand {
+    wsl_driver()
+        .expect("no trusted wsl.exe resolvable — `check_prereqs` must gate this leg")
+        .std_command()
+        .expect("wsl.exe failed identity re-verification")
+}
+
+/// [`wsl_cmd`] for `wslc.exe` — long-lived suite spawns must go through
+/// this too, so the suite drives the same binary the product binds.
+pub fn wslc_cmd() -> StdCommand {
+    wslc_driver()
+        .expect("no trusted wslc.exe resolvable — `check_prereqs` must gate this leg")
+        .std_command()
+        .expect("wslc.exe failed identity re-verification")
+}
+
+/// [`wslc_cmd`] for interactive `tokio::process::Command` spawns.
+pub fn wslc_tokio() -> tokio::process::Command {
+    wslc_driver()
+        .expect("no trusted wslc.exe resolvable — `check_prereqs` must gate this leg")
+        .tokio_command()
+        .expect("wslc.exe failed identity re-verification")
 }
 
 /// `wslc` one-shot with an explicit bound, off the runtime.
@@ -151,7 +180,7 @@ pub async fn wslc_bounded(args: &[&str], secs: u64) -> Option<std::process::Outp
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     blocking(move || {
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        run_cli(wslc_prog(), &refs, secs)
+        run_command(wslc_cmd(), &refs, secs)
     })
     .await
 }
@@ -179,7 +208,7 @@ pub async fn wslc_any(candidates: &[Vec<String>]) -> Option<std::process::Output
 }
 
 pub fn wslc_ok(args: &[&str]) -> Option<std::process::Output> {
-    run_cli(wslc_prog(), args, CLI_TIMEOUT_SECS).filter(|o| o.status.success())
+    run_command(wslc_cmd(), args, CLI_TIMEOUT_SECS).filter(|o| o.status.success())
 }
 
 /// Byte-boundary-safe truncate for evidence records — a multi-byte char
@@ -200,7 +229,7 @@ pub fn clip(s: &str, n: usize) -> String {
 /// `WSL version` match would silently miss (observed on the PR-28
 /// reference host).
 pub fn wsl_versions() -> Option<(u64, u64, u64)> {
-    let out = run_cli(wsl_prog(), &["--version"], CLI_TIMEOUT_SECS)?;
+    let out = run_command(wsl_cmd(), &["--version"], CLI_TIMEOUT_SECS)?;
     let text = decode_cli(&out.stdout);
     let parsed = windows_probe::parse_wsl_version(&text);
     let ver = parsed.product?;
@@ -214,13 +243,13 @@ pub fn wsl_versions() -> Option<(u64, u64, u64)> {
 
 /// The raw `wsl.exe --version` text for evidence.
 pub fn wsl_version_text() -> String {
-    run_cli(wsl_prog(), &["--version"], CLI_TIMEOUT_SECS)
+    run_command(wsl_cmd(), &["--version"], CLI_TIMEOUT_SECS)
         .map(|o| decode_cli(&o.stdout))
         .unwrap_or_default()
 }
 
 pub fn wslc_version_text() -> String {
-    run_cli(wslc_prog(), &["--version"], CLI_TIMEOUT_SECS)
+    run_command(wslc_cmd(), &["--version"], CLI_TIMEOUT_SECS)
         .map(|o| {
             let s = decode_cli(&o.stdout);
             if s.trim().is_empty() {
@@ -248,6 +277,23 @@ pub fn check_prereqs() -> Option<String> {
             TargetArch::host().name()
         ));
     }
+    // The trusted driver gates run before any helper spawn — the
+    // command helpers panic on an unbound driver rather than falling
+    // back to a PATH-resolved binary.
+    if wsl_driver().is_none() {
+        return Some(
+            "no trusted wsl.exe resolvable (MCP_WRIT_WSL_EXE, the Store-WSL \
+             install dir, or System32 — a PATH-only hit is never a driver)"
+                .into(),
+        );
+    }
+    if wslc_driver().is_none() {
+        return Some(
+            "no trusted wslc.exe resolvable (MCP_WRIT_WSLC_EXE or the stock \
+             install dir — a PATH-only hit is never a driver)"
+                .into(),
+        );
+    }
     match wsl_versions() {
         None => {
             return Some(
@@ -266,7 +312,9 @@ pub fn check_prereqs() -> Option<String> {
     match wslc_version_text() {
         t if t.trim().is_empty() => {
             return Some(
-                "no `wslc` CLI resolvable (PATH, MCP_WRIT_WSLC_EXE, or the stock install dir — or `wslc --version` produced no output)".into(),
+                "`wslc --version` produced no output — the resolved driver \
+                 did not answer"
+                    .into(),
             );
         }
         _ => {}
@@ -412,20 +460,22 @@ pub fn linux_runner() -> Option<PathBuf> {
 /// failure text in the environment record and skips.
 pub fn ensure_base_pulled() -> Option<()> {
     static DONE: OnceLock<Option<()>> = OnceLock::new();
-    *DONE.get_or_init(|| match run_cli(wslc_prog(), &["pull", BASE_IMAGE], 900) {
-        Some(o) if o.status.success() => Some(()),
-        Some(o) => {
-            common::skip_wslc_test(&format!(
-                "wslc pull {BASE_IMAGE} failed: {}",
-                decode_cli(&o.stderr)
-            ));
-            None
-        }
-        None => {
-            common::skip_wslc_test("wslc pull timed out or wslc unavailable");
-            None
-        }
-    })
+    *DONE.get_or_init(
+        || match run_command(wslc_cmd(), &["pull", BASE_IMAGE], 900) {
+            Some(o) if o.status.success() => Some(()),
+            Some(o) => {
+                common::skip_wslc_test(&format!(
+                    "wslc pull {BASE_IMAGE} failed: {}",
+                    decode_cli(&o.stderr)
+                ));
+                None
+            }
+            None => {
+                common::skip_wslc_test("wslc pull timed out or wslc unavailable");
+                None
+            }
+        },
+    )
 }
 
 /// `wslc build -t <tag> -f <dockerfile> <ctx>` bounded — a wedged build
@@ -433,7 +483,7 @@ pub fn ensure_base_pulled() -> Option<()> {
 pub fn wslc_build(context: &Path, tag: &str, dockerfile: &Path) -> Result<(), String> {
     let ctx = context.to_string_lossy().into_owned();
     let df = dockerfile.to_string_lossy().into_owned();
-    match run_cli(wslc_prog(), &["build", "-t", tag, "-f", &df, &ctx], 900) {
+    match run_command(wslc_cmd(), &["build", "-t", tag, "-f", &df, &ctx], 900) {
         Some(o) if o.status.success() => Ok(()),
         Some(o) => Err(format!(
             "wslc build {tag} failed: {}",

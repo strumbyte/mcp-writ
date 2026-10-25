@@ -72,12 +72,17 @@ pub(crate) const KATA_CAPABILITIES: BackendCapabilities = BackendCapabilities {
 
 /// `IsolationKind::Kata` over the engine's registered `kata` runtime.
 pub struct KataBackend {
-    engine: Box<dyn ContainerEngine>,
+    /// Shared with the launch handle so its `kill`/`rm`/`inspect`
+    /// lifecycle commands also spawn through the bound, identity-
+    /// re-verified driver — never a bare program spelling.
+    engine: std::sync::Arc<dyn ContainerEngine>,
 }
 
 impl KataBackend {
     pub fn new(engine: Box<dyn ContainerEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine: engine.into(),
+        }
     }
 }
 
@@ -384,7 +389,7 @@ impl IsolationBackend for KataBackend {
             let child = self.engine.run(image, &option_refs, true).await?;
             let mut handle = EngineRunHandle::attach(
                 child,
-                self.engine.program(),
+                self.engine.clone(),
                 spec.unit_id_file.clone(),
                 spec.unit_name.clone(),
             )
