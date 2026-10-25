@@ -1118,14 +1118,14 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [x] `clippy::undocumented_unsafe_blocks` を、境界のモジュール（`warden::namespaced` など）から順に deny にする。→ 第一段として `warden::namespaced` を対象化（2026-10-25）: [namespaced/mod.rs](../src/warden/namespaced/mod.rs) に `#![deny(clippy::undocumented_unsafe_blocks)]` をモジュール内側属性として設定 — lint レベルはサブツリーに継承されるため init/launch/nat/netlink/probe/report/spawn/stack を一括でカバーする。既存注記（`// Safety:` や `// SAFETY:` — 大小文字を問わず `safety:` を含むコメントが受理される）はそのまま通る。残りの warden 境界モジュールは後続で順次 — 現 HEAD で計測した未注記の残存は warden 全体で 180 件（unotify 103・env 13・child 10・ebpf 16・seccomp_impl/tests 15 など。macOS/Windows 系は当該 OS 上の clippy でないと件数・検証が取れない点に注意）
-- [x] 不足している Safety の注記を足す。→ namespaced サブツリーで lint に検出された 102 ブロック（init.rs 46・spawn.rs 23・probe.rs 20・netlink.rs 6・report.rs 3・stack.rs 3・launch.rs 1）に `// SAFETY:` 注記を追加 — 既存の `// nosemgrep:` 行の直上に、各ブロックが依拠する不変条件（ポインタ/長さが示す有効バッファ、fd の所有と一度限りの close、NUL 終端 C 文字列、single-threaded 前提の fork/`env::remove_var`、POD 構造体の `mem::zeroed`、SCM_RIGHTS の所有移転 等）を記述。`unsafe fn` 宣言自体は lint の対象外（ブロックのみ）で、コメントはステートメント直上で受理されることを確認済み
+- [x] `clippy::undocumented_unsafe_blocks` を、境界のモジュール（`warden::namespaced` など）から順に deny にする。→ 第一段として `warden::namespaced` を対象化（2026-10-25）: [namespaced/mod.rs](../src/warden/namespaced/mod.rs) に `#![deny(clippy::undocumented_unsafe_blocks)]` をモジュール内側属性として設定 — lint レベルはサブツリーに継承されるため init/launch/nat/netlink/probe/report/spawn/stack を一括でカバーする。既存注記（`// Safety:` や `// SAFETY:` — 大小文字を問わず `safety:` を含むコメントが受理される）はそのまま通る。残りの warden 境界モジュールは後続で順次 — 現 HEAD で計測した未注記の残存は warden 全体で 180 件（unotify 110・env 13・child 10・ebpf 16・seccomp_impl/tests 15 など。macOS/Windows 系は当該 OS 上の clippy でないと件数・検証が取れない点に注意）
+- [x] 不足している Safety の注記を足す。→ namespaced サブツリーで lint に検出された 104 ブロック（init.rs 46・spawn.rs 23・probe.rs 22・netlink.rs 6・report.rs 3・stack.rs 3・launch.rs 1）に `// SAFETY:` 注記を追加 — 残る 1 ブロック（spawn.rs の `pre_exec` 登録）は既存の `// Safety:` で受理され、計 105 ブロックが注記済み。既存の `// nosemgrep:` 行の直上に、各ブロックが依拠する不変条件（ポインタ/長さが示す有効バッファ、fd の所有と一度限りの close、NUL 終端 C 文字列、single-threaded 前提の fork/`env::remove_var`、POD 構造体の `mem::zeroed`、SCM_RIGHTS の所有移転 等）を記述。`unsafe fn` 宣言自体は lint の対象外（ブロックのみ）で、コメントはステートメント直上で受理されることを確認済み
 
-**検証:** T-BASE。→ 実施（2026-10-25・WSL2 kernel 6.18.54.1・x86-64・rustc 1.99.0）: `cargo fmt --all -- --check` / `cargo clippy --locked --all-targets -- -D warnings`（`undocumented_unsafe_blocks` 違反は対象化前の 102 件 → 0 件、他警告なし）/ `cargo test --locked --lib --bins` 2512 件 / `cargo doc --locked --no-deps` / `cargo test --locked --doc` 0 件 全 pass。差分は注記と lint 属性のみで実行コードの変更なし（「移行・戻し方」と整合）
+**検証:** T-BASE。→ 実施（2026-10-25・WSL2 kernel 6.18.54.1・x86-64・rustc 1.99.0）: `cargo fmt --all -- --check` / `cargo clippy --locked --all-targets -- -D warnings`（`undocumented_unsafe_blocks` 違反は対象化前の 104 件 → 0 件、他警告なし）/ `cargo test --locked --lib --bins` 2512 件 / `cargo doc --locked --no-deps` / `cargo test --locked --doc` 0 件 全 pass。差分は注記・lint 属性に加えて probe.rs の失敗パスのみ実コード変更あり — 未検査だった pipe(2) 戻り値を検査し、pipe 失敗時は生成済みの端だけ close、fork 失敗時は errno を先に確保して全 6 端を close（従来は失敗した pipe の fd-0 プレースホルダをそのまま使い、fork 失敗時に fd がリークし得た）。成功パスの挙動は不変（「移行・戻し方」と整合）
 
 **完了条件:** lint の対象にしたモジュールで、注記の無い unsafe ブロックが無い。→ `warden::namespaced` で充足。残りの warden モジュールへの段階展開は本PRのスコープ外（完了条件は対象モジュールに限る記述どおり）
 
-**移行・戻し方:** 挙動は変えない。→ 実際、差分はコメント・属性のみ
+**移行・戻し方:** 挙動は変えない。→ 実際、差分はコメント・属性と probe.rs 失敗パスの防御的修正のみ — 成功経路の挙動は不変
 
 ## 実装結果として残す記録
 
