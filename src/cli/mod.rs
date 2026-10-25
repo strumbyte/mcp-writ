@@ -566,6 +566,19 @@ pub enum OutputFormat {
     Kdl,
 }
 
+/// The minimal end-to-end flow appended to `run --help` and
+/// `generate-policy --help` — the same order as docs/quickstart.md:
+/// draft → review → plan → dry-run → enforced run. noargs' generated
+/// `Example:` section cannot render it (a multi-word `arg().example()`
+/// is quoted as one token), so the parsers append this fixed text.
+pub(crate) const QUICKSTART_FLOW: &str = "\nExample:
+  $ mcp-writ generate-policy --live-discovery --output draft.kdl -- node server.js
+  # review draft.kdl, then:
+  $ mcp-writ plan --policy draft.kdl -- node server.js
+  $ mcp-writ run --policy draft.kdl --dry-run --audit-log audit.jsonl -- node server.js
+  $ mcp-writ run --policy draft.kdl --audit-log audit.jsonl --report report.json -- node server.js
+";
+
 /// Parse command-line arguments using noargs.
 ///
 /// Expected syntax:
@@ -605,150 +618,150 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
     // --help (activates help mode; finish() will produce help text)
     noargs::HELP_FLAG.take_help(&mut raw);
 
-    // Subcommand: run
-    let run_cmd = noargs::cmd("run")
+    // Subcommand dispatch: `cmd().take()` inspects only the next
+    // unconsumed argument, so a match dispatches immediately and the
+    // matched cmd stays the last `Cmd` entry in noargs' log. Sibling
+    // names taken after it would linger in the log and be rendered as
+    // a trailing "Commands:" section in that subcommand's `--help`;
+    // they would also become the "last taken cmd" that
+    // `finish()`'s command check inspects (the former N-01
+    // order-dependence, which immediate dispatch removes). With no
+    // match at all, every `cmd()` is registered and the top-level
+    // `--help` lists them all, as before.
+    if noargs::cmd("run")
         .doc("Run an MCP server with security policies applied")
-        .take(&mut raw);
-
-    // Subcommand: plan
-    let plan_cmd = noargs::cmd("plan")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_run::parse_run_args(raw, command);
+    }
+    if noargs::cmd("plan")
         .doc("Diagnose launch prerequisites and print the enforcement plan without starting the workload")
-        .take(&mut raw);
-
-    // Subcommand: inspect
-    let inspect_cmd = noargs::cmd("inspect")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_plan::parse_plan_args(raw, command);
+    }
+    if noargs::cmd("inspect")
         .doc("Analyze an ELF/Mach-O binary or script and report its capabilities")
-        .take(&mut raw);
-
-    // Subcommand: generate-policy
-    let gen_policy_cmd = noargs::cmd("generate-policy")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_inspect::parse_inspect_args(raw, command);
+    }
+    if noargs::cmd("generate-policy")
         .doc("Generate a policy KDL from binary analysis and tools/list")
-        .take(&mut raw);
-
-    // Subcommand: capability-matrix (machine-readable OS matrix, PR-13).
-    // Deliberately NOT last: its dispatch branch below avoids
-    // `raw.finish()`'s command check — `check_command_error` inspects
-    // the *last* taken cmd, so calling it on a normal invocation would
-    // make this subcommand depend on registration order (the N-01
-    // regression: bare `capability-matrix` failed `command is not
-    // specified` when a later `.take()` existed). Keeping later takes
-    // makes the bare-invocation test in tests_parse.rs a real
-    // regression check for that order-dependence.
-    let capability_matrix_cmd = noargs::cmd("capability-matrix")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_gen_policy::parse_gen_policy_args(raw, command);
+    }
+    if noargs::cmd("capability-matrix")
         .doc("Print the machine-readable per-OS capability matrix (JSON) — mechanism coverage, requirements, deficiencies")
-        .take(&mut raw);
-
-    // Subcommand: run-image
-    let run_image_cmd = noargs::cmd("run-image")
-        .doc("Run a secured container image with policy and log mounts")
-        .take(&mut raw);
-
-    // Subcommand: wrap-image
-    let wrap_image_cmd = noargs::cmd("wrap-image")
-        .doc("Wrap an existing container image with mcp-writ security layer")
-        .take(&mut raw);
-
-    // Subcommand: containerize
-    let containerize_cmd = noargs::cmd("containerize")
-        .doc("Build a secured container image from an MCP server source directory")
-        .take(&mut raw);
-
-    // Subcommand: dns-gate
-    let dns_gate_cmd = noargs::cmd("dns-gate")
-        .doc("Serve a policy-evaluating DNS resolver (name-layer enforcement)")
-        .take(&mut raw);
-
-    // Subcommand: unotify-run (Linux IP-layer PoC, PR-07)
-    let unotify_cmd = noargs::cmd("unotify-run")
-        .doc("Run a command under a seccomp user-notification supervisor that enforces connect(2) destinations (Linux PoC)")
-        .take(&mut raw);
-
-    // Subcommand: namespaced-run (Linux namespaced egress PoC, PR-09)
-    let namespaced_cmd = noargs::cmd("namespaced-run")
-        .doc("Run a command inside userns+netns+mountns with a TUN-fed TCP/UDP policy proxy (Linux PoC)")
-        .take(&mut raw);
-
-    // Subcommand: ebpf-run (Linux cgroup eBPF opt-in, PR-10)
-    let ebpf_cmd = noargs::cmd("ebpf-run")
-        .doc("Run a command in a private cgroup with in-kernel INET4/6_CONNECT egress enforcement (Linux opt-in, needs CAP_BPF+CAP_NET_ADMIN)")
-        .take(&mut raw);
-
-    // Subcommand: macos-proxy-run (macOS loopback CONNECT proxy, PR-11)
-    let macos_proxy_cmd = noargs::cmd("macos-proxy-run")
-        .doc("Run a command under sandbox-exec with outbound TCP pinned to a loopback CONNECT proxy that enforces name+IP destination rules (macOS opt-in)")
-        .take(&mut raw);
-
-    // Subcommand: check (policy drift re-verification, PR-14)
-    let check_cmd = noargs::cmd("check")
-        .doc("Re-verify a policy's integrity pins (binary/entrypoint/lockfile/docker-manifest/tools-list hashes) against the current artifacts and report drift as JSON")
-        .take(&mut raw);
-
-    // Subcommand: policy (composed-policy inspection, PR-24)
-    let policy_cmd = noargs::cmd("policy")
-        .doc("Inspect a composed policy: `policy resolve --policy <path>` prints the effective KDL and each field's provenance")
-        .take(&mut raw);
-
-    if run_cmd.is_present() {
-        parse_run::parse_run_args(raw, command)
-    } else if plan_cmd.is_present() {
-        parse_plan::parse_plan_args(raw, command)
-    } else if inspect_cmd.is_present() {
-        parse_inspect::parse_inspect_args(raw, command)
-    } else if gen_policy_cmd.is_present() {
-        parse_gen_policy::parse_gen_policy_args(raw, command)
-    } else if run_image_cmd.is_present() {
-        parse_run_image::parse_run_image_args(raw)
-    } else if wrap_image_cmd.is_present() {
-        parse_wrap_image::parse_wrap_image_args(raw)
-    } else if containerize_cmd.is_present() {
-        parse_containerize::parse_containerize_args(raw)
-    } else if dns_gate_cmd.is_present() {
-        parse_dns_gate::parse_dns_gate_args(raw, command)
-    } else if unotify_cmd.is_present() {
-        parse_unotify::parse_unotify_args(raw, command)
-    } else if namespaced_cmd.is_present() {
-        parse_namespaced::parse_namespaced_args(raw, command)
-    } else if ebpf_cmd.is_present() {
-        parse_ebpf::parse_ebpf_args(raw, command)
-    } else if macos_proxy_cmd.is_present() {
-        parse_macos_proxy::parse_macos_proxy_args(raw, command)
-    } else if capability_matrix_cmd.is_present() {
-        // No options: any stray argument is a usage error; `--help`
-        // prints the generated help. `finish()`'s command check would
-        // re-introduce the last-registration dependency, so only the
-        // help-mode path uses it (it returns before that check) and the
-        // unexpected-argument check runs directly on the raw args.
-        if raw.metadata().help_mode {
-            let help = raw
-                .finish()
-                .map_err(|e| CliError::Parse(format!("{e:?}")))?
-                .expect("help mode always returns help text");
-            return Ok(CliOutput::Info(help.to_string()));
-        }
-        if let Some((_, stray)) = raw.remaining_args().next() {
-            return Err(CliError::Parse(format!(
-                "unexpected argument '{stray}' found"
-            )));
-        }
-        if !command.is_empty() {
-            return Err(CliError::Parse(
-                "capability-matrix takes no command".to_string(),
-            ));
-        }
-        Ok(CliOutput::CapabilityMatrix)
-    } else if check_cmd.is_present() {
-        parse_check::parse_check_args(raw, command)
-    } else if policy_cmd.is_present() {
-        parse_policy::parse_policy_args(raw)
-    } else {
+        .take(&mut raw)
+        .is_present()
+    {
+        // No options: `--help` renders via `finish()`; in normal mode
+        // `finish()`'s command check sees this take as the last
+        // (present) `Cmd` entry, so a stray argument falls through to
+        // the unexpected-argument check.
         if let Some(help) = raw
             .finish()
             .map_err(|e| CliError::Parse(format!("{e:?}")))?
         {
             return Ok(CliOutput::Info(help.to_string()));
         }
-        Err(CliError::MissingSubcommand)
+        if !command.is_empty() {
+            return Err(CliError::Parse(
+                "capability-matrix takes no command".to_string(),
+            ));
+        }
+        return Ok(CliOutput::CapabilityMatrix);
     }
+    if noargs::cmd("run-image")
+        .doc("Run a secured container image with policy and log mounts")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_run_image::parse_run_image_args(raw);
+    }
+    if noargs::cmd("wrap-image")
+        .doc("Wrap an existing container image with mcp-writ security layer")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_wrap_image::parse_wrap_image_args(raw);
+    }
+    if noargs::cmd("containerize")
+        .doc("Build a secured container image from an MCP server source directory")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_containerize::parse_containerize_args(raw);
+    }
+    if noargs::cmd("dns-gate")
+        .doc("Serve a policy-evaluating DNS resolver (name-layer enforcement)")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_dns_gate::parse_dns_gate_args(raw, command);
+    }
+    // Linux IP-layer PoC (PR-07)
+    if noargs::cmd("unotify-run")
+        .doc("Run a command under a seccomp user-notification supervisor that enforces connect(2) destinations (Linux PoC)")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_unotify::parse_unotify_args(raw, command);
+    }
+    // Linux namespaced egress PoC (PR-09)
+    if noargs::cmd("namespaced-run")
+        .doc("Run a command inside userns+netns+mountns with a TUN-fed TCP/UDP policy proxy (Linux PoC)")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_namespaced::parse_namespaced_args(raw, command);
+    }
+    // Linux cgroup eBPF opt-in (PR-10)
+    if noargs::cmd("ebpf-run")
+        .doc("Run a command in a private cgroup with in-kernel INET4/6_CONNECT egress enforcement (Linux opt-in, needs CAP_BPF+CAP_NET_ADMIN)")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_ebpf::parse_ebpf_args(raw, command);
+    }
+    // macOS loopback CONNECT proxy opt-in (PR-11)
+    if noargs::cmd("macos-proxy-run")
+        .doc("Run a command under sandbox-exec with outbound TCP pinned to a loopback CONNECT proxy that enforces name+IP destination rules (macOS opt-in)")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_macos_proxy::parse_macos_proxy_args(raw, command);
+    }
+    // Policy drift re-verification (PR-14)
+    if noargs::cmd("check")
+        .doc("Re-verify a policy's integrity pins (binary/entrypoint/lockfile/docker-manifest/tools-list hashes) against the current artifacts and report drift as JSON")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_check::parse_check_args(raw, command);
+    }
+    // Composed-policy inspection (PR-24)
+    if noargs::cmd("policy")
+        .doc("Inspect a composed policy: `policy resolve --policy <path>` prints the effective KDL and each field's provenance")
+        .take(&mut raw)
+        .is_present()
+    {
+        return parse_policy::parse_policy_args(raw);
+    }
+
+    if let Some(help) = raw
+        .finish()
+        .map_err(|e| CliError::Parse(format!("{e:?}")))?
+    {
+        return Ok(CliOutput::Info(help.to_string()));
+    }
+    Err(CliError::MissingSubcommand)
 }
 
 fn parse_output_format(s: &str) -> Result<OutputFormat, CliError> {

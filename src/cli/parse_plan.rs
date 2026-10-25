@@ -217,6 +217,16 @@ pub(super) fn parse_plan_args(
         return Ok(invalid_args(args, msg));
     }
 
+    // Help-only positional for `-- <command> [args...]`: `parse_from`
+    // splits the trailing argv off before noargs sees it, so this entry
+    // exists purely to document it — in help mode `Arg::take` consumes
+    // nothing and real parsing still reads the pre-split `command`.
+    if raw.metadata().help_mode {
+        noargs::arg("[-- <command> [args...]]")
+            .doc("The native-launch command and its arguments (alternative to --image)")
+            .take(&mut raw);
+    }
+
     // Unknown/malformed flags surface here — for `plan` they are a
     // machine-readable `invalid` result, not a usage error. `--help`
     // still produces help text.

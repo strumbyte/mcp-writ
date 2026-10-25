@@ -236,11 +236,23 @@ pub(super) fn parse_run_args(
         None
     };
 
+    // Help-only positional for `-- <command> [args...]`: `parse_from`
+    // splits the trailing argv off before noargs sees it, so this entry
+    // exists purely to document it — in help mode `Arg::take` consumes
+    // nothing and real parsing still reads the pre-split `command`.
+    if raw.metadata().help_mode {
+        noargs::arg("-- <command> [args...]")
+            .doc("The server launch command and its arguments")
+            .take(&mut raw);
+    }
+
     if let Some(help) = raw
         .finish()
         .map_err(|e| CliError::Parse(format!("{e:?}")))?
     {
-        return Ok(CliOutput::Info(help.to_string()));
+        let mut help = help;
+        help.push_str(super::QUICKSTART_FLOW);
+        return Ok(CliOutput::Info(help));
     }
 
     if command.is_empty() {
