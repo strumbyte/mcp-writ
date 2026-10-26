@@ -6,6 +6,7 @@ fn probe(all_ok: bool) -> Result<ProbeReport, String> {
         userns: all_ok,
         netns: all_ok,
         mountns: all_ok,
+        pidns: all_ok,
         id_map: all_ok,
         proc_mount: all_ok,
         tun: all_ok,

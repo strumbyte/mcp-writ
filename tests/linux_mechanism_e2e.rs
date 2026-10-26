@@ -106,8 +106,8 @@ fn fixture() -> Option<PathBuf> {
 }
 
 /// The launcher's own capability probe: `namespaced-probe` exits 0
-/// exactly when every stage `namespaced` needs (userns/netns/mountns,
-/// uid map, TUN, loopback, route) succeeds — the same verdict the
+/// exactly when every stage `namespaced` needs (userns/netns/mountns/
+/// pidns, uid map, TUN, loopback, route) succeeds — the same verdict the
 /// selection consults, so a skip mirrors a refused launch.
 fn namespaced_capable() -> bool {
     match Command::new(env!("CARGO_BIN_EXE_mcp-writ"))

@@ -12,11 +12,17 @@ use std::os::unix::io::FromRawFd;
 /// Serialized probe result — the `--report` payload's `capabilities`
 /// section and the launch-refusal detail. Wire format to the parent
 /// is `key=value` lines (no JSON parser dependency).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProbeReport {
     pub userns: bool,
     pub netns: bool,
     pub mountns: bool,
+    /// `CLONE_NEWPID` was granted by the same single `unshare` that
+    /// created userns/netns/mountns — measured evidence like its
+    /// sibling bools, so a failed or absent probe reports `false`
+    /// rather than the report claiming the namespace unconditionally.
+    /// Lands in `missing` as `pidns`, the catalog's requires id.
+    pub pidns: bool,
     pub id_map: bool,
     /// The `/proc` remount init's pidns-init child performs succeeded
     /// from a fresh pidns under this mountns (PR-35 / D-10). `false`
@@ -75,6 +81,9 @@ impl ProbeReport {
         if !self.mountns {
             v.push("mountns");
         }
+        if !self.pidns {
+            v.push("pidns");
+        }
         if !self.id_map {
             v.push("uid_gid_map");
         }
@@ -109,10 +118,11 @@ impl ProbeReport {
 
 fn report_text(r: &ProbeReport) -> String {
     format!(
-        "userns={}\nnetns={}\nmountns={}\nid_map={}\nproc_mount={}\ntun={}\nloopback_up={}\nroute={}\nipv6_stack={}\nipv6={}\nfailed_stage={}\ndetail={}\n",
+        "userns={}\nnetns={}\nmountns={}\npidns={}\nid_map={}\nproc_mount={}\ntun={}\nloopback_up={}\nroute={}\nipv6_stack={}\nipv6={}\nfailed_stage={}\ndetail={}\n",
         r.userns,
         r.netns,
         r.mountns,
+        r.pidns,
         r.id_map,
         r.proc_mount,
         r.tun,
@@ -126,20 +136,7 @@ fn report_text(r: &ProbeReport) -> String {
 }
 
 fn parse_report(body: &str) -> Option<ProbeReport> {
-    let mut report = ProbeReport {
-        userns: false,
-        netns: false,
-        mountns: false,
-        id_map: false,
-        proc_mount: false,
-        tun: false,
-        loopback_up: false,
-        route: false,
-        ipv6_stack: false,
-        ipv6: false,
-        failed_stage: None,
-        detail: None,
-    };
+    let mut report = ProbeReport::default();
     let mut saw_any = false;
     for line in body.lines() {
         let Some((k, v)) = line.split_once('=') else {
@@ -151,6 +148,7 @@ fn parse_report(body: &str) -> Option<ProbeReport> {
             "userns" => report.userns = truthy,
             "netns" => report.netns = truthy,
             "mountns" => report.mountns = truthy,
+            "pidns" => report.pidns = truthy,
             "id_map" => report.id_map = truthy,
             "proc_mount" => report.proc_mount = truthy,
             "tun" => report.tun = truthy,
@@ -174,20 +172,10 @@ fn parse_report(body: &str) -> Option<ProbeReport> {
 /// the fresh namespaces die with it.
 fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
     let mut r = ProbeReport {
-        userns: false,
-        netns: false,
-        mountns: false,
         // Set by the parent side of the report merge — the grandchild
         // only knows the namespaces half.
         id_map: true,
-        proc_mount: false,
-        tun: false,
-        loopback_up: false,
-        route: false,
-        ipv6_stack: false,
-        ipv6: false,
-        failed_stage: None,
-        detail: None,
+        ..Default::default()
     };
     macro_rules! fail {
         ($stage:literal, $e:expr) => {{
@@ -223,6 +211,7 @@ fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
     r.userns = true;
     r.netns = true;
     r.mountns = true;
+    r.pidns = true;
 
     // Tell the parent "unshared" and wait for the map write.
     // SAFETY: the 1-byte literal is a readable buffer; a bad `sync_w`
@@ -429,18 +418,9 @@ fn errno_code() -> i32 {
 /// work ran — pipe creation or the fork itself.
 fn failed_probe(stage: &str, detail: String) -> ProbeReport {
     ProbeReport {
-        userns: false,
-        netns: false,
-        mountns: false,
-        id_map: false,
-        proc_mount: false,
-        tun: false,
-        loopback_up: false,
-        route: false,
-        ipv6_stack: false,
-        ipv6: false,
         failed_stage: Some(stage.to_string()),
         detail: Some(detail),
+        ..Default::default()
     }
 }
 
@@ -571,18 +551,9 @@ fn probe_in_place() -> ProbeReport {
         let _ = f.read_to_string(&mut body);
     }
     let mut r = parse_report(&body).unwrap_or_else(|| ProbeReport {
-        userns: false,
-        netns: false,
-        mountns: false,
-        id_map: false,
-        proc_mount: false,
-        tun: false,
-        loopback_up: false,
-        route: false,
-        ipv6_stack: false,
-        ipv6: false,
         failed_stage: Some("probe".to_string()),
         detail: Some(format!("grandchild report missing (raw: {body})")),
+        ..Default::default()
     });
     r.id_map = id_map;
     if got && !id_map && r.failed_stage.is_none() {
@@ -632,6 +603,7 @@ mod tests {
             userns: all_ok,
             netns: all_ok,
             mountns: all_ok,
+            pidns: all_ok,
             id_map: all_ok,
             proc_mount: all_ok,
             tun: all_ok,
@@ -658,6 +630,7 @@ mod tests {
             "userns",
             "netns",
             "mountns",
+            "pidns",
             "id_map",
             "proc_mount",
             "tun",
@@ -670,6 +643,7 @@ mod tests {
                 "userns" => r.userns = false,
                 "netns" => r.netns = false,
                 "mountns" => r.mountns = false,
+                "pidns" => r.pidns = false,
                 "id_map" => r.id_map = false,
                 "proc_mount" => r.proc_mount = false,
                 "tun" => r.tun = false,
@@ -687,12 +661,12 @@ mod tests {
         }
         // A fully-failed probe names every stage it measures — the
         // coverage is complete, not a subset, and adds nothing the
-        // catalog does not require. (`pidns` folds into the single
-        // `unshare` stage — the probe and init both create it in the
-        // same call, so a refusal reports `unshare`, never a separate
-        // pidns token.) `ipv6_route_via_tun` is measured only when the
-        // kernel exposes a v6 stack — pin it separately since a
-        // stack-absent host must not report it.
+        // catalog does not require. `pidns` is a measured token like
+        // the rest even though it folds into the same single `unshare`
+        // stage — a refusal still names every unmet requires id.
+        // `ipv6_route_via_tun` is measured only when the kernel
+        // exposes a v6 stack — pin it separately since a stack-absent
+        // host must not report it.
         let mut all = report(false);
         all.ipv6_stack = true;
         let mut all = all.missing();
@@ -705,6 +679,7 @@ mod tests {
                 "loopback_up",
                 "mountns",
                 "netns",
+                "pidns",
                 "proc_mount",
                 "tun",
                 "uid_gid_map",

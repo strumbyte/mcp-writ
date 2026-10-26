@@ -124,20 +124,7 @@ pub fn report_json(
     } else {
         "unknown".to_string()
     };
-    let empty = ProbeReport {
-        userns: false,
-        netns: false,
-        mountns: false,
-        id_map: false,
-        proc_mount: false,
-        tun: false,
-        loopback_up: false,
-        route: false,
-        ipv6_stack: false,
-        ipv6: false,
-        failed_stage: None,
-        detail: None,
-    };
+    let empty = ProbeReport::default();
     // `missing` is probe evidence: only a probe that actually ran can
     // name unmet requirements — a launch refused before the probe has
     // nothing measured to list (the `&[]` unotify/ebpf pass on their
@@ -178,10 +165,11 @@ pub fn report_json(
                         n.member("userns", probe.userns)?;
                         n.member("netns", probe.netns)?;
                         n.member("mountns", probe.mountns)?;
-                        // Created unconditionally inside the launch — a
-                        // failed unshare is a launch refusal, so reaching
-                        // this report means the claim holds.
-                        n.member("pidns", true)?;
+                        // Measured by the probe's single `unshare` like
+                        // its sibling bools — a failed or absent probe
+                        // reports `false` rather than claiming the
+                        // namespace unconditionally.
+                        n.member("pidns", probe.pidns)?;
                         n.member("uid_gid_map", probe.id_map)?;
                         n.member("proc_mount", probe.proc_mount)?;
                         n.member("tun", probe.tun)?;
@@ -371,6 +359,11 @@ mod tests {
             report.contains("\"missing\":[]"),
             "pre-probe failure must not claim unmet requirements: {report}"
         );
+        assert!(
+            report.contains("\"pidns\":false"),
+            "a report without probe evidence must not claim the pid \
+             namespace: {report}"
+        );
     }
 
     #[test]
@@ -379,6 +372,7 @@ mod tests {
             userns: false,
             netns: false,
             mountns: false,
+            pidns: false,
             id_map: false,
             proc_mount: false,
             tun: false,
@@ -403,7 +397,7 @@ mod tests {
             None,
         );
         assert!(
-            report.contains("\"missing\":[\"userns\",\"netns\",\"mountns\",\"uid_gid_map\",\"proc_mount\",\"tun\",\"loopback_up\",\"default_route_via_tun\",\"ipv6_route_via_tun\"]"),
+            report.contains("\"missing\":[\"userns\",\"netns\",\"mountns\",\"pidns\",\"uid_gid_map\",\"proc_mount\",\"tun\",\"loopback_up\",\"default_route_via_tun\",\"ipv6_route_via_tun\"]"),
             "a failed probe must name the unmet requirements: {report}"
         );
     }

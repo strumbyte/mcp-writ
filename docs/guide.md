@@ -271,7 +271,7 @@ OS is the [per-OS enforcement matrix](#per-os-enforcement-matrix).
 | Host | Workload | Method | Operations | Status | Verified environment |
 |---|---|---|---|---|---|
 | Linux x86-64 · AArch64 | host command | native Warden (Landlock + seccomp + `no_new_privs`) — `--linux-mechanism native`, or `auto` when namespaced is unavailable/insufficient and native satisfies the policy | `run`, `plan` | **adopted** | `ubuntu-latest` + `ubuntu-24.04-arm` CI legs and real-hardware runs; kernels exposing only Landlock ABI V1 (e.g. WSL2 5.15) run partially and only under `sandbox allow_degraded=#true` |
-| Linux x86-64 | host command | namespaced Warden (userns + netns + mountns + pidns, TUN-fed TCP/UDP proxy + embedded DNS gate) — `--linux-mechanism namespaced`, preferred by `auto` | `run`, `plan` | **adopted, conditional** — capability-probed before every launch (userns/netns/mountns, uid/gid map, /proc remount, TUN, loopback, route); an unavailable host or an unsatisfiable policy refuses and never falls back to native | WSL2 Ubuntu 24.04 x86-64, kernel 6.18.40.1 — selection matrix + TCP/UDP/DNS legs in [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) |
+| Linux x86-64 | host command | namespaced Warden (userns + netns + mountns + pidns, TUN-fed TCP/UDP proxy + embedded DNS gate) — `--linux-mechanism namespaced`, preferred by `auto` | `run`, `plan` | **adopted, conditional** — capability-probed before every launch (userns/netns/mountns/pidns, uid/gid map, /proc remount, TUN, loopback, route); an unavailable host or an unsatisfiable policy refuses and never falls back to native | WSL2 Ubuntu 24.04 x86-64, kernel 6.18.40.1 — selection matrix + TCP/UDP/DNS legs in [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) |
 | macOS arm64 | host command | native Warden (`sandbox-exec` SBPL) | `run`, `plan` | **adopted** — a legacy mechanism; see [Platform notes (macOS)](#platform-notes-macos) | `macos-latest` CI; macOS 26.6.2 arm64 host |
 | macOS x86-64 | host command | native Warden (`sandbox-exec` SBPL) | `run`, `plan` | builds — sandbox enforcement **unverified** | release archive target exists; no x86-64 macOS test leg |
 | Windows x86-64 | host command | native Warden (AppContainer + Job + DACL) — `--windows-mechanism appcontainer`, the default | `run`, `plan` | **adopted** | `windows-latest` CI; Windows 11 25H2 (26200.9457) host |
@@ -1771,7 +1771,7 @@ surface), the destination `granularity` and `transports` it covers,
 refuses, it never substitutes another path. Only the `requires` ids a
 launch probe actually measures can appear in a `--report` `missing`
 member — the rest name requirements checked at policy/spawn/init time
-(e.g. `pidns`, `x86-64`), where an unmet one refuses the launch through
+(e.g. `x86-64`), where an unmet one refuses the launch through
 its own error path. The same row id surfaces as
 `target.sandbox_mechanism` in `plan`/launch reports and as
 `capability.capability_id` in the PoC `--report` payloads — two member

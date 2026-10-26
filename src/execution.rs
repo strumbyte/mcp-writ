@@ -390,6 +390,9 @@ pub struct NamespacedProbeEvidence {
     pub userns: bool,
     pub netns: bool,
     pub mountns: bool,
+    /// `CLONE_NEWPID` was granted by the same single `unshare` as the
+    /// namespace bools above — lands in `missing` as `pidns`.
+    pub pidns: bool,
     /// `uid_gid_map` writes succeeded (report field name `id_map`).
     pub id_map: bool,
     /// The `/proc` remount init's pidns-init child performs succeeded
