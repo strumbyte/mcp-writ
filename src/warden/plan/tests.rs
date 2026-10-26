@@ -120,8 +120,9 @@ fn env_observation_only_exists_when_the_contract_applies() {
         tmpdir: None,
         ..Default::default()
     };
-    assert!(env_observation(&opts, false, None).is_none());
-    let ok = env_observation(&opts, true, None).unwrap();
+    let contract = super::super::env::env_contract_report(&opts);
+    assert!(env_observation(contract.as_ref(), false, None).is_none());
+    let ok = env_observation(contract.as_ref(), true, None).unwrap();
     assert_eq!(ok.state, ControlState::Verified);
     assert_eq!(ok.phase, ControlPhase::Spawn);
     // The restriction consults the allowlist, so the reason carries the
@@ -133,7 +134,7 @@ fn env_observation_only_exists_when_the_contract_applies() {
              (missing: MCP_WRIT_PLAN_TEST_ENV_OBS)"
         )
     );
-    let err = env_observation(&opts, true, Some("boom".to_string())).unwrap();
+    let err = env_observation(contract.as_ref(), true, Some("boom".to_string())).unwrap();
     assert_eq!(err.state, ControlState::Unknown);
     assert!(
         err.reason
@@ -144,11 +145,13 @@ fn env_observation_only_exists_when_the_contract_applies() {
     );
     // A tmpdir-only contract has no consulted allowlist — no contract
     // reason is attached, matching the pre-PR-33 shape.
+    let tmpdir_fixture = crate::testutil::real_tempdir().expect("tempdir");
     let tmpdir_only = SpawnOptions {
-        tmpdir: Some(std::env::temp_dir()),
+        tmpdir: Some(tmpdir_fixture.path().to_path_buf()),
         ..Default::default()
     };
-    let ok = env_observation(&tmpdir_only, true, None).unwrap();
+    let contract = super::super::env::env_contract_report(&tmpdir_only);
+    let ok = env_observation(contract.as_ref(), true, None).unwrap();
     assert_eq!(ok.reason, None);
 }
 

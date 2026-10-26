@@ -688,6 +688,14 @@ pub async fn launch(
     // details below, and one stderr warning per gap class (emitted by
     // warn_env_allowlist_gaps, which returns the same snapshot).
     let env_contract = crate::warden::warn_env_allowlist_gaps(&spawn_opts);
+    // Bind that snapshot onto the warden so the `launch.env`
+    // observation the spawn produces describes it verbatim — every
+    // reported diagnostic then reflects the one environment read the
+    // warnings and audit details already carry, never a second
+    // parent-env sample that could diverge from them. The binding
+    // keys on the restriction `spawn_opts` carries: a spawn whose
+    // options diverged would re-read rather than misreport.
+    warden.set_env_contract(&spawn_opts, env_contract.clone());
     let attempt = match sandbox_skip_reason {
         Some(reason) => warden.spawn_unsandboxed_async_exe_with_report(
             &spawn_exe,

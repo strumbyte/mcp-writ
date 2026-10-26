@@ -396,13 +396,16 @@ pub(super) fn base_limitations() -> Vec<String> {
 /// when no restriction/override exists — the control stays
 /// `NotApplicable` in the plan and carries no observation.
 ///
-/// Under a restriction the reason carries the launch-time allowlist
-/// diagnosis (`env contract: K present, M missing (...)`) — the same
-/// content the plan reason holds, re-read here because `plan` and `run`
-/// can be different processes: this observation is the actual launch
-/// state. Names only; values never enter the report.
+/// `contract` is the allowlist diagnosis the reason reports — `Some`
+/// only when the restriction consulted a list. `run` passes the
+/// snapshot its `warn_env_allowlist_gaps` captured (bound onto the
+/// warden via `set_env_contract`), so the observation, the stderr
+/// warnings, and the `server.connected` details describe one parent-
+/// environment read; spawn callers without a captured snapshot
+/// re-read it through `env_contract_report`. Names only; values never
+/// enter the report.
 pub(super) fn env_observation(
-    opts: &SpawnOptions,
+    contract: Option<&super::env::EnvContractReport>,
     applied: bool,
     spawn_err: Option<String>,
 ) -> Option<EnforcementObservation> {
@@ -410,7 +413,7 @@ pub(super) fn env_observation(
         return None;
     }
     let failed = spawn_err.is_some();
-    let contract_reason = super::env::env_contract_report(opts).map(|c| {
+    let contract_reason = contract.map(|c| {
         format!(
             "env contract: {} allowlisted name(s): {}",
             c.consulted(),

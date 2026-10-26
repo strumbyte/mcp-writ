@@ -279,6 +279,25 @@ impl Warden {
             .await
     }
 
+    /// The env contract a spawn-side `launch.env` observation reports:
+    /// the snapshot bound by [`Self::set_env_contract`] when the launch
+    /// captured one *for these options* — the same view the stderr
+    /// warnings and `server.connected` details carry — else a fresh
+    /// parent-env read, both for callers that never ran the warning
+    /// pass and for a spawn whose restriction no longer matches the
+    /// bound snapshot's, so the observation always reflects the
+    /// allowlist this child is actually filtered with.
+    fn env_contract_for(&self, opts: &SpawnOptions) -> Option<env::EnvContractReport> {
+        self.env_contract
+            .as_ref()
+            .filter(|bound| {
+                bound.restrict_environment == opts.restrict_environment
+                    && bound.allowed_names == opts.allowed_names
+            })
+            .map(|bound| bound.report.clone())
+            .or_else(|| env::env_contract_report(opts))
+    }
+
     async fn spawn_child_async_impl(
         &self,
         program: Option<&Path>,
@@ -397,7 +416,9 @@ impl Warden {
             } else {
                 env_block_applies(opts)
             };
-            if let Some(o) = plan::env_observation(opts, env_applied, spawn_err) {
+            if let Some(o) =
+                plan::env_observation(self.env_contract_for(opts).as_ref(), env_applied, spawn_err)
+            {
                 observations.push(o);
             }
             let report = WardenReport {
@@ -618,7 +639,11 @@ impl Warden {
                 spawned.as_ref().err(),
                 liveness.as_ref(),
             ));
-            if let Some(o) = plan::env_observation(&env_opts, env_applied, spawn_err) {
+            if let Some(o) = plan::env_observation(
+                self.env_contract_for(&env_opts).as_ref(),
+                env_applied,
+                spawn_err,
+            ) {
                 observations.push(o);
             }
             let report = WardenReport {
@@ -739,6 +764,7 @@ impl Warden {
                         ),
                     );
                 };
+                let env_contract = self.env_contract_for(opts);
                 return namespaced::launch::spawn_namespaced_attempt(
                     &self.policy,
                     self.linux_selection
@@ -749,6 +775,7 @@ impl Warden {
                     opts,
                     dry_run,
                     &ctx,
+                    env_contract.as_ref(),
                 )
                 .await;
             }
@@ -848,7 +875,9 @@ impl Warden {
                 spawned.as_ref().err(),
                 Some(requested_rights.as_str()),
             );
-            if let Some(o) = plan::env_observation(opts, env_applied, spawn_err) {
+            if let Some(o) =
+                plan::env_observation(self.env_contract_for(opts).as_ref(), env_applied, spawn_err)
+            {
                 observations.push(o);
             }
             let mut report = WardenReport {
@@ -1091,7 +1120,7 @@ impl Warden {
             let spawned = windows_proc::spawn_unsandboxed(Some(p), &argv[0], &argv[1..], opts);
             let mut report = plan_report();
             if let Some(o) = plan::env_observation(
-                opts,
+                self.env_contract_for(opts).as_ref(),
                 env_block_applies(opts),
                 spawned.as_ref().err().map(|e| e.to_string()),
             ) {
@@ -1170,7 +1199,7 @@ impl Warden {
         let spawned = cmd.spawn();
         let mut report = plan_report();
         if let Some(o) = plan::env_observation(
-            opts,
+            self.env_contract_for(opts).as_ref(),
             env_block_applies(opts),
             spawned.as_ref().err().map(|e| e.to_string()),
         ) {

@@ -25,6 +25,7 @@ use crate::error::WardenError;
 use crate::policy::Policy;
 
 use super::super::child::{NamespacedRuntime, RunningChildInner};
+use super::super::env::EnvContractReport;
 use super::super::linux_spawn;
 use super::super::plan::{self, SpawnAttempt, WardenReport};
 use super::super::select::LinuxSelection;
@@ -39,7 +40,10 @@ use super::{SpawnConfig, policy_memfd, spawn_namespaced_child_tokio};
 /// spawned — the resolved (possibly fd-exec) image, the caller-spelled
 /// argv, and the policy-derived spawn options — so the hash-pin and
 /// env-restriction contracts are identical. `selection` provides the
-/// mechanism evidence the plan/report carry.
+/// mechanism evidence the plan/report carry. `env_contract` is the
+/// allowlist snapshot the launch captured (`Warden::set_env_contract`)
+/// — the `launch.env` observation reports it verbatim so every
+/// diagnostic surface describes one parent-environment read.
 ///
 /// Failure at any stage returns `SpawnAttempt::err` — the launch layer
 /// turns it into a refusal report; nothing here ever re-dispatches a
@@ -53,6 +57,7 @@ pub(crate) async fn spawn_namespaced_attempt(
     opts: &SpawnOptions,
     dry_run: bool,
     ctx: &NamespacedLaunchCtx,
+    env_contract: Option<&EnvContractReport>,
 ) -> SpawnAttempt {
     let mut controls = plan::shared_controls(policy, opts, dry_run, false, false);
     // The DNS gate exists only when an upstream resolver was resolved —
@@ -327,7 +332,7 @@ pub(crate) async fn spawn_namespaced_attempt(
         ctx.upstream.is_some(),
         None,
     );
-    if let Some(o) = plan::env_observation(opts, env_block_applies(opts), None) {
+    if let Some(o) = plan::env_observation(env_contract, env_block_applies(opts), None) {
         observations.push(o);
     }
 

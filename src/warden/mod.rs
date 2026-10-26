@@ -370,6 +370,27 @@ pub struct Warden {
     /// None`) never reaches a spawn: the launch layer refuses first.
     #[cfg(target_os = "linux")]
     linux_selection: Option<select::LinuxSelection>,
+    /// PR-33 — the allowlist snapshot the launch bound via
+    /// [`Self::set_env_contract`], keyed by the restriction it was
+    /// read under: the `launch.env` observation the spawn paths
+    /// produce reports this view — the same one the stderr warnings
+    /// and `server.connected` details carry — rather than a second
+    /// read of the parent environment, and only while the spawn
+    /// options still carry that restriction. `None` for callers that
+    /// never ran the warning pass; the observation re-reads as before.
+    env_contract: Option<BoundEnvContract>,
+}
+
+/// The `restrict_environment`/`allowed_names` an
+/// [`env::EnvContractReport`] snapshot was read under, kept beside it
+/// so `env_contract_for` can prove the bound snapshot still describes
+/// the spawn options in hand — a mismatch falls back to a fresh read
+/// rather than reporting a diagnosis taken under a different
+/// allowlist.
+struct BoundEnvContract {
+    restrict_environment: bool,
+    allowed_names: Vec<String>,
+    report: env::EnvContractReport,
 }
 
 impl Warden {
@@ -388,7 +409,28 @@ impl Warden {
             windows_mechanism: mechanism,
             #[cfg(target_os = "linux")]
             linux_selection: None,
+            env_contract: None,
         }
+    }
+
+    /// Bind the allowlist snapshot `warn_env_allowlist_gaps` captured
+    /// for this launch under `opts` — the same one the stderr warnings
+    /// and the `server.connected` audit details report. The
+    /// `launch.env` observation the spawn produces reuses it rather
+    /// than re-reading the parent environment, so every diagnostic
+    /// surface describes one snapshot of the consulted allowlist; the
+    /// binding keys on `opts`' restriction so a snapshot can never be
+    /// reported against options it did not diagnose.
+    pub(crate) fn set_env_contract(
+        &mut self,
+        opts: &SpawnOptions,
+        report: Option<env::EnvContractReport>,
+    ) {
+        self.env_contract = report.map(|report| BoundEnvContract {
+            restrict_environment: opts.restrict_environment,
+            allowed_names: opts.allowed_names.clone(),
+            report,
+        });
     }
 
     /// Bind the PR-16 Linux egress selection `run`/`plan` computed.

@@ -456,7 +456,8 @@ mod tests {
         unsafe {
             std::env::set_var(sentinel, "inherited");
         }
-        let tmp = std::env::temp_dir().join("mcp-writ-env-contract"); // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        let tmp_fixture = crate::testutil::real_tempdir().expect("tempdir");
+        let tmp = tmp_fixture.path().to_path_buf();
         let opts = SpawnOptions {
             restrict_environment: true,
             allowed_names: Vec::new(),
@@ -785,7 +786,8 @@ mod tests {
         let missing = "MCP_WRIT_ENV_CONTRACT_MISSING";
         let path_gone = "MCP_WRIT_ENV_CONTRACT_PATH_GONE";
         let list = "MCP_WRIT_ENV_CONTRACT_LIST";
-        let gone = std::env::temp_dir().join("mcp-writ-env-contract-no-such-file");
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
+        let gone = dir.path().join("mcp-writ-env-contract-no-such-file");
         assert!(!gone.exists(), "fixture path must not exist");
         let secret = "s3cr3t-value-that-must-not-appear";
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -853,11 +855,10 @@ mod tests {
     fn env_contract_report_existing_path_is_not_path_missing() {
         let _env = lock_process_env();
         let name = "MCP_WRIT_ENV_CONTRACT_PATH_OK";
-        let dir = std::env::temp_dir().join("mcp-writ-env-contract-exists");
-        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
-            std::env::set_var(name, &dir);
+            std::env::set_var(name, dir.path());
         }
         let opts = SpawnOptions {
             restrict_environment: true,
@@ -873,7 +874,6 @@ mod tests {
         unsafe {
             std::env::remove_var(name);
         }
-        let _ = std::fs::remove_dir(&dir);
     }
 
     /// A present name whose value is a single absolute path beneath an
@@ -883,7 +883,8 @@ mod tests {
     fn env_contract_report_path_under_a_file_is_path_missing() {
         let _env = lock_process_env();
         let name = "MCP_WRIT_ENV_CONTRACT_NOTDIR";
-        let file = std::env::temp_dir().join("mcp-writ-env-contract-file");
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
+        let file = dir.path().join("mcp-writ-env-contract-file");
         std::fs::write(&file, b"x").expect("fixture file");
         let under_file = file.join("child");
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -907,7 +908,6 @@ mod tests {
         unsafe {
             std::env::remove_var(name);
         }
-        let _ = std::fs::remove_file(&file);
     }
 
     /// `describe()` percent-encodes names so a legal-but-exotic
@@ -972,8 +972,9 @@ mod tests {
     #[test]
     fn env_block_applies_matches_spawn_env_pairs_presence() {
         let _env = lock_process_env();
+        let fixture = crate::testutil::real_tempdir().expect("tempdir");
         for restrict in [false, true] {
-            for tmpdir in [None, Some(std::env::temp_dir())] {
+            for tmpdir in [None, Some(fixture.path().to_path_buf())] {
                 let opts = SpawnOptions {
                     restrict_environment: restrict,
                     tmpdir: tmpdir.clone(),
