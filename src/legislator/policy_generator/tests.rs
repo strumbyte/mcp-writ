@@ -2008,8 +2008,10 @@ fn python_venv_launch_seeds_venv_and_base_prefix() {
             "expected exactly one grant for {want}:\n{kdl}"
         );
     }
-    // `home` names a bin dir under the granted prefix — covered.
-    assert!(allow_lines(&kdl, &f(&base_bin)).is_empty(), "{kdl}");
+    // `home` lands as its own grant before the prefix that also
+    // covers it — mirroring the exe dir→prefix pair, so the line the
+    // config actually names carries the provenance comment.
+    assert_eq!(allow_lines(&kdl, &f(&base_bin)).len(), 1, "{kdl}");
     assert!(
         kdl.contains("// seeded from resolved interpreter:"),
         "{kdl}"
@@ -2200,4 +2202,25 @@ fn seed_grants_dedupe_against_string_analysis_and_prefixes() {
     if std::fs::canonicalize("/lib").is_ok_and(|p| p.as_path() == Path::new("/usr/lib")) {
         assert!(allow_lines(&kdl, "/lib").is_empty(), "{kdl}");
     }
+}
+
+/// `grant_covered` honors modes: a read grant does not cover a write
+/// need under it (a `/dev/null` write seed must survive a read grant
+/// on `/dev`), while a write grant (read+write) covers either need.
+#[test]
+fn grant_covered_respects_grant_mode() {
+    // Nonexistent paths exercise the uncanonicalized fallback — the
+    // comparison is the same either way.
+    let granted: Vec<(PathBuf, &'static str)> = vec![
+        (PathBuf::from("ro-grant"), "read"),
+        (PathBuf::from("rw-grant"), "write"),
+    ];
+    assert!(!grant_covered(
+        Path::new("ro-grant/null"),
+        &granted,
+        "write"
+    ));
+    assert!(grant_covered(Path::new("ro-grant/null"), &granted, "read"));
+    assert!(grant_covered(Path::new("rw-grant/null"), &granted, "read"));
+    assert!(grant_covered(Path::new("rw-grant/null"), &granted, "write"));
 }

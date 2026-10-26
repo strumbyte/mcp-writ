@@ -719,9 +719,10 @@ fn stage1_workload_hashes(spec: &ServerSpec, text: &str, out: &Path) {
         spec.name
     );
     // PR-32: interpreted launches seed argv-grounded runtime defaults —
-    // the `-m` python servers run the venv interpreter, and `pyvenv.cfg`
-    // grounds its `site-packages` prefix the same way the resolved
-    // launch spells it.
+    // the `-m` python servers run the venv interpreter, whose spelled
+    // location's dir/parent grants the `.venv` tree; `pyvenv.cfg`'s
+    // `home=` additionally grounds the base prefix a copied
+    // interpreter hides.
     assert!(
         text.contains("// seeded from"),
         "stage1 {}: interpreted draft must seed runtime read grants",

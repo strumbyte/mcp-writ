@@ -553,8 +553,9 @@ fn build_fs_section(
 
     // Directory grants already emitted from binary string analysis — a
     // `/<dir>/**` line covers the interpreter seeds under it, so the
-    // seed pass skips what these lines already grant.
-    let mut granted: Vec<PathBuf> = Vec::new();
+    // seed pass skips what these lines already grant. Each entry keeps
+    // its mode: a read grant cannot cover a write-needed seed.
+    let mut granted: Vec<(PathBuf, &'static str)> = Vec::new();
     for path in &capability.strings.paths {
         if path.starts_with("/usr/lib")
             || path.starts_with("/etc/ssl")
@@ -564,7 +565,7 @@ fn build_fs_section(
             let glob = if path.contains('.') {
                 path.clone()
             } else {
-                granted.push(PathBuf::from(path));
+                granted.push((PathBuf::from(path), "read"));
                 format!("{path}/**")
             };
             out.push_str(&format!(
@@ -612,7 +613,9 @@ enum SeedOrigin {
     /// interpreter prefix a copied `python.exe` does not reveal.
     VenvHome(PathBuf),
     /// The shared runtime baseline file's documented host paths
-    /// (`examples/policies/runtime/<rt>.kdl`).
+    /// (`examples/policies/runtime/<rt>.kdl`) — the documented list is
+    /// Linux-only, so the variant exists only where it is constructed.
+    #[cfg(target_os = "linux")]
     RuntimeFile(&'static str),
 }
 
@@ -623,6 +626,7 @@ impl SeedOrigin {
             Self::SpelledExe(p) => ("launch argv0", p.display().to_string()),
             Self::Payload(p) => ("resolved payload", p.display().to_string()),
             Self::VenvHome(p) => ("pyvenv.cfg home", p.display().to_string()),
+            #[cfg(target_os = "linux")]
             Self::RuntimeFile(f) => ("runtime baseline", (*f).to_string()),
         };
         format!("// seeded from {}: {}", label, escape_kdl_comment(&detail))
@@ -646,6 +650,7 @@ impl SeedOrigin {
                 "base interpreter prefix a venv's pyvenv.cfg names — the \
                  real standard library lives there"
             }
+            #[cfg(target_os = "linux")]
             Self::RuntimeFile(_) => {
                 "path the shared runtime baseline lists for this \
                  interpreter — delete what the workload does not read"
@@ -656,14 +661,18 @@ impl SeedOrigin {
 
 /// True when `dir` is already covered by a grant emitted earlier —
 /// equal to it or inside its subtree (a Landlock grant covers the
-/// subtree; the SBPL/DACL emitters map directories the same way).
-/// Both sides canonicalize when they exist so a `/lib` symlink and
-/// its `/usr/lib` target dedupe.
-fn grant_covered(dir: &Path, granted: &[PathBuf]) -> bool {
+/// subtree; the SBPL/DACL emitters map directories the same way) *and*
+/// that grant's mode covers what the new grant needs (`"write"` is
+/// read+write, so it covers either need; `"read"` covers only a read
+/// need — a read grant must not suppress a write-needed seed like
+/// `/dev/null`). Both sides canonicalize when they exist so a `/lib`
+/// symlink and its `/usr/lib` target dedupe.
+fn grant_covered(dir: &Path, granted: &[(PathBuf, &'static str)], need: &'static str) -> bool {
     let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    granted.iter().any(|g| {
+    granted.iter().any(|(g, mode)| {
+        let mode_covers = *mode == "write" || need == "read";
         let base = std::fs::canonicalize(g).unwrap_or_else(|_| g.clone());
-        canon == base || canon.starts_with(&base)
+        mode_covers && (canon == base || canon.starts_with(&base))
     })
 }
 
@@ -691,7 +700,7 @@ fn pyvenv_home(venv_dir: &Path) -> Option<PathBuf> {
 fn build_runtime_seed_grants(
     out: &mut String,
     workload: &WorkloadHashes,
-    granted: &mut Vec<PathBuf>,
+    granted: &mut Vec<(PathBuf, &'static str)>,
 ) {
     let Some(interpreter) = workload.interpreter else {
         return;
@@ -824,25 +833,28 @@ fn build_runtime_seed_grants(
                 });
                 // The `home=` line is operator-controlled config text —
                 // only an absolute path that names a directory with a
-                // parent is a meaningful grant.
+                // parent is a meaningful grant. `home` lands before its
+                // parent prefix, mirroring the exe dir→prefix pair, so
+                // the line the config actually names carries the
+                // provenance comment.
                 if let Some(home) = pyvenv_home(anc)
                     && home.is_absolute()
                     && home.parent().is_some()
                 {
+                    grants.push(SeedGrant {
+                        dir: home.clone(),
+                        mode: "read",
+                        origin: SeedOrigin::VenvHome(home.clone()),
+                    });
                     if let Some(prefix) = home.parent()
                         && prefix.parent().is_some()
                     {
                         grants.push(SeedGrant {
                             dir: prefix.to_path_buf(),
                             mode: "read",
-                            origin: SeedOrigin::VenvHome(home.clone()),
+                            origin: SeedOrigin::VenvHome(home),
                         });
                     }
-                    grants.push(SeedGrant {
-                        dir: home.clone(),
-                        mode: "read",
-                        origin: SeedOrigin::VenvHome(home),
-                    });
                 }
                 break;
             }
@@ -896,7 +908,7 @@ fn build_runtime_seed_grants(
         // Dedupe against earlier grants as they land — the spelled
         // interpreter resolves to the same directories as the resolved
         // image whenever no venv or shim intervenes.
-        if grant_covered(&grant.dir, granted) {
+        if grant_covered(&grant.dir, granted, grant.mode) {
             continue;
         }
         if !seeded {
@@ -912,7 +924,7 @@ fn build_runtime_seed_grants(
             );
             seeded = true;
         }
-        granted.push(grant.dir.clone());
+        granted.push((grant.dir.clone(), grant.mode));
         out.push_str(&format!("        {}\n", grant.origin.comment()));
         out.push_str(&format!(
             "        {}\n",
