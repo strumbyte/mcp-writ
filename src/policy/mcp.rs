@@ -784,19 +784,29 @@ impl DenyReason {
     /// Client-facing explanation appended after the reason code —
     /// `Some` only for reasons whose bare code does not say what the
     /// peer did wrong. `init-order` explains the expected MCP
-    /// initialization sequence; `unsupported-version` and
-    /// `frame-too-large` already carry their specifics in the
-    /// dedicated diagnostic paths, so they keep the generic format.
-    /// `method` is the frame's method name, interpolated where the
-    /// explanation names it. Reasons joining this mechanism later add
-    /// a `Some` arm here.
-    pub fn explain(self, method: &str) -> Option<String> {
+    /// initialization sequence, worded for the *receiving* peer's
+    /// `direction`: a mis-ordering client is told the send sequence,
+    /// a mis-ordering server is told to hold requests until
+    /// `notifications/initialized` (servers never send `initialize`).
+    /// `unsupported-version` and `frame-too-large` already carry
+    /// their specifics in the dedicated diagnostic paths, so they
+    /// keep the generic format. `method` is the frame's method name,
+    /// interpolated where the explanation names it. Reasons joining
+    /// this mechanism later add a `Some` arm here.
+    pub fn explain(self, method: &str, direction: MessageDirection) -> Option<String> {
         match self {
-            Self::InitOrder => Some(format!(
-                "\"{method}\" arrived before the session was initialized — \
-                 send initialize, wait for its result, send \
-                 notifications/initialized, then other requests"
-            )),
+            Self::InitOrder => Some(match direction {
+                MessageDirection::ClientToServer => format!(
+                    "\"{method}\" arrived before the session was initialized — \
+                     send initialize, wait for its result, send \
+                     notifications/initialized, then other requests"
+                ),
+                MessageDirection::ServerToClient => format!(
+                    "\"{method}\" arrived before the session was initialized — \
+                     a server request other than ping must wait for the \
+                     client's notifications/initialized"
+                ),
+            }),
             _ => None,
         }
     }

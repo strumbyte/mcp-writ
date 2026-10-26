@@ -44,7 +44,10 @@ pub struct ProbeReport {
     /// and lands in `missing()`; `ipv6=false` with `ipv6_stack=false`
     /// is an unavailable socket, not a failure.
     pub ipv6: bool,
-    /// Stage that failed, when one did — matches init's `ERR` stages.
+    /// Stage that failed, when one did — `ERR` stage names where init
+    /// has a counterpart (`unshare`, `idmap`, `tun`, `proc-mount`);
+    /// probe-only stages (`fork`, `pipe`, `loopback`, `route`, `ipv6`,
+    /// `probe`) fold into init's `net`/pre-namespace vocabulary.
     pub failed_stage: Option<String>,
     pub detail: Option<String>,
 }
@@ -308,7 +311,9 @@ fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
     // the early exit would have left untested.
     match probe_proc_mount() {
         Ok(()) => r.proc_mount = true,
-        Err(e) => fail!("proc_mount", e),
+        // `failed_stage` names init's `ERR proc-mount` stage — the
+        // catalog/`missing` token stays `proc_mount` (the bool field).
+        Err(e) => fail!("proc-mount", e),
     }
     // SAFETY: `tun` is still owned by this process — it was opened above
     // and never wrapped — so it is closed exactly once here.

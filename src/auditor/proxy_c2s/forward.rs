@@ -105,7 +105,7 @@ where
         request_extra(ext),
     )?;
     let text = match verdict {
-        McpVerdict::Deny(r) => match deny_explanation(r, method) {
+        McpVerdict::Deny(r) => match deny_explanation(r, method, C2S) {
             Some(text) => text,
             None => format!("{message} ({})", r.as_str()),
         },

@@ -890,7 +890,7 @@ where
             // a 2026 wire.
             if version != V26 {
                 let msg = match verdict {
-                    McpVerdict::Deny(r) => match deny_explanation(r, method) {
+                    McpVerdict::Deny(r) => match deny_explanation(r, method, S2C) {
                         Some(text) => format!("mcp-writ: {text}"),
                         None => format!(
                             "mcp-writ: server request '{method}' denied ({})",
