@@ -13,8 +13,8 @@ use crate::auditor::checker;
 use crate::auditor::proxy_rpc::{self, ExtractedRequest, TrackedRequest};
 use crate::auditor::proxy_state::{MAX_ORIGINAL_TOOLS_LIST_BYTES, ProxyShared};
 use crate::auditor::proxy_wire::{
-    build_error_response, build_jsonrpc_error, extract_raw_id, extract_tool_name_from_line,
-    join_audit_details, write_child_frame, write_client_frame,
+    build_error_response, build_jsonrpc_error, deny_explanation, extract_raw_id,
+    extract_tool_name_from_line, join_audit_details, write_child_frame, write_client_frame,
 };
 use crate::auditor::session::{RpcId, SessionState};
 use crate::error::AuditorError;
@@ -104,15 +104,22 @@ where
         shared.dry_run,
         request_extra(ext),
     )?;
-    let reason = match verdict {
-        McpVerdict::Deny(r) => r.as_str(),
-        other => other.reason_code(),
+    let text = match verdict {
+        McpVerdict::Deny(r) => match deny_explanation(r, method, C2S) {
+            Some(text) => text,
+            None => format!("{message} ({})", r.as_str()),
+        },
+        other => format!("{message} ({})", other.reason_code()),
     };
-    write_client_frame(
-        &shared.client_out,
-        &build_jsonrpc_error(raw_id, &format!("{message} ({reason})")),
-    )
-    .await
+    if matches!(verdict, McpVerdict::Deny(DenyReason::InitOrder))
+        && !shared.init_order_warned.swap(true, Ordering::SeqCst)
+    {
+        // Per-request warns would flood stderr on a mis-ordering
+        // client — the wire error repeats on every denial, so the
+        // stderr diagnostic logs once per session.
+        tracing::warn!("client→server: {text}");
+    }
+    write_client_frame(&shared.client_out, &build_jsonrpc_error(raw_id, &text)).await
 }
 
 /// Dry-run observes only a genuine tool authorization verdict —
@@ -1070,6 +1077,7 @@ mod tests {
                 )),
                 last_list_template: Arc::new(Mutex::new(String::new())),
                 next_internal_id: Arc::new(AtomicU64::new(910_001)),
+                init_order_warned: Arc::new(AtomicBool::new(false)),
                 abort_tx,
             },
             abort_rx,

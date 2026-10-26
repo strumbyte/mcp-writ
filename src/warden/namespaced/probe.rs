@@ -12,12 +12,24 @@ use std::os::unix::io::FromRawFd;
 /// Serialized probe result — the `--report` payload's `capabilities`
 /// section and the launch-refusal detail. Wire format to the parent
 /// is `key=value` lines (no JSON parser dependency).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProbeReport {
     pub userns: bool,
     pub netns: bool,
     pub mountns: bool,
+    /// `CLONE_NEWPID` was granted by the same single `unshare` that
+    /// created userns/netns/mountns — measured evidence like its
+    /// sibling bools, so a failed or absent probe reports `false`
+    /// rather than the report claiming the namespace unconditionally.
+    /// Lands in `missing` as `pidns`, the catalog's requires id.
+    pub pidns: bool,
     pub id_map: bool,
+    /// The `/proc` remount init's pidns-init child performs succeeded
+    /// from a fresh pidns under this mountns (PR-35 / D-10). `false`
+    /// reports the masked-`/proc` environment constraint (container,
+    /// nested userns) the launch would otherwise hit as a bare
+    /// `ERR proc-mount errno=1` — `capable()` refuses it the same way.
+    pub proc_mount: bool,
     pub tun: bool,
     pub loopback_up: bool,
     pub route: bool,
@@ -38,7 +50,10 @@ pub struct ProbeReport {
     /// and lands in `missing()`; `ipv6=false` with `ipv6_stack=false`
     /// is an unavailable socket, not a failure.
     pub ipv6: bool,
-    /// Stage that failed, when one did — matches init's `ERR` stages.
+    /// Stage that failed, when one did — `ERR` stage names where init
+    /// has a counterpart (`unshare`, `idmap`, `tun`, `proc-mount`);
+    /// probe-only stages (`fork`, `pipe`, `loopback`, `route`, `ipv6`,
+    /// `probe`) fold into init's `net`/pre-namespace vocabulary.
     pub failed_stage: Option<String>,
     pub detail: Option<String>,
 }
@@ -66,8 +81,14 @@ impl ProbeReport {
         if !self.mountns {
             v.push("mountns");
         }
+        if !self.pidns {
+            v.push("pidns");
+        }
         if !self.id_map {
             v.push("uid_gid_map");
+        }
+        if !self.proc_mount {
+            v.push("proc_mount");
         }
         if !self.tun {
             v.push("tun");
@@ -97,11 +118,13 @@ impl ProbeReport {
 
 fn report_text(r: &ProbeReport) -> String {
     format!(
-        "userns={}\nnetns={}\nmountns={}\nid_map={}\ntun={}\nloopback_up={}\nroute={}\nipv6_stack={}\nipv6={}\nfailed_stage={}\ndetail={}\n",
+        "userns={}\nnetns={}\nmountns={}\npidns={}\nid_map={}\nproc_mount={}\ntun={}\nloopback_up={}\nroute={}\nipv6_stack={}\nipv6={}\nfailed_stage={}\ndetail={}\n",
         r.userns,
         r.netns,
         r.mountns,
+        r.pidns,
         r.id_map,
+        r.proc_mount,
         r.tun,
         r.loopback_up,
         r.route,
@@ -113,19 +136,7 @@ fn report_text(r: &ProbeReport) -> String {
 }
 
 fn parse_report(body: &str) -> Option<ProbeReport> {
-    let mut report = ProbeReport {
-        userns: false,
-        netns: false,
-        mountns: false,
-        id_map: false,
-        tun: false,
-        loopback_up: false,
-        route: false,
-        ipv6_stack: false,
-        ipv6: false,
-        failed_stage: None,
-        detail: None,
-    };
+    let mut report = ProbeReport::default();
     let mut saw_any = false;
     for line in body.lines() {
         let Some((k, v)) = line.split_once('=') else {
@@ -137,7 +148,9 @@ fn parse_report(body: &str) -> Option<ProbeReport> {
             "userns" => report.userns = truthy,
             "netns" => report.netns = truthy,
             "mountns" => report.mountns = truthy,
+            "pidns" => report.pidns = truthy,
             "id_map" => report.id_map = truthy,
+            "proc_mount" => report.proc_mount = truthy,
             "tun" => report.tun = truthy,
             "loopback_up" => report.loopback_up = truthy,
             "route" => report.route = truthy,
@@ -159,19 +172,10 @@ fn parse_report(body: &str) -> Option<ProbeReport> {
 /// the fresh namespaces die with it.
 fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
     let mut r = ProbeReport {
-        userns: false,
-        netns: false,
-        mountns: false,
         // Set by the parent side of the report merge — the grandchild
         // only knows the namespaces half.
         id_map: true,
-        tun: false,
-        loopback_up: false,
-        route: false,
-        ipv6_stack: false,
-        ipv6: false,
-        failed_stage: None,
-        detail: None,
+        ..Default::default()
     };
     macro_rules! fail {
         ($stage:literal, $e:expr) => {{
@@ -190,16 +194,24 @@ fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
     }
 
     // Same single unshare call init's grandchild makes — success
-    // implies all three namespaces were granted together.
+    // implies all four namespaces were granted together, so the pidns
+    // half init relies on is measured here too (a CLONE_NEWPID refusal
+    // reports `unshare`, never a launch-time surprise).
     // SAFETY: scalar flag bitmask, no pointers; a refused combination
     // returns EINVAL rather than producing UB.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWNS) } < 0 {
+    if unsafe {
+        libc::unshare(
+            libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWNS | libc::CLONE_NEWPID,
+        )
+    } < 0
+    {
         fail!("unshare", std::io::Error::last_os_error());
     }
     r.userns = true;
     r.netns = true;
     r.mountns = true;
+    r.pidns = true;
 
     // Tell the parent "unshared" and wait for the map write.
     // SAFETY: the 1-byte literal is a readable buffer; a bad `sync_w`
@@ -277,6 +289,21 @@ fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
         }
         r.ipv6 = true;
     }
+    // PR-35 / D-10: measure the `/proc` remount init's pidns-init child
+    // performs. Every stage above can pass while this still refuses —
+    // the mount requires CAP_SYS_ADMIN over the *pidns's* owner userns
+    // (so it must be attempted inside the fresh pidns) and a
+    // fully-visible `/proc` in the inherited mount namespace (a
+    // container or nested userns that masks parts of `/proc` answers
+    // EPERM). Testing after the network stages keeps a refusal honest:
+    // `missing` then names `proc_mount` alone instead of every stage
+    // the early exit would have left untested.
+    match probe_proc_mount() {
+        Ok(()) => r.proc_mount = true,
+        // `failed_stage` names init's `ERR proc-mount` stage — the
+        // catalog/`missing` token stays `proc_mount` (the bool field).
+        Err(e) => fail!("proc-mount", e),
+    }
     // SAFETY: `tun` is still owned by this process — it was opened above
     // and never wrapped — so it is closed exactly once here.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -292,21 +319,108 @@ fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
     }
 }
 
+/// Attempt init's `/proc` remount the way init performs it: a child
+/// forked *after* the `CLONE_NEWPID` unshare lands as pid 1 of the
+/// fresh pid namespace — the position a procfs mount actually needs
+/// CAP_SYS_ADMIN over — replays init's `MS_PRIVATE|MS_REC` detach on
+/// the inherited mountns, then tries `mount("proc", "/proc")`. The
+/// outcome returns through the child's exit status (`errno` on
+/// failure, 0 on success); the mount itself lives in this probe's
+/// private mountns, so the host's `/proc` is untouched, and a
+/// successful attempt umounts right back so no later stage sees the
+/// over-mounted view.
+fn probe_proc_mount() -> std::io::Result<()> {
+    // SAFETY: the probe helper is single-threaded here — the child
+    // inherits no foreign-held lock, and it `_exit`s without unwinding.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if pid == 0 {
+        let code: i32 = (|| {
+            // SAFETY: every pointer is a NUL-terminated static C
+            // string; MS_PRIVATE|MS_REC takes null source/fstype/data.
+            // The call lands in the mountns shared with the probe
+            // grandchild — the same detach init performs.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            if unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_PRIVATE | libc::MS_REC,
+                    std::ptr::null(),
+                )
+            } < 0
+            {
+                return errno_code();
+            }
+            // SAFETY: static C strings; proc takes no mount data.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            if unsafe {
+                libc::mount(
+                    c"proc".as_ptr(),
+                    c"/proc".as_ptr(),
+                    c"proc".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                )
+            } < 0
+            {
+                return errno_code();
+            }
+            // Restore the inherited /proc view for the remaining
+            // stages — MNT_DETACH drops the over-mount immediately.
+            // SAFETY: static C string; umount2 takes no mount data.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::umount2(c"/proc".as_ptr(), libc::MNT_DETACH) };
+            0
+        })();
+        // SAFETY: terminates the forked child — `_exit` never returns.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::_exit(code.clamp(0, 255)) };
+    }
+    let mut status = 0i32;
+    loop {
+        // SAFETY: `&mut status` is a valid, writable c_int and `pid`
+        // is this process's unreaped child.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if r == pid {
+            break;
+        }
+        // A wait error must not read the zero-initialized `status` —
+        // an unreported child is a failed measurement, not a success.
+        if r < 0 && errno_code() != libc::EINTR {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    if libc::WIFEXITED(status) {
+        let code = libc::WEXITSTATUS(status);
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(code))
+        }
+    } else {
+        Err(std::io::Error::other(
+            "proc-mount probe child died before reporting",
+        ))
+    }
+}
+
+fn errno_code() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+}
+
 /// Uniform report for a setup stage that failed before any namespace
 /// work ran — pipe creation or the fork itself.
 fn failed_probe(stage: &str, detail: String) -> ProbeReport {
     ProbeReport {
-        userns: false,
-        netns: false,
-        mountns: false,
-        id_map: false,
-        tun: false,
-        loopback_up: false,
-        route: false,
-        ipv6_stack: false,
-        ipv6: false,
         failed_stage: Some(stage.to_string()),
         detail: Some(detail),
+        ..Default::default()
     }
 }
 
@@ -437,17 +551,9 @@ fn probe_in_place() -> ProbeReport {
         let _ = f.read_to_string(&mut body);
     }
     let mut r = parse_report(&body).unwrap_or_else(|| ProbeReport {
-        userns: false,
-        netns: false,
-        mountns: false,
-        id_map: false,
-        tun: false,
-        loopback_up: false,
-        route: false,
-        ipv6_stack: false,
-        ipv6: false,
         failed_stage: Some("probe".to_string()),
         detail: Some(format!("grandchild report missing (raw: {body})")),
+        ..Default::default()
     });
     r.id_map = id_map;
     if got && !id_map && r.failed_stage.is_none() {
@@ -497,7 +603,9 @@ mod tests {
             userns: all_ok,
             netns: all_ok,
             mountns: all_ok,
+            pidns: all_ok,
             id_map: all_ok,
+            proc_mount: all_ok,
             tun: all_ok,
             loopback_up: all_ok,
             route: all_ok,
@@ -522,7 +630,9 @@ mod tests {
             "userns",
             "netns",
             "mountns",
+            "pidns",
             "id_map",
+            "proc_mount",
             "tun",
             "loopback_up",
             "route",
@@ -533,7 +643,9 @@ mod tests {
                 "userns" => r.userns = false,
                 "netns" => r.netns = false,
                 "mountns" => r.mountns = false,
+                "pidns" => r.pidns = false,
                 "id_map" => r.id_map = false,
+                "proc_mount" => r.proc_mount = false,
                 "tun" => r.tun = false,
                 "loopback_up" => r.loopback_up = false,
                 "route" => r.route = false,
@@ -549,11 +661,12 @@ mod tests {
         }
         // A fully-failed probe names every stage it measures — the
         // coverage is complete, not a subset, and adds nothing the
-        // catalog does not require. (`pidns` is a launch-time
-        // requirement: the launch unshares it unconditionally, so the
-        // probe never reports it.) `ipv6_route_via_tun` is measured
-        // only when the kernel exposes a v6 stack — pin it separately
-        // since a stack-absent host must not report it.
+        // catalog does not require. `pidns` is a measured token like
+        // the rest even though it folds into the same single `unshare`
+        // stage — a refusal still names every unmet requires id.
+        // `ipv6_route_via_tun` is measured only when the kernel
+        // exposes a v6 stack — pin it separately since a stack-absent
+        // host must not report it.
         let mut all = report(false);
         all.ipv6_stack = true;
         let mut all = all.missing();
@@ -566,6 +679,8 @@ mod tests {
                 "loopback_up",
                 "mountns",
                 "netns",
+                "pidns",
+                "proc_mount",
                 "tun",
                 "uid_gid_map",
                 "userns"

@@ -435,7 +435,9 @@ fn write_mechanism(
                 f.member("userns", p.userns)?;
                 f.member("netns", p.netns)?;
                 f.member("mountns", p.mountns)?;
+                f.member("pidns", p.pidns)?;
                 f.member("id_map", p.id_map)?;
+                f.member("proc_mount", p.proc_mount)?;
                 f.member("tun", p.tun)?;
                 f.member("loopback_up", p.loopback_up)?;
                 f.member("route", p.route)?;

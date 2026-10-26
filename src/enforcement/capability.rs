@@ -41,7 +41,7 @@ pub const CAPABILITY_MATRIX_SCHEMA_VERSION: &str = "1";
 /// contract — unotify/ebpf's `check_support` ([`UnmetRequirement`]) and
 /// namespaced's `ProbeReport::missing()` emit exactly those tokens. The
 /// rest name requirements checked at policy/spawn/init time (e.g.
-/// `no-new-privs`, `pidns`, `x86-64`) — an unmet one refuses the launch
+/// `no-new-privs`, `x86-64`) — an unmet one refuses the launch
 /// through its own error path, never through a `missing` member.
 #[derive(Debug)]
 pub struct Requirement {

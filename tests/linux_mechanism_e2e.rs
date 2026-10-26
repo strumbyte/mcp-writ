@@ -106,8 +106,8 @@ fn fixture() -> Option<PathBuf> {
 }
 
 /// The launcher's own capability probe: `namespaced-probe` exits 0
-/// exactly when every stage `namespaced` needs (userns/netns/mountns,
-/// uid map, TUN, loopback, route) succeeds — the same verdict the
+/// exactly when every stage `namespaced` needs (userns/netns/mountns/
+/// pidns, uid map, TUN, loopback, route) succeeds — the same verdict the
 /// selection consults, so a skip mirrors a refused launch.
 fn namespaced_capable() -> bool {
     match Command::new(env!("CARGO_BIN_EXE_mcp-writ"))
@@ -522,6 +522,11 @@ struct Report {
     status: Option<String>,
     detail: Option<String>,
     violations: Vec<String>,
+    /// `mechanism.probe.proc_mount` — `Some` whenever the pre-launch
+    /// capability probe ran (absent only when the probe itself was
+    /// skipped, e.g. an explicit `native` request). `false` names the
+    /// masked-/proc environment constraint PR-35 measures.
+    proc_mount: Option<bool>,
     ns: Option<NsReport>,
 }
 
@@ -559,12 +564,14 @@ fn read_report(dir: &Path) -> Report {
                 .collect()
         })
         .unwrap_or_default();
+    let proc_mount = member(&mech, "probe").and_then(|p| member_bool(&p, "proc_mount"));
     Report {
         requested: member_str(&mech, "requested"),
         selected: member_str(&mech, "selected"),
         status: member_str(&result, "status"),
         detail: member_str(&result, "detail"),
         violations,
+        proc_mount,
         ns,
     }
 }
@@ -632,6 +639,14 @@ fn auto_selects_namespaced_for_udp_policy() {
     let report = read_report(dir.path());
     assert_eq!(report.requested.as_deref(), Some("auto"));
     assert_eq!(report.selected.as_deref(), Some("linux-namespaced"));
+    // PR-35 / D-10: the probe's /proc-remount evidence landed — a
+    // capable host records proc_mount=true, and the selection picked
+    // namespaced on that evidence.
+    assert_eq!(
+        report.proc_mount,
+        Some(true),
+        "capable host must report the /proc remount stage"
+    );
     let ns = ns_of(&report);
     assert_eq!(ns.sandbox_applied, Some(true));
     assert_eq!(ns.proxy_lost, Some(false));

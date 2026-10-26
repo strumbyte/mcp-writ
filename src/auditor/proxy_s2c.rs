@@ -20,10 +20,10 @@ use super::proxy_rpc::{self, TrackedRequest, WireFrame, WireState};
 use super::proxy_state::{self, ProxyShared};
 use super::proxy_tools_list::{self, ListFlow, S2cFrame};
 use super::proxy_wire::{
-    build_jsonrpc_error, extract_raw_id, frame_too_large_message, negotiated_version_value,
-    oversize_extra, read_proxy_frame, recover_id_candidates, recover_method, rpc_id_from_raw_id,
-    tools_call_result_succeeded, unsupported_version_message, write_child_frame,
-    write_client_frame,
+    build_jsonrpc_error, deny_explanation, extract_raw_id, frame_too_large_message,
+    negotiated_version_value, oversize_extra, read_proxy_frame, recover_id_candidates,
+    recover_method, rpc_id_from_raw_id, tools_call_result_succeeded, unsupported_version_message,
+    write_child_frame, write_client_frame,
 };
 use super::session::{self, RpcId};
 use crate::error::AuditorError;
@@ -889,18 +889,29 @@ where
             // JSON-RPC error — but never emit a client→server response on
             // a 2026 wire.
             if version != V26 {
-                let reason = match verdict {
-                    McpVerdict::Deny(r) => r.as_str(),
-                    other => other.reason_code(),
-                };
-                write_child_frame(
-                    &shared.child_stdin,
-                    &build_jsonrpc_error(
-                        raw_id,
-                        &format!("mcp-writ: server request '{method}' denied ({reason})"),
+                let msg = match verdict {
+                    McpVerdict::Deny(r) => match deny_explanation(r, method, S2C) {
+                        Some(text) => format!("mcp-writ: {text}"),
+                        None => format!(
+                            "mcp-writ: server request '{method}' denied ({})",
+                            r.as_str()
+                        ),
+                    },
+                    other => format!(
+                        "mcp-writ: server request '{method}' denied ({})",
+                        other.reason_code()
                     ),
-                )
-                .await?;
+                };
+                if matches!(verdict, McpVerdict::Deny(DenyReason::InitOrder))
+                    && !shared
+                        .init_order_warned
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    // Same once-per-session rule as the C2S deny path —
+                    // the server's error reply repeats on every denial.
+                    tracing::warn!("server→client: {msg}");
+                }
+                write_child_frame(&shared.child_stdin, &build_jsonrpc_error(raw_id, &msg)).await?;
             }
             Ok(())
         }

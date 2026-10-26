@@ -12,9 +12,11 @@
 //!    kernels that require `CAP_SETUID` over the parent userns, and
 //!    WSL2 enforces this). Init stays as the supervisor: it writes the
 //!    grandchild's maps, then waitpid()s and forwards the exit status.
-//! 1. `unshare(CLONE_NEWUSER|CLONE_NEWNET|CLONE_NEWNS)` in the
-//!    grandchild — one call, so a partial grant (userns but no netns)
-//!    cannot leave a half-isolated child.
+//! 1. `unshare(CLONE_NEWUSER|CLONE_NEWNET|CLONE_NEWNS|CLONE_NEWPID)` in
+//!    the grandchild — one call, so a partial grant (userns but no
+//!    netns) cannot leave a half-isolated child. The *next* forked
+//!    child enters the new pid namespace as pid 1 (which is also where
+//!    the `/proc` remount runs).
 //! 2. `setgroups=deny` + `uid_map`/`gid_map` written by the init
 //!    parent into `/proc/<grandchild>/` — maps the launcher's
 //!    euid/egid to namespace-root (the `unshare --map-root-user`

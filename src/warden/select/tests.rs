@@ -6,7 +6,9 @@ fn probe(all_ok: bool) -> Result<ProbeReport, String> {
         userns: all_ok,
         netns: all_ok,
         mountns: all_ok,
+        pidns: all_ok,
         id_map: all_ok,
+        proc_mount: all_ok,
         tun: all_ok,
         loopback_up: all_ok,
         route: all_ok,
@@ -98,6 +100,42 @@ fn auto_prefers_namespaced_when_capable_and_satisfiable() {
     let sel = decide(LinuxMechanismRequest::Auto, &input(&p, &pr, upstream(), 8));
     assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
     assert!(sel.violations.is_empty());
+}
+
+/// PR-35 / D-10: a masked-/proc environment (container, nested userns)
+/// fails the probe's `proc_mount` stage even when every namespace
+/// feature works — `auto` must still fall back to a satisfiable
+/// native, and an explicit `namespaced` request must refuse, both
+/// naming `proc_mount` as the missing requirement.
+#[test]
+fn proc_mount_missing_selects_native_under_auto_and_refuses_explicit() {
+    let p = bare_port_policy();
+    let mut r = probe(true).unwrap();
+    r.proc_mount = false;
+    let pr = Ok(r);
+    let sel = decide(LinuxMechanismRequest::Auto, &input(&p, &pr, upstream(), 8));
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Native));
+    assert_eq!(sel.missing, vec!["proc_mount".to_string()]);
+    assert!(
+        sel.reason.contains("proc_mount"),
+        "the auto→native reason must name the missing stage: {}",
+        sel.reason
+    );
+
+    let sel = decide(
+        LinuxMechanismRequest::Namespaced,
+        &input(&p, &pr, upstream(), 8),
+    );
+    assert_eq!(
+        sel.selected, None,
+        "explicit namespaced must refuse on the missing stage"
+    );
+    assert_eq!(sel.missing, vec!["proc_mount".to_string()]);
+    assert!(
+        sel.reason.contains("proc_mount"),
+        "the refusal reason must name the missing stage: {}",
+        sel.reason
+    );
 }
 
 #[test]

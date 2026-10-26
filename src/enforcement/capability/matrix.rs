@@ -267,13 +267,20 @@ pub const LINUX_NAMESPACED: MechanismCapability = MechanismCapability {
         },
         Requirement {
             id: "pidns",
-            detail: "CLONE_NEWPID is created unconditionally at launch — a \
-                     failed unshare refuses",
+            detail: "CLONE_NEWPID is granted by the same single unshare the \
+                     probe measures — a failed unshare refuses",
         },
         Requirement {
             id: "uid_gid_map",
             detail: "setgroups=deny + uid_map/gid_map writes map the launcher's \
                      euid to namespace-root",
+        },
+        Requirement {
+            id: "proc_mount",
+            detail: "remounting /proc inside the new user+pid namespace — the \
+                     kernel requires a fully-visible /proc in the inherited \
+                     mount namespace; a container or nested userns with masked \
+                     /proc entries refuses EPERM",
         },
         Requirement {
             id: "tun",
@@ -317,9 +324,10 @@ pub const LINUX_NAMESPACED: MechanismCapability = MechanismCapability {
              netns without privileges, and the explicit \
              `--linux-mechanism namespaced` route",
     refuse: &[
-        "any probe stage unmet — userns/netns/mountns/uid_gid_map/tun/\
-         loopback_up/default_route_via_tun, and ipv6_route_via_tun when \
-         the kernel exposes a v6 stack — refused, never falls back",
+        "any probe stage unmet — userns/netns/mountns/pidns/uid_gid_map/\
+         proc_mount/tun/loopback_up/default_route_via_tun, and \
+         ipv6_route_via_tun when the kernel exposes a v6 stack — refused, \
+         never falls back",
         "an IPv6-scoped allow the host cannot route — a destination the \
          host has no v6 route to is dead policy, refused at selection",
         "`--upstream` missing or not an IP literal — the embedded gate refuses \

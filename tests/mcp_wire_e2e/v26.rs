@@ -66,9 +66,15 @@ async fn request_without_meta_denied_before_init() {
 
     let resp = send_and_recv(&mut stdin, &mut reader, &call("read_file", 1)).await;
     assert!(has_error(&resp), "pre-init request must be denied: {resp}");
-    assert!(
-        error_message(&resp).contains("init-order"),
-        "expected init-order denial: {resp}"
+    // PR-35: the init-order denial names the method and the expected
+    // initialization sequence, so a mis-ordering client can tell the
+    // sequencing bug apart from a policy refusal.
+    assert_eq!(
+        error_message(&resp),
+        "request denied (init-order): \"tools/call\" arrived before the \
+         session was initialized — send initialize, wait for its result, \
+         send notifications/initialized, then other requests",
+        "the init-order denial must carry the expected-order explanation: {resp}"
     );
 
     drop(stdin);
