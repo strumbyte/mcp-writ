@@ -634,6 +634,23 @@ fn pick_gate_port() -> Option<std::net::SocketAddr> {
     None
 }
 
+/// A loopback-bind failure on the gate's stderr: WSAEACCES (10013)
+/// from an administratively excluded port range (Windows
+/// `excludedportrange`), or a lost release-then-bind race —
+/// WSAEADDRINUSE (10048) on Windows, EADDRINUSE (98 on Linux, 48 on
+/// macOS/BSD). All are gaps in the harness's port pick, not product
+/// failures — the spawn retries with a fresh pick.
+fn is_bind_error(stderr: &str) -> bool {
+    [
+        "os error 10013",
+        "os error 10048",
+        "os error 98",
+        "os error 48",
+    ]
+    .iter()
+    .any(|code| stderr.contains(code))
+}
+
 /// Spawn the real `dns-gate` command and wait until its UDP listener
 /// answers (a header-only packet earns a FORMERR — any response proves
 /// the socket is serving). The returned stderr receiver carries the
@@ -652,27 +669,6 @@ fn spawn_dns_gate(
     std::sync::mpsc::Receiver<String>,
 )> {
     let audit = dir.join("audit.jsonl");
-    let Some(listen) = pick_gate_port() else {
-        common::skip_e2e_test("no loopback port bindable on both UDP and TCP for dns-gate");
-        return None;
-    };
-
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
-    cmd.args(["dns-gate", "--policy"])
-        .arg(policy)
-        .args(["--upstream", &upstream.to_string()])
-        .args(["--listen", &listen.to_string()])
-        .args(["--audit-log", audit.to_str().expect("audit path utf-8")])
-        .arg("--audit-sync");
-    if let Some(rc) = refuse_rcode {
-        cmd.args(["--refuse-rcode", rc]);
-    }
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn mcp-writ dns-gate");
     // Drain both pipes on threads — a full pipe would wedge the gate.
     fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<String> {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -683,41 +679,68 @@ fn spawn_dns_gate(
         });
         rx
     }
-    let _stdout_rx = drain(child.stdout.take().unwrap());
-    let stderr_rx = drain(child.stderr.take().unwrap());
+    // The probe verified each pick, but a still-lost release-then-bind
+    // race — or an excluded range the probe itself raced — surfaces as
+    // the gate dying on its bind: retry with a fresh pick before
+    // treating the environment as unable to host the gate.
+    for attempt in 1..=3usize {
+        let Some(listen) = pick_gate_port() else {
+            common::skip_e2e_test("no loopback port bindable on both UDP and TCP for dns-gate");
+            return None;
+        };
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            let stderr = stderr_rx
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap_or_default();
-            // The probe verified the port, but a still-lost
-            // release-then-bind race lands here as WSAEACCES — an
-            // environment gap, not a product failure.
-            if stderr.contains("os error 10013") {
-                common::skip_e2e_test(&format!(
-                    "dns-gate loopback bind refused (os error 10013): {stderr}"
-                ));
-                return None;
-            }
-            panic!("dns-gate exited before serving ({status}): {stderr}");
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
+        cmd.args(["dns-gate", "--policy"])
+            .arg(policy)
+            .args(["--upstream", &upstream.to_string()])
+            .args(["--listen", &listen.to_string()])
+            .args(["--audit-log", audit.to_str().expect("audit path utf-8")])
+            .arg("--audit-sync");
+        if let Some(rc) = refuse_rcode {
+            cmd.args(["--refuse-rcode", rc]);
         }
-        // Readiness probe: the gate answers even a header-only packet.
-        let mut pkt = Vec::new();
-        pkt.extend_from_slice(&0xEEu16.to_be_bytes());
-        pkt.extend_from_slice(&0x0100u16.to_be_bytes());
-        pkt.extend_from_slice(&[0u8; 8]);
-        if let Some(resp) = udp_query(listen, &pkt)
-            && resp.len() >= 4
-        {
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mcp-writ dns-gate");
+        let _stdout_rx = drain(child.stdout.take().unwrap());
+        let stderr_rx = drain(child.stderr.take().unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let serving = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                let stderr = stderr_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap_or_default();
+                if is_bind_error(&stderr) {
+                    eprintln!("dns-gate could not bind {listen} (attempt {attempt}/3): {stderr}");
+                    break false;
+                }
+                panic!("dns-gate exited before serving ({status}): {stderr}");
+            }
+            // Readiness probe: the gate answers even a header-only packet.
+            let mut pkt = Vec::new();
+            pkt.extend_from_slice(&0xEEu16.to_be_bytes());
+            pkt.extend_from_slice(&0x0100u16.to_be_bytes());
+            pkt.extend_from_slice(&[0u8; 8]);
+            if let Some(resp) = udp_query(listen, &pkt)
+                && resp.len() >= 4
+            {
+                break true;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dns-gate did not answer within 10s"
+            );
+        };
+        if serving {
             return Some((child, listen, audit, stderr_rx));
         }
-        assert!(
-            Instant::now() < deadline,
-            "dns-gate did not answer within 10s"
-        );
     }
+    common::skip_e2e_test("dns-gate could not bind a loopback port after 3 picks");
+    None
 }
 
 fn dns_gate_policy(dir: &Path) -> PathBuf {

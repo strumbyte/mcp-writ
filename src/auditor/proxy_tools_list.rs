@@ -705,34 +705,19 @@ where
     let digest = match crate::verifier::tools_diff::hash_tools_list(&tools_to_verify) {
         Ok(digest) => Some(digest),
         Err(e) => {
-            let block_reason = format!(
-                "tools/list hashing failed: {}",
-                crate::termutil::sanitize_for_terminal(&e.to_string())
-            );
             // Canonicalization is an integrity check too — it fails
             // closed in every mode; dry-run cannot expose definitions
-            // whose canonical form could not be produced.
-            if shared.dry_run {
-                tracing::warn!(reason = %block_reason, "[DRY-RUN] tools/list canonicalization failed: blocking session");
-            } else {
-                tracing::error!(reason = %block_reason, "tools/list canonicalization failed: blocking session");
-            }
-            // Internal request ids are never echoed:
-            // the frame id is the client-facing id, or
-            // null when no client request can be
-            // correlated.
-            if let Some(emit_id) = failure_emit_id(
-                shared,
-                client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal),
-                &block_reason,
-            )
-            .await
-            {
-                let error_response = build_tools_list_error_response(&emit_id);
-                write_client_frame(&shared.client_out, &error_response).await?;
-            }
-            shared.abort_tx.send(true).ok();
-            return Err(AuditorError::VerificationFailed(block_reason));
+            // whose canonical form could not be produced. The listing
+            // joins the blocked path below: its `tools_list.verified`
+            // record commits with `blocked=true` and no digest before
+            // the refusal is emitted, so a refusal never goes
+            // unrecorded.
+            blocked = true;
+            block_reason = format!(
+                "hashing failed: {}",
+                crate::termutil::sanitize_for_terminal(&e.to_string())
+            );
+            None
         }
     };
 
@@ -778,7 +763,33 @@ where
             details.push_str(" dry_run=true");
         }
         event.details = Some(details);
-        shared.audit.log_committed(event).await?;
+        if let Err(e) = shared.audit.log_committed(event).await {
+            if blocked {
+                // The blocked path still owes the session its abort
+                // contract: record the refusal for the abort drain,
+                // answer any correlatable client listing, and stop the
+                // session — a held `tools/list` must not be left to
+                // die at EOF just because the verification record
+                // could not be committed.
+                let emit_id = failure_emit_id(
+                    shared,
+                    client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal),
+                    &block_reason,
+                )
+                .await;
+                // Abort ahead of the client write — a stalled client
+                // must not delay session teardown.
+                shared.abort_tx.send(true).ok();
+                if let Some(emit_id) = emit_id {
+                    let error_response = build_tools_list_error_response(&emit_id);
+                    // Best-effort emit — the session is already ending
+                    // on the audit-sink failure, which is the error
+                    // this path reports.
+                    let _ = write_client_frame(&shared.client_out, &error_response).await;
+                }
+            }
+            return Err(e);
+        }
     }
 
     if blocked {
@@ -1581,6 +1592,84 @@ mod tests {
         assert!(
             changed.contains("\"outcome\":\"failure\""),
             "got: {changed}"
+        );
+    }
+
+    /// A listing whose advertised set cannot be canonicalized commits
+    /// its `tools_list.verified` record too — `blocked=true` with
+    /// `outcome=failure`/`action=observed` and no `digest=` — through
+    /// the same blocked path as a pin mismatch, so a refusal never
+    /// goes unrecorded.
+    #[tokio::test]
+    async fn uncanonicalizable_listing_commits_failure_verified_record() {
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
+        let log_path = dir.path().join("audit.jsonl");
+        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
+        let mut st = S2cListState::new();
+
+        st.bind_client("1".into(), String::new());
+        // An optional JSON field that cannot be normalized fails
+        // `hash_tools_list` — canonicalization is an integrity check.
+        let bad = ToolDefinition::new("alpha", "").with_input_schema("{ not json");
+        st.append_page(vec![bad]).unwrap();
+        let res = verify_and_emit_list(&shared, &mut st, Some("1"), false).await;
+        assert!(
+            matches!(res, Err(AuditorError::VerificationFailed(_))),
+            "an uncanonicalizable manifest must refuse the listing"
+        );
+
+        let _ = shared.audit.shutdown().await;
+        let log = std::fs::read_to_string(&log_path).expect("read audit log");
+        let line = log
+            .lines()
+            .find(|l| l.contains("\"event_type\":\"tools_list.verified\""))
+            .expect("canonicalization failure must still commit tools_list.verified");
+        assert!(line.contains("\"outcome\":\"failure\""), "got: {line}");
+        assert!(line.contains("\"action\":\"observed\""), "got: {line}");
+        assert!(line.contains("blocked=true"), "got: {line}");
+        assert!(
+            !line.contains("digest="),
+            "an unhashable set has no digest to record: {line}"
+        );
+    }
+
+    /// When the verification record cannot be committed — a dead
+    /// fail-closed audit sink — the blocked path still fires the
+    /// session abort and records the refusal for the abort drain: a
+    /// held `tools/list` must not be left to EOF just because the
+    /// record could not be committed.
+    #[tokio::test]
+    async fn blocked_listing_on_dead_sink_still_aborts() {
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
+        let log_path = dir.path().join("audit.jsonl");
+        // `to_file` is the fail-closed logger: a closed channel refuses
+        // every later commit.
+        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let mut policy = policy_allowing("alpha");
+        policy
+            .tools_list_hashes
+            .push(crate::policy::ToolsListHashEntry {
+                server_name: "bound-server".to_string(),
+                hash_value: format!("sha256:{}", "0".repeat(64)),
+                approved: None,
+            });
+        let (shared, abort_rx) = shared_for_test_with(false, policy, audit);
+        let mut st = S2cListState::new();
+
+        st.bind_client("1".into(), String::new());
+        st.append_page(two_tools()).unwrap();
+        let _ = shared.audit.shutdown().await;
+
+        let res = verify_and_emit_list(&shared, &mut st, Some("1"), false).await;
+        assert!(
+            matches!(res, Err(AuditorError::AuditUnavailable(_))),
+            "a dead fail-closed sink refuses the transition"
+        );
+        assert!(*abort_rx.borrow(), "the session must still abort");
+        assert!(
+            shared.internal_list_failure.lock().await.is_some(),
+            "the abort drain must see the recorded refusal"
         );
     }
 

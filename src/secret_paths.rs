@@ -486,8 +486,10 @@ mod tests {
         // `resolve_for_authorization` — impossible when the ambient temp
         // base fails the replaceable-ancestor gate, so the fixture needs
         // a write-restricted root.
-        let Some(dir) = crate::testutil::restricted_tempdir().unwrap() else {
-            eprintln!("secret-path symlink overlay test skipped: no write-restricted root");
+        let Some(dir) = crate::testutil::restricted_tempdir() else {
+            crate::testutil::skip_unless_required(
+                "secret-path symlink overlay test needs a write-restricted root",
+            );
             return;
         };
         match try_create_secret_symlink(dir.path()) {

@@ -1293,8 +1293,10 @@ mod tests {
         // grants `Modify` to its workers). With no write-restricted root
         // anywhere, the fixture itself is unauthorizable and there is
         // nothing to exercise.
-        let Some(dir) = crate::testutil::restricted_tempdir().unwrap() else {
-            eprintln!("skipping: no write-restricted root for authorization fixtures");
+        let Some(dir) = crate::testutil::restricted_tempdir() else {
+            crate::testutil::skip_unless_required(
+                "no write-restricted root for authorization fixtures",
+            );
             return;
         };
         let cwd = dir.path().canonicalize().unwrap();

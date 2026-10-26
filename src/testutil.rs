@@ -2,13 +2,6 @@
 
 use std::path::PathBuf;
 
-/// Real spelling of the system temp dir, resolving platform links such
-/// as macOS's `/var` → `/private/var`. Paths under `$TMPDIR` are handed
-/// to the audit sink and other strict `O_NOFOLLOW` ancestor walks, which
-/// refuse any linked component — tests must spell them the way the
-/// filesystem actually lays them out. The verbatim `\\?\` prefix Windows
-/// canonicalize adds is stripped — device-namespace spellings break
-/// `current_dir` and policy authorization.
 /// Strip the verbatim `\\?\`/`\\?\UNC\` prefix Windows `canonicalize`
 /// adds — device-namespace spellings break `current_dir` and policy
 /// authorization.
@@ -22,6 +15,11 @@ fn plain_spelling(path: PathBuf) -> PathBuf {
     }
 }
 
+/// Real spelling of the system temp dir, resolving platform links such
+/// as macOS's `/var` → `/private/var`. Paths under `$TMPDIR` are handed
+/// to the audit sink and other strict `O_NOFOLLOW` ancestor walks, which
+/// refuse any linked component — tests must spell them the way the
+/// filesystem actually lays them out.
 pub(crate) fn real_temp_base() -> PathBuf {
     let base = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
         .canonicalize()
@@ -36,6 +34,22 @@ pub(crate) fn real_tempdir() -> std::io::Result<tempfile::TempDir> {
     tempfile::Builder::new().tempdir_in(real_temp_base())
 }
 
+/// Report a skipped test — `SKIP:` on stderr, like
+/// `tests/common::skip_e2e_test` — or fail it outright when the
+/// verification job marks unexecuted tests as failures
+/// (`MCP_WRIT_REQUIRE_E2E_TESTS=1`). That env is set at workflow level
+/// on every CI verification job, so it also covers the
+/// `cargo test --lib --bins` unit-test legs: a lib test that cannot
+/// build its fixture is an unexecuted test too and must not pass
+/// silently there.
+pub(crate) fn skip_unless_required(reason: &str) {
+    assert!(
+        std::env::var("MCP_WRIT_REQUIRE_E2E_TESTS").as_deref() != Ok("1"),
+        "test prerequisite failed: {reason} (MCP_WRIT_REQUIRE_E2E_TESTS=1)"
+    );
+    eprintln!("SKIP: {reason}");
+}
+
 /// A `TempDir` under a root every ancestor of which passes
 /// [`crate::fspriv::require_parent_write_restricted`] — the
 /// authorization layer's own demand on any path a test asks it to
@@ -44,10 +58,10 @@ pub(crate) fn real_tempdir() -> std::io::Result<tempfile::TempDir> {
 /// dir makes every fixture beneath it unauthorizable — the refusal is
 /// the contract working, not a testable resolution). Falls back to the
 /// user's home/profile directory — owner-locked by default on unix and
-/// Windows alike — and returns `Ok(None)` when no restricted root
+/// Windows alike — and returns `None` when no restricted root
 /// exists, which callers treat as "this environment cannot run the
-/// test".
-pub(crate) fn restricted_tempdir() -> std::io::Result<Option<tempfile::TempDir>> {
+/// test" via [`skip_unless_required`].
+pub(crate) fn restricted_tempdir() -> Option<tempfile::TempDir> {
     let mut candidates = vec![real_temp_base()];
     for var in ["USERPROFILE", "HOME"] {
         if let Some(home) = std::env::var_os(var).map(PathBuf::from)
@@ -96,8 +110,8 @@ pub(crate) fn restricted_tempdir() -> std::io::Result<Option<tempfile::TempDir>>
         // Probe a *child* path so the fixture dir itself counts among
         // the ancestors the write-restriction walk inspects.
         if crate::fspriv::require_parent_write_restricted(&real.join("probe")).is_ok() {
-            return Ok(Some(dir));
+            return Some(dir);
         }
     }
-    Ok(None)
+    None
 }
