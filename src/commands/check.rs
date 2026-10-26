@@ -52,7 +52,7 @@ use crate::error::PolicyError;
 use crate::execution::ExecutionTarget;
 use crate::legislator::tools_list::{DiscoveryOptions, fetch_tools_list_detailed_with};
 use crate::policy::kdl_loader::load_kdl_policy_for_target_scanned;
-use crate::policy::{HashType, Policy};
+use crate::policy::{HashType, Policy, review::MarkerKind};
 use crate::termutil::sanitize_for_terminal;
 
 /// Run `check` and exit the process with the status-mapped code.
@@ -156,14 +156,12 @@ async fn evaluate(args: CheckArgs) -> CheckReport {
         .map(|m| {
             // Classify the raw marker text — sanitizing first could
             // rewrite bytes the head-match rules key on.
-            let kind = crate::policy::review::MarkerKind::classify(&m.text);
+            let kind = MarkerKind::classify(&m.text);
             ReviewMarkerRecord {
                 file: m.path.display().to_string(),
                 line: m.line,
                 text: sanitize_for_terminal(&m.text),
-                kind: kind.as_str(),
-                why: kind.why(),
-                how: kind.how(),
+                kind,
             }
         })
         .collect();
@@ -654,10 +652,7 @@ fn finalize(mut report: CheckReport) -> CheckReport {
         // One next-action per marker kind present, in first-seen order —
         // the kind's `how` is the representative resolution.
         for kind in marker_kinds_in_order(&report.review_markers) {
-            remediation.push(format!(
-                "{kind}: {}",
-                first_how(&report.review_markers, kind)
-            ));
+            remediation.push(format!("{}: {}", kind.as_str(), kind.how()));
         }
         remediation.push(
             "delete each resolved `// REVIEW` comment — \
@@ -680,24 +675,14 @@ fn finalize(mut report: CheckReport) -> CheckReport {
 /// The marker kinds present, in first-seen order — one entry per kind
 /// so the summary can group and the remediation can list one action
 /// each.
-fn marker_kinds_in_order(markers: &[ReviewMarkerRecord]) -> Vec<&'static str> {
-    let mut kinds: Vec<&'static str> = Vec::new();
+fn marker_kinds_in_order(markers: &[ReviewMarkerRecord]) -> Vec<MarkerKind> {
+    let mut kinds: Vec<MarkerKind> = Vec::new();
     for m in markers {
         if !kinds.contains(&m.kind) {
             kinds.push(m.kind);
         }
     }
     kinds
-}
-
-/// The `how` text of the first marker of `kind` — identical across the
-/// group since `how` is fixed per kind.
-fn first_how(markers: &[ReviewMarkerRecord], kind: &'static str) -> &'static str {
-    markers
-        .iter()
-        .find(|m| m.kind == kind)
-        .map(|m| m.how)
-        .unwrap_or("")
 }
 
 /// Human summary + remediation on stderr.
@@ -770,9 +755,9 @@ fn print_summary(report: &CheckReport) {
                         marker.line,
                         marker.text
                     );
-                    eprintln!("    kind: {kind}");
+                    eprintln!("    kind: {}", kind.as_str());
                 } else {
-                    eprintln!("  {kind} ({} marker(s)):", group.len());
+                    eprintln!("  {} ({} marker(s)):", kind.as_str(), group.len());
                     for marker in group.iter().take(PER_KIND_SHOWN) {
                         eprintln!(
                             "    {}:{}: {}",
@@ -785,10 +770,8 @@ fn print_summary(report: &CheckReport) {
                         eprintln!("    … {} more marker(s)", group.len() - PER_KIND_SHOWN);
                     }
                 }
-                if let Some(first) = group.first() {
-                    eprintln!("    why: {}", first.why);
-                    eprintln!("    how: {}", first.how);
-                }
+                eprintln!("    why: {}", kind.why());
+                eprintln!("    how: {}", kind.how());
             }
         }
     }

@@ -465,26 +465,31 @@ async fn check_review_marker_kinds_fixture() {
         15,
         "one why per kind group: {stderr}"
     );
-    // Remediation enumerates one next action per kind present.
-    for kind in [
-        "header: ",
-        "unbound-tool: ",
-        "blocked-capability: ",
-        "schema-unsupported: ",
-        "hash-pin-host: ",
-        "regenerate-on-update: ",
-        "unbound-workload: ",
-        "syscall-analysis: ",
-        "syscall-blocked: ",
-        "baseline-dropped: ",
-        "interpreter-baseline: ",
-        "non-linux-abi: ",
-        "network-outbound: ",
-        "datagram: ",
-        "custom: ",
-    ] {
+    // Remediation enumerates one next action per kind present, in
+    // first-seen order — the numbered prefix keeps a marker's own
+    // `REVIEW: <kind>:` line from satisfying the assertion.
+    for (n, kind) in [
+        "header",
+        "unbound-tool",
+        "blocked-capability",
+        "schema-unsupported",
+        "hash-pin-host",
+        "regenerate-on-update",
+        "unbound-workload",
+        "syscall-analysis",
+        "syscall-blocked",
+        "baseline-dropped",
+        "interpreter-baseline",
+        "non-linux-abi",
+        "network-outbound",
+        "datagram",
+        "custom",
+    ]
+    .iter()
+    .enumerate()
+    {
         assert!(
-            stderr.contains(kind),
+            stderr.contains(&format!("{}. {kind}:", n + 1)),
             "remediation must list {kind:?}: {stderr}"
         );
     }
