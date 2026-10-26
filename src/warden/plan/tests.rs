@@ -114,12 +114,45 @@ fn shared_controls_distinguish_optional_features() {
 
 #[test]
 fn env_observation_only_exists_when_the_contract_applies() {
-    assert!(env_observation(false, None).is_none());
-    let ok = env_observation(true, None).unwrap();
+    let opts = SpawnOptions {
+        restrict_environment: true,
+        allowed_names: vec!["MCP_WRIT_PLAN_TEST_ENV_OBS".to_string()],
+        tmpdir: None,
+        ..Default::default()
+    };
+    let contract = super::super::env::env_contract_report(&opts);
+    assert!(env_observation(contract.as_ref(), false, None).is_none());
+    let ok = env_observation(contract.as_ref(), true, None).unwrap();
     assert_eq!(ok.state, ControlState::Verified);
     assert_eq!(ok.phase, ControlPhase::Spawn);
-    let err = env_observation(true, Some("boom".to_string())).unwrap();
+    // The restriction consults the allowlist, so the reason carries the
+    // launch-time contract snapshot (this name is unset in the parent).
+    assert_eq!(
+        ok.reason.as_deref(),
+        Some(
+            "env contract: 1 allowlisted name(s): 0 present, 1 missing \
+             (missing: MCP_WRIT_PLAN_TEST_ENV_OBS)"
+        )
+    );
+    let err = env_observation(contract.as_ref(), true, Some("boom".to_string())).unwrap();
     assert_eq!(err.state, ControlState::Unknown);
+    assert!(
+        err.reason
+            .as_deref()
+            .unwrap()
+            .starts_with("spawn failed: boom"),
+        "spawn failure leads the reason: {err:?}"
+    );
+    // A tmpdir-only contract has no consulted allowlist — no contract
+    // reason is attached, matching the pre-PR-33 shape.
+    let tmpdir_fixture = crate::testutil::real_tempdir().expect("tempdir");
+    let tmpdir_only = SpawnOptions {
+        tmpdir: Some(tmpdir_fixture.path().to_path_buf()),
+        ..Default::default()
+    };
+    let contract = super::super::env::env_contract_report(&tmpdir_only);
+    let ok = env_observation(contract.as_ref(), true, None).unwrap();
+    assert_eq!(ok.reason, None);
 }
 
 #[test]

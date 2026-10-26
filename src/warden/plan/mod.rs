@@ -250,20 +250,26 @@ pub(super) fn shared_controls(
                  workload)"
                     .to_string(),
             ),
-            (true, true) => (
-                ControlState::Planned,
-                format!(
-                    "restricted to the base set + {} allowlisted name(s); TMPDIR overridden",
-                    opts.allowed_names.len()
-                ),
-            ),
-            (true, false) => (
-                ControlState::Planned,
-                format!(
-                    "restricted to the base set + {} allowlisted name(s)",
-                    opts.allowed_names.len()
-                ),
-            ),
+            (true, tmp_overridden) => {
+                // The allowlist diagnosis is a snapshot of *this* process's
+                // parent environment: `plan` and `run` can be different
+                // processes, so the actual launch state is what the
+                // `launch.env` observation reports — this reason describes
+                // the plan-time snapshot. Names only, never values.
+                let contract = super::env::env_contract_report(opts)
+                    .map(|c| format!(" + {} allowlisted name(s): {}", c.consulted(), c.describe()));
+                (
+                    ControlState::Planned,
+                    match (contract, tmp_overridden) {
+                        (Some(c), true) => {
+                            format!("restricted to the base set{c}; TMPDIR overridden")
+                        }
+                        (Some(c), false) => format!("restricted to the base set{c}"),
+                        (None, true) => "restricted to the base set; TMPDIR overridden".to_string(),
+                        (None, false) => "restricted to the base set".to_string(),
+                    },
+                )
+            }
             (false, true) => (
                 ControlState::Planned,
                 "TMPDIR override only; the parent environment is otherwise inherited".to_string(),
@@ -389,23 +395,46 @@ pub(super) fn base_limitations() -> Vec<String> {
 /// the spawn call, so a successful spawn verifies it. `applied` is false
 /// when no restriction/override exists — the control stays
 /// `NotApplicable` in the plan and carries no observation.
+///
+/// `contract` is the allowlist diagnosis the reason reports — `Some`
+/// only when the restriction consulted a list. `run` passes the
+/// snapshot its `warn_env_allowlist_gaps` captured (bound onto the
+/// warden via `set_env_contract`), so the observation, the stderr
+/// warnings, and the `server.connected` details describe one parent-
+/// environment read; spawn callers without a captured snapshot
+/// re-read it through `env_contract_report`. Names only; values never
+/// enter the report.
 pub(super) fn env_observation(
+    contract: Option<&super::env::EnvContractReport>,
     applied: bool,
     spawn_err: Option<String>,
 ) -> Option<EnforcementObservation> {
     if !applied {
         return None;
     }
+    let failed = spawn_err.is_some();
+    let contract_reason = contract.map(|c| {
+        format!(
+            "env contract: {} allowlisted name(s): {}",
+            c.consulted(),
+            c.describe()
+        )
+    });
+    let reason = match (spawn_err, contract_reason) {
+        (Some(e), Some(c)) => Some(format!("spawn failed: {e}; {c}")),
+        (Some(e), None) => Some(format!("spawn failed: {e}")),
+        (None, c) => c,
+    };
     Some(observation(
         "launch.env",
-        if spawn_err.is_some() {
+        if failed {
             ControlState::Unknown
         } else {
             ControlState::Verified
         },
         ObservationBasis::SpawnResult,
         ControlPhase::Spawn,
-        spawn_err.map(|e| format!("spawn failed: {e}")),
+        reason,
     ))
 }
 // ---------------------------------------------------------------------------

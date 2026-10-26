@@ -611,6 +611,10 @@ mod imp {
             tmpdir: None,
             ..Default::default()
         };
+        // The allowlist-gap warning `run` prints — same contract, same
+        // stderr surface; the `launch.env` observation records the
+        // launch-time snapshot too.
+        crate::warden::warn_env_allowlist_gaps(&spawn_opts);
         let env_pairs = crate::warden::spawn_env_pairs(&spawn_opts);
 
         // The entrypoint's exec-time guarantee is this re-check — it

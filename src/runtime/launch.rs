@@ -1,6 +1,6 @@
 use crate::audit_log::{
     Action, AuditEvent, AuditLogger, EventType, Outcome, PolicyAuditContext, Severity,
-    now_iso8601_millis,
+    encode_audit_field_value, now_iso8601_millis,
 };
 use crate::auditor::Auditor;
 use crate::enforcement::CodeIdentity;
@@ -679,6 +679,23 @@ pub async fn launch(
         ));
         return Err(LaunchError::ReverifyBeforeSpawn { source, report });
     }
+    // The allowlist diagnosis for this launch — `Some` only when the
+    // environment restriction consults a list — is a names-only
+    // snapshot of this process's parent environment, re-read through
+    // the same allowlist pass the restricted env block will be built
+    // from. A missing name is recorded, never a launch refusal: it
+    // lands on the `launch.env` observation, the `server.connected`
+    // details below, and one stderr warning per gap class (emitted by
+    // warn_env_allowlist_gaps, which returns the same snapshot).
+    let env_contract = crate::warden::warn_env_allowlist_gaps(&spawn_opts);
+    // Bind that snapshot onto the warden so the `launch.env`
+    // observation the spawn produces describes it verbatim — every
+    // reported diagnostic then reflects the one environment read the
+    // warnings and audit details already carry, never a second
+    // parent-env sample that could diverge from them. The binding
+    // keys on the restriction `spawn_opts` carries: a spawn whose
+    // options diverged would re-read rather than misreport.
+    warden.set_env_contract(&spawn_opts, env_contract.clone());
     let attempt = match sandbox_skip_reason {
         Some(reason) => warden.spawn_unsandboxed_async_exe_with_report(
             &spawn_exe,
@@ -862,6 +879,35 @@ pub async fn launch(
         // Ambient environment inheritance is an explicit downgrade —
         // the spawn record names it rather than reading as neutral.
         details.push_str(" env=inherit-parent");
+    }
+    // The allowlist's launch-time gaps ride the same spawn record —
+    // names only (the observation already carries the same list on the
+    // `--report` side). Values are percent-encoded per the details
+    // `k=v` convention: the validator only forbids `=`/NUL in names, so
+    // an exotic-but-legal name cannot forge additional members.
+    if let Some(contract) = &env_contract {
+        if !contract.missing.is_empty() {
+            details.push_str(&format!(
+                " env_missing={}",
+                contract
+                    .missing
+                    .iter()
+                    .map(|n| encode_audit_field_value(n))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if !contract.path_missing.is_empty() {
+            details.push_str(&format!(
+                " env_path_missing={}",
+                contract
+                    .path_missing
+                    .iter()
+                    .map(|n| encode_audit_field_value(n))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
     }
     // The exec method a hash pin produced is part of the launch's
     // security surface: the exe image is snapshot-exec'd (`fd` on

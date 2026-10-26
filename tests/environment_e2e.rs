@@ -415,6 +415,113 @@ async fn environment_applies_when_sandbox_skipped() {
     drop(stdin);
 }
 
+/// PR-33 — an allowlisted name the parent does not define is diagnosed on
+/// stderr by name (never by value); a listed name whose value is a single
+/// absolute path with nothing behind it still reaches the child — the
+/// gap is an observation, not a refusal.
+#[tokio::test]
+async fn environment_missing_allowlisted_names_warn_on_stderr() {
+    let dir = make_test_dir("diagnosis");
+    let gone = dir.path().join("mcp_writ_env_diag_gone_7f3a.bin");
+    let policy = write_policy(
+        dir.path(),
+        r#"
+policy version=1
+defaults {
+    environment {
+        allow "MCP_WRIT_TEST_KEEP" "MCP_WRIT_TEST_MISSING" "MCP_WRIT_TEST_PATH_GONE"
+    }
+}
+logging level="info" fail_closed=#false
+server "env-probe" {
+    tool "env_probe"
+}
+"#,
+    );
+    let mut child = spawn_guard(
+        &policy,
+        true,
+        false,
+        &env_probe_argv(),
+        &[
+            ("MCP_WRIT_TEST_KEEP", "mcp-writ-secret-keep-9z2q"),
+            (
+                "MCP_WRIT_TEST_PATH_GONE",
+                gone.to_str().expect("utf-8 path"),
+            ),
+        ],
+        None,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    // The dangling-path var is *present* in the parent — it reaches the
+    // child; the absent name stays unset.
+    let inner = probe_env(
+        &mut stdin,
+        &mut reader,
+        1,
+        &[
+            "MCP_WRIT_TEST_KEEP",
+            "MCP_WRIT_TEST_MISSING",
+            "MCP_WRIT_TEST_PATH_GONE",
+        ],
+    )
+    .await
+    .expect("env_probe produced no result");
+    assert!(
+        inner_value_is(
+            &inner,
+            "MCP_WRIT_TEST_KEEP",
+            Some("mcp-writ-secret-keep-9z2q")
+        ),
+        "allowlisted var must reach the child: {inner}"
+    );
+    assert!(
+        inner_value_is(&inner, "MCP_WRIT_TEST_MISSING", None),
+        "absent allowlisted var must stay unset: {inner}"
+    );
+    assert!(
+        inner_value_is(&inner, "MCP_WRIT_TEST_PATH_GONE", gone.to_str()),
+        "present-but-dangling var still reaches the child: {inner}"
+    );
+
+    drop(stdin);
+    let mut err = String::new();
+    let _ = timeout(
+        Duration::from_secs(TIMEOUT_SECS),
+        tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut err),
+    )
+    .await;
+    assert!(
+        err.contains(
+            "warning: allowlisted environment variable(s) not set in the parent \
+             environment: MCP_WRIT_TEST_MISSING"
+        ),
+        "stderr must name the absent allowlisted var: {err}"
+    );
+    assert!(
+        err.contains(
+            "warning: allowlisted environment variable(s) whose value names a path \
+             that does not exist: MCP_WRIT_TEST_PATH_GONE"
+        ),
+        "stderr must name the dangling-path allowlisted var: {err}"
+    );
+    // The warning carries names only — the parent's values never leak.
+    assert!(
+        !err.contains("mcp-writ-secret-keep-9z2q"),
+        "the variable value must stay out of stderr: {err}"
+    );
+    assert!(
+        !err.contains("mcp_writ_env_diag_gone_7f3a"),
+        "the checked path spelling must stay out of stderr: {err}"
+    );
+}
+
 /// `--dry-run` skips the OS sandbox but still spawns the child through the
 /// same launch path — the restriction applies there too. `skip_sandbox`
 /// stays off so the test exercises the dry-run path alone, not the

@@ -460,3 +460,78 @@ async fn plan_env_fail_on_invalid_blocks() {
     let c = check_by_id(&json, "env.fail_on");
     assert_eq!(member(c, "status").as_string_str().unwrap(), "fail");
 }
+
+/// PR-33 — `plan`'s `launch.env` control carries the allowlist diagnosis:
+/// how many listed names the parent held, which were absent, and which
+/// held a value reading as a single absolute path with nothing behind it —
+/// names only, values never leak into the plan output.
+#[tokio::test]
+async fn plan_launch_env_diagnoses_allowlist_gaps() {
+    let dir = common::real_tempdir();
+    let mut policy = common::sandboxed_policy("", "");
+    let at = common::kdl_named_insert_pos(&policy, "defaults", 0).expect("defaults block");
+    policy.insert_str(
+        at,
+        "    environment {\n        allow \"MCP_WRIT_PLAN_KEEP\" \"MCP_WRIT_PLAN_MISSING\" \"MCP_WRIT_PLAN_PATH_GONE\"\n    }\n",
+    );
+    let policy_path = dir.path().join("policy.kdl");
+    std::fs::write(&policy_path, &policy).expect("write policy");
+    // A dangling single absolute path: absolute, nonexistent.
+    let gone = dir.path().join("mcp_writ_plan_gone_5c1d.bin");
+    let gone_s = gone.to_string_lossy().into_owned();
+    let policy_s = policy_path.to_string_lossy().into_owned();
+    let out = run_plan_env(
+        &["--policy", &policy_s, "--", bin()],
+        &[
+            ("MCP_WRIT_PLAN_KEEP", "mcp-writ-plan-secret-4x8y"),
+            ("MCP_WRIT_PLAN_PATH_GONE", gone_s.as_str()),
+        ],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a missing allowlisted var is a diagnosis, not a refusal (stderr: {stderr})"
+    );
+    let json = plan_json(&out.stdout);
+    assert_eq!(status_of(&json), "ready");
+    let env_control = member(json.value(), "plan")
+        .to_member("controls")
+        .expect("plan.controls")
+        .required()
+        .expect("plan.controls")
+        .to_array()
+        .expect("controls array")
+        .find(|c| member(*c, "id").as_string_str().unwrap() == "launch.env")
+        .expect("launch.env control");
+    let reason = member(env_control, "reason")
+        .as_string_str()
+        .expect("launch.env reason")
+        .to_string();
+    assert!(
+        reason.contains("3 allowlisted name(s): 2 present, 1 missing"),
+        "contract counts: {reason}"
+    );
+    assert!(
+        reason.contains("missing: MCP_WRIT_PLAN_MISSING"),
+        "the absent name is diagnosed: {reason}"
+    );
+    assert!(
+        reason.contains("path missing: MCP_WRIT_PLAN_PATH_GONE"),
+        "the dangling path is diagnosed by name: {reason}"
+    );
+    // Names only — the variable's value and the checked path spelling
+    // stay out of the plan output entirely.
+    for sink in [&stdout, &stderr] {
+        assert!(
+            !sink.contains("mcp-writ-plan-secret-4x8y"),
+            "the variable value must stay out of plan output: {sink}"
+        );
+        assert!(
+            !sink.contains("mcp_writ_plan_gone_5c1d"),
+            "the checked path spelling must stay out of plan output: {sink}"
+        );
+    }
+}
