@@ -1823,3 +1823,381 @@ fn test_project_hint_cannot_inject_kdl_nodes() {
         );
     }
 }
+
+// --- PR-32: runtime defaults seeded into the draft -------------------
+
+/// The `defaults { … }` block — the only span the runtime-seed
+/// templates may touch — pinned for "output unchanged" comparisons on
+/// launches the template does not apply to.
+fn defaults_section(kdl: &str) -> &str {
+    let start = kdl.find("defaults {").expect("defaults block");
+    let end = kdl[start..].find("\n}\n").expect("defaults close") + start + 3;
+    &kdl[start..end]
+}
+
+fn empty_result() -> CrossValidationResult {
+    CrossValidationResult {
+        allowed: vec![],
+        blocked: vec![],
+        warnings: vec![],
+    }
+}
+
+/// An `allow "<dir>"` line count helper — literal equality on the
+/// emitted line (strings-derived lines carry `/**` and never collide).
+fn allow_lines<'a>(kdl: &'a str, dir: &str) -> Vec<&'a str> {
+    kdl.lines()
+        .filter(|l| l.trim() == format!("allow \"{dir}\" mode=\"read\""))
+        .collect()
+}
+
+/// Build a `WorkloadHashes` the way `workload_hashes` leaves it for a
+/// `node <entry>` launch: the resolved interpreter, the argv0 spelling,
+/// the resolved payload, and the modeled interpreter family.
+fn node_launch_workload(exe: &Path, payload: &Path) -> WorkloadHashes {
+    use crate::legislator::source_bind::InterpreterKind;
+    WorkloadHashes {
+        interpreter: Some(InterpreterKind::Node),
+        interpreter_path: Some(exe.to_path_buf()),
+        spelled_path: Some(exe.to_path_buf()),
+        payload_path: Some(payload.to_path_buf()),
+        ..Default::default()
+    }
+}
+
+/// Interpreted launches get argv-grounded read grants: the resolved
+/// executable's directory and install prefix, plus the package tree
+/// the payload's imports resolve from (`node_modules`' parent).
+/// Every line carries provenance and a `runtime-seed` REVIEW.
+#[test]
+fn interpreted_launch_seeds_runtime_read_grants() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let exe_dir = root.join("opt/node/bin");
+    let pkg = root.join("srv/node_modules/@scope/pkg/dist");
+    std::fs::create_dir_all(&exe_dir).unwrap();
+    std::fs::create_dir_all(&pkg).unwrap();
+    let exe = exe_dir.join("node");
+    let payload = pkg.join("index.js");
+    std::fs::write(&exe, "x").unwrap();
+    std::fs::write(&payload, "x").unwrap();
+
+    let workload = node_launch_workload(&exe, &payload);
+    let kdl = generate_policy(
+        &empty_result(),
+        &CapabilityProfile::empty(),
+        None,
+        &[],
+        &workload,
+    );
+    let f = |p: &Path| p.to_string_lossy().into_owned();
+    for want in [
+        "        // seeded from resolved interpreter:".to_string(),
+        "        // REVIEW: runtime-seed:".to_string(),
+        format!("        allow \"{}\" mode=\"read\"", f(&exe_dir)),
+        format!(
+            "        allow \"{}\" mode=\"read\"",
+            f(exe_dir.parent().unwrap())
+        ),
+        // Nearest node_modules ancestor's parent is the package root.
+        format!("        allow \"{}\" mode=\"read\"", f(&root.join("srv"))),
+    ] {
+        assert!(kdl.contains(&want), "missing {want:?}:\n{kdl}");
+    }
+    // The payload's own dir sits under the package root — deduped away.
+    assert!(allow_lines(&kdl, &f(&pkg)).is_empty(), "{kdl}");
+    // The grants land in the parsed policy — the draft loads and the
+    // fs allow side carries them.
+    let policy = load_policy_str(&kdl);
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+    for want in [&exe_dir, &root.join("srv")] {
+        assert!(
+            policy.fs.read_only.iter().any(|g| std::fs::canonicalize(g)
+                .unwrap_or_else(|_| PathBuf::from(g))
+                == canon(want)),
+            "fs grant for {} missing: {:?}",
+            want.display(),
+            policy.fs.read_only
+        );
+    }
+}
+
+/// A project-local payload that never sits under `node_modules`
+/// seeds the nearest ancestor holding `package.json`.
+#[test]
+fn node_payload_without_node_modules_uses_package_json_dir() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let exe = root.join("opt/node/bin/node");
+    let proj = root.join("srv/my-server");
+    let dist = proj.join("dist");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(&exe, "x").unwrap();
+    std::fs::write(proj.join("package.json"), "{}").unwrap();
+    let payload = dist.join("index.js");
+    std::fs::write(&payload, "x").unwrap();
+
+    let workload = node_launch_workload(&exe, &payload);
+    let kdl = generate_policy(
+        &empty_result(),
+        &CapabilityProfile::empty(),
+        None,
+        &[],
+        &workload,
+    );
+    let f = |p: &Path| p.to_string_lossy().into_owned();
+    assert!(
+        kdl.contains(&format!("allow \"{}\" mode=\"read\"", f(&proj))),
+        "package.json dir grant missing:\n{kdl}"
+    );
+    // The payload dir is inside the package root — one grant covers it.
+    assert!(allow_lines(&kdl, &f(&dist)).is_empty(), "{kdl}");
+}
+
+/// A venv interpreter's spelled location — not its symlink-resolved
+/// image — names the `site-packages` tree: `.venv/bin/python` grants
+/// the `.venv` root, and `pyvenv.cfg`'s `home=` grants the base prefix.
+#[test]
+fn python_venv_launch_seeds_venv_and_base_prefix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let venv = root.join("proj/.venv");
+    let base_bin = root.join("base/bin");
+    std::fs::create_dir_all(venv.join("bin")).unwrap();
+    std::fs::create_dir_all(&base_bin).unwrap();
+    std::fs::write(
+        venv.join("pyvenv.cfg"),
+        format!("home = {}\n", base_bin.display()),
+    )
+    .unwrap();
+    let spelled = venv.join("bin/python");
+    std::fs::write(&spelled, "x").unwrap();
+    // The venv interpreter is a copy (the Windows-venv shape), so the
+    // resolved image IS the spelled one — only `pyvenv.cfg`'s `home=`
+    // names the base install's prefix.
+    let resolved = spelled.clone();
+
+    use crate::legislator::source_bind::InterpreterKind;
+    let workload = WorkloadHashes {
+        interpreter: Some(InterpreterKind::Python),
+        interpreter_path: Some(resolved.clone()),
+        spelled_path: Some(spelled.clone()),
+        payload_path: None,
+        ..Default::default()
+    };
+    let kdl = generate_policy(
+        &empty_result(),
+        &CapabilityProfile::empty(),
+        None,
+        &[],
+        &workload,
+    );
+    let f = |p: &Path| p.to_string_lossy().into_owned();
+    for want in [
+        // Base install prefix — reachable only through `pyvenv.cfg`'s
+        // `home=` (the `home` dir itself sits under it, deduped).
+        f(&root.join("base")),
+        // The venv interpreter's own dir + the venv tree.
+        f(&venv.join("bin")),
+        f(&venv),
+    ] {
+        assert_eq!(
+            allow_lines(&kdl, &want).len(),
+            1,
+            "expected exactly one grant for {want}:\n{kdl}"
+        );
+    }
+    // `home` names a bin dir under the granted prefix — covered.
+    assert!(allow_lines(&kdl, &f(&base_bin)).is_empty(), "{kdl}");
+    assert!(
+        kdl.contains("// seeded from resolved interpreter:"),
+        "{kdl}"
+    );
+    assert!(kdl.contains("// seeded from pyvenv.cfg home:"), "{kdl}");
+    // The home-named base prefix lands in the parsed policy too.
+    let policy = load_policy_str(&kdl);
+    assert!(
+        policy.fs.read_only.iter().any(|g| {
+            std::fs::canonicalize(g).unwrap_or_else(|_| PathBuf::from(g))
+                == std::fs::canonicalize(&venv).unwrap()
+        }),
+        "venv grant missing: {:?}",
+        policy.fs.read_only
+    );
+}
+
+/// The `environment` draft is candidates commented out — nothing live,
+/// so the restricted child environment (fail-closed) is unchanged.
+#[test]
+fn environment_candidates_stay_commented_out() {
+    use crate::legislator::source_bind::InterpreterKind;
+    for (kind, names) in [
+        (
+            InterpreterKind::Node,
+            vec!["NODE_EXTRA_CA_CERTS", "HTTPS_PROXY", "NO_PROXY"],
+        ),
+        (
+            InterpreterKind::Python,
+            vec!["REQUESTS_CA_BUNDLE", "PYTHONUTF8", "TZ"],
+        ),
+    ] {
+        let workload = WorkloadHashes {
+            interpreter: Some(kind),
+            ..Default::default()
+        };
+        let kdl = generate_policy(
+            &empty_result(),
+            &CapabilityProfile::empty(),
+            None,
+            &[],
+            &workload,
+        );
+        for name in names {
+            assert!(
+                kdl.contains("// environment { allow ") && kdl.contains(&format!("\"{name}\"")),
+                "{kind} candidate {name} missing:\n{kdl}"
+            );
+        }
+        // Every environment line is a comment — no live node.
+        for line in kdl.lines() {
+            let t = line.trim_start();
+            if t.contains("environment") {
+                assert!(
+                    t.starts_with("//"),
+                    "live environment line leaked: {line}\n{kdl}"
+                );
+            }
+        }
+        let policy = load_policy_str(&kdl);
+        assert!(!policy.environment.declared, "{kdl}");
+        assert!(policy.environment.restrict, "{kdl}");
+        assert!(policy.environment.allowed.is_empty(), "{kdl}");
+        assert!(
+            kdl.contains("// REVIEW: runtime-seed: enable only the names this server reads"),
+            "{kdl}"
+        );
+    }
+}
+
+/// Launches the template does not apply to — a native binary, or an
+/// invocation whose payload could not be classified — produce byte-
+/// identical `defaults` output: no seeded grants, no environment
+/// candidates, no `runtime-seed` markers.
+#[test]
+fn non_interpreted_launches_seed_nothing() {
+    use crate::legislator::source_bind::HashLine;
+    let cap = CapabilityProfile::empty();
+    let baseline = generate_policy(&empty_result(), &cap, None, &[], &WorkloadHashes::default());
+
+    // Native binary: the launch image resolved, but no interpreter
+    // family was detected.
+    let native = WorkloadHashes {
+        binary: Some(HashLine {
+            target: "/usr/bin/srv".into(),
+            hash_value: "sha256:ab".into(),
+        }),
+        interpreter_path: Some(PathBuf::from("/usr/bin/srv")),
+        spelled_path: Some(PathBuf::from("/usr/bin/srv")),
+        ..Default::default()
+    };
+    let native_kdl = generate_policy(&empty_result(), &cap, None, &[], &native);
+    assert_eq!(
+        defaults_section(&native_kdl),
+        defaults_section(&baseline),
+        "native launch must not seed runtime defaults:\n{native_kdl}"
+    );
+
+    // Unclassifiable invocation (`env python3 server.py`, a renamed
+    // binary): the launch resolved but names no modeled family, so
+    // `interpreter` stays `None` and nothing is seeded.
+    let unbound = WorkloadHashes {
+        binary: Some(HashLine {
+            target: "/usr/bin/env".into(),
+            hash_value: "sha256:cd".into(),
+        }),
+        unbound_reasons: vec![
+            "entrypoint-hash not emitted: env delegates argv[0] selection".into(),
+        ],
+        interpreter_path: Some(PathBuf::from("/usr/bin/env")),
+        spelled_path: Some(PathBuf::from("/usr/bin/env")),
+        interpreter: None,
+        ..Default::default()
+    };
+    let unbound_kdl = generate_policy(&empty_result(), &cap, None, &[], &unbound);
+    assert_eq!(
+        defaults_section(&unbound_kdl),
+        defaults_section(&baseline),
+        "unclassified launch must not seed runtime defaults:\n{unbound_kdl}"
+    );
+    for kdl in [&native_kdl, &unbound_kdl] {
+        assert!(!kdl.contains("runtime-seed"), "{kdl}");
+        assert!(!kdl.contains("seeded from"), "{kdl}");
+        assert!(!kdl.contains("// === Environment ==="), "{kdl}");
+    }
+}
+
+/// Every seeded line classifies back to `runtime-seed` — generated
+/// markers never fall back to `custom`.
+#[test]
+fn seeded_markers_classify_as_runtime_seed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let exe = dir.path().join("opt/node/bin/node");
+    let payload = dir.path().join("srv/index.js");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    std::fs::write(&exe, "x").unwrap();
+    std::fs::write(&payload, "x").unwrap();
+
+    let workload = node_launch_workload(&exe, &payload);
+    let kdl = generate_policy(
+        &empty_result(),
+        &CapabilityProfile::empty(),
+        None,
+        &[],
+        &workload,
+    );
+    let kinds = marker_kinds_in(&kdl);
+    assert!(
+        kinds.contains(&crate::policy::review::MarkerKind::RuntimeSeed),
+        "runtime-seed marker missing:\n{kdl}"
+    );
+    assert!(
+        !kinds.contains(&crate::policy::review::MarkerKind::Custom),
+        "generated markers must not fall back to custom:\n{kdl}"
+    );
+}
+
+/// String-analysis lines and the runtime-file list dedupe: `/usr/lib`
+/// from binary strings suppresses the seed, and a granted prefix
+/// covers everything beneath it.
+#[cfg(target_os = "linux")]
+#[test]
+fn seed_grants_dedupe_against_string_analysis_and_prefixes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let exe = dir.path().join("usr/bin/node");
+    let payload = dir.path().join("srv/index.js");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    std::fs::write(&exe, "x").unwrap();
+    std::fs::write(&payload, "x").unwrap();
+
+    let cap = make_capability(RiskFlags::default(), &[], vec![], vec!["/usr/lib"]);
+    let workload = node_launch_workload(&exe, &payload);
+    let kdl = generate_policy(&empty_result(), &cap, None, &[], &workload);
+    // The strings-derived `/usr/lib/**` line suppresses the
+    // runtime-file `/usr/lib` seed entirely.
+    assert_eq!(
+        kdl.lines()
+            .filter(|l| l.trim() == "allow \"/usr/lib/**\" mode=\"read\"")
+            .count(),
+        1,
+        "{kdl}"
+    );
+    assert!(allow_lines(&kdl, "/usr/lib").is_empty(), "{kdl}");
+    // `/lib` and `/lib64` are symlinks into `/usr/lib` on this layout —
+    // canonicalizing dedup covers them too.
+    if std::fs::canonicalize("/lib").is_ok_and(|p| p.as_path() == Path::new("/usr/lib")) {
+        assert!(allow_lines(&kdl, "/lib").is_empty(), "{kdl}");
+    }
+}

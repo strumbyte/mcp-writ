@@ -341,6 +341,9 @@ pub enum MarkerKind {
     NetworkOutbound,
     /// Datagram-family syscalls; UDP is never inferred.
     Datagram,
+    /// Runtime defaults seeded into the draft — argv-resolved read
+    /// grants and commented-out `environment` candidates.
+    RuntimeSeed,
     /// Marker text matched no known kind — hand-written or edited.
     Custom,
 }
@@ -363,6 +366,7 @@ impl MarkerKind {
         Self::NonLinuxAbi,
         Self::NetworkOutbound,
         Self::Datagram,
+        Self::RuntimeSeed,
     ];
 
     /// The kind's stable name — the `kind` member in `check`'s JSON
@@ -383,6 +387,7 @@ impl MarkerKind {
             Self::NonLinuxAbi => "non-linux-abi",
             Self::NetworkOutbound => "network-outbound",
             Self::Datagram => "datagram",
+            Self::RuntimeSeed => "runtime-seed",
             Self::Custom => "custom",
         }
     }
@@ -455,6 +460,11 @@ impl MarkerKind {
                 "datagram-family syscalls are UDP-compatible but not proof \
                  UDP is required — UDP/QUIC is never inferred and a TCP \
                  allow never covers it"
+            }
+            Self::RuntimeSeed => {
+                "the entry was seeded from launch-time facts — the resolved \
+                 interpreter layout or a fixed per-runtime candidate list — \
+                 and generation cannot prove this server needs it"
             }
             Self::Custom => {
                 "a marker matching no known generator kind — a hand-written \
@@ -536,6 +546,13 @@ impl MarkerKind {
                 "if the workload needs UDP, declare proto=\"udp\" \
                  explicitly; on Linux `run`, UDP grants are enforced only \
                  on the namespaced route"
+            }
+            Self::RuntimeSeed => {
+                "keep only the grants the server reads under and delete the \
+                 rest; uncomment an `environment` candidate just for the \
+                 names the server reads — an enabled `allow` copies the \
+                 parent's value into the restricted child environment \
+                 (guide §4.3)"
             }
             Self::Custom => {
                 "read the note and decide what it asks; delete the comment \
@@ -826,6 +843,7 @@ mod tests {
                 "non-linux-abi",
                 "network-outbound",
                 "datagram",
+                "runtime-seed",
                 "custom",
             ]
         );

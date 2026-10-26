@@ -1215,10 +1215,10 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **タスク**
 
-- [ ] `WorkloadHashes` に、解決済みのインタプリタ実行ファイルのパスとペイロード（entrypoint）のパスを載せる（hash line が持つ `target=` と同じ値を使う）。
-- [ ] `build_fs_section` にインタプリタ由来の読み取り許可を投入する: 実行ファイルのディレクトリとその親（インストール prefix）、ペイロードを含むパッケージツリー（Node: entrypoint から上に辿った最寄りの `node_modules` の親、または `package.json` のあるディレクトリ。Python: entrypoint のディレクトリと venv / `site-packages` の prefix）。各行に `// seeded from resolved interpreter: <path>` の由来コメントと REVIEW を付け、`runtime/node.kdl` のコメントが列挙する項目を網羅する。既存の文字列分析由来の行と二重にしない。D-7 の推奨どおりフラグ gate は設けない（代替案を採る場合は `--runtime-baseline <node|python>` を追加し、未指定時の出力を現状と同一に保つ）。
-- [ ] `environment` ブロックの雛形を、コメントアウトした候補として出す（例: `// environment { allow "NODE_EXTRA_CA_CERTS" "SSL_CERT_FILE" "HTTPS_PROXY" "NO_PROXY" }` と `// REVIEW: enable only the names this server reads`）。有効な KDL としては投入しない（fail-closed を保つ）。候補はランタイム別の固定リストに限り、親環境を走査して名前を集めることはしない。
-- [ ] 雛形を適用しない経路（native バイナリ、分類不能な起動）の出力が現状と同一であることを snapshot 試験で固定する。
+- [x] `WorkloadHashes` に、解決済みのインタプリタ実行ファイルのパスとペイロード（entrypoint）のパスを載せる（hash line が持つ `target=` と同じ値を使う）。
+- [x] `build_fs_section` にインタプリタ由来の読み取り許可を投入する: 実行ファイルのディレクトリとその親（インストール prefix）、ペイロードを含むパッケージツリー（Node: entrypoint から上に辿った最寄りの `node_modules` の親、または `package.json` のあるディレクトリ。Python: entrypoint のディレクトリと venv / `site-packages` の prefix）。各行に `// seeded from resolved interpreter: <path>` の由来コメントと REVIEW を付け、`runtime/node.kdl` のコメントが列挙する項目を網羅する。既存の文字列分析由来の行と二重にしない。D-7 の推奨どおりフラグ gate は設けない（代替案を採る場合は `--runtime-baseline <node|python>` を追加し、未指定時の出力を現状と同一に保つ）。
+- [x] `environment` ブロックの雛形を、コメントアウトした候補として出す（例: `// environment { allow "NODE_EXTRA_CA_CERTS" "SSL_CERT_FILE" "HTTPS_PROXY" "NO_PROXY" }` と `// REVIEW: enable only the names this server reads`）。有効な KDL としては投入しない（fail-closed を保つ）。候補はランタイム別の固定リストに限り、親環境を走査して名前を集めることはしない。
+- [x] 雛形を適用しない経路（native バイナリ、分類不能な起動）の出力が現状と同一であることを snapshot 試験で固定する。
 
 **検証:** T-BASE、T-POLICY、`tests/self_test.rs`、`tests/real_servers_e2e.rs`（Node / Python 系サーバーで、生成直後のドラフト＋最小の手編集で enforced run が起動すること）。
 
