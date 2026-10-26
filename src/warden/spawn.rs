@@ -397,7 +397,7 @@ impl Warden {
             } else {
                 spawn_env_pairs(opts).is_some()
             };
-            if let Some(o) = plan::env_observation(env_applied, spawn_err) {
+            if let Some(o) = plan::env_observation(opts, env_applied, spawn_err) {
                 observations.push(o);
             }
             let report = WardenReport {
@@ -618,7 +618,7 @@ impl Warden {
                 spawned.as_ref().err(),
                 liveness.as_ref(),
             ));
-            if let Some(o) = plan::env_observation(env_applied, spawn_err) {
+            if let Some(o) = plan::env_observation(&env_opts, env_applied, spawn_err) {
                 observations.push(o);
             }
             let report = WardenReport {
@@ -848,7 +848,7 @@ impl Warden {
                 spawned.as_ref().err(),
                 Some(requested_rights.as_str()),
             );
-            if let Some(o) = plan::env_observation(env_applied, spawn_err) {
+            if let Some(o) = plan::env_observation(opts, env_applied, spawn_err) {
                 observations.push(o);
             }
             let mut report = WardenReport {
@@ -1091,6 +1091,7 @@ impl Warden {
             let spawned = windows_proc::spawn_unsandboxed(Some(p), &argv[0], &argv[1..], opts);
             let mut report = plan_report();
             if let Some(o) = plan::env_observation(
+                opts,
                 spawn_env_pairs(opts).is_some(),
                 spawned.as_ref().err().map(|e| e.to_string()),
             ) {
@@ -1169,6 +1170,7 @@ impl Warden {
         let spawned = cmd.spawn();
         let mut report = plan_report();
         if let Some(o) = plan::env_observation(
+            opts,
             spawn_env_pairs(opts).is_some(),
             spawned.as_ref().err().map(|e| e.to_string()),
         ) {

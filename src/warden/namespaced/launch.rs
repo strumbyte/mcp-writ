@@ -325,7 +325,7 @@ pub(crate) async fn spawn_namespaced_attempt(
         ctx.upstream.is_some(),
         None,
     );
-    if let Some(o) = plan::env_observation(spawn_env_pairs(opts).is_some(), None) {
+    if let Some(o) = plan::env_observation(opts, spawn_env_pairs(opts).is_some(), None) {
         observations.push(o);
     }
 

@@ -138,6 +138,81 @@ pub(crate) fn apply_spawn_env_sync(cmd: &mut std::process::Command, opts: &Spawn
     }
 }
 
+/// The `defaults.environment` allowlist diagnosis: for each consulted
+/// name, whether the parent environment defined it — and, when the
+/// value reads as a single absolute path, whether that path exists.
+/// The report carries **names only** — a variable's value, including
+/// the checked path spelling, never enters it. Nothing here gates the
+/// launch: a missing name or a dangling path is an observation, never
+/// a refusal (D-8).
+///
+/// `present` and `missing` partition the consulted allowlist;
+/// `path_missing` is a subset of `present` — the variable is set, its
+/// value just names a path with nothing behind it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct EnvContractReport {
+    /// Allowlisted names the parent environment defines — copied into
+    /// the child's restricted environment.
+    pub present: Vec<String>,
+    /// Allowlisted names the parent environment does not define — they
+    /// stay unset in the child.
+    pub missing: Vec<String>,
+    /// Present names whose value is a single absolute path with no
+    /// filesystem object behind it — the variable reaches the child;
+    /// the path may not.
+    pub path_missing: Vec<String>,
+}
+
+impl EnvContractReport {
+    /// The deduplicated count of allowlist names the contract actually
+    /// consulted — `present` + `missing` partition that set
+    /// (`path_missing` is a subset of `present`). Plan and observation
+    /// text report the "N allowlisted name(s)" count from this, so the
+    /// numbers always reconcile with `describe()` even when the
+    /// declared list carries duplicates or pair-unsafe spellings.
+    pub(crate) fn consulted(&self) -> usize {
+        self.present.len() + self.missing.len()
+    }
+
+    /// `"K present, M missing"`, plus `(missing: A, B; path missing: C)`
+    /// when either list is non-empty — the allowlist diagnosis the
+    /// `launch.env` plan reason and launch-report observation share.
+    /// Names only; a value never enters this string.
+    pub(crate) fn describe(&self) -> String {
+        let mut out = format!(
+            "{} present, {} missing",
+            self.present.len(),
+            self.missing.len()
+        );
+        let mut notes = Vec::new();
+        if !self.missing.is_empty() {
+            notes.push(format!("missing: {}", self.missing.join(", ")));
+        }
+        if !self.path_missing.is_empty() {
+            notes.push(format!("path missing: {}", self.path_missing.join(", ")));
+        }
+        if !notes.is_empty() {
+            out.push_str(&format!(" ({})", notes.join("; ")));
+        }
+        out
+    }
+}
+
+/// The allowlist diagnosis for `opts` — `Some` only when
+/// `restrict_environment` consults a non-empty `allowed_names`; an
+/// inherited, base-set-only, or tmpdir-only environment has no
+/// allowlist to report on (matching the plan wording where an empty
+/// `allow` reads "restricted to the base set" with no contract
+/// summary). Computed by the same pass that builds the restricted
+/// block, so the report is a snapshot of the parent environment at
+/// call time — `plan` and `run` can be different processes with
+/// different parents, and each surface reports the snapshot it
+/// observed.
+pub(crate) fn env_contract_report(opts: &SpawnOptions) -> Option<EnvContractReport> {
+    (opts.restrict_environment && !opts.allowed_names.is_empty())
+        .then(|| restricted_base_env(&opts.allowed_names).1)
+}
+
 /// Environment entries applied to a sandboxed child.
 ///
 /// `None` means inherit the parent environment (and do not override TMPDIR).
@@ -148,7 +223,7 @@ pub(crate) fn spawn_env_pairs(opts: &SpawnOptions) -> Option<Vec<(OsString, OsSt
         return None;
     }
     let mut pairs = if opts.restrict_environment {
-        restricted_base_env(&opts.allowed_names)
+        restricted_base_env(&opts.allowed_names).0
     } else {
         std::env::vars_os().collect()
     };
@@ -161,7 +236,7 @@ pub(crate) fn spawn_env_pairs(opts: &SpawnOptions) -> Option<Vec<(OsString, OsSt
     Some(pairs)
 }
 
-fn restricted_base_env(allowed_names: &[String]) -> Vec<(OsString, OsString)> {
+fn restricted_base_env(allowed_names: &[String]) -> (Vec<(OsString, OsString)>, EnvContractReport) {
     let mut pairs = Vec::new();
     if let Some(path) = std::env::var_os("PATH") {
         pairs.push((OsString::from("PATH"), path));
@@ -185,21 +260,54 @@ fn restricted_base_env(allowed_names: &[String]) -> Vec<(OsString, OsString)> {
             }
         }
     }
+    let mut report = EnvContractReport::default();
     // Policy allowlist: copy each name from the parent when present; a listed
-    // name the parent does not define stays unset. Names that cannot form a
-    // `KEY=value` pair are skipped — the policy validator rejects them at
-    // load, so this only guards programmatic SpawnOptions misuse (var_os
-    // would panic on an empty/`=`/NUL name otherwise).
+    // name the parent does not define stays unset — and is recorded as
+    // `missing`, so the launch report and audit trail name the gap instead
+    // of leaving it silent. Names that cannot form a `KEY=value` pair are
+    // skipped — the policy validator rejects them at load, so this only
+    // guards programmatic SpawnOptions misuse (var_os would panic on an
+    // empty/`=`/NUL name otherwise).
+    // `env_key_eq` on the dedupe keeps the report consistent with the
+    // env block on Windows, where "Path"/"PATH" resolve to the same
+    // variable — the diagnosis counts the consulted names exactly as
+    // often as the block writes them.
+    let already = |list: &[String], name: &str| {
+        list.iter()
+            .any(|n| env_key_eq(OsStr::new(n), OsStr::new(name)))
+    };
     for name in allowed_names {
         if name.is_empty() || name.contains('=') || name.contains('\0') {
             continue;
         }
         let key = OsString::from(name);
         if let Some(val) = std::env::var_os(&key) {
+            if !already(&report.present, name) {
+                report.present.push(name.clone());
+                // The path check applies to every allowlisted name, but
+                // only when the value reads as one absolute path — a
+                // PATH-list spelling or a non-path value has nothing to
+                // stat (PR-33: the checked path itself is never recorded).
+                if single_absolute_path(&val) && std::fs::metadata(&val).is_err() {
+                    report.path_missing.push(name.clone());
+                }
+            }
             upsert_env(&mut pairs, key, val);
+        } else if !already(&report.missing, name) {
+            report.missing.push(name.clone());
         }
     }
-    pairs
+    (pairs, report)
+}
+
+/// True when `value` reads as exactly one absolute path — a PATH-list
+/// spelling (`a:b` / `a;b` splits into several `split_paths` entries)
+/// or a relative/bare value is not a path claim the diagnosis can
+/// check, so those stay unreported.
+fn single_absolute_path(value: &OsStr) -> bool {
+    !value.is_empty()
+        && std::env::split_paths(value).nth(1).is_none()
+        && std::path::Path::new(value).is_absolute()
 }
 
 fn env_key_eq(a: &OsStr, b: &OsStr) -> bool {
@@ -544,9 +652,120 @@ mod tests {
             .filter(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(name))
             .count();
         assert_eq!(count, 1, "duplicate allow names must dedupe: {pairs:?}");
+        // The report dedupes on the same key equality — the diagnosis
+        // never counts a consulted name more often than the block writes
+        // it.
+        let report = env_contract_report(&opts).expect("restricted env is consulted");
+        assert_eq!(
+            report.present,
+            vec![name.to_string()],
+            "the report dedupes the same way the env block does: {report:?}"
+        );
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var(name);
         }
+    }
+
+    /// PR-33 — the contract report partitions the allowlist into
+    /// present/missing by name only: values never enter it, and a
+    /// single-absolute-path value that names nothing on disk lands in
+    /// `path_missing` *while staying* `present`.
+    #[test]
+    fn env_contract_report_partitions_names_without_values() {
+        let _env = lock_process_env();
+        let present = "MCP_WRIT_ENV_CONTRACT_PRESENT";
+        let missing = "MCP_WRIT_ENV_CONTRACT_MISSING";
+        let path_gone = "MCP_WRIT_ENV_CONTRACT_PATH_GONE";
+        let list = "MCP_WRIT_ENV_CONTRACT_LIST";
+        let gone = std::env::temp_dir().join("mcp-writ-env-contract-no-such-file");
+        assert!(!gone.exists(), "fixture path must not exist");
+        let secret = "s3cr3t-value-that-must-not-appear";
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::set_var(present, secret);
+            std::env::remove_var(missing);
+            std::env::set_var(path_gone, &gone);
+            // A PATH-list spelling is not a single-path claim.
+            std::env::set_var(list, std::env::join_paths([&gone, &gone]).unwrap());
+        }
+        let opts = SpawnOptions {
+            restrict_environment: true,
+            allowed_names: vec![
+                present.to_string(),
+                missing.to_string(),
+                path_gone.to_string(),
+                list.to_string(),
+            ],
+            tmpdir: None,
+            ..Default::default()
+        };
+        let report = env_contract_report(&opts).expect("restricted env is consulted");
+        assert_eq!(
+            report.present,
+            vec![present.to_string(), path_gone.to_string(), list.to_string()]
+        );
+        assert_eq!(report.missing, vec![missing.to_string()]);
+        assert_eq!(report.path_missing, vec![path_gone.to_string()]);
+        // The structure cannot hold a value — assert the rendered
+        // diagnosis carries names only.
+        let text = report.describe();
+        assert!(
+            !text.contains(secret) && !text.contains(gone.to_string_lossy().as_ref()),
+            "report must carry names only, never values: {text}"
+        );
+        assert!(
+            text.contains(missing) && text.contains(path_gone),
+            "the diagnosis names the gaps: {text}"
+        );
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::remove_var(present);
+            std::env::remove_var(path_gone);
+            std::env::remove_var(list);
+        }
+    }
+
+    /// `env_contract_report` is `None` when the allowlist is not
+    /// consulted — an inherited parent environment has no contract.
+    #[test]
+    fn env_contract_report_none_without_restriction() {
+        let _env = lock_process_env();
+        let opts = SpawnOptions {
+            restrict_environment: false,
+            allowed_names: vec!["MCP_WRIT_ENV_ALLOWLIST_INHERIT".to_string()],
+            tmpdir: None,
+            ..Default::default()
+        };
+        assert!(env_contract_report(&opts).is_none());
+    }
+
+    /// A present name whose value is an existing absolute path is not a
+    /// `path_missing` — only a dangling path is.
+    #[test]
+    fn env_contract_report_existing_path_is_not_path_missing() {
+        let _env = lock_process_env();
+        let name = "MCP_WRIT_ENV_CONTRACT_PATH_OK";
+        let dir = std::env::temp_dir().join("mcp-writ-env-contract-exists");
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::set_var(name, &dir);
+        }
+        let opts = SpawnOptions {
+            restrict_environment: true,
+            allowed_names: vec![name.to_string()],
+            tmpdir: None,
+            ..Default::default()
+        };
+        let report = env_contract_report(&opts).unwrap();
+        assert_eq!(report.present, vec![name.to_string()]);
+        assert!(report.path_missing.is_empty());
+        assert!(report.missing.is_empty());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::remove_var(name);
+        }
+        let _ = std::fs::remove_dir(&dir);
     }
 }

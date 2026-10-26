@@ -330,6 +330,10 @@ use env::apply_spawn_env;
 #[cfg(test)]
 pub(crate) use env::lock_process_env;
 
+/// `env_contract_report` — the PR-33 allowlist diagnosis the launch
+/// layer records (names only, never values). Ungated: `launch` calls it
+/// on every target, so the symbol must exist wherever `mod env` does.
+pub(crate) use env::env_contract_report;
 /// `spawn_env_pairs` for the namespaced launch (PR-09), the macOS
 /// spawn/env-observation path, and the Windows env-observation calls —
 /// same env block contract as the native spawns. (Was linux-gated,

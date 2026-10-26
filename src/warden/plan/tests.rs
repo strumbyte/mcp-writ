@@ -114,12 +114,42 @@ fn shared_controls_distinguish_optional_features() {
 
 #[test]
 fn env_observation_only_exists_when_the_contract_applies() {
-    assert!(env_observation(false, None).is_none());
-    let ok = env_observation(true, None).unwrap();
+    let opts = SpawnOptions {
+        restrict_environment: true,
+        allowed_names: vec!["MCP_WRIT_PLAN_TEST_ENV_OBS".to_string()],
+        tmpdir: None,
+        ..Default::default()
+    };
+    assert!(env_observation(&opts, false, None).is_none());
+    let ok = env_observation(&opts, true, None).unwrap();
     assert_eq!(ok.state, ControlState::Verified);
     assert_eq!(ok.phase, ControlPhase::Spawn);
-    let err = env_observation(true, Some("boom".to_string())).unwrap();
+    // The restriction consults the allowlist, so the reason carries the
+    // launch-time contract snapshot (this name is unset in the parent).
+    assert_eq!(
+        ok.reason.as_deref(),
+        Some(
+            "env contract: 1 allowlisted name(s): 0 present, 1 missing \
+             (missing: MCP_WRIT_PLAN_TEST_ENV_OBS)"
+        )
+    );
+    let err = env_observation(&opts, true, Some("boom".to_string())).unwrap();
     assert_eq!(err.state, ControlState::Unknown);
+    assert!(
+        err.reason
+            .as_deref()
+            .unwrap()
+            .starts_with("spawn failed: boom"),
+        "spawn failure leads the reason: {err:?}"
+    );
+    // A tmpdir-only contract has no consulted allowlist — no contract
+    // reason is attached, matching the pre-PR-33 shape.
+    let tmpdir_only = SpawnOptions {
+        tmpdir: Some(std::env::temp_dir()),
+        ..Default::default()
+    };
+    let ok = env_observation(&tmpdir_only, true, None).unwrap();
+    assert_eq!(ok.reason, None);
 }
 
 #[test]
