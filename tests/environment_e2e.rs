@@ -504,6 +504,13 @@ server "env-probe" {
         ),
         "stderr must name the absent allowlisted var: {err}"
     );
+    assert!(
+        err.contains(
+            "warning: allowlisted environment variable(s) whose value names a path \
+             that does not exist: MCP_WRIT_TEST_PATH_GONE"
+        ),
+        "stderr must name the dangling-path allowlisted var: {err}"
+    );
     // The warning carries names only — the parent's values never leak.
     assert!(
         !err.contains("mcp-writ-secret-keep-9z2q"),

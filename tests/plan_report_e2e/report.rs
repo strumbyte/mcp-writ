@@ -291,7 +291,8 @@ async fn run_env_allowlist_gaps_are_diagnosed() {
         );
     }
 
-    // stderr warns, naming the absent name — never a value.
+    // stderr warns, naming the absent name and the dangling-path name —
+    // never a value.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains(
@@ -299,6 +300,13 @@ async fn run_env_allowlist_gaps_are_diagnosed() {
              environment: MCP_WRIT_E2E_MISSING"
         ),
         "stderr must name the absent allowlisted var: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "warning: allowlisted environment variable(s) whose value names a path \
+             that does not exist: MCP_WRIT_E2E_PATH_GONE"
+        ),
+        "stderr must name the dangling-path allowlisted var: {stderr}"
     );
 
     // The launch.env observation records the launch-time snapshot.

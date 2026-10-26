@@ -177,7 +177,12 @@ impl EnvContractReport {
     /// `"K present, M missing"`, plus `(missing: A, B; path missing: C)`
     /// when either list is non-empty — the allowlist diagnosis the
     /// `launch.env` plan reason and launch-report observation share.
-    /// Names only; a value never enters this string.
+    /// Names only; a value never enters this string. Names render
+    /// percent-encoded (the `env_missing=` audit-token convention):
+    /// ordinary env names are all-unreserved and pass through verbatim,
+    /// while a legal-but-exotic name — the validator only forbids
+    /// `=`/NUL — cannot smuggle a comma that reads as a second list
+    /// member or a `; path missing:` fragment that forges structure.
     pub(crate) fn describe(&self) -> String {
         let mut out = format!(
             "{} present, {} missing",
@@ -186,16 +191,66 @@ impl EnvContractReport {
         );
         let mut notes = Vec::new();
         if !self.missing.is_empty() {
-            notes.push(format!("missing: {}", self.missing.join(", ")));
+            notes.push(format!("missing: {}", encode_name_list(&self.missing)));
         }
         if !self.path_missing.is_empty() {
-            notes.push(format!("path missing: {}", self.path_missing.join(", ")));
+            notes.push(format!(
+                "path missing: {}",
+                encode_name_list(&self.path_missing)
+            ));
         }
         if !notes.is_empty() {
             out.push_str(&format!(" ({})", notes.join("; ")));
         }
         out
     }
+
+    /// The stderr warnings this contract produces — one line per gap
+    /// class, names only, percent-encoded (terminal-safe by
+    /// construction, and the same spelling [`describe`] and the
+    /// `env_missing=` audit token carry). `run`/`mcp-secure-runner`
+    /// emit them pre-spawn through [`warn_env_allowlist_gaps`]; the PoC
+    /// launch front-ends call the same helper so the diagnosis is not a
+    /// `run`-only surface.
+    pub(crate) fn stderr_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.missing.is_empty() {
+            out.push(format!(
+                "warning: allowlisted environment variable(s) not set in the \
+                 parent environment: {}",
+                encode_name_list(&self.missing)
+            ));
+        }
+        if !self.path_missing.is_empty() {
+            out.push(format!(
+                "warning: allowlisted environment variable(s) whose value names \
+                 a path that does not exist: {}",
+                encode_name_list(&self.path_missing)
+            ));
+        }
+        out
+    }
+
+    /// Print [`Self::stderr_warnings`] to stderr.
+    pub(crate) fn emit_stderr_warnings(&self) {
+        for w in self.stderr_warnings() {
+            eprintln!("{w}");
+        }
+    }
+}
+
+/// Join `names` with `", "` after percent-encoding each — the
+/// `env_missing=` audit-token convention shared by [`EnvContractReport::describe`]
+/// and the stderr warnings, so the same name renders identically on
+/// every surface and a comma inside a name cannot read as a second
+/// list member. Ordinary env names are all-unreserved and pass through
+/// verbatim.
+fn encode_name_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| crate::audit_log::encode_audit_field_value(n))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The allowlist diagnosis for `opts` — `Some` only when
@@ -203,14 +258,38 @@ impl EnvContractReport {
 /// inherited, base-set-only, or tmpdir-only environment has no
 /// allowlist to report on (matching the plan wording where an empty
 /// `allow` reads "restricted to the base set" with no contract
-/// summary). Computed by the same pass that builds the restricted
-/// block, so the report is a snapshot of the parent environment at
-/// call time — `plan` and `run` can be different processes with
-/// different parents, and each surface reports the snapshot it
-/// observed.
+/// summary). Each call re-reads the parent environment through
+/// [`consult_allowlist`] — the same allowlist pass the env block is
+/// built from, run again here — so the report is a snapshot at call
+/// time: `plan` and `run` can be different processes with different
+/// parents, and each surface reports the snapshot it observed.
 pub(crate) fn env_contract_report(opts: &SpawnOptions) -> Option<EnvContractReport> {
     (opts.restrict_environment && !opts.allowed_names.is_empty())
-        .then(|| restricted_base_env(&opts.allowed_names).1)
+        .then(|| consult_allowlist(&opts.allowed_names).1)
+}
+
+/// Compute `opts`' allowlist diagnosis and emit its stderr warnings —
+/// one line per gap class, names only, sanitized for the terminal.
+/// Every launch front-end calls this where it assembles the spawn env,
+/// so the diagnosis is uniform across `run`, `mcp-secure-runner`, and
+/// the PoC surfaces. Returns the report so a caller that also records
+/// the diagnosis (`server.connected` details) reuses the same snapshot.
+/// Silent when no allowlist is consulted or nothing is missing.
+pub(crate) fn warn_env_allowlist_gaps(opts: &SpawnOptions) -> Option<EnvContractReport> {
+    let report = env_contract_report(opts);
+    if let Some(c) = &report {
+        c.emit_stderr_warnings();
+    }
+    report
+}
+
+/// Whether [`spawn_env_pairs`] produces an env block for `opts` — the
+/// `Option`'s cheap predicate, for callers that need the boolean only.
+/// The full build runs the allowlist pass (a parent-env read plus a
+/// `metadata()` stat per path-valued name); a yes/no question must not
+/// pay for it.
+pub(crate) fn env_block_applies(opts: &SpawnOptions) -> bool {
+    opts.restrict_environment || opts.tmpdir.is_some()
 }
 
 /// Environment entries applied to a sandboxed child.
@@ -219,7 +298,7 @@ pub(crate) fn env_contract_report(opts: &SpawnOptions) -> Option<EnvContractRepo
 /// `Some` is the complete environment block: restricted allow-list, or a
 /// snapshot of the parent with TMPDIR/TMP/TEMP overridden.
 pub(crate) fn spawn_env_pairs(opts: &SpawnOptions) -> Option<Vec<(OsString, OsString)>> {
-    if !opts.restrict_environment && opts.tmpdir.is_none() {
+    if !env_block_applies(opts) {
         return None;
     }
     let mut pairs = if opts.restrict_environment {
@@ -260,18 +339,30 @@ fn restricted_base_env(allowed_names: &[String]) -> (Vec<(OsString, OsString)>, 
             }
         }
     }
+    let (allow_pairs, report) = consult_allowlist(allowed_names);
+    for (key, val) in allow_pairs {
+        upsert_env(&mut pairs, key, val);
+    }
+    (pairs, report)
+}
+
+/// The allowlist pass shared by the restricted env block and the
+/// launch diagnosis: each pair-safe listed name is looked up once in
+/// the parent environment — present names yield a `(key, value)` pair
+/// for the block, absent names land in the report's `missing`, and a
+/// present name whose value reads as a single absolute path with
+/// nothing behind it lands in `path_missing`.
+/// Names that cannot form a `KEY=value` pair are skipped — the policy
+/// validator rejects them at load, so this only guards programmatic
+/// SpawnOptions misuse (var_os would panic on an empty/`=`/NUL name
+/// otherwise).
+/// `env_key_eq` on the dedupe keeps the report consistent with the
+/// env block on Windows, where "Path"/"PATH" resolve to the same
+/// variable — the diagnosis counts the consulted names exactly as
+/// often as the block writes them.
+fn consult_allowlist(allowed_names: &[String]) -> (Vec<(OsString, OsString)>, EnvContractReport) {
+    let mut pairs = Vec::new();
     let mut report = EnvContractReport::default();
-    // Policy allowlist: copy each name from the parent when present; a listed
-    // name the parent does not define stays unset — and is recorded as
-    // `missing`, so the launch report and audit trail name the gap instead
-    // of leaving it silent. Names that cannot form a `KEY=value` pair are
-    // skipped — the policy validator rejects them at load, so this only
-    // guards programmatic SpawnOptions misuse (var_os would panic on an
-    // empty/`=`/NUL name otherwise).
-    // `env_key_eq` on the dedupe keeps the report consistent with the
-    // env block on Windows, where "Path"/"PATH" resolve to the same
-    // variable — the diagnosis counts the consulted names exactly as
-    // often as the block writes them.
     let already = |list: &[String], name: &str| {
         list.iter()
             .any(|n| env_key_eq(OsStr::new(n), OsStr::new(name)))
@@ -288,7 +379,7 @@ fn restricted_base_env(allowed_names: &[String]) -> (Vec<(OsString, OsString)>, 
                 // only when the value reads as one absolute path — a
                 // PATH-list spelling or a non-path value has nothing to
                 // stat (PR-33: the checked path itself is never recorded).
-                if single_absolute_path(&val) && std::fs::metadata(&val).is_err() {
+                if single_absolute_path(&val) && path_unresolvable(&val) {
                     report.path_missing.push(name.clone());
                 }
             }
@@ -308,6 +399,22 @@ fn single_absolute_path(value: &OsStr) -> bool {
     !value.is_empty()
         && std::env::split_paths(value).nth(1).is_none()
         && std::path::Path::new(value).is_absolute()
+}
+
+/// True when `metadata` fails because nothing can exist at `path` —
+/// `NotFound` (ENOENT; a dangling symlink included) or `NotADirectory`
+/// (a non-directory component mid-path). Other failures — EACCES and
+/// the like — mean the check could not decide, not that the path is
+/// absent; the name stays out of `path_missing` rather than reporting
+/// an accessible-or-not guess as a missing path.
+fn path_unresolvable(path: &OsStr) -> bool {
+    match std::fs::metadata(path) {
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+        Ok(_) => false,
+    }
 }
 
 fn env_key_eq(a: &OsStr, b: &OsStr) -> bool {
@@ -767,5 +874,117 @@ mod tests {
             std::env::remove_var(name);
         }
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A present name whose value is a single absolute path beneath an
+    /// existing *file* cannot resolve — `NotADirectory` classifies the
+    /// same "nothing behind it" gap as `NotFound`.
+    #[test]
+    fn env_contract_report_path_under_a_file_is_path_missing() {
+        let _env = lock_process_env();
+        let name = "MCP_WRIT_ENV_CONTRACT_NOTDIR";
+        let file = std::env::temp_dir().join("mcp-writ-env-contract-file");
+        std::fs::write(&file, b"x").expect("fixture file");
+        let under_file = file.join("child");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::set_var(name, &under_file);
+        }
+        let opts = SpawnOptions {
+            restrict_environment: true,
+            allowed_names: vec![name.to_string()],
+            tmpdir: None,
+            ..Default::default()
+        };
+        let report = env_contract_report(&opts).unwrap();
+        assert_eq!(report.present, vec![name.to_string()]);
+        assert_eq!(
+            report.path_missing,
+            vec![name.to_string()],
+            "a path with a non-directory component is unresolvable"
+        );
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::remove_var(name);
+        }
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// `describe()` percent-encodes names so a legal-but-exotic
+    /// allowlist spelling — the validator forbids only `=`/NUL —
+    /// cannot smuggle a comma that reads as a second list member or a
+    /// `; path missing:` fragment that forges structure.
+    #[test]
+    fn env_contract_describe_encodes_exotic_names() {
+        let report = EnvContractReport {
+            present: vec![],
+            missing: vec![
+                "A,B".to_string(),
+                "X) (missing: FORGED".to_string(),
+                "PLAIN_NAME".to_string(),
+            ],
+            path_missing: vec![],
+        };
+        let text = report.describe();
+        assert!(
+            text.contains("missing: A%2CB, X%29%20%28missing%3A%20FORGED, PLAIN_NAME"),
+            "exotic names are encoded, ordinary names pass through: {text}"
+        );
+        assert!(
+            !text.contains("(missing: FORGED"),
+            "the forged fragment must not render: {text}"
+        );
+    }
+
+    /// One stderr line per non-empty gap class — names only, sanitized.
+    #[test]
+    fn env_contract_stderr_warnings_cover_both_gap_classes() {
+        let none = EnvContractReport::default();
+        assert!(none.stderr_warnings().is_empty());
+        let report = EnvContractReport {
+            present: vec![],
+            missing: vec!["GONE".to_string()],
+            path_missing: vec!["DANGLING".to_string()],
+        };
+        let warnings = report.stderr_warnings();
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            warnings[0].contains("not set in the parent environment: GONE"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("a path that does not exist: DANGLING"),
+            "{warnings:?}"
+        );
+        // A comma inside a name is percent-encoded — it cannot read as
+        // a second list member.
+        let exotic = EnvContractReport {
+            present: vec![],
+            missing: vec!["A,B".to_string()],
+            path_missing: vec![],
+        };
+        let warnings = exotic.stderr_warnings();
+        assert!(warnings[0].ends_with("environment: A%2CB"), "{warnings:?}");
+    }
+
+    /// `env_block_applies` is the cheap predicate `spawn_env_pairs`'s
+    /// `Option` stands on — they must agree for every combination.
+    #[test]
+    fn env_block_applies_matches_spawn_env_pairs_presence() {
+        let _env = lock_process_env();
+        for restrict in [false, true] {
+            for tmpdir in [None, Some(std::env::temp_dir())] {
+                let opts = SpawnOptions {
+                    restrict_environment: restrict,
+                    tmpdir: tmpdir.clone(),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    env_block_applies(&opts),
+                    spawn_env_pairs(&opts).is_some(),
+                    "predicate must agree with the Option: {opts:?}"
+                );
+            }
+        }
     }
 }

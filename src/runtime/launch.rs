@@ -681,24 +681,13 @@ pub async fn launch(
     }
     // The allowlist diagnosis for this launch — `Some` only when the
     // environment restriction consults a list — is a names-only
-    // snapshot of this process's parent environment, the same pass the
-    // restricted env block was built from. A missing name is recorded,
-    // never a launch refusal: it lands on the `launch.env` observation,
-    // the `server.connected` details below, and one stderr warning.
-    let env_contract = crate::warden::env_contract_report(&spawn_opts);
-    if let Some(contract) = &env_contract
-        && !contract.missing.is_empty()
-    {
-        eprintln!(
-            "warning: allowlisted environment variable(s) not set in the parent environment: {}",
-            contract
-                .missing
-                .iter()
-                .map(|n| crate::termutil::sanitize_for_terminal(n))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    // snapshot of this process's parent environment, re-read through
+    // the same allowlist pass the restricted env block will be built
+    // from. A missing name is recorded, never a launch refusal: it
+    // lands on the `launch.env` observation, the `server.connected`
+    // details below, and one stderr warning per gap class (emitted by
+    // warn_env_allowlist_gaps, which returns the same snapshot).
+    let env_contract = crate::warden::warn_env_allowlist_gaps(&spawn_opts);
     let attempt = match sandbox_skip_reason {
         Some(reason) => warden.spawn_unsandboxed_async_exe_with_report(
             &spawn_exe,

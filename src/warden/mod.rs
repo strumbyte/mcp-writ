@@ -330,17 +330,18 @@ use env::apply_spawn_env;
 #[cfg(test)]
 pub(crate) use env::lock_process_env;
 
-/// `env_contract_report` — the PR-33 allowlist diagnosis the launch
-/// layer records (names only, never values). Ungated: `launch` calls it
-/// on every target, so the symbol must exist wherever `mod env` does.
-pub(crate) use env::env_contract_report;
-/// `spawn_env_pairs` for the namespaced launch (PR-09), the macOS
-/// spawn/env-observation path, and the Windows env-observation calls —
-/// same env block contract as the native spawns. (Was linux-gated,
-/// which broke the macOS build, then linux+macOS-gated, which broke
-/// the Windows build: the spawn blocks call it unconditionally.)
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// `spawn_env_pairs` for the namespaced launch (PR-09) and the
+/// `namespaced-run` command's env staging — the only callers outside
+/// `mod env` itself; sibling modules reach it via `super::env::` and
+/// the other front-ends only need `env_block_applies`.
+#[cfg(target_os = "linux")]
 pub(crate) use env::spawn_env_pairs;
+/// `warn_env_allowlist_gaps` — the PR-33 allowlist diagnosis every
+/// launch front-end emits on stderr (names only, never values); it
+/// returns the snapshot so `launch` reuses it for the audit details.
+/// `env_block_applies` is the cheap `Option` predicate behind
+/// `spawn_env_pairs`. Ungated: both are called on every target.
+pub(crate) use env::{env_block_applies, warn_env_allowlist_gaps};
 
 pub struct Warden {
     policy: Policy,

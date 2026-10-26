@@ -773,7 +773,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 
 `plan` が出すのは起動レポートではなく*結果*スキーマ（status/reason/checks/remediation と算出済み計画）である: 何も起動していないので `launch_id` も `observations` も無い。
 
-`launch.env` 制御は環境契約の診断も兼ねる: `defaults.environment` が子を `allow` リストへ制限する場合、その reason は親環境に実在した列挙名の数、親に存在しなかった列挙名（`missing`）、単一の絶対パスと読める値を持ちそのパスが実在しない名前（`path missing`）を示す。診断は名前のみで、変数の値は plan・レポート・監査 details・stderr のいずれにも入らない。またこれは起動時の状態の記録であり拒否ではない — 親に存在しない許可名は子でも未設定のままで、起動は続行される。同じスナップショットは起動レポートの `launch.env` 観測、`server.connected` 監査レコードの `env_missing=` / `env_path_missing=` 名リスト、および stderr の 1 行警告に現れる。欠落変数で起動を拒否する専用スイッチは無い — 厳格運用が必要なら CI で `plan` の `launch.env` reason を検査すること。
+`launch.env` 制御は環境契約の診断も兼ねる: `defaults.environment` が子を `allow` リストへ制限する場合、その reason は親環境に実在した列挙名の数、親に存在しなかった列挙名（`missing`）、単一の絶対パスと読める値を持ちそのパスが実在しない名前（`path missing`）を示す。診断は名前のみで — 名リストはパーセントエンコード（通常名はそのまま）され、変数の値は plan・レポート・監査 details・stderr のいずれにも入らない。またこれは起動時の状態の記録であり拒否ではない — 親に存在しない許可名は子でも未設定のままで、起動は続行される。同じスナップショットは起動レポートの `launch.env` 観測、`server.connected` 監査レコードの `env_missing=` / `env_path_missing=` 名リスト、および stderr の警告（ギャップ種別ごとに 1 行、すべての起動経路で出力）に現れる。欠落変数で起動を拒否する専用スイッチは無い — 厳格運用が必要なら CI で `plan` の `launch.env` reason を検査すること。
 
 ### 4.9 `dns-gate` — ポリシー評価 DNS リゾルバ
 

@@ -28,7 +28,9 @@ use super::super::child::{NamespacedRuntime, RunningChildInner};
 use super::super::linux_spawn;
 use super::super::plan::{self, SpawnAttempt, WardenReport};
 use super::super::select::LinuxSelection;
-use super::super::{NamespacedLaunchCtx, RunningChild, SpawnOptions, spawn_env_pairs};
+use super::super::{
+    NamespacedLaunchCtx, RunningChild, SpawnOptions, env_block_applies, spawn_env_pairs,
+};
 use super::{SpawnConfig, policy_memfd, spawn_namespaced_child_tokio};
 
 /// Dispatch a namespaced launch from the warden's spawn path.
@@ -325,7 +327,7 @@ pub(crate) async fn spawn_namespaced_attempt(
         ctx.upstream.is_some(),
         None,
     );
-    if let Some(o) = plan::env_observation(opts, spawn_env_pairs(opts).is_some(), None) {
+    if let Some(o) = plan::env_observation(opts, env_block_applies(opts), None) {
         observations.push(o);
     }
 

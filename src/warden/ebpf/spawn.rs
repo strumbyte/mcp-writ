@@ -165,6 +165,9 @@ pub(crate) fn spawn_supervised(
         tmpdir: None,
         ..Default::default()
     };
+    // The allowlist-gap warning `run` prints — same contract, same
+    // stderr surface on this front-end too.
+    env::warn_env_allowlist_gaps(&env_opts);
     // Exec the executable through the pinned descriptor's
     // `/proc/self/fd` spelling when a pin exists — the kernel maps the
     // verified object itself, so a pathname swap after verification

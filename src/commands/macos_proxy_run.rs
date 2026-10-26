@@ -581,6 +581,9 @@ mod imp {
                 &resolved_exe,
                 &command_argv,
             ));
+        // The allowlist-gap warning `run` prints — same contract, same
+        // stderr surface on this front-end too.
+        crate::warden::warn_env_allowlist_gaps(&spawn_opts);
         // Register the signal streams before the child exists — a
         // signal landing between the spawn and stream creation would
         // otherwise take the default disposition, killing the

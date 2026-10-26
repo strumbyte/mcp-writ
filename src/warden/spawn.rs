@@ -395,7 +395,7 @@ impl Warden {
             let env_applied = if psec_env {
                 opts.restrict_environment
             } else {
-                spawn_env_pairs(opts).is_some()
+                env_block_applies(opts)
             };
             if let Some(o) = plan::env_observation(opts, env_applied, spawn_err) {
                 observations.push(o);
@@ -546,7 +546,7 @@ impl Warden {
                 env_opts.tmpdir = Some(tmpdir.path().to_path_buf());
             }
             apply_spawn_env(&mut cmd, &env_opts);
-            let env_applied = spawn_env_pairs(&env_opts).is_some();
+            let env_applied = env_block_applies(&env_opts);
             if let Some(exe) = python_executable_override(command, program) {
                 cmd.env("PYTHONEXECUTABLE", exe);
             }
@@ -826,7 +826,7 @@ impl Warden {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit());
             apply_spawn_env(&mut cmd, opts);
-            let env_applied = spawn_env_pairs(opts).is_some();
+            let env_applied = env_block_applies(opts);
             apply_unix_process_group_tokio(&mut cmd);
             // fd-exec handoff: the pin's CLOEXEC dups uncloak inside the
             // child's apply pipeline (before the policy seccomp filter
@@ -1092,7 +1092,7 @@ impl Warden {
             let mut report = plan_report();
             if let Some(o) = plan::env_observation(
                 opts,
-                spawn_env_pairs(opts).is_some(),
+                env_block_applies(opts),
                 spawned.as_ref().err().map(|e| e.to_string()),
             ) {
                 report.observations.push(o);
@@ -1171,7 +1171,7 @@ impl Warden {
         let mut report = plan_report();
         if let Some(o) = plan::env_observation(
             opts,
-            spawn_env_pairs(opts).is_some(),
+            env_block_applies(opts),
             spawned.as_ref().err().map(|e| e.to_string()),
         ) {
             report.observations.push(o);
