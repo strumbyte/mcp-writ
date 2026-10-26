@@ -934,3 +934,119 @@ fn analyzed_launch_image_binds_the_binary_pin() {
     assert_eq!(binary.hash_value, analyzed.digest);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `workload_hashes` carries the path facts the runtime seeds need:
+/// the resolved launch image (what `binary-hash` names), the resolved
+/// payload (what `entrypoint-hash` names), and the uncanonicalized
+/// `argv[0]` spelling a venv layout keys on.
+#[test]
+fn workload_hashes_carry_resolved_and_spelled_paths() {
+    if crate::workload::resolve_command_path("python3").is_err() {
+        return;
+    }
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp_writ_seedpaths_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("server.py");
+    std::fs::write(&script, "print(1)\n").unwrap();
+
+    let argv = vec!["python3".into(), script.to_string_lossy().into_owned()];
+    let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
+    let interp = w
+        .interpreter_path
+        .clone()
+        .expect("the launch image resolved");
+    let spelled = w.spelled_path.clone().expect("the argv0 spelling resolved");
+    assert!(interp.is_absolute() && spelled.is_absolute(), "{w:?}");
+    assert!(
+        crate::workload::same_file(&interp, &spelled),
+        "spelled and resolved name the same image: {w:?}"
+    );
+    let payload = w.payload_path.clone().expect("the payload resolved");
+    assert!(
+        crate::workload::same_file(&payload, &script),
+        "payload_path names the payload the pin binds: {w:?}"
+    );
+
+    // `-m` leaves the payload unbound but the launch paths still
+    // resolve — and the launch still runs CPython, so the family is
+    // read from argv: `-m` is how the real Python servers start and
+    // their drafts need the same interpreter-derived seeds.
+    let argv = vec!["python3".into(), "-m".into(), "somemod".into()];
+    let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
+    assert_eq!(w.interpreter, Some(InterpreterKind::Python), "{w:?}");
+    assert!(w.interpreter_path.is_some(), "{w:?}");
+    assert!(w.spelled_path.is_some(), "{w:?}");
+    assert!(w.payload_path.is_none(), "{w:?}");
+
+    // A launch naming no modeled family (`env` delegates argv[0])
+    // stays family-less: nothing classifies it, nothing seeds.
+    let argv = vec![
+        "env".into(),
+        "FOO=1".into(),
+        "python3".into(),
+        "s.py".into(),
+    ];
+    let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
+    assert_eq!(w.interpreter, None, "{w:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A venv `bin/python` symlink resolves to the base image for the pin,
+/// but the spelled path keeps the venv location — where the
+/// interpreter's own prefix discovery (`pyvenv.cfg`, the
+/// `site-packages` layout) starts from. Unix-only: symlink creation.
+#[cfg(unix)]
+#[test]
+fn spelled_path_keeps_the_venv_symlink_location() {
+    let Ok(base) = crate::workload::resolve_command_path("python3") else {
+        return;
+    };
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp_writ_venvspell_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    let venv_bin = dir.join(".venv/bin");
+    std::fs::create_dir_all(&venv_bin).unwrap();
+    let link = venv_bin.join("python");
+    std::os::unix::fs::symlink(&base, &link).unwrap();
+    let script = dir.join("server.py");
+    std::fs::write(&script, "print(1)\n").unwrap();
+
+    let argv = vec![
+        link.to_string_lossy().into_owned(),
+        script.to_string_lossy().into_owned(),
+    ];
+    let w = workload_hashes(&argv, &discover_from_argv(&argv), None);
+    assert_eq!(
+        w.interpreter,
+        Some(InterpreterKind::Python),
+        "venv python argv0 classifies as Python: {w:?}"
+    );
+    assert_eq!(
+        w.spelled_path.as_deref(),
+        Some(link.as_path()),
+        "the spelled path is the venv link, not its target: {w:?}"
+    );
+    assert!(
+        w.interpreter_path
+            .as_deref()
+            .is_some_and(|p| crate::workload::same_file(p, &base)),
+        "the resolved path follows the symlink to the base image: {w:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -718,6 +718,56 @@ fn stage1_workload_hashes(spec: &ServerSpec, text: &str, out: &Path) {
         "stage1 {}: generated policy must carry workload hash entries",
         spec.name
     );
+    // PR-32: interpreted launches seed argv-grounded runtime defaults —
+    // the `-m` python servers run the venv interpreter, whose spelled
+    // location's dir/parent grants the `.venv` tree; `pyvenv.cfg`'s
+    // `home=` additionally grounds the base prefix a copied
+    // interpreter hides.
+    assert!(
+        text.contains("// seeded from"),
+        "stage1 {}: interpreted draft must seed runtime read grants",
+        spec.name
+    );
+    assert!(
+        text.contains("// REVIEW: runtime-seed:"),
+        "stage1 {}: seeded grants must carry runtime-seed REVIEW markers",
+        spec.name
+    );
+    assert!(
+        text.contains("// environment { allow "),
+        "stage1 {}: draft must offer environment candidates as comments",
+        spec.name
+    );
+    assert!(
+        !policy.environment.declared,
+        "stage1 {}: commented candidates must not enable a live environment block",
+        spec.name
+    );
+    // The runtime baseline syscall list also applies: the launched
+    // interpreter has no ELF table to analyze either way (`-m` or a
+    // script payload).
+    assert!(
+        text.contains("interpreter-baseline"),
+        "stage1 {}: interpreted draft must seed the shared syscall baseline",
+        spec.name
+    );
+    let seeded_root = match spec.runtime {
+        "node" => std::fs::canonicalize(fixtures_dir().join("node")).expect("node root"),
+        "python" => {
+            std::fs::canonicalize(fixtures_dir().join("python/.venv")).expect("python venv")
+        }
+        other => panic!("unknown runtime: {other}"),
+    };
+    assert!(
+        policy.fs.read_only.iter().any(|g| {
+            std::fs::canonicalize(g)
+                .map(|p| p == seeded_root)
+                .unwrap_or(false)
+        }),
+        "stage1 {}: draft must grant the runtime package tree {}",
+        spec.name,
+        seeded_root.display()
+    );
     if spec.runtime == "node" {
         // The entrypoint pin must name dist/index.js — not the operand of a
         // value-taking option (Windows preloads win-realpath-stub.cjs via

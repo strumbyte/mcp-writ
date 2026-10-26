@@ -8,13 +8,21 @@
 //     link target's prefix and the `.venv` tree itself
 //   - the `site-packages` tree that holds the server
 //   - the server's data directories
+// `generate-policy` seeds the first two groups from the resolved launch for
+// interpreted workloads (`python <script>`, `python -m <module>`, `-c`): the
+// resolved image's prefix, the argv0-spelled venv tree (whose `pyvenv.cfg`
+// `home=` recovers the base prefix a copied `python.exe` hides), and the
+// `site-packages`/`dist-packages` tree the payload lives in — each line
+// carries a `// seeded from …` provenance comment and a REVIEW marker;
+// data directories are never inferred and stay the operator's grants.
 // On Linux additionally grant, when present: /usr/lib, /lib,
 // /lib64, /usr/local/lib, /etc/ssl, and /proc; /dev/null needs
 // mode="write" — runtimes open it read-write for stdio redirection.
 // Zone-aware servers (e.g. mcp-server-time via ZoneInfo) also need the
 // host TZDB search path — /usr/share/zoneinfo et al.: a denied lookup
 // path aborts the search with PermissionError rather than falling back
-// to the `tzdata` package.
+// to the `tzdata` package. The generator seeds this list the same way,
+// deduplicated against the argv-derived grants and string analysis.
 // On macOS the sandbox-exec profile already covers the fixed system paths;
 // add the resolved prefix.
 // On Windows grant read on the resolved prefix (AppContainer grants inherit).

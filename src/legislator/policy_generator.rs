@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::inspector::profile::CapabilityProfile;
 use crate::legislator::cross_validator::CrossValidationResult;
@@ -141,7 +142,7 @@ pub fn generate_policy(
     out.push_str("defaults {\n");
 
     // filesystem
-    build_fs_section(&mut out, result, capability);
+    build_fs_section(&mut out, result, capability, workload);
 
     // syscalls
     let interpreter_baseline = workload.interpreter.and_then(interpreter_syscall_baseline);
@@ -149,6 +150,9 @@ pub fn generate_policy(
 
     // network (advisory only — destinations are never inferred)
     build_network_section(&mut out, result, capability);
+
+    // environment (commented-out candidates only — restriction stays)
+    build_environment_section(&mut out, workload);
 
     out.push_str("}\n\n");
 
@@ -538,6 +542,7 @@ fn build_fs_section(
     out: &mut String,
     result: &CrossValidationResult,
     capability: &CapabilityProfile,
+    workload: &WorkloadHashes,
 ) {
     out.push_str("    // === Filesystem ===\n");
     out.push_str("    filesystem {\n");
@@ -546,6 +551,11 @@ fn build_fs_section(
     );
     out.push_str("        secret-overlay #true\n");
 
+    // Directory grants already emitted from binary string analysis — a
+    // `/<dir>/**` line covers the interpreter seeds under it, so the
+    // seed pass skips what these lines already grant. Each entry keeps
+    // its mode: a read grant cannot cover a write-needed seed.
+    let mut granted: Vec<(PathBuf, &'static str)> = Vec::new();
     for path in &capability.strings.paths {
         if path.starts_with("/usr/lib")
             || path.starts_with("/etc/ssl")
@@ -555,6 +565,7 @@ fn build_fs_section(
             let glob = if path.contains('.') {
                 path.clone()
             } else {
+                granted.push((PathBuf::from(path), "read"));
                 format!("{path}/**")
             };
             out.push_str(&format!(
@@ -563,6 +574,8 @@ fn build_fs_section(
             ));
         }
     }
+
+    build_runtime_seed_grants(out, workload, &mut granted);
 
     let has_fs = result
         .allowed
@@ -573,6 +586,422 @@ fn build_fs_section(
     }
 
     out.push_str("    }\n");
+}
+
+/// One interpreter-derived filesystem grant the draft seeds: the
+/// directory to allow, the Landlock mode, and the fact it was derived
+/// from (emitted with the line so the operator can trim it back).
+struct SeedGrant {
+    dir: PathBuf,
+    mode: &'static str,
+    origin: SeedOrigin,
+}
+
+/// Where a seeded grant was derived from — the `// seeded from …`
+/// comment's content and the `// REVIEW: runtime-seed:` detail.
+enum SeedOrigin {
+    /// The resolved `argv[0]` image the `binary-hash` pin names —
+    /// grants for the executable's directory and install prefix.
+    ResolvedExe(PathBuf),
+    /// `argv[0]` — or a `#!`-selected interpreter — spelled before
+    /// symlink canonicalization: a venv or shim's own layout.
+    SpelledExe(PathBuf),
+    /// The resolved payload — grants for the package tree the
+    /// payload's imports resolve from.
+    Payload(PathBuf),
+    /// The `home=` line of a venv's `pyvenv.cfg` — the base
+    /// interpreter prefix a copied `python.exe` does not reveal.
+    VenvHome(PathBuf),
+    /// The shared runtime baseline file's documented host paths
+    /// (`examples/policies/runtime/<rt>.kdl`) — the documented list is
+    /// Linux-only, so the variant exists only where it is constructed.
+    #[cfg(target_os = "linux")]
+    RuntimeFile(&'static str),
+}
+
+impl SeedOrigin {
+    fn comment(&self) -> String {
+        let (label, detail) = match self {
+            Self::ResolvedExe(p) => ("resolved interpreter", p.display().to_string()),
+            Self::SpelledExe(p) => ("launch argv0", p.display().to_string()),
+            Self::Payload(p) => ("resolved payload", p.display().to_string()),
+            Self::VenvHome(p) => ("pyvenv.cfg home", p.display().to_string()),
+            #[cfg(target_os = "linux")]
+            Self::RuntimeFile(f) => ("runtime baseline", (*f).to_string()),
+        };
+        format!("// seeded from {}: {}", label, escape_kdl_comment(&detail))
+    }
+
+    fn detail(&self) -> &'static str {
+        match self {
+            Self::ResolvedExe(_) => {
+                "install prefix of the resolved interpreter — keep only if \
+                 the runtime loads under it"
+            }
+            Self::SpelledExe(_) => {
+                "prefix of the argv0-spelled interpreter — a venv or shim \
+                 layout the resolved pin does not show"
+            }
+            Self::Payload(_) => {
+                "package tree the payload's imports resolve from — keep \
+                 what the server loads"
+            }
+            Self::VenvHome(_) => {
+                "base interpreter prefix a venv's pyvenv.cfg names — the \
+                 real standard library lives there"
+            }
+            #[cfg(target_os = "linux")]
+            Self::RuntimeFile(_) => {
+                "path the shared runtime baseline lists for this \
+                 interpreter — delete what the workload does not read"
+            }
+        }
+    }
+}
+
+/// True when `dir` is already covered by a grant emitted earlier —
+/// equal to it or inside its subtree (a Landlock grant covers the
+/// subtree; the SBPL/DACL emitters map directories the same way) *and*
+/// that grant's mode covers what the new grant needs (`"write"` is
+/// read+write, so it covers either need; `"read"` covers only a read
+/// need — a read grant must not suppress a write-needed seed like
+/// `/dev/null`). Both sides canonicalize when they exist so a `/lib`
+/// symlink and its `/usr/lib` target dedupe.
+fn grant_covered(dir: &Path, granted: &[(PathBuf, &'static str)], need: &'static str) -> bool {
+    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    granted.iter().any(|(g, mode)| {
+        let mode_covers = *mode == "write" || need == "read";
+        let base = std::fs::canonicalize(g).unwrap_or_else(|_| g.clone());
+        mode_covers && (canon == base || canon.starts_with(&base))
+    })
+}
+
+/// The `home =` line of a `pyvenv.cfg` names the base interpreter
+/// prefix — needed where the venv interpreter is a copy (Windows
+/// `Scripts\python.exe`) rather than a symlink the resolved pin can
+/// follow.
+fn pyvenv_home(venv_dir: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(venv_dir.join("pyvenv.cfg")).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("home")
+            && let Some(value) = rest.trim_start().strip_prefix('=')
+        {
+            return Some(PathBuf::from(value.trim()));
+        }
+    }
+    None
+}
+
+/// `home=` names the directory holding the base `python` executable —
+/// an existing directory containing a `python*` entry (`python3`,
+/// `python3.12`, `python.exe`, …). A line naming a nonexistent path or
+/// an unrelated absolute directory is not a base install and seeds no
+/// grant.
+fn is_python_home(home: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(home) else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("python"))
+    })
+}
+
+/// Read grants grounded in the resolved launch paths — the same class
+/// of argv fact as the interpreter seccomp baseline, so the seed is
+/// unconditional like that baseline (D-7): no flag gate, every line
+/// carries provenance and a `runtime-seed` REVIEW so `check` lists
+/// what the operator still owes.
+fn build_runtime_seed_grants(
+    out: &mut String,
+    workload: &WorkloadHashes,
+    granted: &mut Vec<(PathBuf, &'static str)>,
+) {
+    let Some(interpreter) = workload.interpreter else {
+        return;
+    };
+    let mut grants: Vec<SeedGrant> = Vec::new();
+
+    // The executable's directory and its parent (the install prefix):
+    // shared libraries and runtime data load from under the prefix.
+    // Run it for the resolved image and again for the argv0/shebang
+    // spelling — a venv `bin/python` symlink resolves away from the
+    // tree the interpreter reads `pyvenv.cfg` and site-packages from.
+    for (exe, ctor) in [
+        (
+            workload.interpreter_path.as_deref(),
+            SeedOrigin::ResolvedExe as fn(PathBuf) -> SeedOrigin,
+        ),
+        (
+            workload.spelled_path.as_deref(),
+            SeedOrigin::SpelledExe as fn(PathBuf) -> SeedOrigin,
+        ),
+    ] {
+        let Some(exe) = exe else { continue };
+        if let Some(dir) = exe.parent() {
+            if dir.parent().is_some() {
+                grants.push(SeedGrant {
+                    dir: dir.to_path_buf(),
+                    mode: "read",
+                    origin: ctor(exe.to_path_buf()),
+                });
+            }
+            if let Some(prefix) = dir.parent()
+                && prefix.parent().is_some()
+            {
+                grants.push(SeedGrant {
+                    dir: prefix.to_path_buf(),
+                    mode: "read",
+                    origin: ctor(exe.to_path_buf()),
+                });
+            }
+        }
+    }
+
+    // The package tree the payload's imports resolve from.
+    if let Some(payload) = workload.payload_path.as_deref() {
+        match interpreter {
+            InterpreterKind::Node | InterpreterKind::Npx => {
+                // Nearest `node_modules` the payload sits under → its
+                // parent (the package root covering `package.json` and
+                // sibling trees); otherwise the nearest ancestor holding
+                // `package.json` — a project-local entrypoint that never
+                // reached a node_modules layout.
+                if let Some(root) = payload
+                    .ancestors()
+                    .find(|a| a.file_name().is_some_and(|n| n == "node_modules"))
+                    .and_then(|nm| nm.parent())
+                {
+                    grants.push(SeedGrant {
+                        dir: root.to_path_buf(),
+                        mode: "read",
+                        origin: SeedOrigin::Payload(payload.to_path_buf()),
+                    });
+                } else if let Some(pkg) = payload
+                    .ancestors()
+                    .find(|a| a.join("package.json").is_file())
+                {
+                    grants.push(SeedGrant {
+                        dir: pkg.to_path_buf(),
+                        mode: "read",
+                        origin: SeedOrigin::Payload(payload.to_path_buf()),
+                    });
+                }
+            }
+            InterpreterKind::Python => {
+                // A payload inside `site-packages`/`dist-packages` —
+                // the same tree holds the server's installed
+                // dependencies, so the payload dir alone is not enough.
+                if let Some(site) = payload.ancestors().find(|a| {
+                    a.file_name()
+                        .is_some_and(|n| n == "site-packages" || n == "dist-packages")
+                }) {
+                    grants.push(SeedGrant {
+                        dir: site.to_path_buf(),
+                        mode: "read",
+                        origin: SeedOrigin::Payload(payload.to_path_buf()),
+                    });
+                }
+            }
+        }
+        // The payload's own directory — sibling modules and resources
+        // resolve relative to it.
+        if let Some(dir) = payload.parent() {
+            grants.push(SeedGrant {
+                dir: dir.to_path_buf(),
+                mode: "read",
+                origin: SeedOrigin::Payload(payload.to_path_buf()),
+            });
+        }
+    }
+
+    // Python: the venv / site-packages prefix — `pyvenv.cfg` above a
+    // `bin/` or `Scripts/` ancestor names the venv root, and its
+    // `home=` line names the base interpreter prefix a copied
+    // `python.exe` (a Windows venv) does not reveal.
+    if matches!(interpreter, InterpreterKind::Python) {
+        for (base, ctor) in [
+            (
+                workload.spelled_path.as_deref(),
+                SeedOrigin::SpelledExe as fn(PathBuf) -> SeedOrigin,
+            ),
+            (
+                workload.interpreter_path.as_deref(),
+                SeedOrigin::ResolvedExe as fn(PathBuf) -> SeedOrigin,
+            ),
+        ] {
+            let Some(base) = base else { continue };
+            // `pyvenv.cfg` lives in the venv root — beside the exe or
+            // one level above its `bin/`/`Scripts/` directory. Anything
+            // higher cannot be a venv root, so the lookup stays within
+            // those two directories and a stray config further up the
+            // tree is not mistaken for one.
+            let dir = base.parent();
+            for anc in [dir, dir.and_then(Path::parent)].into_iter().flatten() {
+                if !anc.join("pyvenv.cfg").is_file() {
+                    continue;
+                }
+                grants.push(SeedGrant {
+                    dir: anc.to_path_buf(),
+                    mode: "read",
+                    origin: ctor(base.to_path_buf()),
+                });
+                // The `home=` line is operator-controlled config text —
+                // it seeds a grant only when it names a real base
+                // install: an absolute path with a parent whose
+                // directory holds a `python*` entry (`/`, a missing
+                // path, or an unrelated absolute dir seeds nothing).
+                // `home` lands before its parent prefix, mirroring the
+                // exe dir→prefix pair, so the line the config actually
+                // names carries the provenance comment.
+                if let Some(home) = pyvenv_home(anc)
+                    && home.is_absolute()
+                    && home.parent().is_some()
+                    && is_python_home(&home)
+                {
+                    grants.push(SeedGrant {
+                        dir: home.clone(),
+                        mode: "read",
+                        origin: SeedOrigin::VenvHome(home.clone()),
+                    });
+                    if let Some(prefix) = home.parent()
+                        && prefix.parent().is_some()
+                    {
+                        grants.push(SeedGrant {
+                            dir: prefix.to_path_buf(),
+                            mode: "read",
+                            origin: SeedOrigin::VenvHome(home),
+                        });
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Documented host paths the runtime needs on Linux, when present —
+    // the shared baseline file's own list, not an inference.
+    #[cfg(target_os = "linux")]
+    {
+        let runtime_file = match interpreter {
+            InterpreterKind::Node | InterpreterKind::Npx => "examples/policies/runtime/node.kdl",
+            InterpreterKind::Python => "examples/policies/runtime/python.kdl",
+        };
+        let mut dirs: Vec<&str> = vec![
+            "/usr/lib",
+            "/lib",
+            "/lib64",
+            "/usr/local/lib",
+            "/etc/ssl",
+            "/proc",
+        ];
+        // python.kdl: zone-aware servers need the host TZDB search
+        // path — a denied lookup aborts rather than falling back.
+        if matches!(interpreter, InterpreterKind::Python) {
+            dirs.push("/usr/share/zoneinfo");
+        }
+        for dir in dirs {
+            if Path::new(dir).exists() {
+                grants.push(SeedGrant {
+                    dir: PathBuf::from(dir),
+                    mode: "read",
+                    origin: SeedOrigin::RuntimeFile(runtime_file),
+                });
+            }
+        }
+        // Interpreters open /dev/null O_RDWR (libuv stream setup,
+        // subprocess stdio) — a read grant alone cannot satisfy the
+        // write half.
+        if Path::new("/dev/null").exists() {
+            grants.push(SeedGrant {
+                dir: PathBuf::from("/dev/null"),
+                mode: "write",
+                origin: SeedOrigin::RuntimeFile(runtime_file),
+            });
+        }
+    }
+
+    let mut seeded = false;
+    for grant in grants {
+        // Dedupe against earlier grants as they land — the spelled
+        // interpreter resolves to the same directories as the resolved
+        // image whenever no venv or shim intervenes.
+        if grant_covered(&grant.dir, granted, grant.mode) {
+            continue;
+        }
+        if !seeded {
+            out.push_str("        // === Runtime defaults ===\n");
+            out.push_str(
+                "        // Read paths the resolved interpreter layout needs — grounded in\n",
+            );
+            out.push_str(
+                "        // the launch argv like the seeded syscall baseline. The server's\n",
+            );
+            out.push_str(
+                "        // data/work directories cannot be inferred — grant those by hand.\n",
+            );
+            seeded = true;
+        }
+        granted.push((grant.dir.clone(), grant.mode));
+        out.push_str(&format!("        {}\n", grant.origin.comment()));
+        out.push_str(&format!(
+            "        {}\n",
+            MarkerKind::RuntimeSeed.comment(grant.origin.detail())
+        ));
+        out.push_str(&format!(
+            "        allow \"{}\" mode=\"{}\"\n",
+            escape_kdl_string(&grant.dir.to_string_lossy()),
+            grant.mode
+        ));
+    }
+}
+
+/// The `environment` draft — commented-out candidates only. The child
+/// environment is restricted by default, so enabling names stays the
+/// operator's act and the draft itself adds no live `environment`
+/// block (fail-closed). Candidate names are a fixed per-runtime list;
+/// the generator never scans the parent environment to collect names,
+/// and values are never inferred (D-7).
+fn build_environment_section(out: &mut String, workload: &WorkloadHashes) {
+    let Some(interpreter) = workload.interpreter else {
+        return;
+    };
+    let candidates: &[&str] = match interpreter {
+        InterpreterKind::Node | InterpreterKind::Npx => &[
+            "NODE_EXTRA_CA_CERTS",
+            "SSL_CERT_FILE",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+        ],
+        InterpreterKind::Python => &[
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "PYTHONUTF8",
+            "PYTHONIOENCODING",
+            "TZ",
+        ],
+    };
+    out.push_str("    // === Environment ===\n");
+    out.push_str("    // The spawned server receives a restricted environment: names are\n");
+    out.push_str("    // copied from the parent only when an `allow` lists them — the\n");
+    out.push_str("    // draft enables nothing itself.\n");
+    out.push_str(&format!(
+        "    {} enable only the names this server reads\n",
+        MarkerKind::RuntimeSeed.comment_head()
+    ));
+    out.push_str(&format!(
+        "    // environment {{ allow {} }}\n",
+        candidates
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
 }
 
 /// The interpreter's shared seccomp baseline, compiled in from the same

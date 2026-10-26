@@ -11,10 +11,15 @@
 //   - the server package tree (the `node_modules` directory that holds
 //     `@modelcontextprotocol/<server>`)
 //   - the server's data/work directories
+// `generate-policy` seeds the first two groups from the resolved launch for
+// interpreted workloads (`node <entry>`, `node -e`, `npx`) — each line
+// carries a `// seeded from …` provenance comment and a REVIEW marker;
+// data directories are never inferred and stay the operator's grants.
 // On Linux additionally grant, when present: /usr/lib, /lib,
 // /lib64, /usr/local/lib, /etc/ssl, and /proc (V8/libuv read
 // /proc/self/* at startup). /dev/null needs mode="write" — libuv opens
-// it read-write.
+// it read-write. The generator seeds these the same way, deduplicated
+// against the argv-derived grants and binary string analysis.
 // On macOS the sandbox-exec profile already covers the fixed system paths;
 // add the resolved prefix.
 // On Windows grant read on the resolved prefix (AppContainer grants inherit).
