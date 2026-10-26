@@ -75,4 +75,10 @@ server "docs" {
 
 `mcp_message.*` の判定行は `details` の先頭に `dir=<c2s|s2c> kind=<request|response|notification> revision=<ワイヤ版>` を持ちます。旧表記は `version=` で、`revision=` への改名は「そのフレームの判定に使ったワイヤ版であり、ピアが名乗った `protocolVersion` ではない」ことを明示するものです。`details` 内の値表記の破壊的変更となるため、`mcp_message.*` レコードから `version=` を抽出している利用側は `revision=` へ切り替える必要があります。サーバーが実際に交渉した版は別の `server_protocol_version=` 拡張に載り、`initialize` 結果ごとに許可・拒否の別なく記録され、`unsupported-version` の拒否では `supported=<list>` と対になります。
 
+## 監査 `outcome` 値の変更: `tools_list.filtered` が `success` に
+
+`tools_list.filtered` は `outcome: "success"` を記録するようになりました — 広告一覧を許可セットまでフィルタするという要求された操作が完了したためです（レコードは応答の転送前にコミットされ、クライアントへの到達を意味しません）。従来は `tool_call.denied` と同じ規約で `"failure"` でした。変更はこの 1 イベント種別の値のみです: `outcome=failure` で `tools_list.filtered` を数えていた利用側は `action=denied`（`--dry-run` では `action=observed`）へ切り替えてください。outcome の値域と各イベントへの割当は[ユーザーガイドの監査スキーマ](../guide.ja.md#監査ログスキーマ)の表を参照してください — `outcome=failure` を異常の指標にしないこともそこに明記しています。
+
+また、検証が一覧を拒否した場合にも `tools_list.verified` レコードがコミットされるようになりました — `details` に `blocked=true` を持つ `outcome: "failure"` / `action: "observed"` で、拒否応答の送出の前に記録されます。従来は不一致の記録（`tools_list.changed`、`hash.mismatch`）のみが失敗を表していました。通過した `tools_list.verified` レコードは変更ありません（`action: "allowed"` / `outcome: "success"`）。
+
 元の MIT ライセンスと著作権表示を保持しています。

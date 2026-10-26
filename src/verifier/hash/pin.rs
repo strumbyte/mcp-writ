@@ -351,7 +351,7 @@ pub fn bind_launched_workload(
 /// by path *after* CreateProcess, so the share-mode pin must outlive
 /// that open; dropping it earlier reopens the hash-to-exec window.
 ///
-/// On Unix the pin also mints [`FdExecPlan`]: the *executable* —
+/// On Unix the pin also mints `FdExecPlan`: the *executable* —
 /// always the image the kernel maps (`resolve_launch` already expands
 /// a `#!` `argv[0]` to its interpreter launch under a pin, so the
 /// resolved exe is never itself a script payload) — execs the pinned
@@ -1039,7 +1039,7 @@ pub(super) fn simplify_verbatim(path: PathBuf) -> PathBuf {
 /// modification/rename fail while held, and since a pinned entrypoint
 /// is opened by its real path *after* CreateProcess, that hold is the
 /// pin's exec-time guarantee there. On Unix the executable execs
-/// through [`SpawnPin::fd_exec_plan`]'s hash-verified snapshot
+/// through `SpawnPin::fd_exec_plan`'s hash-verified snapshot
 /// (`/proc/self/fd` descriptor spelling on Linux, staged owner-only
 /// copy elsewhere) so the kernel maps the held object itself, while a
 /// payload-bound entrypoint launches by its real path — the same gate

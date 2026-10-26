@@ -917,7 +917,7 @@ fn test_v3_ancestor_network_replace_flag_cleared_when_subtree_silent() {
     )
     .unwrap();
 
-    let policy = load_kdl_policy(&dir.join("top.kdl")).unwrap();
+    let policy = load_for_target(&dir.join("top.kdl"));
     assert!(
         policy
             .network

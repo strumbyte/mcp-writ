@@ -2553,7 +2553,7 @@ Each line carries:
 | `event_category` | string | Category of `event_type` (list below) |
 | `severity` | string | `info` / `low` / `medium` / `high` / `critical` |
 | `severity_id` | number | `1`–`5` matching `severity` |
-| `outcome` | string | `success` / `failure` / `unknown` |
+| `outcome` | string | `success` / `failure` / `unknown` (vocabulary below) |
 | `action` | string | `allowed` / `denied` / `observed` / `modified` |
 | `target_server` | string or `null` | MCP server name the event refers to |
 | `target_tool` | string or `null` | Tool name for `tool_call.*` events; the MCP method name for `mcp_message.*` events |
@@ -2562,6 +2562,21 @@ Each line carries:
 | `details` | string or `null` | Free-form reason (for example the hidden tool names) |
 | `enforcement` | object or `null` | On `server.connected`/`server.error`, the structured digest of the launch's enforcement plan + observations (shape below); `null` on every other event |
 | `guard_version` | string | mcp-writ package version |
+
+`outcome` reports whether the requested operation completed — it is not
+an enforcement verdict:
+
+| `outcome` | Meaning | Assigned on |
+|---|---|---|
+| `success` | The requested operation completed | `tool_call.allowed` (the call ran), `tools_list.filtered` (the advertised list was filtered down to the allowed set), `tools_list.verified` (the advertised set verified), `hash.verified`, `mcp_message.allowed`, `sandbox.network_allowed` / `sandbox.network_resolved`, and lifecycle/configuration records for completed steps (`guard.started`, `policy.loaded`, `session.started`, …) |
+| `failure` | The requested operation did not complete | `tool_call.denied` (the call was refused with an error), `mcp_message.denied`, `hash.mismatch`, `tools_list.changed` (a hash-pin mismatch), a blocked `tools_list.verified`, `sandbox.*_denied`, `policy.error`, `server.error` |
+| `unknown` | The result could not be observed | terminal records whose result falls outside the known vocabulary — e.g. a `session.ended`/`guard.stopped` `status` that is neither `exited` nor `failed` |
+
+Denials and anomalies are different axes: a refusal the policy was
+written to make is enforcement working as designed. Detect denials
+through `action` (`denied`, or `observed` for the dry-run shadow
+verdict), not `outcome` — `outcome=failure` alone is not an anomaly
+indicator.
 
 `event_type` values, grouped by `event_category`:
 
@@ -2622,19 +2637,24 @@ to the waiter, so an `unsupported-version` denial also audits
 once per listing when the allowlist filter hides one or more advertised
 tools; `details` enumerates the hidden names ("would be hidden" under
 `--dry-run`, which forwards the full list). `action` is `denied` in a
-normal run and `observed` under `--dry-run`; `outcome` is `failure` in
-both — in a normal run it is the same convention as `tool_call.denied`
-(the requested full view was refused), and under `--dry-run` it records
-the simulated policy result — the set a normal run would hide — rather
-than an actual refusal. An internal re-list triggered by
+normal run and `observed` under `--dry-run`; `outcome` is `success` in
+both — the requested operation, filtering the advertised tools/list
+down to the allowed set, completed, and the refusal itself travels in
+`action`. The record commits before the filtered response is forwarded,
+so `success` attests that filtering finished — it is not proof the
+reply reached the client. An internal re-list triggered by
 `notifications/tools/list_changed` that reproduces the last verified
 digest hides the identical set and is not re-logged.
 
-`tools_list.verified` (`supply_chain`) records that a server's advertised
-list passed manifest scan + hash verification. It is committed to durable
-storage **before** the verified digest is published and the response is
-forwarded — under `logging.fail_closed` an uncommittable record refuses
-the transition instead of shipping an unaudited list.
+`tools_list.verified` (`supply_chain`) records the verdict on a server's
+advertised list under manifest scan + hash verification —
+`action: "allowed"`/`outcome: "success"` when it passed, and
+`action: "observed"`/`outcome: "failure"` with `blocked=true` in
+`details` when verification refused the listing. It is committed to
+durable storage **before** the verified digest is published and the
+response is forwarded — or, on a block, before the refusal is emitted —
+so under `logging.fail_closed` an uncommittable record refuses the
+transition instead of shipping an unaudited list.
 
 `run` / `run-image` bracket a launch with lifecycle records that all
 share `correlation_id` — the same launch id the `--report` artifact

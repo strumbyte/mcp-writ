@@ -1571,7 +1571,7 @@ logging level="info"
 | `event_category` | string | `event_type` のカテゴリ（下記一覧） |
 | `severity` | string | `info` / `low` / `medium` / `high` / `critical` |
 | `severity_id` | number | `severity` に対応する `1`–`5` |
-| `outcome` | string | `success` / `failure` / `unknown` |
+| `outcome` | string | `success` / `failure` / `unknown`（値域は下記） |
 | `action` | string | `allowed` / `denied` / `observed` / `modified` |
 | `target_server` | string または `null` | イベントが参照する MCP サーバー名 |
 | `target_tool` | string または `null` | `tool_call.*` イベントではツール名、`mcp_message.*` イベントでは MCP メソッド名 |
@@ -1580,6 +1580,16 @@ logging level="info"
 | `details` | string または `null` | 自由形式の理由（例: 隠されたツール名） |
 | `enforcement` | object または `null` | `server.connected` / `server.error` では、その起動の enforcement plan + observations の構造化ダイジェスト（形状は下記）。その他のイベントでは `null` |
 | `guard_version` | string | mcp-writ のパッケージバージョン |
+
+`outcome` は要求された操作が完了したかどうかを表す — 執行の判定そのものではない:
+
+| `outcome` | 意味 | 割り当てられるイベント |
+|---|---|---|
+| `success` | 要求された操作が完了した | `tool_call.allowed`（呼び出しが実行された）、`tools_list.filtered`（広告一覧が許可セットまでフィルタされた）、`tools_list.verified`（広告セットが検証を通過した）、`hash.verified`、`mcp_message.allowed`、`sandbox.network_allowed` / `sandbox.network_resolved`、完了した各段のライフサイクル・設定レコード（`guard.started`、`policy.loaded`、`session.started` など） |
+| `failure` | 要求された操作が完了しなかった | `tool_call.denied`（呼び出しがエラーで拒否された）、`mcp_message.denied`、`hash.mismatch`、`tools_list.changed`（ハッシュピン不一致）、blocked な `tools_list.verified`、`sandbox.*_denied`、`policy.error`、`server.error` |
+| `unknown` | 結果を観測できなかった | 結果が既知の語彙に収まらない終端レコード — 例: `session.ended` / `guard.stopped` の `status` が `exited` でも `failed` でもない場合 |
+
+拒否と異常は別の軸である: ポリシーが意図した拒否は設計どおりの執行である。拒否の検出は `outcome` ではなく `action`（`denied`。dry-run の影の判定は `observed`）で行い、`outcome=failure` 単体を異常の指標にしないこと。
 
 `event_category` ごとの `event_type` 値:
 
@@ -1594,9 +1604,9 @@ logging level="info"
 
 `mcp_message.*` は `tools/call` 以外の MCP トラフィック — メソッド台帳の要求・応答・通知 — のフレーム単位の判定を記録する。各判定行は `dir=<c2s|s2c>`・`kind=<request|response|notification>`・`revision=<判定に使ったワイヤ版>` で始まる — `revision=` は判定時点のワイヤ版であり、ピアが名乗った `protocolVersion` ではない。サーバーが交渉した版は `server_protocol_version=` 拡張のみに載る — `initialize` 結果ごとに許可・拒否の別なく記録され（結果が版を持たない場合は `<absent>`。値は非予約バイトを percent-encode するため、サーバー制御の値が `k=v` フィールドを偽造できない）、別の拒否理由が先に立っても交渉版が失われることはない。`mcp_message.denied`（`severity: "high"`、`outcome: "failure"`）は `details` に拒否コードを持つ（`verdict=deny reason=<code>`。例: 一致する `mcp` 規則の無い要求は `no-rule`、分類に失敗したフレームは `shape`、`--max-frame-bytes` 超過のフレームは `frame-too-large` — この場合 `details` に `frame_bytes=<n>` と `frame_limit=<n>` も載る — そして mcp-writ が実装しない版を `initialize` 結果が交渉した場合は `unsupported-version` — この場合 `details` に `server_protocol_version=<v>` と `supported=<list>` も載る）。メソッド名は `target_tool` に、クライアントの JSON-RPC id は `request_id` に入る。クライアントへ返る `-32001` エラーにコードが含まれるのは分類前の拒否だけで、ポリシー拒否は `request '<method>' denied by MCP policy` を返し内部理由は含めない。応答側の例外として、拒否された `initialize` 応答では、待機中のクライアントへ `response rejected (unsupported-version): server negotiated unsupported protocol version "<v>" (supported: <list>)` が返り、同じ1行の原因が stderr にも1回だけ出る。セッションは開いたまま — 拒否された結果は版を確立しないため、再送した `initialize` は再交渉できる。`--dry-run` で拒否後も転送された要求は `forwarded=true` の `action: "observed"` として記録される — ただし上限超過フレームは例外で、一切転送されず（ドレイン後に残るのは有界な先頭/末尾ウィンドウのみ）、dry-run でも `forwarded=false` のままである。拒否された応答も同様に一切転送されない — 拒否された応答は待機中のピアへの JSON-RPC エラーに置き換わるため、`unsupported-version` の拒否も `--dry-run` では `forwarded=false` のまま監査される。
 
-`tools_list.filtered`（`severity: "info"`、`policy_enforcement`）は、allowlist フィルタが広告されたツールを 1 件以上隠した一覧ごとに 1 回だけ出力され、`details` に隠した名前を列挙する（`--dry-run` は全件を転送するため "would be hidden" と記録される）。`action` は通常運用で `denied`、`--dry-run` では `observed`。`outcome` は `failure` — 通常実行では要求された一覧全体の表示が拒否されたという `tool_call.denied` と同じ規約で、`--dry-run` では実際の拒否ではなくフィルタ適用時のポリシー結果（仮に通常実行なら隠す集合）を記録するため failure のままである。`notifications/tools/list_changed` に起因する内部再リストが直前に検証した digest と同一の広告セットを返した場合、隠される集合も同一であるため重複記録は行わない。
+`tools_list.filtered`（`severity: "info"`、`policy_enforcement`）は、allowlist フィルタが広告されたツールを 1 件以上隠した一覧ごとに 1 回だけ出力され、`details` に隠した名前を列挙する（`--dry-run` は全件を転送するため "would be hidden" と記録される）。`action` は通常運用で `denied`、`--dry-run` では `observed`。`outcome` はいずれも `success` — 広告一覧を許可セットまでフィルタするという要求された操作は完了しており、拒否の事実は `action` が担う。レコードは整形済み応答の転送前にコミットされるため、`success` はフィルタリングの完了を示すのであり、クライアントへの到達を証明するものではない。`notifications/tools/list_changed` に起因する内部再リストが直前に検証した digest と同一の広告セットを返した場合、隠される集合も同一であるため重複記録は行わない。
 
-`tools_list.verified`（`supply_chain`）は、サーバの広告リストがマニフェストスキャン＋ハッシュ検証を通過したことを記録する。検証済み digest の公開とレスポンス転送の**前に**永続ストレージへコミットされる — `logging.fail_closed` 下でコミットできないレコードは状態遷移を拒否し、監査なしのリストを送出しない。
+`tools_list.verified`（`supply_chain`）は、サーバの広告リストに対するマニフェストスキャン＋ハッシュ検証の判定を記録する — 通過時は `action: "allowed"` / `outcome: "success"`、検証が一覧を拒否した場合は `details` に `blocked=true` を持つ `action: "observed"` / `outcome: "failure"`。検証済み digest の公開とレスポンス転送の**前に**（拒否の場合は拒否応答の送出の前に）永続ストレージへコミットされる — `logging.fail_closed` 下でコミットできないレコードは状態遷移を拒否し、監査なしのリストを送出しない。
 
 `run` / `run-image` は起動をライフサイクルレコードで囲む。これらはすべて同じ `correlation_id`（`--report` 成果物が `launch_id` として持つ起動 ID と同値）と `details.session_id`（emit したロガーのプロセスごとの ID）を共有する。`run` ではホストのガードが書く。`run-image` ではゲスト内の `mcp-secure-runner` が書き（`--log-dir` がマウントされていればその中へ、無ければゲストの stderr へ）、ホスト採番の `MCP_WRIT_LAUNCH_ID` で相関する — ゲスト開始前のホスト側処理（イメージ解決・隔離チェック・コンテナ spawn）はライフサイクルレコードを出さない:
 

@@ -482,7 +482,16 @@ mod tests {
 
     #[test]
     fn symlink_to_secret_is_denied() {
-        let dir = tempfile::tempdir().unwrap();
+        // The overlay proves the link's target through
+        // `resolve_for_authorization` — impossible when the ambient temp
+        // base fails the replaceable-ancestor gate, so the fixture needs
+        // a write-restricted root.
+        let Some(dir) = crate::testutil::restricted_tempdir() else {
+            crate::testutil::skip_unless_required(
+                "secret-path symlink overlay test needs a write-restricted root",
+            );
+            return;
+        };
         match try_create_secret_symlink(dir.path()) {
             Ok(link) => {
                 let path = link.to_str().expect("symlink path is utf-8");
@@ -492,7 +501,9 @@ mod tests {
                 );
             }
             Err(e) => {
-                eprintln!("secret-path symlink overlay test skipped: {e}");
+                crate::testutil::skip_unless_required(&format!(
+                    "secret-path symlink fixture unavailable: {e}"
+                ));
             }
         }
     }
