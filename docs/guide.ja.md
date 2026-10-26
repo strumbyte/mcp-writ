@@ -544,6 +544,8 @@ flowchart LR
 
 バイナリ / AST 証拠のないツール（ケース C / 未束縛ハンドラ）は草案でも拒否のままである。overlay と初見スキャンは効くが、`side_effect` 付き検査は人が埋めるまで効かない。ディスパッチャ型サーバー — ツールごとのハンドラではなく `@server.call_tool()` / `setRequestHandler` の単一エントリポイントに全呼び出しを集める形 — では、静的な束縛がハンドラ本体を個別ツール名へ対応付けられないため、**全ツールがケース C** になる。この場合、草案はレビュー待ちの `deny=#true` 一色になる。
 
+出力された全ツールが根拠を欠く場合、草案の冒頭は `// NOTE` でその形を — なぜそうなるかとともに — 明記する。ツール名が文字列リテラルとしてハンドラに結び付いていないため、能力分析（syscall・文字列・マニフェスト）をツール単位に対応付けられず `allowed`/`blocked` の判定を立てられない、という事情である。NOTE は運用者が引き受ける確認事項も列挙する: 許可判断はツール単位で行う — レビューして残すツールだけ `deny=#true` を外し、残したツールには `side_effect`（と必要な下位ポリシー）を手で書く。整合性の拠り所は `tools-list-hash` pin — `--live-discovery` が返した `tools/list` のダイジェスト — で、`check` と `run` が以後もライブサーバーと照合するため、公表ツール群の後日の変化は drift として現れる — ライブ検出なしで pin が出なかった草案では、その旨と `--live-discovery` か別のレビュー済み整合性手段を求める文に変わる。サーバー更新時は別ファイルに再生成して差分レビューする（[§8.2](#82-ランチャー型起動のピン留めnpxpython--m-など) 参照）。**一部**のツールだけ根拠を欠く草案でも、同じ勘定を冒頭に出す — `K/N tools in this draft carry no capability grounding` と件数を示し、ディスパッチャ型とは断定しない。
+
 ### 4.4 `wrap-image` — コンテナラッピング
 
 既存の MCP サーバーコンテナイメージを `mcp-secure-runner` を PID 1 としてラップする。
@@ -1003,13 +1005,15 @@ mcp-writ check --policy policy.kdl --report check-report.json
 
 **未解消 `// REVIEW` マーカーは帯域内の drift。** `check` は `MCP_WRIT_REVIEW_MODE` を強制しない — ロード時に死ぬ診断面は、報告すべきマーカー自体を隠してしまう。マーカーのあるポリシーは `reason.code` = `unresolved_review` の `drifted` となり、各マーカーがファイルと行とともに `review_markers` に列挙される（`extends`/`include` の祖先ファイル由来も含む）。スキャンはロードされたソーステキスト全体に及ぶため、環境が選択しなかった `when` 領域内のマーカーも計上される — 未解消のマーカーはファイル内のどこにあっても drift である。
 
+各マーカーは、ドラフト生成器が出すテンプレート（`// REVIEW: <kind>: <detail>`）と照合して分類される — 先頭の種別トークンと区切りによる一致で、どのテンプレートにも合わないものは `custom` になる。stderr では `check` が各マーカーの `file:line: text` に続けて、その `kind` と種別の `why`（何を判断すべきか）・`how`（代表的な解消方法）を出す。同じ種別が複数あるときは件数・上限付きの位置一覧・案内 1 回に集約する。`remediation[]` は存在する種別ごとの次の判断を列挙するため、`unbound-tool` が十数個並ぶディスパッチャ型草案でも、短い作業リストとして読める。
+
 `check` は常に **native** ターゲットを評価する — このホストに見えるアーティファクトが対象である。別プラットフォームの機構を要求するポリシー（例: Landlock 専用ポリシーを Windows ホストで検査する場合）は `drifted` ではなく `invalid` となる — drift はアーティファクトについての結果であり、クロスターゲットの能力計画は `plan` の領分である。
 
 **終了コード** は `plan` と同じ規約: `clean` は 0、`drifted` は 1、`invalid`（不正な呼び出し、ロード不能なポリシー、束縛不能な複数サーバーポリシー）は 2、`error`（`--report` が書けない等）は 1 — `drifted` と `error` は `status`/`reason.code` で区別する。
 
-**結果 JSON**（`schema_version` `"1"`）: `status`、`reason.code` + `reason`、`target`、`policy`（ロードされたポリシーの監査用識別情報）、`pins[]` — 各要素は `server`、`pin_type`、`target`、`status`（`verified` / `mismatch` / `unreadable` / `unverified`）、`expected`、`actual`（アーティファクトが読めた場合に観測したダイジェスト）、`detail` — に加えて `review_markers[]`（`file` / `line` / `text`）、`warnings[]`（ポリシーロード時の所見 — `{kind, file, line, message}` — `replaced` と `schema` の kind を含む）、`remediation[]` を持つ。`--report` でファイルを指定しない限り JSON は stdout に出る。人間向けの要約と remediation はどちらの場合も stderr に出るため、stdout は常に JSON 結果として安全に消費できる。
+**結果 JSON**（`schema_version` `"1"`）: `status`、`reason.code` + `reason`、`target`、`policy`（ロードされたポリシーの監査用識別情報）、`pins[]` — 各要素は `server`、`pin_type`、`target`、`status`（`verified` / `mismatch` / `unreadable` / `unverified`）、`expected`、`actual`（アーティファクトが読めた場合に観測したダイジェスト）、`detail` — に加えて `review_markers[]`（`file` / `line` / `text` / `kind` — `unbound-tool` などの生成テンプレート名、手書き注記は `custom` / `why` — 判断が必要な理由 / `how` — 代表的な解消方法）、`warnings[]`（ポリシーロード時の所見 — `{kind, file, line, message}` — `replaced` と `schema` の kind を含む）、`remediation[]` を持つ。`--report` でファイルを指定しない限り JSON は stdout に出る。人間向けの要約と remediation はどちらの場合も stderr に出るため、stdout は常に JSON 結果として安全に消費できる。
 
-**drift への運用:** `drifted` 結果は動いたものを名指しする。`mismatch` / `unreadable` の pin については、アーティファクトを突き合わせる — デプロイ先ホストで草案を*別ファイルに*再生成（`generate-policy`）し、デプロイ済みポリシーと差分を取り、変更をレビューしてから pin を更新する。不一致を pin の削除で解消してはならない。`unverified` の `tools-list-hash` には `-- <command>` を付けて再実行し、`docker-manifest-hash` はエンジン解決と pull 状態を確認する（`check` は pull しない）。`unresolved_review` には各マーカーを解決する — 指名されたダイジェストを再計算し、束縛不能ペイロードの扱いを決めて、コメントを消す。その後 `MCP_WRIT_REVIEW_MODE=refuse` が、レビュー完了後のロード経路を強制し続ける。
+**drift への運用:** `drifted` 結果は動いたものを名指しする。`mismatch` / `unreadable` の pin については、アーティファクトを突き合わせる — デプロイ先ホストで草案を*別ファイルに*再生成（`generate-policy`）し、デプロイ済みポリシーと差分を取り、変更をレビューしてから pin を更新する。不一致を pin の削除で解消してはならない。`unverified` の `tools-list-hash` には `-- <command>` を付けて再実行し、`docker-manifest-hash` はエンジン解決と pull 状態を確認する（`check` は pull しない）。`unresolved_review` には各マーカーを解決する — stderr の要約が種別ごとの `why`/`how` を、`remediation[]` が種別ごとの次の判断を示す — その後コメントを消す。その後 `MCP_WRIT_REVIEW_MODE=refuse` が、レビュー完了後のロード経路を強制し続ける。
 
 ### 4.16 `policy` — 合成ポリシーの検査
 

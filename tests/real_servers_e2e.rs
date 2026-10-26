@@ -699,7 +699,7 @@ fn stage1_workload_hashes(spec: &ServerSpec, text: &str, out: &Path) {
         ),
         "python" => {
             assert!(
-                text.contains("// REVIEW: entrypoint-hash not emitted"),
+                text.contains("// REVIEW: unbound-workload: entrypoint-hash not emitted"),
                 "stage1 {}: python -m must record why the payload is unbound",
                 spec.name
             );

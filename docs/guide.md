@@ -615,6 +615,8 @@ flowchart LR
 
 Tools without binary/AST evidence (Case C / unbound handlers) therefore stay denied in the draft: overlay and first-seen scan still apply, but `side_effect`-gated checks do not until a human fills them in. A dispatcher-style server — one that routes all calls through a single `@server.call_tool()` / `setRequestHandler` entry point instead of per-tool handlers — makes *every* tool Case C: static binding cannot attribute the handler body to an individual tool name, so the whole draft lands `deny=#true` pending review.
 
+When every emitted tool lacks grounding the draft head carries a `// NOTE` saying so — and *why*: tool names are not bound to handlers as string literals, so capability analysis (syscalls, strings, manifest) cannot be attributed per tool and no `allowed`/`blocked` verdict can be proven. The note spells out what the operator then owns: allow decisions are per tool — lift `deny=#true` only on tools you have reviewed and keep, and a kept tool needs `side_effect` (and any sub-policies) written by hand; the integrity anchor is the `tools-list-hash` pin — the digest of the `tools/list` `--live-discovery` returned — which `check` and `run` keep verifying against the live server, so a later change in the advertised tool set surfaces as drift — or, when no pin was emitted (no live discovery), an explicit statement that the pin is absent plus a call for `--live-discovery` or another reviewed integrity measure; on a server update, regenerate into a separate file and diff-review the change (see [§8.2](#82-pinning-launcher-based-workloads-npx-python--m-)). A draft where only *some* tools lack grounding shows the same accounting without claiming the dispatcher shape — its head reads `K/N tools in this draft carry no capability grounding` and names the denied entries for review.
+
 ### 4.4 `wrap-image` — Container Wrapping
 
 Wraps an existing MCP server container image with `mcp-secure-runner` as PID 1.
@@ -1839,6 +1841,17 @@ source text, so a marker inside a `when` region the environment did not
 select is still counted — an unresolved marker is drift regardless of
 where it sits in the file.
 
+Each marker is also classified against the templates the draft
+generator emits (`// REVIEW: <kind>: <detail>`), by the leading kind
+token plus a delimiter — `custom` for a note that matches no template.
+On stderr `check` prints each marker's `file:line: text` followed by
+its `kind`, the kind's `why` (what needs deciding), and `how` (a
+representative way to resolve it); a kind with several markers
+collapses to a count, a capped location list, and the guidance once.
+`remediation[]` then enumerates one next action per kind present, so a
+dispatcher-shaped draft with a dozen `unbound-tool` markers still
+reads as a short task list.
+
 `check` always evaluates the **native** target — the artifacts visible
 on this host. A policy gating on another platform's mechanisms (say, a
 Landlock-only policy checked on a Windows host) loads as `invalid`,
@@ -1855,7 +1868,10 @@ policy) exits 2, and `error` (e.g. `--report` unwritable) exits 1 —
 `pins[]` — each with `server`, `pin_type`, `target`, `status`
 (`verified` / `mismatch` / `unreadable` / `unverified`), `expected`,
 `actual` (the digest observed now, when the artifact was readable), and
-`detail` — plus `review_markers[]` (`file` / `line` / `text`),
+`detail` — plus `review_markers[]` (`file` / `line` / `text` /
+`kind` — a generator-template name like `unbound-tool`, or `custom` for
+a hand-written note / `why` — why the marker needs an operator
+decision / `how` — a representative resolution),
 `warnings[]` (the policy load's findings — `{kind, file, line,
 message}` — including `replaced` and `schema` kinds), and
 `remediation[]`. The JSON goes to stdout unless `--report` names a
@@ -1870,8 +1886,9 @@ change, then update the pin. Never resolve a mismatch by deleting the
 pin. For an `unverified` `tools-list-hash`, re-run with
 `-- <command>`; for `docker-manifest-hash`, check the engine resolution
 or pull state (`check` never pulls). For `unresolved_review`, resolve
-each marker — recompute the digests it names, decide the unbound
-payload's handling — and remove the comment; `MCP_WRIT_REVIEW_MODE=refuse`
+each marker — the stderr summary prints each kind's `why`/`how`, and
+`remediation[]` lists the next action per kind — and remove the
+comment; `MCP_WRIT_REVIEW_MODE=refuse`
 then keeps the load path enforcing what the review completed.
 
 ### 4.16 `policy` — Composed-Policy Inspection

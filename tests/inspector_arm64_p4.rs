@@ -314,7 +314,7 @@ fn exec_code_without_text_is_partial_not_analyzed() {
         &mcp_writ::legislator::source_bind::WorkloadHashes::default(),
     );
     assert!(
-        kdl_str.contains("REVIEW: syscall analysis status=partial"),
+        kdl_str.contains("REVIEW: syscall-analysis: syscall analysis status=partial"),
         "{kdl_str}"
     );
 }
@@ -485,7 +485,7 @@ fn aarch64_non_linux_abi_stays_unsupported() {
         &mcp_writ::legislator::source_bind::WorkloadHashes::default(),
     );
     assert!(
-        kdl_str.contains("REVIEW: syscall analysis status=unsupported"),
+        kdl_str.contains("REVIEW: syscall-analysis: syscall analysis status=unsupported"),
         "{kdl_str}"
     );
 }

@@ -2,12 +2,17 @@
 //!
 //! `legislator::policy_generator` tags each generated line that needs an
 //! operator decision with a `// REVIEW` comment, plus an unconditional
-//! `// REVIEW all entries before deploying` header. KDL comments carry no
-//! representation in the parsed document, so the load path scans the raw
-//! source text: every loaded file (the entry policy and each `extends`
-//! / `include` ancestor) is lexed for line and block comments, and a
-//! comment whose body begins with the `REVIEW` token is recorded as a
-//! marker. String and raw-string contents are not comments.
+//! `// REVIEW: header: all entries before deploying` header. KDL comments
+//! carry no representation in the parsed document, so the load path scans
+//! the raw source text: every loaded file (the entry policy and each
+//! `extends` / `include` ancestor) is lexed for line and block comments,
+//! and a comment whose body begins with the `REVIEW` token is recorded
+//! as a marker. String and raw-string contents are not comments.
+//!
+//! [`MarkerKind`] is the ledger both sides read: the generator emits each
+//! marker through it (`// REVIEW: <token>: <detail>`), and `check`
+//! classifies recorded marker text back into a kind for its `kind` /
+//! `why` / `how` guidance.
 //!
 //! `ReviewMode` — resolved from `MCP_WRIT_REVIEW_MODE` — decides what the
 //! loaders do with a non-empty marker list:
@@ -296,6 +301,292 @@ fn review_text(body: &str) -> Option<String> {
     }
 }
 
+/// Which generated template a `// REVIEW` marker came from — the single
+/// ledger the draft generator and `check` both read, so an unresolved
+/// marker carries guidance, not just a location.
+///
+/// A generated marker's body starts with the kind's token (its
+/// `as_str()` name) and continues with `:`, whitespace, or ends the
+/// line: `// REVIEW: <token>: <detail>`. `check` classifies the
+/// recorded marker text by that head under the same delimiter rule
+/// `review_text` applies to `REVIEW` itself — a custom note that merely
+/// shares a prefix with a token (`unbound-toolkit`) stays `Custom`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MarkerKind {
+    /// `// REVIEW: header:` — the draft head's blanket review note.
+    Header,
+    /// `deny=#true` tool emitted without a verdict grounding an allow.
+    UnboundTool,
+    /// Manifest scan finding that blocks the tool it annotates.
+    BlockedCapability,
+    /// Live `inputSchema` dropped for using unsupported constructs.
+    SchemaUnsupported,
+    /// Workload hashes pin the generating host's files.
+    HashPinHost,
+    /// The draft must be regenerated on server/interpreter updates.
+    RegenerateOnUpdate,
+    /// Part of the launch could not be bound to a hashable file.
+    UnboundWorkload,
+    /// Syscall analysis did not complete; the allowlist may be short.
+    SyscallAnalysis,
+    /// Syscall detected but withheld under a blocked permission class.
+    SyscallBlocked,
+    /// Interpreter-baseline names dropped by blocked permissions.
+    BaselineDropped,
+    /// Shared interpreter baseline, not a workload measurement.
+    InterpreterBaseline,
+    /// The analyzed target is not a Linux-ABI binary.
+    NonLinuxAbi,
+    /// Outbound-network capability; destinations cannot be inferred.
+    NetworkOutbound,
+    /// Datagram-family syscalls; UDP is never inferred.
+    Datagram,
+    /// Marker text matched no known kind — hand-written or edited.
+    Custom,
+}
+
+impl MarkerKind {
+    /// Every kind `classify` can return except `Custom` — the fallback
+    /// for marker text that carries no known head.
+    const KNOWN: &'static [MarkerKind] = &[
+        Self::Header,
+        Self::UnboundTool,
+        Self::BlockedCapability,
+        Self::SchemaUnsupported,
+        Self::HashPinHost,
+        Self::RegenerateOnUpdate,
+        Self::UnboundWorkload,
+        Self::SyscallAnalysis,
+        Self::SyscallBlocked,
+        Self::BaselineDropped,
+        Self::InterpreterBaseline,
+        Self::NonLinuxAbi,
+        Self::NetworkOutbound,
+        Self::Datagram,
+    ];
+
+    /// The kind's stable name — the `kind` member in `check`'s JSON
+    /// result and the token a generated marker body starts with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Header => "header",
+            Self::UnboundTool => "unbound-tool",
+            Self::BlockedCapability => "blocked-capability",
+            Self::SchemaUnsupported => "schema-unsupported",
+            Self::HashPinHost => "hash-pin-host",
+            Self::RegenerateOnUpdate => "regenerate-on-update",
+            Self::UnboundWorkload => "unbound-workload",
+            Self::SyscallAnalysis => "syscall-analysis",
+            Self::SyscallBlocked => "syscall-blocked",
+            Self::BaselineDropped => "baseline-dropped",
+            Self::InterpreterBaseline => "interpreter-baseline",
+            Self::NonLinuxAbi => "non-linux-abi",
+            Self::NetworkOutbound => "network-outbound",
+            Self::Datagram => "datagram",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// Why the marker needs an operator decision — the fixed text
+    /// `check` reports under `why`.
+    pub fn why(self) -> &'static str {
+        match self {
+            Self::Header => {
+                "this file is a generated draft — every entry is provisional \
+                 until a human has read it"
+            }
+            Self::UnboundTool => {
+                "the tool was emitted deny=#true with no verdict grounding an \
+                 allow — the draft cannot show the tool is safe, so it stays \
+                 closed until a human decides"
+            }
+            Self::BlockedCapability => {
+                "a permission verdict or a manifest-scan finding blocked \
+                 this tool — evidence was found, but it grounded a deny \
+                 rather than an allow"
+            }
+            Self::SchemaUnsupported => {
+                "the discovered inputSchema uses constructs the args_schema \
+                 evaluator does not support; it was dropped rather than \
+                 emitted unenforceably"
+            }
+            Self::HashPinHost => {
+                "the digests pin the generating host's files — the \
+                 deployment host's artifacts may differ"
+            }
+            Self::RegenerateOnUpdate => {
+                "a server or interpreter update invalidates the pinned \
+                 digests and the tools/list this draft was built from"
+            }
+            Self::UnboundWorkload => {
+                "part of the launch could not be bound to a hashable file — \
+                 nothing pins what actually runs"
+            }
+            Self::SyscallAnalysis => {
+                "syscall analysis did not complete, so the emitted allowlist \
+                 was built on incomplete data and may be missing names the \
+                 workload needs"
+            }
+            Self::SyscallBlocked => {
+                "a syscall the binary can make was kept out of the allowlist \
+                 because its permission class was denied as excess"
+            }
+            Self::BaselineDropped => {
+                "shared interpreter-baseline syscalls were dropped because \
+                 their permission class is blocked — the runtime may still \
+                 need them"
+            }
+            Self::InterpreterBaseline => {
+                "the allowlist is a shared interpreter baseline, not a \
+                 measurement of this workload — needed calls may be missing \
+                 and unused ones included"
+            }
+            Self::NonLinuxAbi => {
+                "the analyzed target is not a Linux-ABI binary — its call \
+                 numbers and names do not map onto a Linux seccomp \
+                 allowlist, so none was emitted"
+            }
+            Self::NetworkOutbound => {
+                "the workload can open outbound connections but destinations \
+                 cannot be inferred — the draft keeps deny-all rather than \
+                 guess"
+            }
+            Self::Datagram => {
+                "datagram-family syscalls are UDP-compatible but not proof \
+                 UDP is required — UDP/QUIC is never inferred and a TCP \
+                 allow never covers it"
+            }
+            Self::Custom => {
+                "a marker matching no known generator kind — a hand-written \
+                 or hand-edited note"
+            }
+        }
+    }
+
+    /// Representative way to resolve the marker — the fixed text
+    /// `check` reports under `how` and enumerates in `remediation`.
+    pub fn how(self) -> &'static str {
+        match self {
+            Self::Header => {
+                "work through the REVIEW items, edit or accept each, and \
+                 remove their markers — the draft is deployable when none \
+                 remain"
+            }
+            Self::UnboundTool => {
+                "check what the tool does (source, manifest, a dry-run \
+                 call); for a tool you keep, remove deny=#true and set \
+                 side_effect plus any sub-policies — otherwise keep the \
+                 deny and delete the marker (guide §4.3, Case C)"
+            }
+            Self::BlockedCapability => {
+                "read the named reason; if the verdict or finding is a \
+                 false positive or an accepted risk, remove deny=#true \
+                 and set side_effect plus any sub-policies — otherwise \
+                 keep the deny and delete the marker"
+            }
+            Self::SchemaUnsupported => {
+                "write a reviewed args_schema inside the supported subset \
+                 (policy-authoring, \"Constraining argument structure\")"
+            }
+            Self::HashPinHost => {
+                "re-hash the same targets on the deployment host — or \
+                 regenerate there — and update the pins; check/run report \
+                 the drift until then (guide §4.15)"
+            }
+            Self::RegenerateOnUpdate => {
+                "on updates, regenerate into a separate file on the \
+                 deployment host, diff it against this policy, review, and \
+                 merge"
+            }
+            Self::UnboundWorkload => {
+                "read the named reason; bind the payload explicitly — a \
+                 resolved script path for entrypoint-hash — or accept the \
+                 gap deliberately, then delete the marker (guide §8.2, \
+                 launcher workloads)"
+            }
+            Self::SyscallAnalysis => {
+                "read the status and reason; run the workload and add the \
+                 syscalls that `unknown syscall` or EPERM denials name"
+            }
+            Self::SyscallBlocked => {
+                "confirm the class stays blocked; if the workload genuinely \
+                 needs the call, revisit the permission verdict rather \
+                 than editing the allowlist"
+            }
+            Self::BaselineDropped => {
+                "if the workload breaks on these calls, revisit the \
+                 blocked-permission verdict and re-allow only what the \
+                 runtime proves it needs"
+            }
+            Self::InterpreterBaseline => {
+                "run the workload; add what `unknown syscall` or EPERM \
+                 names — a child `syscalls` allow REPLACES the whole list, \
+                 it does not append"
+            }
+            Self::NonLinuxAbi => {
+                "write the syscall policy by hand for the target runtime, \
+                 or rely on the platform's own sandbox controls"
+            }
+            Self::NetworkOutbound => {
+                "declare each needed destination explicitly, e.g. \
+                 network { allow host=\"<ip-or-name>\" proto=\"tcp\" \
+                 port=<port> } (guide §5, defaults.network)"
+            }
+            Self::Datagram => {
+                "if the workload needs UDP, declare proto=\"udp\" \
+                 explicitly; on Linux `run`, UDP grants are enforced only \
+                 on the namespaced route"
+            }
+            Self::Custom => {
+                "read the note and decide what it asks; delete the comment \
+                 once resolved"
+            }
+        }
+    }
+
+    /// The `// REVIEW: <token>:` head a generated marker line starts
+    /// with — the form `classify` requires (token, then `:`, whitespace,
+    /// or end-of-line).
+    pub fn comment_head(self) -> String {
+        format!("// REVIEW: {}:", self.as_str())
+    }
+
+    /// A generated `// REVIEW: <token>: <detail>` comment line — no
+    /// leading indent, no trailing newline. `detail` is text already
+    /// escaped for a KDL comment.
+    pub fn comment(self, detail: &str) -> String {
+        format!("{} {}", self.comment_head(), detail)
+    }
+
+    /// Classify a marker's recorded `text` (`REVIEW …` as
+    /// `scan_review_markers` produces it) by the leading kind token:
+    /// the body after `REVIEW` must begin with the token followed by
+    /// end-of-text, `:`, or whitespace — the same delimiter rule
+    /// `review_text` applies to `REVIEW` itself. Anything else,
+    /// including text that merely shares a prefix with a token, is
+    /// `Custom`.
+    pub fn classify(marker_text: &str) -> Self {
+        let body = marker_body(marker_text);
+        for kind in Self::KNOWN {
+            if let Some(rest) = body.strip_prefix(kind.as_str()) {
+                match rest.chars().next() {
+                    None | Some(':') => return *kind,
+                    Some(c) if c.is_whitespace() => return *kind,
+                    _ => {}
+                }
+            }
+        }
+        Self::Custom
+    }
+}
+
+/// The marker body after the `REVIEW` token and its delimiter (`:` or
+/// whitespace) — what `classify` head-matches against.
+fn marker_body(text: &str) -> &str {
+    let rest = text.strip_prefix("REVIEW").unwrap_or(text).trim_start();
+    rest.strip_prefix(':').unwrap_or(rest).trim_start()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +707,127 @@ mod tests {
         assert!(matches!(err, PolicyError::Validation(_)));
         assert!(err.to_string().contains("policy.kdl:1"));
         assert!(ReviewMode::Refuse.enforce(&[]).is_ok());
+    }
+
+    // --- MarkerKind classification -------------------------------------
+
+    #[test]
+    fn classify_recognizes_every_generated_form() {
+        // The emitted `// REVIEW: <token>: <detail>` shape must classify
+        // back to its kind — this is the contract that keeps a changed
+        // 文面 from silently drifting out of the ledger.
+        for kind in MarkerKind::KNOWN {
+            let comment = kind.comment("some detail");
+            let text = review_text(&comment[2..]).expect("emits a REVIEW line");
+            assert_eq!(
+                MarkerKind::classify(&text),
+                *kind,
+                "{comment} must classify as {}",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn classify_accepts_token_delimiters() {
+        assert_eq!(
+            MarkerKind::classify("REVIEW: unbound-tool: Capability(A) [Case C]"),
+            MarkerKind::UnboundTool
+        );
+        assert_eq!(
+            MarkerKind::classify("REVIEW unbound-tool detail text"),
+            MarkerKind::UnboundTool
+        );
+        assert_eq!(
+            MarkerKind::classify("REVIEW: unbound-tool"),
+            MarkerKind::UnboundTool
+        );
+        // `REVIEW :` and extra whitespace still expose the body token.
+        assert_eq!(
+            MarkerKind::classify("REVIEW  :hash-pin-host: x"),
+            MarkerKind::HashPinHost
+        );
+    }
+
+    #[test]
+    fn classify_rejects_token_prefix_without_delimiter() {
+        // A custom note that merely shares a token prefix must stay
+        // `custom`.
+        for text in [
+            "REVIEW: unbound-toolkit needs a look",
+            "REVIEW: unbound",
+            "REVIEW: hash-pin",
+            "REVIEW: hash-pin-hostile",
+            "REVIEW: datagrams on the wire",
+            "REVIEW: syscall-analysisx",
+            "REVIEW: blocked-capabilities here",
+        ] {
+            assert_eq!(
+                MarkerKind::classify(text),
+                MarkerKind::Custom,
+                "{text:?} must not be claimed by a known kind"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_custom_for_hand_written_and_unrelated_text() {
+        for text in [
+            "REVIEW",
+            "REVIEW:",
+            "REVIEW: confirm the workload list before pinning",
+            "REVIEW: payload not bindable",
+            "REVIEW all entries before deploying",
+        ] {
+            assert_eq!(MarkerKind::classify(text), MarkerKind::Custom, "{text:?}");
+        }
+        // A hand-written note that heads with a kind token + delimiter
+        // classifies under the same rule — the delimiter, not authorship,
+        // is what the match keys on.
+        assert_eq!(
+            MarkerKind::classify(
+                "REVIEW: datagram syscalls (sendto, recvmsg) — compatible with UDP"
+            ),
+            MarkerKind::Datagram
+        );
+    }
+
+    #[test]
+    fn kind_guidance_is_fixed_non_empty_text() {
+        for kind in MarkerKind::KNOWN
+            .iter()
+            .copied()
+            .chain([MarkerKind::Custom])
+        {
+            assert!(!kind.why().is_empty(), "{} why", kind.as_str());
+            assert!(!kind.how().is_empty(), "{} how", kind.as_str());
+        }
+        // The ledger is the single source of the JSON-facing kind names —
+        // pin the full set so a rename is a deliberate change.
+        let names: Vec<_> = MarkerKind::KNOWN
+            .iter()
+            .chain([&MarkerKind::Custom])
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "header",
+                "unbound-tool",
+                "blocked-capability",
+                "schema-unsupported",
+                "hash-pin-host",
+                "regenerate-on-update",
+                "unbound-workload",
+                "syscall-analysis",
+                "syscall-blocked",
+                "baseline-dropped",
+                "interpreter-baseline",
+                "non-linux-abi",
+                "network-outbound",
+                "datagram",
+                "custom",
+            ]
+        );
     }
 }
