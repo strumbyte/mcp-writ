@@ -82,6 +82,16 @@ pub(crate) fn restricted_tempdir() -> Option<tempfile::TempDir> {
         };
         #[cfg(windows)]
         let base = plain_spelling(base);
+        // A UNC root — a roaming-profile %TEMP%/%USERPROFILE%, or a
+        // junction canonicalized onto a share — can pass the DACL probe
+        // below yet is never authorizable: `resolve_for_authorization`
+        // refuses `\\server\share` before any lookup. Treat it as no
+        // candidate so callers take the optional-skip path.
+        #[cfg(windows)]
+        if base.to_string_lossy().starts_with(r"\\") {
+            eprintln!("restricted tempdir: {} is a UNC path", base.display());
+            continue;
+        }
         let dir = match tempfile::Builder::new().tempdir_in(&base) {
             Ok(dir) => dir,
             Err(e) => {

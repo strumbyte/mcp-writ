@@ -1252,6 +1252,27 @@ fn json_tool_names(response: &str) -> Vec<String> {
     names
 }
 
+/// Reap the guard after stdin EOF: a child that outlives the pipe is a
+/// hang, not a usable audit target — kill it and fail rather than read
+/// a log it may still hold open.
+async fn wait_for_guard_exit(guard: &mut ChildGuard) {
+    if timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
+        .await
+        .is_err()
+    {
+        let _ = guard.0.kill().await;
+        panic!("mcp-writ did not exit after stdin EOF");
+    }
+}
+
+/// Lines in `audit` whose `"event_type"` field is `event_type`.
+fn audit_events<'a>(audit: &'a str, event_type: &str) -> Vec<&'a str> {
+    audit
+        .lines()
+        .filter(|l| l.contains(&format!("\"event_type\":\"{event_type}\"")))
+        .collect()
+}
+
 /// Query the scripted fixture directly for its advertised tools/list so a
 /// pinned hash is computed on the real response, not a retyped copy.
 async fn advertised_tools(fixture: &str) -> Vec<mcp_writ::tool_def::ToolDefinition> {
@@ -1344,21 +1365,9 @@ async fn tools_list_dry_run_keeps_all_tools_and_observes() {
 
     // The audit log must still record what a normal run would have hidden.
     drop(stdin);
-    if timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
-        .await
-        .is_err()
-    {
-        // A child that outlives stdin EOF is a hang, not a usable audit
-        // target — reap it and fail instead of reading a log it may
-        // still hold open.
-        let _ = guard.0.kill().await;
-        panic!("mcp-writ did not exit after stdin EOF");
-    }
+    wait_for_guard_exit(&mut guard).await;
     let audit = std::fs::read_to_string(&audit_log).expect("read audit log");
-    let filtered: Vec<&str> = audit
-        .lines()
-        .filter(|line| line.contains("\"event_type\":\"tools_list.filtered\""))
-        .collect();
+    let filtered = audit_events(&audit, "tools_list.filtered");
     // The initialize-time verification probe runs its own filtered
     // listing, and a client list answered from the probe's verified copy
     // may not re-emit — so the count is 1 or 2 depending on the race.
@@ -1457,20 +1466,14 @@ async fn tools_list_hash_pins_full_advertised_set_not_filtered_view() {
     );
     assert!(!json_has_result(&list_resp), "got: {list_resp}");
     drop(stdin);
-    if timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
-        .await
-        .is_err()
-    {
-        let _ = guard.0.kill().await;
-        panic!("mcp-writ did not exit after stdin EOF");
-    }
+    wait_for_guard_exit(&mut guard).await;
     // The paired outcome: a blocked verification is a genuine failure —
     // `tools_list.verified` commits `outcome=failure`/`action=observed`
     // with `blocked=true`, unlike the delivered filter's `success`.
     let audit_text = std::fs::read_to_string(&bad_audit).expect("read audit log");
-    let verified = audit_text
-        .lines()
-        .find(|l| l.contains("\"event_type\":\"tools_list.verified\""))
+    let verified = audit_events(&audit_text, "tools_list.verified")
+        .first()
+        .copied()
         .unwrap_or_else(|| panic!("blocked listing must commit tools_list.verified: {audit_text}"));
     assert!(
         verified.contains("\"outcome\":\"failure\"")
@@ -1552,21 +1555,9 @@ async fn list_changed_relist_is_filtered() {
     // event enumerates the hidden pair. The first (clean, single-tool) list
     // hid nothing, so every filtered event here came from the relist path.
     drop(stdin);
-    if timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
-        .await
-        .is_err()
-    {
-        // A child that outlives stdin EOF is a hang, not a usable audit
-        // target — reap it and fail instead of reading a log it may
-        // still hold open.
-        let _ = guard.0.kill().await;
-        panic!("mcp-writ did not exit after stdin EOF");
-    }
+    wait_for_guard_exit(&mut guard).await;
     let audit = std::fs::read_to_string(&audit_log).expect("read audit log");
-    let filtered: Vec<&str> = audit
-        .lines()
-        .filter(|line| line.contains("\"event_type\":\"tools_list.filtered\""))
-        .collect();
+    let filtered = audit_events(&audit, "tools_list.filtered");
     assert!(
         !filtered.is_empty(),
         "the relist path must emit a tools_list.filtered event: {audit}"

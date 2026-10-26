@@ -501,7 +501,9 @@ fn test_secret_overlay_follows_symlink() {
             );
         }
         Err(e) => {
-            eprintln!("secret overlay symlink test skipped: {e}");
+            crate::testutil::skip_unless_required(&format!(
+                "secret overlay symlink fixture unavailable: {e}"
+            ));
         }
     }
 }

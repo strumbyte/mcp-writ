@@ -501,7 +501,9 @@ mod tests {
                 );
             }
             Err(e) => {
-                eprintln!("secret-path symlink overlay test skipped: {e}");
+                crate::testutil::skip_unless_required(&format!(
+                    "secret-path symlink fixture unavailable: {e}"
+                ));
             }
         }
     }

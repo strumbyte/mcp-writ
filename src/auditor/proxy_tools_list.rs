@@ -1288,9 +1288,7 @@ mod tests {
     /// transition — the response never leaves and calls stay gated.
     #[tokio::test]
     async fn dead_audit_sink_blocks_verified_transitions() {
-        let dir = crate::testutil::real_tempdir().expect("tempdir");
-        let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (_dir, log_path, audit) = audit_log_fixture();
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         // Kill the sink before verification — the commit must refuse.
         shared.audit.shutdown().await.unwrap();
@@ -1325,9 +1323,7 @@ mod tests {
     /// in the stream.
     #[tokio::test]
     async fn verified_record_commits_before_client_emit() {
-        let dir = crate::testutil::real_tempdir().expect("tempdir");
-        let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (_dir, log_path, audit) = audit_log_fixture();
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
         st.bind_client("1".into(), String::new());
@@ -1373,15 +1369,44 @@ mod tests {
             .unwrap();
     }
 
+    /// A fail-closed `AuditLogger` writing `audit.jsonl` inside a fresh
+    /// tempdir. Bind the `TempDir` (as `_dir` where unused) so the log
+    /// outlives `shared.audit.shutdown()` for the assertions below.
+    fn audit_log_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        crate::audit_log::AuditLogger,
+    ) {
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
+        let log_path = dir.path().join("audit.jsonl");
+        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        (dir, log_path, audit)
+    }
+
+    /// First audit-log line whose `"event_type"` field is `event_type`.
+    fn event_line<'a>(log: &'a str, event_type: &str) -> Option<&'a str> {
+        log.lines()
+            .find(|l| l.contains(&format!("\"event_type\":\"{event_type}\"")))
+    }
+
+    /// The `tools_list.verified` record a blocked listing still commits:
+    /// `blocked=true` with `outcome=failure`/`action=observed`.
+    fn blocked_verified_line(log: &str) -> &str {
+        let line = event_line(log, "tools_list.verified")
+            .unwrap_or_else(|| panic!("blocked listing must commit tools_list.verified: {log}"));
+        assert!(line.contains("\"outcome\":\"failure\""), "got: {line}");
+        assert!(line.contains("\"action\":\"observed\""), "got: {line}");
+        assert!(line.contains("blocked=true"), "got: {line}");
+        line
+    }
+
     /// A `list_changed` revalidation that yields the same advertised set
     /// as the last verified listing must not repeat the
     /// `tools_list.filtered` event — the hidden set it would enumerate was
     /// already audited.
     #[tokio::test]
     async fn identical_revalidation_does_not_repeat_filtered_event() {
-        let dir = crate::testutil::real_tempdir().expect("tempdir");
-        let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (_dir, log_path, audit) = audit_log_fixture();
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
 
@@ -1408,9 +1433,7 @@ mod tests {
     /// advertised set changed still emits the filtered event.
     #[tokio::test]
     async fn changed_revalidation_logs_filtered_event() {
-        let dir = crate::testutil::real_tempdir().expect("tempdir");
-        let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (_dir, log_path, audit) = audit_log_fixture();
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
 
@@ -1448,9 +1471,7 @@ mod tests {
     /// `target_server` falls back to the single declared server identity.
     #[tokio::test]
     async fn dry_run_filtered_event_reports_would_be_hidden_and_declared_server() {
-        let dir = crate::testutil::real_tempdir().expect("tempdir");
-        let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (_dir, log_path, audit) = audit_log_fixture();
         let mut policy = policy_allowing("alpha");
         policy.tools[0].server = Some("bound-server".to_string());
         let (shared, _abort_rx) = shared_for_test_with(true, policy, audit);
@@ -1464,10 +1485,7 @@ mod tests {
 
         let _ = shared.audit.shutdown().await;
         let log = std::fs::read_to_string(&log_path).expect("read audit log");
-        let line = log
-            .lines()
-            .find(|l| l.contains("\"event_type\":\"tools_list.filtered\""))
-            .expect("filtered event missing");
+        let line = event_line(&log, "tools_list.filtered").expect("filtered event missing");
         assert!(line.contains("\"action\":\"observed\""), "got: {line}");
         // The filtered response was delivered: a would-be denial under
         // dry-run still completes the operation — outcome is `success`.
@@ -1484,9 +1502,7 @@ mod tests {
     /// `target_server` — a synthetic name is never written.
     #[tokio::test]
     async fn filtered_event_without_declared_server_has_no_target() {
-        let dir = crate::testutil::real_tempdir().expect("tempdir");
-        let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (_dir, log_path, audit) = audit_log_fixture();
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
 
@@ -1498,10 +1514,7 @@ mod tests {
 
         let _ = shared.audit.shutdown().await;
         let log = std::fs::read_to_string(&log_path).expect("read audit log");
-        let line = log
-            .lines()
-            .find(|l| l.contains("\"event_type\":\"tools_list.filtered\""))
-            .expect("filtered event missing");
+        let line = event_line(&log, "tools_list.filtered").expect("filtered event missing");
         assert!(line.contains("\"target_server\":null"), "got: {line}");
         // A normal run delivers the filtered list — `action=denied`
         // carries the refusal, `outcome=success` the completed delivery.
@@ -1514,9 +1527,7 @@ mod tests {
     /// records no `target_server` rather than guessing one.
     #[tokio::test]
     async fn filtered_event_with_multiple_declared_servers_has_no_target() {
-        let dir = crate::testutil::real_tempdir().expect("tempdir");
-        let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (_dir, log_path, audit) = audit_log_fixture();
         let mut policy = policy_allowing("alpha");
         policy.tools[0].server = Some("srv-a".to_string());
         let mut second = crate::policy::ToolPolicy::named("beta", true);
@@ -1535,10 +1546,7 @@ mod tests {
 
         let _ = shared.audit.shutdown().await;
         let log = std::fs::read_to_string(&log_path).expect("read audit log");
-        let line = log
-            .lines()
-            .find(|l| l.contains("\"event_type\":\"tools_list.filtered\""))
-            .expect("filtered event missing");
+        let line = event_line(&log, "tools_list.filtered").expect("filtered event missing");
         assert!(line.contains("\"target_server\":null"), "got: {line}");
         assert!(line.contains("\"outcome\":\"success\""), "got: {line}");
         assert!(line.contains("gamma"), "got: {line}");
@@ -1551,9 +1559,7 @@ mod tests {
     /// complete; the filtering event above is `success` by contrast.
     #[tokio::test]
     async fn blocked_listing_commits_failure_verified_record() {
-        let dir = crate::testutil::real_tempdir().expect("tempdir");
-        let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (_dir, log_path, audit) = audit_log_fixture();
         let mut policy = policy_allowing("alpha");
         // A pin that cannot match the advertised set blocks verification.
         policy
@@ -1576,19 +1582,11 @@ mod tests {
 
         let _ = shared.audit.shutdown().await;
         let log = std::fs::read_to_string(&log_path).expect("read audit log");
-        let line = log
-            .lines()
-            .find(|l| l.contains("\"event_type\":\"tools_list.verified\""))
-            .expect("blocked listing must still commit tools_list.verified");
-        assert!(line.contains("\"outcome\":\"failure\""), "got: {line}");
-        assert!(line.contains("\"action\":\"observed\""), "got: {line}");
-        assert!(line.contains("blocked=true"), "got: {line}");
+        blocked_verified_line(&log);
         // The paired refusal record — the hash diff that blocked the
         // listing — is a `tools_list.changed` failure, unchanged.
-        let changed = log
-            .lines()
-            .find(|l| l.contains("\"event_type\":\"tools_list.changed\""))
-            .expect("the mismatch must be recorded");
+        let changed =
+            event_line(&log, "tools_list.changed").expect("the mismatch must be recorded");
         assert!(
             changed.contains("\"outcome\":\"failure\""),
             "got: {changed}"
@@ -1602,9 +1600,7 @@ mod tests {
     /// goes unrecorded.
     #[tokio::test]
     async fn uncanonicalizable_listing_commits_failure_verified_record() {
-        let dir = crate::testutil::real_tempdir().expect("tempdir");
-        let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (_dir, log_path, audit) = audit_log_fixture();
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
 
@@ -1621,13 +1617,7 @@ mod tests {
 
         let _ = shared.audit.shutdown().await;
         let log = std::fs::read_to_string(&log_path).expect("read audit log");
-        let line = log
-            .lines()
-            .find(|l| l.contains("\"event_type\":\"tools_list.verified\""))
-            .expect("canonicalization failure must still commit tools_list.verified");
-        assert!(line.contains("\"outcome\":\"failure\""), "got: {line}");
-        assert!(line.contains("\"action\":\"observed\""), "got: {line}");
-        assert!(line.contains("blocked=true"), "got: {line}");
+        let line = blocked_verified_line(&log);
         assert!(
             !line.contains("digest="),
             "an unhashable set has no digest to record: {line}"
@@ -1641,11 +1631,9 @@ mod tests {
     /// record could not be committed.
     #[tokio::test]
     async fn blocked_listing_on_dead_sink_still_aborts() {
-        let dir = crate::testutil::real_tempdir().expect("tempdir");
-        let log_path = dir.path().join("audit.jsonl");
         // `to_file` is the fail-closed logger: a closed channel refuses
         // every later commit.
-        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (_dir, _log_path, audit) = audit_log_fixture();
         let mut policy = policy_allowing("alpha");
         policy
             .tools_list_hashes
