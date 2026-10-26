@@ -1040,12 +1040,19 @@ async fn check_reports_version3_migration_diff() {
         "v3 unions the base list"
     );
 
+    // Two rows move, not one: the defaults list, and the same list
+    // materialized onto `tool "probe"` — the tool's effective
+    // `syscalls.allowed` is a distinct field in the diff.
+    assert_eq!(
+        fields.len(),
+        2,
+        "defaults.syscalls.allowed and its materialized tool copy: {fields:?}"
+    );
     let stderr = stderr_text(&out);
     assert!(
-        stderr.contains(&format!(
-            "info: policy version 2 — {} field(s) would compose differently under version 3 (see policy resolve --version-diff)",
-            fields.len()
-        )),
+        stderr.contains(
+            "info: policy version 2 — 2 field(s) would compose differently under version 3 (see policy resolve --version-diff)"
+        ),
         "stderr carries the one-line preview: {stderr}"
     );
 }
@@ -1091,6 +1098,61 @@ async fn check_reports_version3_migration_unchanged() {
     assert!(
         stderr.contains("info: policy version 1 — composes identically under version 3"),
         "stderr carries the identical-composition line: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn check_reports_version3_migration_simulation_failed() {
+    // The v2 extends pair loads because the child's `allow` replaces
+    // the base tool's filesystem allow side — deny stays accumulated,
+    // and "/srv/secret" sits under no allowed path. Under v3 the allow
+    // side unions instead, so the inherited deny lands under the
+    // inherited "/srv" grant and the simulated load fails validation:
+    // `check` reports that failure as the preview, and status and
+    // exit code still do not move.
+    let dir = common::real_tempdir();
+    std::fs::write(
+        dir.path().join("base.kdl"),
+        "policy version=2\nserver \"svc\" {\n    tool \"probe\" {\n        filesystem {\n            allow \"/srv\"\n            deny \"/srv/secret\"\n        }\n    }\n}\n",
+    )
+    .unwrap();
+    let policy = dir.path().join("policy.kdl");
+    std::fs::write(
+        &policy,
+        "extends \"base.kdl\"\npolicy version=2\nserver \"svc\" {\n    tool \"probe\" {\n        filesystem {\n            allow \"/other\"\n        }\n    }\n}\n",
+    )
+    .unwrap();
+
+    let out = run_check(&["--policy".into(), policy_arg(&policy)]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failed simulation is informational, not a finding: {}",
+        stderr_text(&out)
+    );
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "clean");
+
+    let migration = member(json.value(), "migration");
+    assert_eq!(
+        member(migration, "status").as_string_str().unwrap(),
+        "simulation_failed"
+    );
+    assert_eq!(
+        member(migration, "fields").to_array().unwrap().count(),
+        0,
+        "a failed simulation carries no field rows"
+    );
+    let reason = member(migration, "reason").as_string_str().unwrap();
+    assert!(
+        reason.contains("denied under allowed parent path"),
+        "reason names the v3-rules load failure: {reason}"
+    );
+
+    let stderr = stderr_text(&out);
+    assert!(
+        stderr.contains("info: policy version 2 — simulated version 3 load failed:"),
+        "stderr carries the simulation-failure line: {stderr}"
     );
 }
 

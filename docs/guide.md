@@ -1913,7 +1913,12 @@ moved field with its `declared` and `simulated` values), or
 `simulation_failed` (`reason` names the load error the v3 rules hit).
 stderr carries one `info: policy version N — …` line. The member is
 informational like `warnings`: it never moves `status`, `reason.code`,
-or the exit code. Migrating is optional — inspect the diff with
+or the exit code. The preview re-reads and re-loads the documents —
+a file that changes between the two reads can produce a stale diff —
+and its member names differ from `--version-diff`'s JSON (`migration`
+uses `candidate_version`/`status`/`reason`; `version_diff` uses
+`simulated_version`/`simulated_error`) although both render the same
+computation. Migrating is optional — inspect the diff with
 `policy resolve --version-diff`, then rewrite the file to `policy
 version=3` when the composed result suits you.
 
