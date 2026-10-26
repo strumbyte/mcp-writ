@@ -153,10 +153,18 @@ async fn evaluate(args: CheckArgs) -> CheckReport {
     report.review_markers = diagnostics
         .review_markers
         .iter()
-        .map(|m| ReviewMarkerRecord {
-            file: m.path.display().to_string(),
-            line: m.line,
-            text: sanitize_for_terminal(&m.text),
+        .map(|m| {
+            // Classify the raw marker text — sanitizing first could
+            // rewrite bytes the head-match rules key on.
+            let kind = crate::policy::review::MarkerKind::classify(&m.text);
+            ReviewMarkerRecord {
+                file: m.path.display().to_string(),
+                line: m.line,
+                text: sanitize_for_terminal(&m.text),
+                kind: kind.as_str(),
+                why: kind.why(),
+                how: kind.how(),
+            }
         })
         .collect();
     report.warnings = diagnostics
@@ -643,10 +651,17 @@ fn finalize(mut report: CheckReport) -> CheckReport {
     };
     if markers > 0 {
         parts.push(format!("{markers} unresolved REVIEW marker(s)"));
+        // One next-action per marker kind present, in first-seen order —
+        // the kind's `how` is the representative resolution.
+        for kind in marker_kinds_in_order(&report.review_markers) {
+            remediation.push(format!(
+                "{kind}: {}",
+                first_how(&report.review_markers, kind)
+            ));
+        }
         remediation.push(
-            "resolve each `// REVIEW` marker in the policy and remove the \
-             comment; `MCP_WRIT_REVIEW_MODE=refuse` makes a marked policy \
-             fail to load"
+            "delete each resolved `// REVIEW` comment — \
+             `MCP_WRIT_REVIEW_MODE=refuse` makes a marked policy fail to load"
                 .to_string(),
         );
     }
@@ -660,6 +675,29 @@ fn finalize(mut report: CheckReport) -> CheckReport {
         report.remediation = remediation;
     }
     report
+}
+
+/// The marker kinds present, in first-seen order — one entry per kind
+/// so the summary can group and the remediation can list one action
+/// each.
+fn marker_kinds_in_order(markers: &[ReviewMarkerRecord]) -> Vec<&'static str> {
+    let mut kinds: Vec<&'static str> = Vec::new();
+    for m in markers {
+        if !kinds.contains(&m.kind) {
+            kinds.push(m.kind);
+        }
+    }
+    kinds
+}
+
+/// The `how` text of the first marker of `kind` — identical across the
+/// group since `how` is fixed per kind.
+fn first_how(markers: &[ReviewMarkerRecord], kind: &'static str) -> &'static str {
+    markers
+        .iter()
+        .find(|m| m.kind == kind)
+        .map(|m| m.how)
+        .unwrap_or("")
 }
 
 /// Human summary + remediation on stderr.
@@ -712,13 +750,44 @@ fn print_summary(report: &CheckReport) {
                     detail
                 );
             }
-            for marker in &report.review_markers {
-                eprintln!(
-                    "  {}:{}: {}",
-                    sanitize_for_terminal(&marker.file),
-                    marker.line,
-                    marker.text
-                );
+            // Each marker shows its location, then the kind's why and
+            // how on the next lines. A kind with several markers
+            // collapses to a count, a capped location list, and the
+            // guidance once — a 12-tool dispatcher draft should not
+            // repeat the same advice a dozen times.
+            const PER_KIND_SHOWN: usize = 8;
+            for kind in marker_kinds_in_order(&report.review_markers) {
+                let group: Vec<&ReviewMarkerRecord> = report
+                    .review_markers
+                    .iter()
+                    .filter(|m| m.kind == kind)
+                    .collect();
+                if group.len() == 1 {
+                    let marker = group[0];
+                    eprintln!(
+                        "  {}:{}: {}",
+                        sanitize_for_terminal(&marker.file),
+                        marker.line,
+                        marker.text
+                    );
+                } else {
+                    eprintln!("  {kind} ({} marker(s)):", group.len());
+                    for marker in group.iter().take(PER_KIND_SHOWN) {
+                        eprintln!(
+                            "    {}:{}: {}",
+                            sanitize_for_terminal(&marker.file),
+                            marker.line,
+                            marker.text
+                        );
+                    }
+                    if group.len() > PER_KIND_SHOWN {
+                        eprintln!("    … {} more marker(s)", group.len() - PER_KIND_SHOWN);
+                    }
+                }
+                if let Some(first) = group.first() {
+                    eprintln!("    why: {}", first.why);
+                    eprintln!("    how: {}", first.how);
+                }
             }
         }
     }

@@ -115,8 +115,17 @@ pub struct ReviewMarkerRecord {
     pub file: String,
     /// 1-based line the marker's comment starts on.
     pub line: u32,
-    /// The marker text (`REVIEW: …` / `REVIEW all entries …`).
+    /// The marker text (`REVIEW: <token>: …` / `REVIEW …`).
     pub text: String,
+    /// `policy::review::MarkerKind` name — the generated template the
+    /// marker heads with, or `custom` for a hand-written note.
+    pub kind: &'static str,
+    /// Why the marker needs an operator decision — the kind's fixed
+    /// text, so the report explains itself.
+    pub why: &'static str,
+    /// Representative way to resolve it — the kind's fixed text, also
+    /// surfaced in `remediation`.
+    pub how: &'static str,
 }
 
 /// One non-fatal finding a policy load raised — serialized from

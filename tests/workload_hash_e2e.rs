@@ -566,7 +566,7 @@ async fn module_and_inline_eval_emit_reason_not_fabricated_hash() {
     ];
     let (draft, _stderr) = generate_policy(&argv, &["--static-only"]).await;
     assert!(
-        draft.contains("// REVIEW: entrypoint-hash not emitted"),
+        draft.contains("// REVIEW: unbound-workload: entrypoint-hash not emitted"),
         "module launch must explain the missing pin: {draft}"
     );
     assert!(
@@ -582,7 +582,7 @@ async fn module_and_inline_eval_emit_reason_not_fabricated_hash() {
     ];
     let (draft, _stderr) = generate_policy(&argv, &["--static-only"]).await;
     assert!(
-        draft.contains("// REVIEW: entrypoint-hash not emitted"),
+        draft.contains("// REVIEW: unbound-workload: entrypoint-hash not emitted"),
         "inline eval must explain the missing pin: {draft}"
     );
     assert!(
