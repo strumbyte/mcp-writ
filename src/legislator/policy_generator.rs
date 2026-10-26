@@ -692,6 +692,22 @@ fn pyvenv_home(venv_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// `home=` names the directory holding the base `python` executable —
+/// an existing directory containing a `python*` entry (`python3`,
+/// `python3.12`, `python.exe`, …). A line naming a nonexistent path or
+/// an unrelated absolute directory is not a base install and seeds no
+/// grant.
+fn is_python_home(home: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(home) else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("python"))
+    })
+}
+
 /// Read grants grounded in the resolved launch paths — the same class
 /// of argv fact as the interpreter seccomp baseline, so the seed is
 /// unconditional like that baseline (D-7): no flag gate, every line
@@ -832,14 +848,17 @@ fn build_runtime_seed_grants(
                     origin: ctor(base.to_path_buf()),
                 });
                 // The `home=` line is operator-controlled config text —
-                // only an absolute path that names a directory with a
-                // parent is a meaningful grant. `home` lands before its
-                // parent prefix, mirroring the exe dir→prefix pair, so
-                // the line the config actually names carries the
-                // provenance comment.
+                // it seeds a grant only when it names a real base
+                // install: an absolute path with a parent whose
+                // directory holds a `python*` entry (`/`, a missing
+                // path, or an unrelated absolute dir seeds nothing).
+                // `home` lands before its parent prefix, mirroring the
+                // exe dir→prefix pair, so the line the config actually
+                // names carries the provenance comment.
                 if let Some(home) = pyvenv_home(anc)
                     && home.is_absolute()
                     && home.parent().is_some()
+                    && is_python_home(&home)
                 {
                     grants.push(SeedGrant {
                         dir: home.clone(),

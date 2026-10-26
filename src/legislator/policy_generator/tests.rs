@@ -1890,7 +1890,9 @@ fn interpreted_launch_seeds_runtime_read_grants() {
         &[],
         &workload,
     );
-    let f = |p: &Path| p.to_string_lossy().into_owned();
+    // Emitted `allow` lines run the path through `escape_kdl_string` —
+    // compare against the escaped spelling so Windows `\` matches.
+    let f = |p: &Path| escape_kdl_string(&p.to_string_lossy());
     for want in [
         "        // seeded from resolved interpreter:".to_string(),
         "        // REVIEW: runtime-seed:".to_string(),
@@ -1946,7 +1948,9 @@ fn node_payload_without_node_modules_uses_package_json_dir() {
         &[],
         &workload,
     );
-    let f = |p: &Path| p.to_string_lossy().into_owned();
+    // Emitted `allow` lines run the path through `escape_kdl_string` —
+    // compare against the escaped spelling so Windows `\` matches.
+    let f = |p: &Path| escape_kdl_string(&p.to_string_lossy());
     assert!(
         kdl.contains(&format!("allow \"{}\" mode=\"read\"", f(&proj))),
         "package.json dir grant missing:\n{kdl}"
@@ -1966,6 +1970,9 @@ fn python_venv_launch_seeds_venv_and_base_prefix() {
     let base_bin = root.join("base/bin");
     std::fs::create_dir_all(venv.join("bin")).unwrap();
     std::fs::create_dir_all(&base_bin).unwrap();
+    // `home` seeds only when it names a real base install — the dir
+    // must hold a `python*` entry.
+    std::fs::write(base_bin.join("python3"), "x").unwrap();
     std::fs::write(
         venv.join("pyvenv.cfg"),
         format!("home = {}\n", base_bin.display()),
@@ -1993,10 +2000,12 @@ fn python_venv_launch_seeds_venv_and_base_prefix() {
         &[],
         &workload,
     );
-    let f = |p: &Path| p.to_string_lossy().into_owned();
+    // Emitted `allow` lines run the path through `escape_kdl_string` —
+    // compare against the escaped spelling so Windows `\` matches.
+    let f = |p: &Path| escape_kdl_string(&p.to_string_lossy());
     for want in [
         // Base install prefix — reachable only through `pyvenv.cfg`'s
-        // `home=` (the `home` dir itself sits under it, deduped).
+        // `home=` (the `home` dir itself is granted separately below).
         f(&root.join("base")),
         // The venv interpreter's own dir + the venv tree.
         f(&venv.join("bin")),
@@ -2027,6 +2036,71 @@ fn python_venv_launch_seeds_venv_and_base_prefix() {
         "venv grant missing: {:?}",
         policy.fs.read_only
     );
+}
+
+/// `pyvenv.cfg`'s `home=` is config text: it seeds a grant only when it
+/// names a real base install — an existing directory holding a
+/// `python*` entry. The filesystem root (no parent), a nonexistent
+/// absolute path, and an existing dir with no interpreter each seed
+/// nothing.
+#[test]
+fn pyvenv_home_outside_a_base_install_seeds_nothing() {
+    use crate::legislator::source_bind::InterpreterKind;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let venv = root.join("proj/.venv");
+    std::fs::create_dir_all(venv.join("bin")).unwrap();
+    let spelled = venv.join("bin/python");
+    std::fs::write(&spelled, "x").unwrap();
+    // An existing dir that is not a base install — no `python*` entry.
+    let unrelated = root.join("unrelated");
+    std::fs::create_dir_all(&unrelated).unwrap();
+    std::fs::write(unrelated.join("readme"), "x").unwrap();
+
+    // The filesystem root — `parent()` is `None` on both `\`/`/` forms.
+    let fs_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .last()
+        .expect("filesystem root")
+        .to_path_buf();
+    for home in [
+        fs_root,
+        root.join("nonexistent-base"), // absolute but absent
+        unrelated,
+    ] {
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            format!("home = {}\n", home.display()),
+        )
+        .unwrap();
+        let workload = WorkloadHashes {
+            interpreter: Some(InterpreterKind::Python),
+            interpreter_path: Some(spelled.clone()),
+            spelled_path: Some(spelled.clone()),
+            payload_path: None,
+            ..Default::default()
+        };
+        let kdl = generate_policy(
+            &empty_result(),
+            &CapabilityProfile::empty(),
+            None,
+            &[],
+            &workload,
+        );
+        // The venv layout grants still land — only the `home=` line is
+        // refused.
+        assert_eq!(
+            allow_lines(&kdl, &escape_kdl_string(&venv.to_string_lossy())).len(),
+            1,
+            "venv root grant missing for home={}:\n{kdl}",
+            home.display()
+        );
+        assert!(
+            !kdl.contains("seeded from pyvenv.cfg home"),
+            "home={} must seed no grant:\n{kdl}",
+            home.display()
+        );
+    }
 }
 
 /// The `environment` draft is candidates commented out — nothing live,
