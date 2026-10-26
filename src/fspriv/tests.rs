@@ -376,7 +376,7 @@ fn on_disk_entry_name_resolves_verbatim_long_path() {
         "fixture must exceed MAX_PATH: {leaf:?}"
     );
     assert_eq!(on_disk_entry_name(&leaf).as_deref(), Some("leaf-entry.txt"));
-    let _ = fs::remove_dir_all(&dir.canonicalize().unwrap());
+    let _ = fs::remove_dir_all(dir.canonicalize().unwrap());
 }
 
 /// Evaluate `dacl_has_untrusted_grant` on a DACL spelled in SDDL —

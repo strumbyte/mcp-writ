@@ -1289,8 +1289,14 @@ mod tests {
     fn relative_traversal_joins_cwd() {
         // A private cwd: resolution now refuses paths whose ancestors a
         // non-owner principal could replace, and the ambient cwd may be
-        // one (shared mounts, group checkouts).
-        let dir = tempfile::tempdir().unwrap();
+        // one (shared mounts, group checkouts — a sandbox fleet's %TEMP%
+        // grants `Modify` to its workers). With no write-restricted root
+        // anywhere, the fixture itself is unauthorizable and there is
+        // nothing to exercise.
+        let Some(dir) = crate::testutil::restricted_tempdir().unwrap() else {
+            eprintln!("skipping: no write-restricted root for authorization fixtures");
+            return;
+        };
         let cwd = dir.path().canonicalize().unwrap();
         let cwd = cwd.as_path();
         let resolved = resolve_for_authorization_with_cwd("data/../../secret", cwd).unwrap();

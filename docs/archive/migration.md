@@ -129,4 +129,24 @@ separately in the `server_protocol_version=` extra, recorded on every
 `initialize` result — allowed or denied — and paired with
 `supported=<list>` on the `unsupported-version` denial.
 
+## Audit `outcome` value change: `tools_list.filtered` is `success`
+
+`tools_list.filtered` now records `outcome: "success"` — the requested
+operation, filtering the advertised `tools/list` down to the allowed
+set, completed. It was
+`"failure"` before, by the same convention as `tool_call.denied`. The
+change touches one event type only: consumers that counted
+`tools_list.filtered` events via `outcome=failure` must switch to
+`action=denied` (`action=observed` under `--dry-run`) — the audit schema
+in the [user guide](../guide.md#audit-log-schema) fixes the outcome
+vocabulary per event and warns against using `outcome=failure` as an
+anomaly indicator.
+
+A blocked listing also commits its `tools_list.verified` record now —
+`outcome: "failure"` / `action: "observed"` with `blocked=true` in
+`details`, before the refusal is emitted — where previously only the
+mismatch record (`tools_list.changed`, `hash.mismatch`) covered the
+failure. Unblocked `tools_list.verified` records are unchanged
+(`action: "allowed"` / `outcome: "success"`).
+
 The original MIT license and copyright notice are retained.

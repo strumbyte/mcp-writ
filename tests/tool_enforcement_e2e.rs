@@ -1371,6 +1371,13 @@ async fn tools_list_dry_run_keeps_all_tools_and_observes() {
         "dry-run filter event must be observed: {}",
         filtered[0]
     );
+    // The full advertised list was delivered: the would-be denial is an
+    // `observed` action on a completed operation — `outcome` is `success`.
+    assert!(
+        filtered[0].contains("\"outcome\":\"success\""),
+        "dry-run filter event must be a success: {}",
+        filtered[0]
+    );
     assert!(
         filtered[0].contains("fetch_url") && filtered[0].contains("fail_write"),
         "hidden tool names must be enumerated: {}",
@@ -1427,15 +1434,18 @@ async fn tools_list_hash_pins_full_advertised_set_not_filtered_view() {
     // longer matches, so verification must fail closed.
     let bad_dir = make_test_dir("list_pin_filtered");
     let bad_policy = write_policy(bad_dir.path(), &filter_policy_with_hash(&filtered_hash));
-    let mut child = spawn_guard(
+    let bad_audit = common::next_audit_log_path();
+    let mut child = spawn_guard_at(
         &bad_policy,
         false,
+        None,
         &scripted_argv(),
         &[("MCP_WRIT_FIXTURE", "tools_call_ok")],
+        &bad_audit,
     );
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let _guard = ChildGuard(child);
+    let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
@@ -1447,6 +1457,27 @@ async fn tools_list_hash_pins_full_advertised_set_not_filtered_view() {
     );
     assert!(!json_has_result(&list_resp), "got: {list_resp}");
     drop(stdin);
+    if timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
+        .await
+        .is_err()
+    {
+        let _ = guard.0.kill().await;
+        panic!("mcp-writ did not exit after stdin EOF");
+    }
+    // The paired outcome: a blocked verification is a genuine failure —
+    // `tools_list.verified` commits `outcome=failure`/`action=observed`
+    // with `blocked=true`, unlike the delivered filter's `success`.
+    let audit_text = std::fs::read_to_string(&bad_audit).expect("read audit log");
+    let verified = audit_text
+        .lines()
+        .find(|l| l.contains("\"event_type\":\"tools_list.verified\""))
+        .unwrap_or_else(|| panic!("blocked listing must commit tools_list.verified: {audit_text}"));
+    assert!(
+        verified.contains("\"outcome\":\"failure\"")
+            && verified.contains("\"action\":\"observed\"")
+            && verified.contains("blocked=true"),
+        "blocked verification must record failure/observed: {verified}"
+    );
 }
 
 #[tokio::test]
@@ -1545,6 +1576,12 @@ async fn list_changed_relist_is_filtered() {
             .iter()
             .all(|e| e.contains("fetch_url") && e.contains("fail_write")),
         "filtered events must enumerate the relist's hidden tools: {filtered:?}"
+    );
+    assert!(
+        filtered
+            .iter()
+            .all(|e| e.contains("\"outcome\":\"success\"")),
+        "filtered events deliver the filtered list — outcome is success: {filtered:?}"
     );
 }
 

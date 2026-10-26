@@ -3,7 +3,7 @@
 //! Launches `-- <command>` under the ordinary Linux sandbox pipeline
 //! (`no_new_privs` → Landlock → seccomp) plus a seccomp
 //! user-notification filter on `connect(2)`, supervised in-process by
-//! [`crate::warden::unotify`]. Wiring mirrors the `run`/`dns-gate`
+//! `crate::warden::unotify`. Wiring mirrors the `run`/`dns-gate`
 //! pre-launch contract: policy load/bind → tracing → audit sink →
 //! `guard.started`/`policy.loaded` → supervise → `guard.stopped`. The
 //! command is not an MCP session — no `session.*`/`server.*` records

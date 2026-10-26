@@ -1360,6 +1360,12 @@ async fn real_filesystem_server_lists_only_allowed_tools() {
         filtered_line.contains("\"action\":\"denied\""),
         "normal-run filter event must be denied: {filtered_line}"
     );
+    // The filtered list was delivered — `action=denied` carries the
+    // refusal, `outcome=success` the completed operation.
+    assert!(
+        filtered_line.contains("\"outcome\":\"success\""),
+        "normal-run filter event must be a success: {filtered_line}"
+    );
     assert!(
         filtered_line.contains(denied),
         "hidden tool must be named in details: {filtered_line}"

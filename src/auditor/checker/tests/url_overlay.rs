@@ -463,7 +463,13 @@ fn test_secret_overlay_false_falls_back_to_glob() {
 
 #[test]
 fn test_secret_overlay_follows_symlink() {
-    let dir = tempfile::tempdir().unwrap();
+    // Same write-restricted-root requirement as the overlay's own
+    // symlink test — an unauthorizable fixture dir means the resolved
+    // target can never be reached to match the reserved set.
+    let Some(dir) = crate::testutil::restricted_tempdir().unwrap() else {
+        eprintln!("secret overlay symlink test skipped: no write-restricted root");
+        return;
+    };
     match crate::secret_paths::try_create_secret_symlink(dir.path()) {
         Ok(link) => {
             let mut policy = Policy::default();

@@ -695,39 +695,12 @@ where
         }
     }
 
-    if blocked {
-        // Identity/integrity failures fail closed in every mode: a hash
-        // or baseline mismatch, a first-seen manifest block, and any
-        // verification error all refuse the advertised list. Dry-run
-        // relaxes only *authorization observation* — it never exposes
-        // tool definitions whose integrity check failed.
-        if shared.dry_run {
-            tracing::warn!(
-                reason = %block_reason,
-                fail_on = shared.fail_on.as_str(),
-                "[DRY-RUN] tools/list verification failed: emitting error, not forwarding tools/list result"
-            );
-        } else {
-            tracing::error!(
-                reason = %block_reason,
-                "tools/list verification failed: blocking response"
-            );
-        }
-        if let Some(emit_id) = failure_emit_id(
-            shared,
-            client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal),
-            &block_reason,
-        )
-        .await
-        {
-            let error_response = build_tools_list_error_response(&emit_id);
-            write_client_frame(&shared.client_out, &error_response).await?;
-        }
-        shared.abort_tx.send(true).ok();
-        return Err(AuditorError::VerificationFailed(format!(
-            "tools/list {block_reason}"
-        )));
-    }
+    // Split the advertised set for the client-facing response only — pure
+    // computation; the pin and the recorded digest cover the full
+    // advertised set, not the filtered view the client sees.
+    let (visible, hidden): (Vec<&ToolDefinition>, Vec<&ToolDefinition>) = tools_to_verify
+        .iter()
+        .partition(|tool| checker::tool_is_allowed(&shared.policy, &tool.name));
 
     let digest = match crate::verifier::tools_diff::hash_tools_list(&tools_to_verify) {
         Ok(digest) => Some(digest),
@@ -763,19 +736,15 @@ where
         }
     };
 
-    // Split the advertised set for the client-facing response only — pure
-    // computation; the pin and the recorded digest cover the full
-    // advertised set, not the filtered view the client sees.
-    let (visible, hidden): (Vec<&ToolDefinition>, Vec<&ToolDefinition>) = tools_to_verify
-        .iter()
-        .partition(|tool| checker::tool_is_allowed(&shared.policy, &tool.name));
-
     // The authoritative verification record must be durable before any
     // verified state transition — `record_verified_digest`,
     // `finish_verification`, the busy-gate release, and the client emit
     // all follow this commit. A dead or saturated sink refuses here: no
     // unaudited manifest can publish verified state or cross to the
     // client. (On a best-effort logger the commit degrades to `log`.)
+    // A blocked listing is recorded too: `blocked=true` carries
+    // `outcome=failure`/`action=observed` — the refusal it precedes is
+    // the error emit and abort below, not a verified state transition.
     {
         let mut event = AuditEvent::new(
             Uuid::now_v7(),
@@ -810,6 +779,40 @@ where
         }
         event.details = Some(details);
         shared.audit.log_committed(event).await?;
+    }
+
+    if blocked {
+        // Identity/integrity failures fail closed in every mode: a hash
+        // or baseline mismatch, a first-seen manifest block, and any
+        // verification error all refuse the advertised list. Dry-run
+        // relaxes only *authorization observation* — it never exposes
+        // tool definitions whose integrity check failed.
+        if shared.dry_run {
+            tracing::warn!(
+                reason = %block_reason,
+                fail_on = shared.fail_on.as_str(),
+                "[DRY-RUN] tools/list verification failed: emitting error, not forwarding tools/list result"
+            );
+        } else {
+            tracing::error!(
+                reason = %block_reason,
+                "tools/list verification failed: blocking response"
+            );
+        }
+        if let Some(emit_id) = failure_emit_id(
+            shared,
+            client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal),
+            &block_reason,
+        )
+        .await
+        {
+            let error_response = build_tools_list_error_response(&emit_id);
+            write_client_frame(&shared.client_out, &error_response).await?;
+        }
+        shared.abort_tx.send(true).ok();
+        return Err(AuditorError::VerificationFailed(format!(
+            "tools/list {block_reason}"
+        )));
     }
 
     let mut digest_changed = false;
@@ -856,14 +859,20 @@ where
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        // Same outcome convention as tool_call.denied: the requested
-        // operation — seeing the full advertised list — was refused.
-        // Dry-run records the would-be denial as `observed`.
+        // The requested operation — filtering the advertised tools/list
+        // down to the allowed set — completed, so the outcome is
+        // `success`; the refusal itself travels in `action` (`denied`,
+        // or `observed` for the would-be denial under dry-run). The
+        // record commits before the filtered response is forwarded, so
+        // `success` asserts that filtering finished — it is not proof
+        // the reply reached the client. `outcome=failure` stays
+        // reserved for operations that did not complete, like a blocked
+        // verification.
         let mut event = AuditEvent::new(
             Uuid::now_v7(),
             EventType::ToolsListFiltered,
             Severity::Info,
-            Outcome::Failure,
+            Outcome::Success,
             if shared.dry_run {
                 Action::Observed
             } else {
@@ -1449,6 +1458,9 @@ mod tests {
             .find(|l| l.contains("\"event_type\":\"tools_list.filtered\""))
             .expect("filtered event missing");
         assert!(line.contains("\"action\":\"observed\""), "got: {line}");
+        // The filtered response was delivered: a would-be denial under
+        // dry-run still completes the operation — outcome is `success`.
+        assert!(line.contains("\"outcome\":\"success\""), "got: {line}");
         assert!(line.contains("would be hidden"), "got: {line}");
         assert!(line.contains("beta"), "got: {line}");
         assert!(
@@ -1480,6 +1492,10 @@ mod tests {
             .find(|l| l.contains("\"event_type\":\"tools_list.filtered\""))
             .expect("filtered event missing");
         assert!(line.contains("\"target_server\":null"), "got: {line}");
+        // A normal run delivers the filtered list — `action=denied`
+        // carries the refusal, `outcome=success` the completed delivery.
+        assert!(line.contains("\"action\":\"denied\""), "got: {line}");
+        assert!(line.contains("\"outcome\":\"success\""), "got: {line}");
         assert!(line.contains("beta"), "got: {line}");
     }
 
@@ -1513,7 +1529,59 @@ mod tests {
             .find(|l| l.contains("\"event_type\":\"tools_list.filtered\""))
             .expect("filtered event missing");
         assert!(line.contains("\"target_server\":null"), "got: {line}");
+        assert!(line.contains("\"outcome\":\"success\""), "got: {line}");
         assert!(line.contains("gamma"), "got: {line}");
+    }
+
+    /// A listing refused by the pin check still commits its
+    /// `tools_list.verified` record — `blocked=true` with
+    /// `outcome=failure`/`action=observed` — before the refusal emit.
+    /// `outcome=failure` stays reserved for operations that did not
+    /// complete; the filtering event above is `success` by contrast.
+    #[tokio::test]
+    async fn blocked_listing_commits_failure_verified_record() {
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
+        let log_path = dir.path().join("audit.jsonl");
+        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let mut policy = policy_allowing("alpha");
+        // A pin that cannot match the advertised set blocks verification.
+        policy
+            .tools_list_hashes
+            .push(crate::policy::ToolsListHashEntry {
+                server_name: "bound-server".to_string(),
+                hash_value: format!("sha256:{}", "0".repeat(64)),
+                approved: None,
+            });
+        let (shared, _abort_rx) = shared_for_test_with(false, policy, audit);
+        let mut st = S2cListState::new();
+
+        st.bind_client("1".into(), String::new());
+        st.append_page(two_tools()).unwrap();
+        let res = verify_and_emit_list(&shared, &mut st, Some("1"), false).await;
+        assert!(
+            matches!(res, Err(AuditorError::VerificationFailed(_))),
+            "a mismatched pin must refuse the listing"
+        );
+
+        let _ = shared.audit.shutdown().await;
+        let log = std::fs::read_to_string(&log_path).expect("read audit log");
+        let line = log
+            .lines()
+            .find(|l| l.contains("\"event_type\":\"tools_list.verified\""))
+            .expect("blocked listing must still commit tools_list.verified");
+        assert!(line.contains("\"outcome\":\"failure\""), "got: {line}");
+        assert!(line.contains("\"action\":\"observed\""), "got: {line}");
+        assert!(line.contains("blocked=true"), "got: {line}");
+        // The paired refusal record — the hash diff that blocked the
+        // listing — is a `tools_list.changed` failure, unchanged.
+        let changed = log
+            .lines()
+            .find(|l| l.contains("\"event_type\":\"tools_list.changed\""))
+            .expect("the mismatch must be recorded");
+        assert!(
+            changed.contains("\"outcome\":\"failure\""),
+            "got: {changed}"
+        );
     }
 
     #[tokio::test]

@@ -524,7 +524,7 @@ impl RunningChild {
     /// On a namespaced launch the wait additionally polls the egress
     /// proxy task: its completion while the leader still runs is a
     /// fail-closed supervision loss — reported as
-    /// [`NaturalExit::SupervisionLost`] so the caller kills the tree
+    /// `NaturalExit::SupervisionLost` so the caller kills the tree
     /// rather than leave it without an egress enforcement point.
     pub async fn wait_for_natural_exit(&mut self) -> NaturalExit {
         // Namespaced launches poll the egress proxy alongside the
