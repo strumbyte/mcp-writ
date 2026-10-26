@@ -750,8 +750,8 @@ fn print_summary(report: &CheckReport) {
                     detail
                 );
             }
-            // Each marker shows its location, then the kind's why and
-            // how on the next lines. A kind with several markers
+            // Each marker shows its location and kind, then the kind's
+            // why and how on the next lines. A kind with several markers
             // collapses to a count, a capped location list, and the
             // guidance once — a 12-tool dispatcher draft should not
             // repeat the same advice a dozen times.
@@ -770,6 +770,7 @@ fn print_summary(report: &CheckReport) {
                         marker.line,
                         marker.text
                     );
+                    eprintln!("    kind: {kind}");
                 } else {
                     eprintln!("  {kind} ({} marker(s)):", group.len());
                     for marker in group.iter().take(PER_KIND_SHOWN) {

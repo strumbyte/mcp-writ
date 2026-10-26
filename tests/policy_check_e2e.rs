@@ -337,9 +337,19 @@ async fn check_review_markers_are_drift() {
         "a marker matching no known generator kind — a hand-written or hand-edited note"
     );
 
-    // stderr prints each marker's location followed by the kind's why
-    // and how; remediation enumerates one next action per kind present.
+    // stderr prints each marker's location and kind followed by the
+    // kind's why and how; remediation enumerates one next action per
+    // kind present.
     let stderr = stderr_text(&out);
+    assert_eq!(
+        stderr.matches("kind:").count(),
+        3,
+        "one kind line per single-marker kind: {stderr}"
+    );
+    assert!(
+        stderr.contains("kind: unbound-workload") && stderr.contains("kind: custom"),
+        "kind lines name the classification: {stderr}"
+    );
     assert_eq!(
         stderr.matches("why:").count(),
         3,
@@ -439,11 +449,16 @@ async fn check_review_marker_kinds_fixture() {
     }
 
     // The two-marker kind aggregates to a count + locations + one
-    // why/how; every other kind prints per-marker.
+    // why/how; every other kind prints per-marker with its kind line.
     let stderr = stderr_text(&out);
     assert!(
         stderr.contains("syscall-analysis (2 marker(s)):"),
         "multi-marker kind must aggregate: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("kind:").count(),
+        14,
+        "kind line per single-marker kind (the grouped kind's header names it): {stderr}"
     );
     assert_eq!(
         stderr.matches("why:").count(),

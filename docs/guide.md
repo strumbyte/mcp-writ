@@ -1845,12 +1845,12 @@ Each marker is also classified against the templates the draft
 generator emits (`// REVIEW: <kind>: <detail>`), by the leading kind
 token plus a delimiter — `custom` for a note that matches no template.
 On stderr `check` prints each marker's `file:line: text` followed by
-the kind's `why` (what needs deciding) and `how` (a representative way
-to resolve it); a kind with several markers collapses to a count, a
-capped location list, and the guidance once. `remediation[]` then
-enumerates one next action per kind present, so a dispatcher-shaped
-draft with a dozen `unbound-tool` markers still reads as a short task
-list.
+its `kind`, the kind's `why` (what needs deciding), and `how` (a
+representative way to resolve it); a kind with several markers
+collapses to a count, a capped location list, and the guidance once.
+`remediation[]` then enumerates one next action per kind present, so a
+dispatcher-shaped draft with a dozen `unbound-tool` markers still
+reads as a short task list.
 
 `check` always evaluates the **native** target — the artifacts visible
 on this host. A policy gating on another platform's mechanisms (say, a

@@ -2,12 +2,17 @@
 //!
 //! `legislator::policy_generator` tags each generated line that needs an
 //! operator decision with a `// REVIEW` comment, plus an unconditional
-//! `// REVIEW all entries before deploying` header. KDL comments carry no
-//! representation in the parsed document, so the load path scans the raw
-//! source text: every loaded file (the entry policy and each `extends`
-//! / `include` ancestor) is lexed for line and block comments, and a
-//! comment whose body begins with the `REVIEW` token is recorded as a
-//! marker. String and raw-string contents are not comments.
+//! `// REVIEW: header: all entries before deploying` header. KDL comments
+//! carry no representation in the parsed document, so the load path scans
+//! the raw source text: every loaded file (the entry policy and each
+//! `extends` / `include` ancestor) is lexed for line and block comments,
+//! and a comment whose body begins with the `REVIEW` token is recorded
+//! as a marker. String and raw-string contents are not comments.
+//!
+//! [`MarkerKind`] is the ledger both sides read: the generator emits each
+//! marker through it (`// REVIEW: <token>: <detail>`), and `check`
+//! classifies recorded marker text back into a kind for its `kind` /
+//! `why` / `how` guidance.
 //!
 //! `ReviewMode` — resolved from `MCP_WRIT_REVIEW_MODE` — decides what the
 //! loaders do with a non-empty marker list:
