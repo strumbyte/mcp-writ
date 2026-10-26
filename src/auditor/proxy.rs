@@ -70,6 +70,7 @@ where
         })),
         last_list_template: Arc::new(tokio::sync::Mutex::new(String::new())),
         next_internal_id: Arc::new(AtomicU64::new(910_001)),
+        init_order_warned: Arc::new(AtomicBool::new(false)),
         abort_tx: abort_tx.clone(),
     };
 

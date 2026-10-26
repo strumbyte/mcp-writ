@@ -297,6 +297,19 @@ pub(crate) fn frame_too_large_message(kind: &str, limit: usize) -> String {
     format!("{kind} exceeds the {limit}-byte frame cap (frame-too-large)")
 }
 
+/// Client-facing text for a `Deny` verdict whose reason carries an
+/// explanation — `request denied (<code>): <explain(method)>`. Reasons
+/// without an explanation return `None` and keep the caller's generic
+/// `<message> (<reason>)` format (PR-35).
+pub(crate) fn deny_explanation(
+    reason: crate::policy::mcp::DenyReason,
+    method: &str,
+) -> Option<String> {
+    reason
+        .explain(method)
+        .map(|e| format!("request denied ({}): {e}", reason.as_str()))
+}
+
 /// The negotiated `result.protocolVersion` rendered for human-facing
 /// surfaces: quoted, terminal-safe, bounded to the audit field budget.
 /// `<absent>` when the server returned no usable member. Shared by the

@@ -129,6 +129,7 @@ pub fn report_json(
         netns: false,
         mountns: false,
         id_map: false,
+        proc_mount: false,
         tun: false,
         loopback_up: false,
         route: false,
@@ -182,6 +183,7 @@ pub fn report_json(
                         // this report means the claim holds.
                         n.member("pidns", true)?;
                         n.member("uid_gid_map", probe.id_map)?;
+                        n.member("proc_mount", probe.proc_mount)?;
                         n.member("tun", probe.tun)?;
                         n.member("loopback_up", probe.loopback_up)?;
                         n.member("default_route_via_tun", probe.route)?;
@@ -378,6 +380,7 @@ mod tests {
             netns: false,
             mountns: false,
             id_map: false,
+            proc_mount: false,
             tun: false,
             loopback_up: false,
             route: false,
@@ -400,7 +403,7 @@ mod tests {
             None,
         );
         assert!(
-            report.contains("\"missing\":[\"userns\",\"netns\",\"mountns\",\"uid_gid_map\",\"tun\",\"loopback_up\",\"default_route_via_tun\",\"ipv6_route_via_tun\"]"),
+            report.contains("\"missing\":[\"userns\",\"netns\",\"mountns\",\"uid_gid_map\",\"proc_mount\",\"tun\",\"loopback_up\",\"default_route_via_tun\",\"ipv6_route_via_tun\"]"),
             "a failed probe must name the unmet requirements: {report}"
         );
     }

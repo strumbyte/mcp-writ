@@ -135,6 +135,7 @@ impl LinuxSelection {
                 netns: p.netns,
                 mountns: p.mountns,
                 id_map: p.id_map,
+                proc_mount: p.proc_mount,
                 tun: p.tun,
                 loopback_up: p.loopback_up,
                 route: p.route,

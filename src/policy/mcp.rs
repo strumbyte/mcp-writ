@@ -780,6 +780,26 @@ impl DenyReason {
             Self::UnsupportedVersion => "unsupported-version",
         }
     }
+
+    /// Client-facing explanation appended after the reason code —
+    /// `Some` only for reasons whose bare code does not say what the
+    /// peer did wrong. `init-order` explains the expected MCP
+    /// initialization sequence; `unsupported-version` and
+    /// `frame-too-large` already carry their specifics in the
+    /// dedicated diagnostic paths, so they keep the generic format.
+    /// `method` is the frame's method name, interpolated where the
+    /// explanation names it. Reasons joining this mechanism later add
+    /// a `Some` arm here.
+    pub fn explain(self, method: &str) -> Option<String> {
+        match self {
+            Self::InitOrder => Some(format!(
+                "\"{method}\" arrived before the session was initialized — \
+                 send initialize, wait for its result, send \
+                 notifications/initialized, then other requests"
+            )),
+            _ => None,
+        }
+    }
 }
 
 impl UndecidedReason {

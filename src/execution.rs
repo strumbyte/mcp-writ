@@ -392,6 +392,12 @@ pub struct NamespacedProbeEvidence {
     pub mountns: bool,
     /// `uid_gid_map` writes succeeded (report field name `id_map`).
     pub id_map: bool,
+    /// The `/proc` remount init's pidns-init child performs succeeded
+    /// inside the probe's fresh pid namespace (PR-35 / D-10). `false`
+    /// names the masked-`/proc` environment constraint — a container
+    /// or nested user namespace whose `/proc` is not fully visible —
+    /// and lands in `missing` as `proc_mount`.
+    pub proc_mount: bool,
     pub tun: bool,
     pub loopback_up: bool,
     /// `default_route_via_tun` (report field name `route`).

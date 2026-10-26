@@ -119,7 +119,10 @@ fn go_handshake(
     } else if let Some(t) = line.strip_prefix("SANDBOX-SKIPPED") {
         (false, t)
     } else if line.starts_with("ERR ") {
-        return Err(format!("init post-GO failure: {}", line.trim()));
+        return Err(format!(
+            "init post-GO failure: {}",
+            annotate_init_err(&line)
+        ));
     } else {
         return Err(format!("unrecognized init status: {}", line.trim()));
     };
@@ -136,9 +139,54 @@ fn go_handshake(
         tail.to_string()
     };
     if !tail.is_empty() {
-        return Err(format!("init exec stage failed: {}", tail.trim()));
+        return Err(format!(
+            "init exec stage failed: {}",
+            annotate_init_err(&tail)
+        ));
     }
     Ok(())
+}
+
+/// Append a known-cause hint to init's `ERR <stage> errno=<n>` report
+/// (PR-35): the stage name and errno stay verbatim — a diagnostic must
+/// never re-label them — and the appended text names the environment
+/// constraint the `<stage> <errno>` pair usually means. Lines that are
+/// not `ERR`-shaped, and pairs with no established cause, return
+/// unchanged (a guessed cause would be worse than a bare errno).
+fn annotate_init_err(line: &str) -> String {
+    let trimmed = line.trim();
+    match err_stage_hint(trimmed) {
+        Some(hint) => format!("{trimmed} — {hint}"),
+        None => trimmed.to_string(),
+    }
+}
+
+fn err_stage_hint(line: &str) -> Option<&'static str> {
+    let rest = line.strip_prefix("ERR ")?;
+    let (stage, errno_raw) = rest.split_once(' ')?;
+    let errno: i32 = errno_raw.strip_prefix("errno=")?.parse().ok()?;
+    match (stage, errno) {
+        ("proc-mount", libc::EPERM) => Some(
+            "remounting /proc inside the new user+pid namespace requires the \
+             current /proc to be fully visible — inside a container or a \
+             nested user namespace (where parts of /proc are masked) the \
+             kernel refuses EPERM; this is an environment constraint, not a \
+             product bug — use `--linux-mechanism native` on this host",
+        ),
+        ("unshare", libc::EPERM) => Some(
+            "unprivileged user-namespace creation was refused — check the \
+             kernel.unprivileged_userns_clone and user.max_user_namespaces \
+             sysctls and any LSM/container profile; recent WSL2 kernels \
+             support userns",
+        ),
+        ("idmap", libc::EPERM) => Some(
+            "the uid_map/gid_map write was refused — the maps must be \
+             written by a process in the new userns's parent namespace \
+             (self-map after unshare(CLONE_NEWUSER) is EPERM on WSL2); \
+             check the userns sysctl settings on this host",
+        ),
+        _ => None,
+    }
 }
 
 impl NamespacedChild {
@@ -213,7 +261,7 @@ fn await_ready(sock: &mut std::fs::File) -> Result<std::fs::File, String> {
     }
     let line = String::from_utf8_lossy(&data[..n as usize]).to_string();
     if line.starts_with("ERR ") {
-        return Err(format!("init refused: {}", line.trim()));
+        return Err(format!("init refused: {}", annotate_init_err(&line)));
     }
     if !line.starts_with("READY") {
         return Err(format!("unexpected init message: {}", line.trim()));
@@ -622,5 +670,45 @@ fn set_sock_timeout(fd: RawFd, secs: u64) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::annotate_init_err;
+
+    #[test]
+    fn proc_mount_eperm_gets_the_environment_hint() {
+        let annotated = annotate_init_err("ERR proc-mount errno=1");
+        // The stage name and errno stay verbatim; the hint names the
+        // constraint and the native route.
+        assert!(annotated.contains("ERR proc-mount errno=1"), "{annotated}");
+        assert!(annotated.contains("fully visible"), "{annotated}");
+        assert!(annotated.contains("linux-mechanism native"), "{annotated}");
+    }
+
+    #[test]
+    fn unshare_and_idmap_eperm_get_userns_hints() {
+        let unshare = annotate_init_err("ERR unshare errno=1");
+        assert!(unshare.contains("unprivileged user-namespace"), "{unshare}");
+        let idmap = annotate_init_err("ERR idmap errno=1");
+        assert!(idmap.contains("parent namespace"), "{idmap}");
+        assert!(idmap.contains("WSL2"), "{idmap}");
+    }
+
+    #[test]
+    fn unrecognized_lines_and_pairs_pass_through() {
+        // No hint is ever a guessed cause: unknown stages, other
+        // errnos, and non-errno ERR forms keep the line verbatim.
+        for line in [
+            "ERR exec errno=2",
+            "ERR unshare errno=0",
+            "ERR proc-mount errno=22",
+            "ERR sandbox policy-load bad kdl",
+            "ERR argv missing-sockfd-or-workload",
+            "something else entirely",
+        ] {
+            assert_eq!(annotate_init_err(line), line.trim());
+        }
     }
 }

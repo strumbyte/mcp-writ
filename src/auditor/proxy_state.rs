@@ -194,6 +194,11 @@ pub(crate) struct ProxyShared<W> {
     pub(crate) verified_tools: Arc<std::sync::Mutex<VerifiedToolSet>>,
     pub(crate) last_list_template: Arc<Mutex<String>>,
     pub(crate) next_internal_id: Arc<AtomicU64>,
+    /// Whether the once-per-session `init-order` stderr diagnostic was
+    /// already emitted — per-request warns would flood stderr on a
+    /// mis-ordering client, so only the first denial in either
+    /// direction logs (the wire error repeats on every denial).
+    pub(crate) init_order_warned: Arc<AtomicBool>,
     /// Cancellation signal shared between S2C and C2S to immediately abort session.
     pub(crate) abort_tx: watch::Sender<bool>,
 }
@@ -223,6 +228,7 @@ impl<W> Clone for ProxyShared<W> {
             verified_tools: self.verified_tools.clone(),
             last_list_template: self.last_list_template.clone(),
             next_internal_id: self.next_internal_id.clone(),
+            init_order_warned: self.init_order_warned.clone(),
             abort_tx: self.abort_tx.clone(),
         }
     }

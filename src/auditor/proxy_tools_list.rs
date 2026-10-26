@@ -1040,6 +1040,7 @@ mod tests {
             )),
             last_list_template: Arc::new(Mutex::new(String::new())),
             next_internal_id: Arc::new(std::sync::atomic::AtomicU64::new(910_001)),
+            init_order_warned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             abort_tx,
         };
         (shared, abort_rx)

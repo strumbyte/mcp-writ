@@ -1378,3 +1378,47 @@ fn verdict_codes_are_stable() {
     assert_eq!(A_SUB.outcome(), "allow");
     assert_eq!(A_SUB.reason_code(), "subscription-matched");
 }
+
+/// PR-35: only `init-order` carries a client-facing explanation — the
+/// bare code does not say what the peer did wrong, so the wire text
+/// names the frame's method and the expected initialization sequence.
+/// Reasons with dedicated diagnostics (`unsupported-version`,
+/// `frame-too-large`) and every generic reason keep `None`.
+#[test]
+fn deny_reason_explain_covers_init_order_only() {
+    assert_eq!(
+        DenyReason::InitOrder.explain("tools/call").as_deref(),
+        Some(
+            "\"tools/call\" arrived before the session was initialized — \
+             send initialize, wait for its result, send \
+             notifications/initialized, then other requests"
+        )
+    );
+    for r in [
+        DenyReason::UnknownMethod,
+        DenyReason::VersionRemoved,
+        DenyReason::VersionDirection,
+        DenyReason::NoRule,
+        DenyReason::RuleDeny,
+        DenyReason::Capability,
+        DenyReason::MetaMissing,
+        DenyReason::MetaVersion,
+        DenyReason::MetaMalformed,
+        DenyReason::Shape,
+        DenyReason::UriNotAllowed,
+        DenyReason::FilterUnknown,
+        DenyReason::FilterNotAllowed,
+        DenyReason::Uncorrelated,
+        DenyReason::ResultType,
+        DenyReason::CacheFields,
+        DenyReason::InputRequiredTarget,
+        DenyReason::LevelRange,
+        DenyReason::FrameTooLarge,
+        DenyReason::UnsupportedVersion,
+    ] {
+        assert!(
+            r.explain("m").is_none(),
+            "{r:?} must keep the generic format"
+        );
+    }
+}
