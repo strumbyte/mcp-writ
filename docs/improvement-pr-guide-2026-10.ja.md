@@ -1238,12 +1238,12 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **タスク**
 
-- [ ] `spawn_env_pairs`（`env.rs:188-200`）が、許可名ごとの状態を返す構造を足す（例: `EnvContractReport { present: Vec<String>, missing: Vec<String>, path_missing: Vec<String> }`）。値は構造に入れない。
-- [ ] 値がパスらしい変数の実在確認: 値が単一の絶対パス（PATH 区切りを含まない）のとき `metadata()` で存在を確認し、無ければ `path_missing` に名前を入れる。記録するのは名前と有無だけで、値・パス文字列は記録しない。対象を全許可名にするか名前規則（`*_FILE`・`*_CERTS`・`*_BUNDLE`・`*_PATH` など）に限るかは担当PRで決める（既定は全許可名、単一絶対パスの値に限る）。
-- [ ] plan の `launch.env` の理由文（`plan/mod.rs:255-279`）を「base set + N allowlisted name(s): K present, M missing (missing: A, B; path missing: C)」の形にする。present/missing の結果は plan 実行時点の親環境のスナップショットであり、`plan` と `run` は別プロセスで動き得るため実起動時の環境とは異なりうる。実起動時の状態は起動レポート側の観測が反映する。
-- [ ] 起動レポートの `launch.env` 観測（`plan/mod.rs:388-410`）に同じ内容を載せ、`server.connected` の details に `env_missing=A,B env_path_missing=C` を加える（`runtime/launch.rs:861-865` の `env=inherit-parent` と同じ位置。名前はポリシー検証済みのため追加のエンコードは不要だが、`encode_audit_field_value` を通すかは PR-23 の規約に合わせて担当PRで決める）。
-- [ ] 起動時に stderr へ 1 行の警告を出す（`warning: allowlisted environment variable(s) not set in the parent environment: A, B`）。`--report` と JSONL が同じ事実を指すことを照合する（「PRを閉じるとき」の規則）。
-- [ ] guide 英日に「欠落は観測として残し、起動は止めない。厳格運用が必要なら CI で `plan` の `launch.env` を検査する」と書く（D-8）。
+- [x] `spawn_env_pairs`（`env.rs:188-200`）が、許可名ごとの状態を返す構造を足す（例: `EnvContractReport { present: Vec<String>, missing: Vec<String>, path_missing: Vec<String> }`）。値は構造に入れない。
+- [x] 値がパスらしい変数の実在確認: 値が単一の絶対パス（PATH 区切りを含まない）のとき `metadata()` で存在を確認し、無ければ `path_missing` に名前を入れる。記録するのは名前と有無だけで、値・パス文字列は記録しない。対象を全許可名にするか名前規則（`*_FILE`・`*_CERTS`・`*_BUNDLE`・`*_PATH` など）に限るかは担当PRで決める（既定は全許可名、単一絶対パスの値に限る）。→ 実装は既定どおり全許可名を対象に `single_absolute_path` + `path_unresolvable` で判定。`NotFound`/`NotADirectory`（途中要素が非ディレクトリ）のみ不存在とし、EACCES 等の判定不能エラーは報告しない。
+- [x] plan の `launch.env` の理由文（`plan/mod.rs:255-279`）を「base set + N allowlisted name(s): K present, M missing (missing: A, B; path missing: C)」の形にする。present/missing の結果は plan 実行時点の親環境のスナップショットであり、`plan` と `run` は別プロセスで動き得るため実起動時の環境とは異なりうる。実起動時の状態は起動レポート側の観測が反映する。→ N は重複排除後の consulted 数。
+- [x] 起動レポートの `launch.env` 観測（`plan/mod.rs:388-410`）に同じ内容を載せ、`server.connected` の details に `env_missing=A,B env_path_missing=C` を加える（`runtime/launch.rs:861-865` の `env=inherit-parent` と同じ位置。名前はポリシー検証済みのため追加のエンコードは不要だが、`encode_audit_field_value` を通すかは PR-23 の規約に合わせて担当PRで決める）。→ `encode_audit_field_value` を採用。監査トークン・plan/観測の名リスト・stderr 警告で同一表記になり、`,` を含む合法名が 2 名に見える偽装も防ぐ。
+- [x] 起動時に stderr へ 1 行の警告を出す（`warning: allowlisted environment variable(s) not set in the parent environment: A, B`）。`--report` と JSONL が同じ事実を指すことを照合する（「PRを閉じるとき」の規則）。→ 実装では `path_missing` にも同形式の警告を追加（ギャップ種別ごとに 1 行）。`run`/`mcp-secure-runner`（runtime/launch.rs）に加え `namespaced-run`/`unotify-run`/`ebpf-run`/`macos-proxy-run` の各起動経路にも `warn_env_allowlist_gaps` で適用。
+- [x] guide 英日に「欠落は観測として残し、起動は止めない。厳格運用が必要なら CI で `plan` の `launch.env` を検査する」と書く（D-8）。
 
 **検証:** T-BASE、T-NATIVE（`environment_e2e`・`diagnostics_e2e`・`plan_report_e2e`）。許可名を意図的に欠いた起動で、plan・report・`server.connected` の 3 面に名前が残り、値が残らないことを fixture で固定する（値に秘密らしい文字列を入れ、report と audit に現れないことを assert する）。
 
