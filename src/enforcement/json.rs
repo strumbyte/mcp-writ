@@ -606,9 +606,9 @@ fn write_review_marker(
     f.member("file", m.file.as_str())?;
     f.member("line", m.line)?;
     f.member("text", m.text.as_str())?;
-    f.member("kind", m.kind.as_str())?;
-    f.member("why", m.kind.why())?;
-    f.member("how", m.kind.how())
+    f.member("kind", m.kind)?;
+    f.member("why", m.why)?;
+    f.member("how", m.how)
 }
 
 fn write_policy_warning(

@@ -4,7 +4,6 @@
 
 use crate::audit_log::PolicyAuditContext;
 use crate::execution::ExecutionTarget;
-use crate::policy::review::MarkerKind;
 
 /// Schema version of the JSON produced by [`CheckReport::to_json`].
 pub const CHECK_REPORT_SCHEMA_VERSION: &str = "1";
@@ -118,10 +117,15 @@ pub struct ReviewMarkerRecord {
     pub line: u32,
     /// The marker text (`REVIEW: <token>: …` / `REVIEW …`).
     pub text: String,
-    /// The generated template the marker heads with, or
-    /// [`MarkerKind::Custom`] for a hand-written note — the `why`/`how`
-    /// guidance is the kind's fixed text, derived where it is read.
-    pub kind: MarkerKind,
+    /// `policy::review::MarkerKind` name — the generated template the
+    /// marker heads with, or `custom` for a hand-written note.
+    pub kind: &'static str,
+    /// Why the marker needs an operator decision — the kind's fixed
+    /// text, so the report explains itself.
+    pub why: &'static str,
+    /// Representative way to resolve it — the kind's fixed text, also
+    /// surfaced in `remediation`.
+    pub how: &'static str,
 }
 
 /// One non-fatal finding a policy load raised — serialized from
