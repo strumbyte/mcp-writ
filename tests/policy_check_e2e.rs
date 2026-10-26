@@ -970,6 +970,156 @@ async fn review_mode_warns_by_default_and_refuse_fails_the_load() {
     );
 }
 
+// ── version-3 migration preview (PR-36) ──────────────────────────────
+
+#[tokio::test]
+async fn check_reports_version3_migration_diff() {
+    // A v2 `extends` pair whose composition changes under v3 rules —
+    // the child's `allow` replaces the base list under v2 but unions
+    // under v3. `check` reports the preview in-band; status and exit
+    // code do not move.
+    let dir = common::real_tempdir();
+    std::fs::write(
+        dir.path().join("base.kdl"),
+        "policy version=2\ndefaults {\n    syscalls {\n        allow \"read\" \"execve\"\n    }\n}\n",
+    )
+    .unwrap();
+    let policy = dir.path().join("policy.kdl");
+    std::fs::write(
+        &policy,
+        "extends \"base.kdl\"\npolicy version=2\ndefaults {\n    syscalls {\n        allow \"write\"\n    }\n}\nserver \"svc\" {\n    tool \"probe\"\n}\n",
+    )
+    .unwrap();
+
+    let out = run_check(&["--policy".into(), policy_arg(&policy)]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "migration info must not move the exit code: {}",
+        stderr_text(&out)
+    );
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "clean");
+
+    let migration = member(json.value(), "migration");
+    assert_eq!(
+        member(migration, "declared_version")
+            .as_number_str()
+            .unwrap(),
+        "2"
+    );
+    assert_eq!(
+        member(migration, "candidate_version")
+            .as_number_str()
+            .unwrap(),
+        "3"
+    );
+    assert_eq!(
+        member(migration, "status").as_string_str().unwrap(),
+        "fields_differ"
+    );
+    let fields: Vec<_> = member(migration, "fields").to_array().unwrap().collect();
+    let entry = fields
+        .iter()
+        .find(|f| member(**f, "field").as_string_str().unwrap() == "defaults.syscalls.allowed")
+        .expect("defaults.syscalls.allowed must be listed");
+    let declared: Vec<String> = member(*entry, "declared")
+        .to_array()
+        .unwrap()
+        .map(|v| v.as_string_str().unwrap().to_string())
+        .collect();
+    let simulated: Vec<String> = member(*entry, "simulated")
+        .to_array()
+        .unwrap()
+        .map(|v| v.as_string_str().unwrap().to_string())
+        .collect();
+    assert_eq!(declared, vec!["write"], "v2 replaces the base list");
+    assert_eq!(
+        simulated,
+        vec!["execve", "read", "write"],
+        "v3 unions the base list"
+    );
+
+    let stderr = stderr_text(&out);
+    assert!(
+        stderr.contains(&format!(
+            "info: policy version 2 — {} field(s) would compose differently under version 3 (see policy resolve --version-diff)",
+            fields.len()
+        )),
+        "stderr carries the one-line preview: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn check_reports_version3_migration_unchanged() {
+    // A single-file policy has no composition to re-interpret — v3
+    // rules compose it identically, and that is still reported.
+    let dir = common::real_tempdir();
+    let policy = write_policy(&dir, "server \"svc\" {\n    tool \"probe\"\n}\n");
+
+    let out = run_check(&["--policy".into(), policy_arg(&policy)]).await;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "clean");
+    let migration = member(json.value(), "migration");
+    assert_eq!(
+        member(migration, "declared_version")
+            .as_number_str()
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        member(migration, "candidate_version")
+            .as_number_str()
+            .unwrap(),
+        "3"
+    );
+    assert_eq!(
+        member(migration, "status").as_string_str().unwrap(),
+        "unchanged"
+    );
+    assert_eq!(
+        member(migration, "fields").to_array().unwrap().count(),
+        0,
+        "unchanged carries no field rows"
+    );
+    assert!(
+        member(migration, "reason").kind().is_null(),
+        "reason is null unless the simulated load failed"
+    );
+    let stderr = stderr_text(&out);
+    assert!(
+        stderr.contains("info: policy version 1 — composes identically under version 3"),
+        "stderr carries the identical-composition line: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn check_v3_policy_reports_null_migration() {
+    // Already on version 3 — nothing to preview: `migration` is `null`
+    // and no info line is printed.
+    let dir = common::real_tempdir();
+    let path = dir.path().join("policy.kdl");
+    std::fs::write(
+        &path,
+        "policy version=3\nserver \"svc\" {\n    tool \"probe\"\n}\n",
+    )
+    .unwrap();
+
+    let out = run_check(&["--policy".into(), policy_arg(&path)]).await;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let json = check_json(&out.stdout);
+    let migration = member(json.value(), "migration");
+    assert!(
+        migration.kind().is_null(),
+        "v3 policies report migration: null — got {migration:?}"
+    );
+    assert!(
+        !stderr_text(&out).contains("info: policy version"),
+        "no info line when there is nothing to migrate"
+    );
+}
+
 fn stderr_text(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }

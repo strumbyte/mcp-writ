@@ -1311,10 +1311,10 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **タスク**
 
-- [ ] `compute_version_diff` / `VersionDiff` を `check` から呼べる場所に移す（`commands` 内の共有モジュール、または `policy::version_diff`）。T-LAYER の依存方向を確認する。
-- [ ] `check` で bound policy の `version < 3` のとき、v3 で再解決した差分を `migration` オブジェクトとして JSON に載せる: `{declared_version, candidate_version: 3, status: "unchanged" | "fields_differ" | "simulation_failed", fields: [{field, declared, simulated}], reason}`。`status`・`reason_code`・終了コードは変えない（`warnings` と同じ情報扱い）。version 3 のポリシーでは `migration` を `null` にする。
-- [ ] stderr に情報行を 1 つ出す: `info: policy version 2 — N field(s) would compose differently under version 3 (see policy resolve --version-diff)`、差が無ければ `… composes identically under version 3`。
-- [ ] guide 英日 §4.15 に `migration` の説明と「移行は任意。`policy resolve --version-diff` で差分を確認してから `policy version=3` に書き換える」を追記する。
+- [x] `compute_version_diff` / `VersionDiff` を `check` から呼べる場所に移す（`commands` 内の共有モジュール、または `policy::version_diff`）。T-LAYER の依存方向を確認する。→ [policy/version_diff.rs](../src/policy/version_diff.rs) に新設 — 依存は `policy::kdl_loader`（同一モジュール）と layer-0 の `execution`/`termutil`/`error` のみで T-LAYER 適合（`module_layering` テスト通過）。引数の `PolicyResolveArgs`（cli 層）は `server: Option<&str>` に置き換え、`policy_resolve` は同じ selector を渡す。`comment_lines`/`effective_field_map` も同ファイルへ移動
+- [x] `check` で bound policy の `version < 3` のとき、v3 で再解決した差分を `migration` オブジェクトとして JSON に載せる: `{declared_version, candidate_version: 3, status: "unchanged" | "fields_differ" | "simulation_failed", fields: [{field, declared, simulated}], reason}`。`status`・`reason_code`・終了コードは変えない（`warnings` と同じ情報扱い）。version 3 のポリシーでは `migration` を `null` にする。→ [enforcement/check.rs](../src/enforcement/check.rs) に `MigrationRecord`/`MigrationStatus`/`MigrationFieldDiff` と `CheckReport.migration: Option<MigrationRecord>` を追加（`enforcement` は layer-0 で `policy` を参照できないため専用レコード型）。`evaluate` の `migration_preview` が `bound.version < 3` のとき `compute_version_diff` を実行し `VersionDiff` を変換（field 値は sanitize 済みで格納）。`reason` は `simulation_failed` 時のみ文字列、他は `null`。`emit_and_exit` の error フォールバックも `migration` を clone
+- [x] stderr に情報行を 1 つ出す: `info: policy version 2 — N field(s) would compose differently under version 3 (see policy resolve --version-diff)`、差が無ければ `… composes identically under version 3`。→ `print_summary` 末尾に `info:` 行を追加（stdout/`--report` 両経路で 1 行）。`simulation_failed` は `info: policy version N — simulated version 3 load failed: <reason>` を追加
+- [x] guide 英日 §4.15 に `migration` の説明と「移行は任意。`policy resolve --version-diff` で差分を確認してから `policy version=3` に書き換える」を追記する。→ guide.md / guide.ja.md の Result JSON メンバ列挙に `migration` を追加し、`Version-3 migration preview` / `version-3 移行プレビュー` の段落を新設（3 status の意味・`policy resolve --version-diff` との同一計算・情報扱いで status/exit code 不変・移行は任意を記述）
 
 **検証:** T-BASE、T-POLICY（`policy_check_e2e` に v2 ポリシーの `migration` 出力と、`status` 不変の対を追加）。
 

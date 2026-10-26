@@ -1,7 +1,9 @@
 //! JSON serialization of the launch-report model and `plan`
 //! diagnostics via `nojson` (same style as `audit_log`).
 
-use super::check::{CheckReport, PinResult, PolicyWarningRecord, ReviewMarkerRecord};
+use super::check::{
+    CheckReport, MigrationRecord, PinResult, PolicyWarningRecord, ReviewMarkerRecord,
+};
 use super::model::*;
 use super::plan::{PlanCheck, PlanReport};
 
@@ -637,6 +639,52 @@ fn write_policy_warnings(
     }
 }
 
+/// The `migration` member — `{declared_version, candidate_version,
+/// status, fields[{field, declared, simulated}], reason}`. `fields` is
+/// empty for `unchanged` and `simulation_failed`; `reason` is `null`
+/// unless the simulated load failed.
+fn write_migration(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    m: &MigrationRecord,
+) -> std::fmt::Result {
+    f.member("declared_version", m.declared_version)?;
+    f.member("candidate_version", m.candidate_version)?;
+    f.member("status", m.status.as_str())?;
+    f.member(
+        "fields",
+        nojson::array(|f| {
+            for d in &m.fields {
+                f.element(nojson::object(|o| {
+                    o.member("field", d.field.as_str())?;
+                    o.member(
+                        "declared",
+                        nojson::array(|v| {
+                            for i in &d.declared {
+                                v.element(i.as_str())?;
+                            }
+                            Ok(())
+                        }),
+                    )?;
+                    o.member(
+                        "simulated",
+                        nojson::array(|v| {
+                            for i in &d.simulated {
+                                v.element(i.as_str())?;
+                            }
+                            Ok(())
+                        }),
+                    )
+                }))?;
+            }
+            Ok(())
+        }),
+    )?;
+    match &m.reason {
+        Some(r) => f.member("reason", r.as_str()),
+        None => f.member("reason", JsonNull),
+    }
+}
+
 fn write_check(f: &mut nojson::JsonObjectFormatter<'_, '_, '_>, c: &PlanCheck) -> std::fmt::Result {
     f.member("id", c.id)?;
     f.member("status", c.status.as_str())?;
@@ -781,6 +829,10 @@ impl CheckReport {
                 "warnings",
                 nojson::array(write_policy_warnings(&report.warnings)),
             )?;
+            match &report.migration {
+                Some(m) => f.member("migration", nojson::object(|f| write_migration(f, m))),
+                None => f.member("migration", JsonNull),
+            }?;
             f.member(
                 "remediation",
                 nojson::array(|f| {
