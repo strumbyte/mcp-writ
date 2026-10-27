@@ -8,11 +8,11 @@
 
 方針更新: 2026-10-26 — 実運用検証フィードバック対応（改善計画 §9）として PR-30〜36 を追加する。v0.5.0 のタグは止めず、次版の範囲とする。PR-30 以降の事実・行番号は `41d23e3` のコード読解で照合し、PR-30 の事象のみ Windows ホストのデバッグビルド（`cargo build --locked`）で `run --help` / `generate-policy --help` を実行して再現した（テストは未実行）。
 
-状態: **計画のみ**。各PRの実装・環境更新・コミット・ブランチ作成・push・GitHub PR作成は、別途指示があるまで行いません。以下の共通手順にある実装・PR操作は、将来の実装着手時の手順です。
+状態: **アーカイブ（PR-01〜36 すべてマージ済み、v0.5.0 リリース済み）**。各PR節のチェック・検証欄・リリース節は実施時の記録であり、計画ではありません。未実施のまま残るのは v0.5 リリース節のリリースノート項目だけで、`2f87236` 以降の作業は [improvement-pr-guide-2026-11.ja.md](../improvement-pr-guide-2026-11.ja.md) に引き継いでいます。以下の共通手順にある実装・PR操作は、各PRの実施時に適用した手順です。
 
 [改善計画](improvement-plan-2026-10.ja.md)を目的・範囲・ロードマップの正とし、本書をPR単位の作業順序の正とします。基準コミットは `562ea185`（v0.2.0 tip）。対象箇所が基準から変わった場合は、本書の事実・依存・試験を更新します。
 
-本書のPR番号は本計画内の番号です。旧手順書 [archive/implementation-pr-guide.ja.md](archive/implementation-pr-guide.ja.md) のPR-01〜32とは無関係です。
+本書のPR番号は本計画内の番号です。旧手順書 [archive/implementation-pr-guide.ja.md](implementation-pr-guide.ja.md) のPR-01〜32とは無関係です。
 
 ロードマップ対応: PR-01〜08 が v0.3（§2 全部＋§1.1／§1.2／§1.3(a)／§1.6／§2.5）、PR-09〜13 が v0.4（§1.3(c)／§1.3(b)／§1.5／§3.3 Windows／§3.1）、PR-14〜16 が v0.5+（§5.1-5.2／netns 本番化／§1.7 継続評価）に対応します。PR-17〜29 は外部レビュー対応（§8）で、P0 の PR-17〜22 は v0.5+ に必須、P1 の PR-23〜26 は v0.5+ に含める範囲をリリース時に判断（PR-16 の残存限界を解消する PR-26a はリリース前対応として含める）、P2 の PR-27〜29 は次版以降です。PR-30〜36 は実運用検証フィードバック対応（§9）で、すべて次版以降（v0.5.0 のタグは止めない）です。各リリースでバージョンを上げる条件と手順は、作業の流れの中のリリース節（[v0.3.0](#release-v0-3)／[v0.4.0](#release-v0-4)／[v0.5+](#release-v0-5)）に記載します — その時点で確認するものなので、先読みは不要です。
 
@@ -61,7 +61,7 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 - 対象コミット、OS・arch・カーネル／ビルド、実行方式、コマンド、結果を記録する。
 - 成功・失敗・スキップ・環境未確保を分ける。実行していない試験を「通過」と書かない。
-- 追加・変更したテストがどの手動ワークフローに含まれるか確認し、[test-matrix.md](test-matrix.md) の担当一覧へ登録する。
+- 追加・変更したテストがどの手動ワークフローに含まれるか確認し、[test-matrix.md](../test-matrix.md) の担当一覧へ登録する。
 - 表示した権限・制御が、実際のルール構築と同じ情報から得られるか確認する。`--report` と JSONL 監査で同じ事実を指すか照合する。
 - UTF-8、BOMなし、LF、リンク、差分を確認する。PowerShellで日本語を書く場合はUTF-8を明示する。
 - 「拒否した」ことを示す証拠と「観測できない」ことを区別する。カーネル内拒否（Landlock/seccomp/Job）は通知が来ないため emit 不可であり、観測経路のある経路（supervisor/proxy/DNS ゲート）のみ emit できる。
@@ -170,7 +170,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 起動・終了・ポリシー読込・セッションの監査イベントを実際に emit し、emit 経路の無いイベント定義の去留を項目ごとに決める。
 
-**主な変更先:** [audit_log.rs](../src/audit_log.rs)、[launch.rs](../src/runtime/launch.rs)、[wait.rs](../src/runtime/wait.rs)、[main.rs](../src/main.rs)、[proxy.rs](../src/auditor/proxy.rs)、英日ガイドの監査スキーマ節。
+**主な変更先:** [audit_log.rs](../../src/audit_log.rs)、[launch.rs](../../src/runtime/launch.rs)、[wait.rs](../../src/runtime/wait.rs)、[main.rs](../../src/main.rs)、[proxy.rs](../../src/auditor/proxy.rs)、英日ガイドの監査スキーマ節。
 
 **タスク**
 
@@ -198,15 +198,15 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** サンドボックス省略・判定緩和・dry-run の実行を監査ログへ残し、「証拠が無い」状態を無くす。
 
-**主な変更先:** [main.rs](../src/main.rs)、[plan.rs](../src/commands/plan.rs)、[launch.rs](../src/runtime/launch.rs)、[fail_on.rs](../src/verifier/fail_on.rs)、[audit_log.rs](../src/audit_log.rs)。
+**主な変更先:** [main.rs](../../src/main.rs)、[plan.rs](../../src/commands/plan.rs)、[launch.rs](../../src/runtime/launch.rs)、[fail_on.rs](../../src/verifier/fail_on.rs)、[audit_log.rs](../../src/audit_log.rs)。
 
 **タスク**
 
 - [x] `MCP_WRIT_SKIP_SANDBOX` 検出時に `guard.started` details または新規 `config.override` イベントへ `sandbox=skipped via MCP_WRIT_SKIP_SANDBOX` を必ず記録する。stderr 警告は維持する。
 - [x] `FAIL_ON=none` を起動時に記録する — `policy.loaded` details に `fail_on` 値を含める方式が候補（PR-01 の details 設計と整合）。finding 0 件でも痕跡が残ること。
-- [x] `--dry-run` を `guard.started` details の `dry_run=true`、または全イベントへの伝播で記録する。`LaunchReport.dry_run`（[launch.rs](../src/runtime/launch.rs) 既存）との対応を取る。
+- [x] `--dry-run` を `guard.started` details の `dry_run=true`、または全イベントへの伝播で記録する。`LaunchReport.dry_run`（[launch.rs](../../src/runtime/launch.rs) 既存）との対応を取る。
 - [x] `allow_degraded` による部分適用や `MCP_WRIT_PROBE_LANDLOCK_ABI` 等の診断用環境変数も、実実行に影響するものは同じ基準で記録対象とするか判断する。判断: `sandbox allow_degraded=#true` は許容した弱化なので `policy.loaded` の `allow_degraded=true` と `server.connected` の `os.*=<state>` トークン（`partially_applied`/`not_applied`/`failed`）で記録する。`MCP_WRIT_PROBE_LANDLOCK_ABI` はプローブ応答のため `main` 先頭で即終了し起動・監査経路へ一切到達しない（実行を弱める経路ではない）ため監査対象外とする。
-- [x] `plan` サブコマンドのチェック出力（[plan.rs](../src/commands/plan.rs) の SKIP_SANDBOX 警告等）と監査記録の対応を揃える。`env.fail_on` チェックを追加し、`run` が `policy.loaded` に記録する解決済みダイヤルと同じ値を plan 側でも診断する。
+- [x] `plan` サブコマンドのチェック出力（[plan.rs](../../src/commands/plan.rs) の SKIP_SANDBOX 警告等）と監査記録の対応を揃える。`env.fail_on` チェックを追加し、`run` が `policy.loaded` に記録する解決済みダイヤルと同じ値を plan 側でも診断する。
 
 **検証:** T-BASE、T-NATIVE。SKIP_SANDBOX 設定下・FAIL_ON=none・dry-run の各起動で JSONL に証拠が残ることを fixture で確認する。
 
@@ -222,7 +222,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 起動時点の実効制御状態を JSONL に残し、`--report` と監査で同じ事実を読めるようにする。
 
-**主な変更先:** [launch.rs](../src/runtime/launch.rs)（`server.connected` emit 箇所）、[enforcement.rs](../src/enforcement.rs)、[windows_psec.rs](../src/warden/windows_psec.rs)、[plan 配下](../src/warden/plan/mod.rs)、英日ガイドの監査スキーマ節。
+**主な変更先:** [launch.rs](../../src/runtime/launch.rs)（`server.connected` emit 箇所）、[enforcement.rs](../../src/enforcement.rs)、[windows_psec.rs](../../src/warden/windows_psec.rs)、[plan 配下](../../src/warden/plan/mod.rs)、英日ガイドの監査スキーマ節。
 
 **タスク**
 
@@ -245,15 +245,15 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 強制終了時の末尾欠損を小さくし、残った損失の大きさを監査側が知れる形にする。
 
-**主な変更先:** [audit_log.rs](../src/audit_log.rs)、[cli](../src/cli)、[main.rs](../src/main.rs)、英日ガイド。
+**主な変更先:** [audit_log.rs](../../src/audit_log.rs)、[cli](../../src/cli)、[main.rs](../../src/main.rs)、英日ガイド。
 
 **タスク**
 
-- [x] High 以上の severity でも即時 flush+fsync する（現行は Critical のみ即時 flush — [audit_log.rs](../src/audit_log.rs) の writer task）。性能影響を計測し、判定閾値を設定可能にするか決める。 → `IMMEDIATE_SYNC_SEVERITY`（High 固定・非設定化 — 弱化できない契約として明示）で即時 flush+fsync。性能影響は `audit_durability_e2e` の drain 計測で両モードを比較できる形にした。
+- [x] High 以上の severity でも即時 flush+fsync する（現行は Critical のみ即時 flush — [audit_log.rs](../../src/audit_log.rs) の writer task）。性能影響を計測し、判定閾値を設定可能にするか決める。 → `IMMEDIATE_SYNC_SEVERITY`（High 固定・非設定化 — 弱化できない契約として明示）で即時 flush+fsync。性能影響は `audit_durability_e2e` の drain 計測で両モードを比較できる形にした。
 - [x] `--audit-sync`（仮）オプションで逐次 fsync する経路を追加する。性能との引き換えを明記する。 → `AuditSyncMode::EveryEvent` として実装（`--audit-sync`、`--audit-log` 必須、windows-sandbox では拒否）。引き換えは英日ガイドの「Audit durability, sync modes, and external forwarding」節に明記。
 - [x] `guard.stopped` details に `dropped` カウンタ（channel 満杯で捨てた件数、既存 `dropped` フィールド）と `writer_failed` を記録する。 → `dropped=<n>` / `writer_failed=<bool>` を常時記録。
 - [x] stdout audit モード（既存の `to_tracing` 経路との関係を整理）または tail → SIEM の外部転送の運用例をガイドに追加する。起動側が SIGKILL されても転送先が生きていれば末尾が残る構成を示す。 → tail → SIEM（別プロセス）例を英日ガイドに追加。stderr/tracing は耐久性契約を持たず fail-closed はファイルシンク必須、という整理も明記。
-- [x] バッファ条件（64KB BufWriter・1s/100件 flush・5s fsync — [audit_log.rs](../src/audit_log.rs) の定数）の現行値を明文化し、変更時の互換性方針を決める。 → 英日ガイドに明文化（定数は再調整可・順序保証は維持の方針）。SIGKILL 損失上限も bound として記述。
+- [x] バッファ条件（64KB BufWriter・1s/100件 flush・5s fsync — [audit_log.rs](../../src/audit_log.rs) の定数）の現行値を明文化し、変更時の互換性方針を決める。 → 英日ガイドに明文化（定数は再調整可・順序保証は維持の方針）。SIGKILL 損失上限も bound として記述。
 
 **検証:** T-BASE。SIGKILL 末尾欠損の計測（§5.4）— 親強制終了で失われるイベント数の実測値と、`--audit-sync` でのゼロ確認を fixture で行う（PR-08 で回帰固定）。
 
@@ -269,17 +269,17 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** ドメイン層（名前ポリシー）と IP 層（接続時強制）の 2 層を、ポリシー形式のレベルで分離・共存させる。
 
-**主な変更先:** [leaves.rs](../src/policy/kdl_parse/leaves.rs)（`parse_network_rules`）、[mod.rs](../src/policy/mod.rs)（`OutboundPolicy`/`ToolNetworkPolicy`）、[host.rs](../src/policy/host.rs)、[kdl_emit.rs](../src/policy/kdl_emit.rs)、[kdl_inherit](../src/policy/kdl_inherit)、[validator](../src/policy/validator.rs)、[policy_export.rs](../src/container/policy_export.rs)、[plan.rs](../src/commands/plan.rs)、英日ガイド・[policy.example.kdl](../policy.example.kdl)。
+**主な変更先:** [leaves.rs](../../src/policy/kdl_parse/leaves.rs)（`parse_network_rules`）、[mod.rs](../../src/policy/mod.rs)（`OutboundPolicy`/`ToolNetworkPolicy`）、[host.rs](../../src/policy/host.rs)、[kdl_emit.rs](../../src/policy/kdl_emit.rs)、[kdl_inherit](../../src/policy/kdl_inherit)、[validator](../../src/policy/validator.rs)、[policy_export.rs](../../src/container/policy_export.rs)、[plan.rs](../../src/commands/plan.rs)、英日ガイド・[policy.example.kdl](../../policy.example.kdl)。
 
 **タスク**
 
 - [x] `network` の `allow` に `cidr="…"` 属性を新設する。IPv4/IPv6 CIDR の受理・正規化・重複統合を定義し、`host` とは別フィールド（`OutboundPolicy` の新規フィールド、名称は担当PRで確定）に保持する。→ `allowed_cidrs`/`denied_cidrs`（`addr/prefix` 正規形、host ビット masked、IPv4-mapped fold、port 修飾は `allowed_*_port_qualified` に provenance 保持）
 - [x] `deny` 側の IP 層規則の要否を決める（`deny cidr` の追加か、`denied_hosts` の IP リテラル項を IP 層で評価するか）。→ 両方採用: `deny cidr=` 新設 + `denied_hosts` の IP リテラルは `ip_layer_denies()` で IP 層にも射影
-- [x] `denied_hosts` を両層で評価するモデルを確定する: 名前拒否は DNS ゲートで解決時点 fail、IP リテラルの拒否は接続時点 fail。Auditor 側の `denied_hosts` 引数検査（[checker.rs](../src/auditor/checker.rs)）は維持する。→ モデル確定済み（`OutboundPolicy` doc: "evaluated at both layers"）。DNS ゲート実装自体は PR-06
-- [x] port 修飾の扱いを確定する — メカニズム別 expressibility（PSEC は port 非表現として既に拒否、[validator/psec.rs](../src/policy/validator/psec.rs)）に落とし、暗黙の全ポート拡大をしない。`allowed_port_qualified` の既存の履歴管理と整合させる。→ `allowed_cidrs_port_qualified` も同契約、deny 側は parse 時拒否
+- [x] `denied_hosts` を両層で評価するモデルを確定する: 名前拒否は DNS ゲートで解決時点 fail、IP リテラルの拒否は接続時点 fail。Auditor 側の `denied_hosts` 引数検査（[checker.rs](../../src/auditor/checker.rs)）は維持する。→ モデル確定済み（`OutboundPolicy` doc: "evaluated at both layers"）。DNS ゲート実装自体は PR-06
+- [x] port 修飾の扱いを確定する — メカニズム別 expressibility（PSEC は port 非表現として既に拒否、[validator/psec.rs](../../src/policy/validator/psec.rs)）に落とし、暗黙の全ポート拡大をしない。`allowed_port_qualified` の既存の履歴管理と整合させる。→ `allowed_cidrs_port_qualified` も同契約、deny 側は parse 時拒否
 - [x] 継承・include・when・profile・`kdl_emit` 往復・ゲスト用 policy export で新フィールドを保持する。`policy version=2` の未知属性拒否に `cidr` を正規属性として登録する。→ overlay/when/profile 保持、`to_kdl` round-trip・guest export とも対応済み（v1/v2 共通の property 検査に `cidr` 登録 — 旧バイナリは unknown property として load error で落とすため silent drop にならない）
 - [x] `mcp-writ plan` 出力に「host 規則（名前層）と CIDR 規則（IP 層）の対応表」を含める — どの機構がどちらの層を担うか、ホストエントリが IP 層に届かない OS での表示を決める。→ `plan.egress_layers`（rules 対応表 + 層別 disposition、sandbox-skip/guest 変種あり、additive `null`/object）
-- [x] IP リテラル宛の `allow host=` 指定が IP 層の静的規則としても効くかの挙動を定義する（現行 `analyze_policy_host` は IP を正規化する — [host.rs](../src/policy/host.rs)）。→ リテラルは `/32`/`/128` 静的規則として IP 層に射影（`ip_layer_allows()`）— name 層エントリと併存
+- [x] IP リテラル宛の `allow host=` 指定が IP 層の静的規則としても効くかの挙動を定義する（現行 `analyze_policy_host` は IP を正規化する — [host.rs](../../src/policy/host.rs)）。→ リテラルは `/32`/`/128` 静的規則として IP 層に射影（`ip_layer_allows()`）— name 層エントリと併存
 
 **検証:** T-BASE、T-POLICY、T-LAYER（新フィールドの層位置）。継承・export・再出力での保存、未知/不正 CIDR の拒否、PSEC 経路での表現不能拒否を単体試験で確認する。
 
@@ -300,7 +300,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 **タスク**
 
 - [x] UDP/TCP の DNS リゾルバーを実装する。上流リゾルバへの転送はクエリを中継する形とし、通信の中身（応答ペイロードの意味解釈）はしない — 宛先制御の範囲に留める。→ `src/dnsgate/`（`wire` 最小コーデック / `upstream` UDP→TCP 中継 / `server` UDP+TCP リスナ）。応答から読むのは CNAME チェーン・A/AAAA・TTL の制御面のみで、応答本体は verbatim 中継
-- [x] クエリ名を [host.rs](../src/policy/host.rs) の UTS-46 正規化（`normalize_policy_host`、`idna` crate 導入済み）に通してから名前ポリシー（`allowed`/`denied_hosts`、ワイルドカードは `host_matches` 相当）を評価する。Unicode 変種（全角ドット等）による拒否回避は既対策を再利用する。→ `name_policy::evaluate` が `normalize_policy_host`+`canonicalize_policy_host` 経由で判定。`host_matches` は `policy::host` へ共有化し Auditor は委譲 — 同一意味論。IP リテラルのクエリ名は `cidr` 規則にも照合
+- [x] クエリ名を [host.rs](../../src/policy/host.rs) の UTS-46 正規化（`normalize_policy_host`、`idna` crate 導入済み）に通してから名前ポリシー（`allowed`/`denied_hosts`、ワイルドカードは `host_matches` 相当）を評価する。Unicode 変種（全角ドット等）による拒否回避は既対策を再利用する。→ `name_policy::evaluate` が `normalize_policy_host`+`canonicalize_policy_host` 経由で判定。`host_matches` は `policy::host` へ共有化し Auditor は委譲 — 同一意味論。IP リテラルのクエリ名は `cidr` 規則にも照合
 - [x] 拒否名は NXDOMAIN/REFUSED を返し、`sandbox.network_denied` を `name`/`qtype`/`session_id` 付きで emit する — 解決時点で止まった流出が監査に乗る（§1.6 名前層の最初の実装）。→ `--refuse-rcode nxdomain|refused` で選択。`details` に `layer=name`/`name`/`qtype`/`decision`/`rule`/`rcode`/`client`/`session_id`。fail-closed 時は応答前に `log_committed` で耐久化
 - [x] CNAME は最終名まで追跡するが、allow/deny の評価はクエリ名のみに対称適用する（§1.2 の根拠 — チェーンはワークロードが制御しない）。応答のチェーン全体は監査 details に記録し、観測はするが強制はしない。→ `wire::parse_response` が深さ16・ループ検出付きで追跡し `chain=a>b>c`/`chain_truncated` を記録。許可側には `sandbox.network_resolved` を新設
 - [x] 応答 IP を TTL スコープ（チェーン最小 TTL）で IP 層の動的 allowlist に登録するインターフェースを定義する — PR-07 の supervisor / PR-09 のプロキシが読む共有表。TTL 失効・再上書き・同一 IP の複数名共有を扱う。→ `DynamicAllowList`（`register`/`is_allowed`/`names_for`/`live_len` + `snapshot_json`/`export_to` の JSON スナップショット契約 `{"schema_version","generated_at_unix_secs","entries":[{name,addr,expires_at_unix_secs}]}`。`--allowlist-export` でバッチごとに原子書き出し。grant はクエリ名に紐付き、TTL はチェーン最小
@@ -322,11 +322,11 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** `connect()` 時点で宛先 IP を検査し、静的 CIDR と DNS ゲートの動的許可の両方で判定する。
 
-**主な変更先:** [seccomp_impl.rs](../src/warden/seccomp_impl.rs)、[linux_spawn.rs](../src/warden/linux_spawn.rs)、[child.rs](../src/warden/child.rs)、新規 supervisor モジュール（`src/warden/` 配下を候補）、`docs/validation/` の新規検証文書。
+**主な変更先:** [seccomp_impl.rs](../../src/warden/seccomp_impl.rs)、[linux_spawn.rs](../../src/warden/linux_spawn.rs)、[child.rs](../../src/warden/child.rs)、新規 supervisor モジュール（`src/warden/` 配下を候補）、`docs/validation/` の新規検証文書。
 
 **タスク**
 
-- [x] `SECCOMP_USER_NOTIF`（`SECCOMP_FILTER_FLAG_NEW_LISTENER`）で `connect` を通知対象にするフィルタを追加し、リスナ fd を supervisor 側へ渡す経路を作る — 現行の pre_exec 自己適用モデル（[linux_spawn.rs](../src/warden/linux_spawn.rs) の `no_new_privs → Landlock → seccomp`）と supervisor 常駐モデルの共存形を決める。→ `warden::unotify` 新設 + opt-in サブコマンド `unotify-run`。共存形: 子の pre_exec で `Landlock` 後・ポリシー seccomp 前に通知フィルタを装着（`stage::UNOTIFY`）し、SCM_RIGHTS の Unix socketpair でリスナ fd を親へ handoff — supervisor は `unotify-run` プロセス内に常駐し、子の存続中 `NOTIF_RECV`/`NOTIF_SEND` を回す
+- [x] `SECCOMP_USER_NOTIF`（`SECCOMP_FILTER_FLAG_NEW_LISTENER`）で `connect` を通知対象にするフィルタを追加し、リスナ fd を supervisor 側へ渡す経路を作る — 現行の pre_exec 自己適用モデル（[linux_spawn.rs](../../src/warden/linux_spawn.rs) の `no_new_privs → Landlock → seccomp`）と supervisor 常駐モデルの共存形を決める。→ `warden::unotify` 新設 + opt-in サブコマンド `unotify-run`。共存形: 子の pre_exec で `Landlock` 後・ポリシー seccomp 前に通知フィルタを装着（`stage::UNOTIFY`）し、SCM_RIGHTS の Unix socketpair でリスナ fd を親へ handoff — supervisor は `unotify-run` プロセス内に常駐し、子の存続中 `NOTIF_RECV`/`NOTIF_SEND` を回す
 - [x] supervisor は子の `sockaddr` を `process_vm_readv`/`/proc/pid/mem` で読み、静的 CIDR 規則と動的 allowlist（PR-06 の TTL スコープ表）に照合する。「引数検査〜実使用の隙間」（読み取り後に子が sockaddr を書き換えうる）を限界として記録する。→ `process_vm_readv` で `AF_INET`/`AF_INET6` を復号（v4-mapped は正規化）。評価は `OutboundPolicy::ip_layer_allows/denies` の静的射影 + `--allowlist` スナップショットの live grant（TTL は接続ごとに再評価、陳腐ファイルは空集合 fail-closed）。TOCTOU は `LIMITATIONS` と検証文書に明記（後のセキュリティスキャン対応で、許可 connect は `pidfd_getfd` で複製したソケット fd に pin 済み sockaddr で `connect(2)` を代行するエミュレーションへ置換 — CONTINUE は非 INET/未知 syscall のみに限定され、検査後の書き換えはカーネルへ届かなくなった）
 - [x] 許可側は `SECCOMP_USER_NOTIF_FLAG_CONTINUE`（kernel 5.5+）でオーバーヘッドを抑える。カーネル未対応時は起動前診断で拒否する。→ 起動時に `SECCOMP_GET_NOTIF_SIZES` + 実際の fork→通知→`CONTINUE` ラウンドトリップで検査し、未対応は exit 2 で拒否（`allow_degraded` で緩めない）
 - [x] 拒否時は `sandbox.network_denied` を `dest`/`port`/`proto`/`session_id` で emit する — IP 層 emit 経路の最初の実装。→ `details` に `layer=ip`/`proto`（`pidfd_getfd`+`SO_TYPE`、失敗時 `unknown`）/`dest`/`port`/`pid`/`decision`/`rule`/`session_id`。fail-closed 監査では応答前に `log_committed`、シンク死亡時は許可判定も拒否化し子を kill
@@ -350,17 +350,17 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 「拒否された通信が監査に残る」ことをエンドツーエンドで固定し、観測できない経路を仕様として区別する。
 
-**主な変更先:** 新規 `tests/` ターゲット、[test-matrix.md](test-matrix.md)、[development.md](development.md)、英日ガイド。
+**主な変更先:** 新規 `tests/` ターゲット、[test-matrix.md](../test-matrix.md)、[development.md](../development.md)、英日ガイド。
 
 **タスク**
 
 - [x] シナリオ A（注入 → 拒否 → JSONL 確認）を e2e 化する — RPC 層の拒否が `tool_call.denied`/`mcp_message.denied` として残る経路を fixture で固定する。→ `tests/denial_audit_e2e.rs::scenario_a_denied_rpc_requests_are_audited` — `scripted_stdio` fixture 上の実 `run` で、ポリシー未収載の `tools/call exec_shell` が `tool_call.denied`（`request_id`/`severity=high`/`action=denied`）、`mcp` 規則の無い `resources/read` が `mcp_message.denied`（`reason=no-rule`/`forwarded=false`）としてクライアントへの拒否応答と共に残ることを固定。`guard.started`/`stopped` のライフサイクルブラケットも検証。RPC 層の計測であり `MCP_WRIT_SKIP_SANDBOX` 経路である点は検証文書に明記
-- [x] シナリオ B（443 直出し）を再現し、PR-07 の IP 層で拒否されること・拒否イベントが残ることを回帰テストにする。→ `scenario_b_direct_443_egress_denied_and_audited`（Linux のみ）— 実 `unotify-run`＋`connect_probe` fixture で `192.0.2.1:443`（TEST-NET-1）への connect が supervisor 拒否（EACCES/exit 10）し、`sandbox.network_denied` `layer=ip`/`dest`/`port`/`decision=deny-cidr` が JSONL に残ることを固定。`check_support` 非対応ホストは `MCP_WRIT_REQUIRE_E2E_TESTS` 経路の skip。初実測で unotify の潜伏不具合 3 件（probe の引数違い・`NOTIF_ID_VALID` の値渡し・POLLHUP race）を発見・修正し、bare-port 正規化の未修正不具合は PR-09 へ繰越 — [denial-audit.md](validation/denial-audit.md)「Latent defects」
+- [x] シナリオ B（443 直出し）を再現し、PR-07 の IP 層で拒否されること・拒否イベントが残ることを回帰テストにする。→ `scenario_b_direct_443_egress_denied_and_audited`（Linux のみ）— 実 `unotify-run`＋`connect_probe` fixture で `192.0.2.1:443`（TEST-NET-1）への connect が supervisor 拒否（EACCES/exit 10）し、`sandbox.network_denied` `layer=ip`/`dest`/`port`/`decision=deny-cidr` が JSONL に残ることを固定。`check_support` 非対応ホストは `MCP_WRIT_REQUIRE_E2E_TESTS` 経路の skip。初実測で unotify の潜伏不具合 3 件（probe の引数違い・`NOTIF_ID_VALID` の値渡し・POLLHUP race）を発見・修正し、bare-port 正規化の未修正不具合は PR-09 へ繰越 — [denial-audit.md](../validation/denial-audit.md)「Latent defects」
 - [x] 名前拒否（PR-06）→ NXDOMAIN/REFUSED + `sandbox.network_denied` の e2e。→ `dns_gate_denied_names_are_refused_and_audited` — 実 `dns-gate` バイナリを既定（REFUSED）と `--refuse-rcode nxdomain`（NXDOMAIN）の 2 脚で起動し、`deny host=`・未許可名それぞれで `sandbox.network_denied` `layer=name`（`decision=deny-host`/`not-allowed`・`rcode`）を検証。許可名の `sandbox.network_resolved` を対として確認し、`--audit-sync`＋`log_committed` で拒否レコードの応答前耐久化も固定
-- [x] SIGKILL 末尾欠損の計測（PR-04 のバッファ改善の効果測定）を実装し、失われうる範囲を数値で記録する。→ 計測器は `tests/audit_durability_e2e.rs`（PR-04 で実装）、PR-08 で再実行して [denial-audit.md](validation/denial-audit.md) に数値記録 — 参照ホスト（WSL2 kernel 6.18.40.1・debug）で buffered は 53 emit/3 生存/`lost_info=50`（`high`+ は全件即時 fsync で生存）、`--audit-sync` は 54/54・損失 0、drain は buffered 13ms vs sync 167ms。単一ホストの計測値で契約は順序保証のみ — `MEASURE` 行で毎回再記録
+- [x] SIGKILL 末尾欠損の計測（PR-04 のバッファ改善の効果測定）を実装し、失われうる範囲を数値で記録する。→ 計測器は `tests/audit_durability_e2e.rs`（PR-04 で実装）、PR-08 で再実行して [denial-audit.md](../validation/denial-audit.md) に数値記録 — 参照ホスト（WSL2 kernel 6.18.40.1・debug）で buffered は 53 emit/3 生存/`lost_info=50`（`high`+ は全件即時 fsync で生存）、`--audit-sync` は 54/54・損失 0、drain は buffered 13ms vs sync 167ms。単一ホストの計測値で契約は順序保証のみ — `MEASURE` 行で毎回再記録
 - [x] PSEC 状態の JSONL emit（PR-03）の e2e を Windows で実施する。→ `winiso_live_product_run`（tests/windows_isolation_e2e.rs）に `assert_audit_enforcement` を実装 — `server.connected` の `enforcement.backend` が要求 mechanism と一致、PSEC 起動で `psec.schema_version="1.0"`＋egress 状態、AppContainer 起動で `psec` が null、拒否された PSEC 起動が `appcontainer` を名乗る `server.connected` を残さないことを検証。**Windows 実機実行は未実施** — windows-msvc ターゲットへのコンパイル確認まで。denial-audit.md に `not run` と記録し、実行は windows-isolation ジョブ（`MCP_WRIT_REQUIRE_WINISO_TESTS`）の責務として merge コミットでの再記録を残す
 - [x] Landlock 単独経路の FS/ネットワーク拒否が監査に残らないことを「観測不能」として試験と文書に固定する — emit されないことを検知するテストではなく、「残らないことが仕様」であることを表明するテストにする。→ `landlock_fs_denial_is_unobservable_by_spec`/`seccomp_connect_denial_is_unobservable_by_spec`＋`tests/fixtures/denial_audit/kernel_deny_probe.rs` — プローブ自身の EACCES/EPERM 報告（KDP stderr マーカー＋exit 10）が「拒否は起きた」証人、`enforcement.backend=landlock+seccomp` が拒否主体の証拠、`sandbox.*_denied` 不在は仕様の表明として検査する構成。プローブ未実行時は unavailable 報告で pass-by-absence にしない。ガイド英日の監査節に「Regression coverage」を追加
-- [x] 新規試験を [test-matrix.md](test-matrix.md) の担当一覧と手動ワークフローへ登録する。→ `denial_audit_e2e` 行を追加（脚別内容・要件・証拠リンク）し `MCP_WRIT_REQUIRE_E2E_TESTS` の対象一覧へ追記。CI/Platform tests/Linux tests ワークフローへ `--test denial_audit_e2e` を登録、development.md に実行手順と脚の説明を追加。PSEC JSONL 脚は `windows_isolation_e2e` 行を更新し windows-isolation ジョブの責務として登録
+- [x] 新規試験を [test-matrix.md](../test-matrix.md) の担当一覧と手動ワークフローへ登録する。→ `denial_audit_e2e` 行を追加（脚別内容・要件・証拠リンク）し `MCP_WRIT_REQUIRE_E2E_TESTS` の対象一覧へ追記。CI/Platform tests/Linux tests ワークフローへ `--test denial_audit_e2e` を登録、development.md に実行手順と脚の説明を追加。PSEC JSONL 脚は `windows_isolation_e2e` 行を更新し windows-isolation ジョブの責務として登録
 
 **検証:** 上記シナリオが全て実行され、成功・拒否・環境未確保が区別されて記録される。
 
@@ -377,14 +377,14 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 **到達条件 — 全て満たしたらバージョンを上げる**
 
 - [x] PR-01〜08 が全てマージ済み — `main` で merge #52〜#59（`2ba1c6d`〜`753a492`）を確認（2026-10-10）
-- [x] §5.4 の検証記録（シナリオ A/B・PSEC JSONL・SIGKILL 計測）が残っている — [denial-audit.md](validation/denial-audit.md) に記録。**ただし** PSEC JSONL 脚は Windows 実機未実施の `not run` 記録であり、`windows-isolation` ジョブが merge コミットで再記録する責務が残る — タグ前に実施するか「記録済みの限界」として受理するかはリリース判断
-- [x] 「観測不能」の残存経路が仕様として文書化されている — `sandbox.file_denied`/`sandbox.process_denied` の予約済み仕様（英日ガイド監査節）、[denial-audit.md](validation/denial-audit.md) の kernel-internal 節、`denial_audit_e2e` の仕様表明脚で固定
+- [x] §5.4 の検証記録（シナリオ A/B・PSEC JSONL・SIGKILL 計測）が残っている — [denial-audit.md](../validation/denial-audit.md) に記録。**ただし** PSEC JSONL 脚は Windows 実機未実施の `not run` 記録であり、`windows-isolation` ジョブが merge コミットで再記録する責務が残る — タグ前に実施するか「記録済みの限界」として受理するかはリリース判断
+- [x] 「観測不能」の残存経路が仕様として文書化されている — `sandbox.file_denied`/`sandbox.process_denied` の予約済み仕様（英日ガイド監査節）、[denial-audit.md](../validation/denial-audit.md) の kernel-internal 節、`denial_audit_e2e` の仕様表明脚で固定
 
 **バージョン更新の手順**
 
-- [x] [Cargo.toml](../Cargo.toml) の `version` を `0.3.0` に更新し、`Cargo.lock` を再生成する — 作業ツリーに反映済み・未コミット。`--locked` ビルドで lock 整合を確認
+- [x] [Cargo.toml](../../Cargo.toml) の `version` を `0.3.0` に更新し、`Cargo.lock` を再生成する — 作業ツリーに反映済み・未コミット。`--locked` ビルドで lock 整合を確認
 - [x] 最新コミットで T-BASE・T-DOC・該当する実機記録を再確認する — merge コミット＋バージョン更新のツリーで T-BASE/T-DOC を実施（2026-10-10・WSL2 kernel 6.18.40.1・x86-64・rustc 1.99.0）: fmt / clippy `-D warnings` / lib+bins 1954 件 / doc / doc-test 0 件 / docs_check 12 件 全 pass。`cargo doc` に private-item link の警告 7 件（既存）。`cargo package --locked --list` で同梱物確認（478 件、`.local/`・`target/`・監査ログの混入なし）。実機記録: denial-audit.md は当該ホストで 2026-10-09 実測済み、PSEC JSONL 脚の Windows 再記録は未実施。OS 固有コードの T-BASE は platform-tests 等の当該 OS ワークフローの責務
-- [x] タグ `v0.3.0` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](releasing.md) 手順 2）
+- [x] タグ `v0.3.0` を付ける — タグ push が [release.yml](../../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](../releasing.md) 手順 2）
 - [x] リリースノートに「この版で保証する制御」と「残る限界」（§1.7・§5.2 の対応状況）を明記する — 下書きはセッション出力を参照
 
 <a id="pr-09"></a>
@@ -399,8 +399,8 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **タスク**
 
-- [x] 先に能力検査を実装する。一般ユーザー・ホスト側の追加 capability なしで userns/netns/mountns 作成、TUN 作成・FD 引き渡し、経路設定、私有 mount が可能かを実操作で確認する。作成禁止、TUN 不在・アクセス拒否、カーネル機能不足を区別して報告し、失敗したプローブの資源を回収する。→ `namespaced::probe`（tokio 起動前 dispatch の `namespaced-probe` re-exec）が実操作で unshare/idmap/tun/loopback/route を stage 別に報告し、init handshake の `ERR <stage>`（`unshare`/`idmap`/`tun`/`net`/`pidns-fork`/`proc-mount`/`sandbox`/`exec`）も区別する。実機確認: [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) の capability gate
-- [x] プロトコル（TCP/UDP）・宛先ポート・必須の実通信制御を表すスキーマを定義し、要求能力と backend 能力の照合を実装する。旧規則を暗黙に UDP 許可へ広げず、未表現の規則は起動前に拒否する。load/validate/継承/生成/export/emit と全 backend の対応をそろえる。PR-08 の bare-port 正規化不具合（[denial-audit.md](validation/denial-audit.md)）も解消し、数値 `host` とポートを混同しない。→ `EgressRule`/`EgressProto`/`EgressDest` で `proto=`/`port=` qualifier を保持し、parse（`kdl_parse`）→ emit（`kdl_emit`）→ memfd 再 parse の往復が成立（scoped `allow host="*"` は posture を汚染しない）。表現不能な backend（PSEC）は qualifier を拒否して widen しない。bare-port は `host::bare_port_spelling` で `allow host="443"`→port 規則に解消済み（deny の proto/port 修飾・all-digits host は parse 拒否で fail-closed）
+- [x] 先に能力検査を実装する。一般ユーザー・ホスト側の追加 capability なしで userns/netns/mountns 作成、TUN 作成・FD 引き渡し、経路設定、私有 mount が可能かを実操作で確認する。作成禁止、TUN 不在・アクセス拒否、カーネル機能不足を区別して報告し、失敗したプローブの資源を回収する。→ `namespaced::probe`（tokio 起動前 dispatch の `namespaced-probe` re-exec）が実操作で unshare/idmap/tun/loopback/route を stage 別に報告し、init handshake の `ERR <stage>`（`unshare`/`idmap`/`tun`/`net`/`pidns-fork`/`proc-mount`/`sandbox`/`exec`）も区別する。実機確認: [linux-namespaced-proxy.md](../validation/linux-namespaced-proxy.md) の capability gate
+- [x] プロトコル（TCP/UDP）・宛先ポート・必須の実通信制御を表すスキーマを定義し、要求能力と backend 能力の照合を実装する。旧規則を暗黙に UDP 許可へ広げず、未表現の規則は起動前に拒否する。load/validate/継承/生成/export/emit と全 backend の対応をそろえる。PR-08 の bare-port 正規化不具合（[denial-audit.md](../validation/denial-audit.md)）も解消し、数値 `host` とポートを混同しない。→ `EgressRule`/`EgressProto`/`EgressDest` で `proto=`/`port=` qualifier を保持し、parse（`kdl_parse`）→ emit（`kdl_emit`）→ memfd 再 parse の往復が成立（scoped `allow host="*"` は posture を汚染しない）。表現不能な backend（PSEC）は qualifier を拒否して widen しない。bare-port は `host::bare_port_spelling` で `allow host="443"`→port 規則に解消済み（deny の proto/port 修飾・all-digits host は parse 拒否で fail-closed）
 - [x] userns+netns+mountns で子を分離し、信頼する起動処理だけが初期設定を行う。不要な capability とその再取得経路を閉じ、`no_new_privs` を設定してから MCP サーバーを exec する。子・孫にも隔離を継承させる。→ `namespaced::init` — `CLONE_NEWUSER|NEWNET|NEWNS|NEWPID` を1 `unshare`、init 親が `/proc/<pid>/{setgroups,uid_map,gid_map}` を書込（WSL2 で唯一の非特権経路）、pidns init＋`/proc` 再 mount、`no_new_privs`→Landlock→seccomp→exec、3段 `PR_SET_PDEATHSIG` カスケード。実機で `uid=0` in userns・`Pid: 1` を確認
 - [x] mountns 内で `resolv.conf` を自前 mount で差し替え、DNS をゲート（PR-06）経由に制限する。外向き経路の判定も併用し、ファイル差し替えだけで強制済みとしない。ゲート外のハードコードリゾルバは拒否し、許可済み宛先を使う DoH 等は §1.7 の限界として残す。→ 私有 `/run` tmpfs でホスト AF_UNIX を遮蔽後、解決先が `/run` 配下なら tmpfs 内へ再生成、それ以外は私有 `/tmp` tmpfs から bind-mount（memfd パスは mount EINVAL）。`nameserver 10.250.0.1`（GATEWAY）で埋め込みゲートを指し、生の外部リゾルバは port-53 intercept（UDP/TCP 両対応）が捕捉して bypass 不可。ホスト側ファイル不変・DoT/DoH 限界は limitations に記録
 - [x] netns 内の外向き IP 経路を TUN 経由に限定し、その FD をホスト側の非特権プロキシへ渡す。プロキシは判定済みの宛先だけに自身の socket で中継する。tun + smoltcp 相当の依存選定はこのPRで確定し、最小フットプリント・外部デーモン非依存を維持する。→ `stack.rs` — `/dev/net/tun` 一本化（`IFF_NO_PI`）＋ smoltcp DNAT splice、親保持の TUN fd が唯一の egress で proxy 死→fd close→fail-closed が構造的に成立。依存は `smoltcp` crate のみ・外部デーモンなし
@@ -436,11 +436,11 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 特権の使える環境で、IP 層をカーネル内強制＋deny イベント観測に寄せる。
 
-**主な変更先:** 新規 eBPF 経路（`src/warden/` 配下または新モジュール）、[seccomp_impl.rs](../src/warden/seccomp_impl.rs)・[linux_spawn.rs](../src/warden/linux_spawn.rs) との併用整理、英日ガイド。
+**主な変更先:** 新規 eBPF 経路（`src/warden/` 配下または新モジュール）、[seccomp_impl.rs](../../src/warden/seccomp_impl.rs)・[linux_spawn.rs](../../src/warden/linux_spawn.rs) との併用整理、英日ガイド。
 
 **タスク**
 
-- [x] cgroup eBPF で `BPF_CGROUP_INET4_CONNECT`/`INET6_CONNECT` をフックし、静的 CIDR＋動的 allowlist で判定する。crate 選定（aya 等）・BPF object の同梱形態をこのPRで確定する。→ 外部 crate なしの生 insn 生成＋`bpf(2)` 直接呼出しに確定（[src/warden/ebpf/](../src/warden/ebpf/mod.rs)）。静的規則は deny 優先の ARRAY map＋生成 straight-line プログラム、動的 grant は別 map＋TTL をカーネル側で評価。grant map の書き換えは dead-expiry フェーズ＋専用 seq マップの seqlock で囲まれ、torn read は判定を既定へ倒す（deny-all 下では拒否: fail-closed）
+- [x] cgroup eBPF で `BPF_CGROUP_INET4_CONNECT`/`INET6_CONNECT` をフックし、静的 CIDR＋動的 allowlist で判定する。crate 選定（aya 等）・BPF object の同梱形態をこのPRで確定する。→ 外部 crate なしの生 insn 生成＋`bpf(2)` 直接呼出しに確定（[src/warden/ebpf/](../../src/warden/ebpf/mod.rs)）。静的規則は deny 優先の ARRAY map＋生成 straight-line プログラム、動的 grant は別 map＋TTL をカーネル側で評価。grant map の書き換えは dead-expiry フェーズ＋専用 seq マップの seqlock で囲まれ、torn read は判定を既定へ倒す（deny-all 下では拒否: fail-closed）
 - [x] CAP_BPF/CAP_SYS_ADMIN 等の権限前提を起動前診断で検査し、不足時は opt-in 経路だけを拒否する — 既定経路を特権前提にしない（§1.3 表の評価を維持）。→ `check_support` が stage 名つきで拒否（`--report` では `state: "unsupported"`、exit 2）。`allow_degraded` は本チェックを覆さず、unotify/通常経路へのフォールバックもしない
 - [x] ring buffer 等で deny イベントを観測し、`sandbox.network_denied`（`dest`/`port`/`proto`）を emit する — カーネル内拒否でも観測可能な経路。→ `BPF_MAP_TYPE_RINGBUF`＋drain スレッドが commit 済み `sandbox.network_denied`（`layer=ip`・`decision`・`rule`・`session_id` 込み）を emit。ring 飽和は判定を弱めず `denied_dropped` で計数し、判定数そのものはカーネル側カウンタを drain 終了時に回収して `kernel_denied` として報告
 - [x] cgroup の割り当て・detach・後始末を実装し、他プロセスの cgroup を巻き込まない。→ 私有 cgroup（`/sys/fs/cgroup/mcp-writ-ebpf-<pid>-<nonce>`）を子の `pre_exec` で `cgroup.procs` へ書き込んで join。退避時は残存メンバーを先に kill（`cgroup.kill`、無ければ freeze＋pid sweep）してから detach＋rmdir — デーモン化した子孫が強制を残したまま残留しない
@@ -460,17 +460,17 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** `localhost:port` 許可だけが書ける SBPL の制約を、loopback 上の宛先判定プロキシでドメイン制御に変換する。
 
-**主な変更先:** [macos_sandbox.rs](../src/warden/macos_sandbox.rs)、新規プロキシコンポーネント（PR-09 の宛先判定コアと共有できるか検討）、英日ガイド。
+**主な変更先:** [macos_sandbox.rs](../../src/warden/macos_sandbox.rs)、新規プロキシコンポーネント（PR-09 の宛先判定コアと共有できるか検討）、英日ガイド。
 
 **タスク**
 
-- [x] `sandbox-exec` の `(allow network-outbound (remote tcp "localhost:port"))` でプロキシだけに出られる構成を作る。プロキシが CONNECT/宛先情報から名前・IP を判定して外向き dial する — 中身は見ない。→ `EgressProfile::ConnectProxy { proxy_port }`（[macos_sandbox.rs](../src/warden/macos_sandbox.rs)）が `remote tcp "localhost:<proxy_port>"` のみ許可し、プロセス内 `ConnectProxy`（[macos_proxy/proxy.rs](../src/warden/macos_proxy/proxy.rs)）が CONNECT authority を名前/IP 規則で判定してから dial — `200` 後はバイトを splice するだけで内容は見ない
-- [x] SBPL の `(remote ip "…")` で IP リテラル egress も試行し、使える範囲を実機で確かめる。→ macOS 26.6.2 で実測: `(remote ip)` と IP リテラルの `remote tcp` はプロファイルロード時に拒否（"host must be * or localhost"）。使えるのは `localhost` と `*` のみ — プロキシ経路が必須であることを裏付け、結果は [docs/validation/macos-connect-proxy.md](validation/macos-connect-proxy.md) に記録
+- [x] `sandbox-exec` の `(allow network-outbound (remote tcp "localhost:port"))` でプロキシだけに出られる構成を作る。プロキシが CONNECT/宛先情報から名前・IP を判定して外向き dial する — 中身は見ない。→ `EgressProfile::ConnectProxy { proxy_port }`（[macos_sandbox.rs](../../src/warden/macos_sandbox.rs)）が `remote tcp "localhost:<proxy_port>"` のみ許可し、プロセス内 `ConnectProxy`（[macos_proxy/proxy.rs](../../src/warden/macos_proxy/proxy.rs)）が CONNECT authority を名前/IP 規則で判定してから dial — `200` 後はバイトを splice するだけで内容は見ない
+- [x] SBPL の `(remote ip "…")` で IP リテラル egress も試行し、使える範囲を実機で確かめる。→ macOS 26.6.2 で実測: `(remote ip)` と IP リテラルの `remote tcp` はプロファイルロード時に拒否（"host must be * or localhost"）。使えるのは `localhost` と `*` のみ — プロキシ経路が必須であることを裏付け、結果は [docs/validation/macos-connect-proxy.md](../validation/macos-connect-proxy.md) に記録
 - [x] プロキシの listen・宛先判定・拒否時の `sandbox.network_denied` emit を実装する。macOS 側の拒否は SBPL が loopback 外を止める構成であり、「プロキシが宛先を判定した」ことが emit の根拠。→ `ConnectProxy` が判定・dial・emit を担い、判定コアは PR-09 と共有（`warden::flow_gate`/`warden::ip_eval` へ OS 非依存として移動）。拒否は commit 済み `sandbox.network_denied`（`layer=name|ip`）、成立フローは `sandbox.network_allowed`。カーネル側 SBPL 拒否は観測不能として文書化
 - [x] 強い境界が要る場合は Apple Container バックエンドの NAT/ホスト側にゲートを置く経路を guide に明記する（実装はそのバックエンド側の話として切り分ける）。→ 英日 guide §4.13 と `--report.limitations` に「プロキシはランチャー内の信頼コードであり、supervisor を信頼しない境界には Apple Container の VM/NAT 隔離が文書化された強い経路」と明記 — 実装は本 PR 範囲外
 - [x] deprecated API への投資はこの範囲に限定し、sandbox-exec 自体の拡張はしない。→ 変更は SBPL 生成の egress モード分岐と新規プロキシコンポーネントのみ。ネイティブ経路・プロファイル生成の他規則は無変更（既存テストで固定）
 
-**検証:** 実 macOS でプロキシ経由の egress 制御と拒否 emit を確認。ネイティブ経路（sandbox-exec 単体）の既存挙動に回帰が無いこと。→ `macos_proxy_e2e` 15/15（macOS 26.6.2 arm64、シリアルおよび通常の並列実行）: CONNECT 許可経路 splice＋`network_allowed`、`deny cidr=`→403＋`network_denied layer=ip`、`deny host=`→`layer=name`、SSRF 保護宛先拒否、407、workload 直接/loopback egress カーネル拒否、UDP＋サンドボックス内 `getaddrinfo` 拒否、pipelined バイト中継、oversized head→431、`--listen` ポート報告、名前解決失敗の `decision=resolve-error` レコード、名許可後に拒否されたフローが `network_allowed` を残さないこと（同イベントは「確立」のみ）、WHATWG 数値 authority が畳み込み先 IP リテラルとして判定されること、SIGTERM がサンドボックス内 workload まで転送されること、ネイティブ `run` 非回帰。レビュー後の強化（移行スキーム宛先正規化、grant 容量拒否の可観測化、`proxy_stats.active` 出力、シグナルハンドラの spawn 前登録＋転送後の境界付き猶予）に加え、2回目レビュー指摘の是正 — `sandbox.network_allowed` をフロー確立後の記録点のみに限定（名層 Allow 時点の早期 emit を除去、成立しないフローが許可として記録される不具合）・名前解決を `{canonical}.` の絶対問い合わせに変更（ホストリゾルバの検索ドメインがポリシー未判定の別名を展開する経路を閉塞、IP リテラルへ畳まれた名は問い合わせせずリテラルとして判定）— も同ツリーで実施済み。シグナルテストの flake 解消: `proxy_sigterm_reaches_the_sandboxed_workload` が高並列負荷時に稀に `GOT_TERM` エコーを欠く件を調査した結果、supervisor の転送は常に正しく（`sleep` の SIGTERM 死と `kill(-pgid)` 成功を計測で確認）、原因はテスト側の `sh` workload — `wait` 中の子が同じグループシグナルで死ぬ局面では `sh` の TERM trap dispatch が保証されず、pending trap が EOF 経路で捨てられる（`sh` が exit 0 で echo なし）か無期限に遅延される（5 秒猶予を超えて SIGKILL まで生存）シェルセマンティクスの競合だった。workload を単一プロセスの Rust コンパイル fixture（`tests/fixtures/macos_proxy/sigterm_probe.rs` — `open_path_server.rs` と同じテスト時 `rustc -O` 方式、SIGTERM ハンドラが `write(2)` で `GOT_TERM` を出力）に差し替えて決定論的にした — 変更後の並列スイート 9 連続 15/15・直接再現ハーネス 90/90。証拠: [docs/validation/macos-connect-proxy.md](validation/macos-connect-proxy.md)
+**検証:** 実 macOS でプロキシ経由の egress 制御と拒否 emit を確認。ネイティブ経路（sandbox-exec 単体）の既存挙動に回帰が無いこと。→ `macos_proxy_e2e` 15/15（macOS 26.6.2 arm64、シリアルおよび通常の並列実行）: CONNECT 許可経路 splice＋`network_allowed`、`deny cidr=`→403＋`network_denied layer=ip`、`deny host=`→`layer=name`、SSRF 保護宛先拒否、407、workload 直接/loopback egress カーネル拒否、UDP＋サンドボックス内 `getaddrinfo` 拒否、pipelined バイト中継、oversized head→431、`--listen` ポート報告、名前解決失敗の `decision=resolve-error` レコード、名許可後に拒否されたフローが `network_allowed` を残さないこと（同イベントは「確立」のみ）、WHATWG 数値 authority が畳み込み先 IP リテラルとして判定されること、SIGTERM がサンドボックス内 workload まで転送されること、ネイティブ `run` 非回帰。レビュー後の強化（移行スキーム宛先正規化、grant 容量拒否の可観測化、`proxy_stats.active` 出力、シグナルハンドラの spawn 前登録＋転送後の境界付き猶予）に加え、2回目レビュー指摘の是正 — `sandbox.network_allowed` をフロー確立後の記録点のみに限定（名層 Allow 時点の早期 emit を除去、成立しないフローが許可として記録される不具合）・名前解決を `{canonical}.` の絶対問い合わせに変更（ホストリゾルバの検索ドメインがポリシー未判定の別名を展開する経路を閉塞、IP リテラルへ畳まれた名は問い合わせせずリテラルとして判定）— も同ツリーで実施済み。シグナルテストの flake 解消: `proxy_sigterm_reaches_the_sandboxed_workload` が高並列負荷時に稀に `GOT_TERM` エコーを欠く件を調査した結果、supervisor の転送は常に正しく（`sleep` の SIGTERM 死と `kill(-pgid)` 成功を計測で確認）、原因はテスト側の `sh` workload — `wait` 中の子が同じグループシグナルで死ぬ局面では `sh` の TERM trap dispatch が保証されず、pending trap が EOF 経路で捨てられる（`sh` が exit 0 で echo なし）か無期限に遅延される（5 秒猶予を超えて SIGKILL まで生存）シェルセマンティクスの競合だった。workload を単一プロセスの Rust コンパイル fixture（`tests/fixtures/macos_proxy/sigterm_probe.rs` — `open_path_server.rs` と同じテスト時 `rustc -O` 方式、SIGTERM ハンドラが `write(2)` で `GOT_TERM` を出力）に差し替えて決定論的にした — 変更後の並列スイート 9 連続 15/15・直接再現ハーネス 90/90。証拠: [docs/validation/macos-connect-proxy.md](../validation/macos-connect-proxy.md)
 
 **完了条件:** ネイティブ経路でも loopback プロキシ経由なら宛先制御が効き、制限（deprecated API・プロキシ信頼性）は文書化される。
 
@@ -484,7 +484,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 唯一の宛先 egress 実装である PSEC を、実測に基づいて既定化の可否まで進める。
 
-**主な変更先:** [windows_psec.rs](../src/warden/windows_psec.rs)、[psec_spec.rs](../src/warden/psec_spec.rs)、[validator/psec.rs](../src/policy/validator/psec.rs)、[cli](../src/cli)、英日ガイド。
+**主な変更先:** [windows_psec.rs](../../src/warden/windows_psec.rs)、[psec_spec.rs](../../src/warden/psec_spec.rs)、[validator/psec.rs](../../src/policy/validator/psec.rs)、[cli](../../src/cli)、英日ガイド。
 
 **タスク**
 
@@ -509,12 +509,12 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 「何がどの OS で効くか」を EnforcementPlan のデータから機械可読に出し、文書との乖離を CI で検出する。
 
-**主な変更先:** [enforcement.rs](../src/enforcement.rs)、[capability.rs](../src/enforcement/capability.rs)、[test-matrix.md](test-matrix.md)、英日 [guide.md](guide.md)、[README.md](../README.md)、CI 検査。
+**主な変更先:** [enforcement.rs](../../src/enforcement.rs)、[capability.rs](../../src/enforcement/capability.rs)、[test-matrix.md](../test-matrix.md)、英日 [guide.md](../guide.md)、[README.md](../../README.md)、CI 検査。
 
 **タスク**
 
 - [x] `PlannedControl`/`ProcessGrant`/`EnforcementPlan` の既存モデルから OS 横断の capability 出力を統一する — `mcp-writ plan`/`--report` が同じ情報源を使う形にする。実装: `enforcement::capability`（葉モジュール）に `MechanismCapability`/`LayerCapability`/`Requirement`/`UnmetRequirement` の共通モデルと 9 行の機構カタログを追加。各 OS の `os_egress_layer_status`（linux/macos/windows/fallback）と PoC レポート（unotify/namespaced/ebpf/macos-proxy）はカタログ行の `LayerCapability` から `EgressLayerStatus` を生成する — 文字列は起動経路と対応表で共有され、plan/report JSON の `target.sandbox_mechanism` と PoC `capability.capability_id`/`capability.missing` が同じ id を指す。
-- [x] 出力と [test-matrix.md](test-matrix.md)（または新規の機械可読対応表）との整合を CI 試験で検査する — 実装と対応表が乖離したら fail する。実装: `mcp-writ capability-matrix` が `capability_matrix_json()`（`schema_version: "1"`）を出力。`docs/capability-matrix.json` はそのコミット済み写しで、`tests/capability_matrix.rs` がバイト比較・機構行の形状・`os: null` 層の Auditor 帰属・`mechanism_for` の全対象カバー・ホスト plan の `egress_layers` とカタログ行の一致を検査する。ci.yml / platform-tests.yml の Integration tests に登録済み。
+- [x] 出力と [test-matrix.md](../test-matrix.md)（または新規の機械可読対応表）との整合を CI 試験で検査する — 実装と対応表が乖離したら fail する。実装: `mcp-writ capability-matrix` が `capability_matrix_json()`（`schema_version: "1"`）を出力。`docs/capability-matrix.json` はそのコミット済み写しで、`tests/capability_matrix.rs` がバイト比較・機構行の形状・`os: null` 層の Auditor 帰属・`mechanism_for` の全対象カバー・ホスト plan の `egress_layers` とカタログ行の一致を検査する。ci.yml / platform-tests.yml の Integration tests に登録済み。
 - [x] 「native warden は Linux が本命、他 OS で強い境界が要る場合は `--isolation`（Kata/Apple Container/Hyper-V/Windows Sandbox/WSLc/OCI）経路を推奨」という階層設計を README/guide に明記する — OS 差評価を言い訳でなく設計として説明する。実装: マトリクス JSON の `positioning` ブロック（`native_warden`/`stronger_boundaries`/`honesty`）に加え、README「Security boundaries」と guide/guide.ja「実行方式と対応状況」に同じ位置づけを明記。
 - [x] Landlock ABI 追従（probe 機構 `MCP_WRIT_PROBE_LANDLOCK_ABI` 済み）の現状と、新 ABI への追従方針を記録する。実装: カタログの `linux-native` 行は ABI 4 を optional 条件 `landlock-abi-v4` として持ち、追従方針（optional 条件として採用・記録レベルは正直に・`verified` へ昇格しない）を guide/guide.ja の OS 別適用範囲節に記録。
 - [x] Linux の native / unotify / namespaced / eBPF を区別し、TCP/UDP、ポート/IP/名前の粒度、要求能力、不足能力、選択・拒否理由を共通モデルへ載せる。PR-09 の PoC 表示と PR-16 の方式選択に同じ判定を使う。実装: 4 行の Linux 機構は `transports`/`granularity`（fqdn/cidr/literal-ip/port/proto）/`requires`/`optional`/`deficiencies`/`select`/`refuse` を持ち、unotify・ebpf の `check_support` は `UnmetRequirement`（カタログ `requires` id）を返し `missing` メンバへ投影、namespaced の `ProbeReport::missing()` は同じ id を列挙する（`capable()` は `missing().is_empty()` と同値 — 1 つの判定を両者が使う）。`auto_candidate` フラグが PR-16 の選択候補を先行記録する。
@@ -535,15 +535,15 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 **到達条件 — 全て満たしたらバージョンを上げる**
 
 - [x] PR-09〜13 が全てマージ済み — `main` で merge #60〜#64（`4633fcc`〜`cb68e87`）を確認（2026-10-15）
-- [x] PR-09/10/11 の PoC 検証文書が残っている — PR-09: [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md)、PR-11: [macos-connect-proxy.md](validation/macos-connect-proxy.md)。**ただし** PR-10 は `docs/validation/` の専用文書がなく、検証記録は [test-matrix.md](test-matrix.md) `ebpf_e2e` 行（WSL2 kernel 6.18・特権コンテナ 9/9）とガイド §4.12 の記載に留まる — 専用文書を要するかはリリース判断
+- [x] PR-09/10/11 の PoC 検証文書が残っている — PR-09: [linux-namespaced-proxy.md](../validation/linux-namespaced-proxy.md)、PR-11: [macos-connect-proxy.md](../validation/macos-connect-proxy.md)。**ただし** PR-10 は `docs/validation/` の専用文書がなく、検証記録は [test-matrix.md](../test-matrix.md) `ebpf_e2e` 行（WSL2 kernel 6.18・特権コンテナ 9/9）とガイド §4.12 の記載に留まる — 専用文書を要するかはリリース判断
 - [x] PR-09 の TCP/UDP・DNS・迂回・障害試験に未確認の必須項目がなく、PoC の範囲と native との差が明記されている — 必須脚（capability probe・TCP/UDP 許可・拒否・監査・DNS ゲート・TTL grant・迂回経路遮断・supervisor SIGKILL teardown）は同検証文書で実機確認済み、opt-in PoC と native 経路不変も明記済み。**ただし** spec 検証表にあった `sendmmsg` 宛先混在・実 QUIC クライアント・TCP 接続中の TTL 失効・セッション間 grant 分離・v6 拡張ヘッダー細工・通信中の proxy/gate 強制終了は同文書 "not yet exercised" 節の未確認一覧に記録 — これらを必須項目とみなすかはリリース判断
-- [x] PR-12 の既定化判断（する/しないとその条件）が記録されている — **既定化しない**（単一ビルド実測・preview 契約・環境非継承・ループバック免除なし・ARM64 未検証→拒否。再検討条件: 追加ビルド/エディション/arch の probe 脚実績と v1.0 契約の安定性確約）。記録: [windows-isolation.md](validation/windows-isolation.md) "PR-12 hardening record" 節 + `src/execution.rs` `WindowsNativeMechanism` ドキュメント
+- [x] PR-12 の既定化判断（する/しないとその条件）が記録されている — **既定化しない**（単一ビルド実測・preview 契約・環境非継承・ループバック免除なし・ARM64 未検証→拒否。再検討条件: 追加ビルド/エディション/arch の probe 脚実績と v1.0 契約の安定性確約）。記録: [windows-isolation.md](../validation/windows-isolation.md) "PR-12 hardening record" 節 + `src/execution.rs` `WindowsNativeMechanism` ドキュメント
 
 **バージョン更新の手順**
 
-- [x] [Cargo.toml](../Cargo.toml) の `version` を `0.4.0` に更新し、`Cargo.lock` を再生成する — 作業ツリーに反映済み・未コミット（2026-10-15）。`Cargo.lock` は `mcp-writ` の version 欄のみの 1 行差分、`--locked` ビルドで lock 整合を確認
+- [x] [Cargo.toml](../../Cargo.toml) の `version` を `0.4.0` に更新し、`Cargo.lock` を再生成する — 作業ツリーに反映済み・未コミット（2026-10-15）。`Cargo.lock` は `mcp-writ` の version 欄のみの 1 行差分、`--locked` ビルドで lock 整合を確認。→ `3b2140b`（chore(release): bump version to 0.4.0 and fix lint across the tree）としてコミット済み
 - [x] 最新コミットで T-BASE・T-DOC・該当する実機記録を再確認する — merge コミット（`cb68e87`）＋ lint 修正・バージョン更新の未コミットツリーで T-BASE/T-DOC を実施（2026-10-15・WSL2 kernel 6.18.54.1・x86-64・rustc 1.99.0）: fmt / clippy `-D warnings` / lib+bins 2195 件 / doc / doc-test 0 件 / docs_check 12 件 / capability_matrix 6 件 全 pass。`cargo doc` に private-item link の警告 15 件（既存クラス）。`cargo package --locked --list` で同梱物確認（525 件、`.local/`・`target/`・監査ログの混入なし）。**ただし** HEAD（`cb68e87`）自体は pinned 1.99.0 で fmt 4 箇所・clippy 27 件が失敗（PR-09〜13 系コミット由来）— 修正は作業ツリーに未コミットのため、コミット後の実ツリーで CI による再確認が前提。実機記録: 各 validation 文書の記録どおり（PR-10 は test-matrix `ebpf_e2e` 行・特権コンテナ 9/9）。OS 固有コードの T-BASE は platform-tests 等の当該 OS ワークフローの責務
-- [x] タグ `v0.4.0` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](releasing.md) 手順 2）
+- [x] タグ `v0.4.0` を付ける — タグ push が [release.yml](../../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](../releasing.md) 手順 2）。→ 上の T-BASE/T-DOC は未コミットツリーでの結果だったため、タグの完了はそれではなく、タグが指すコミット自体での Release 実行で判定した: 最終的なタグは `ec5441d`（`3b2140b` の 9 コミット後、`Cargo.toml` は `0.4.0`）を指し、Release 実行 38728723813（2026-10-15、success）が同コミットで ci・platform-tests・container-tests・go-runtime の verify を通過。それ以前にタグを付けた `3b2140b`〜`f98cd95` の 7 コミットでは Release が failure となり、都度修正コミットを足してタグを付け直した（2026-10-14〜15。失敗した実行 38597277953〜38713273649）
 - [x] リリースノートに「この版で保証する制御」と「残る限界」（§1.7・§5.2 の対応状況）を明記する — 下書きはセッション出力を参照
 
 <a id="pr-14"></a>
@@ -554,7 +554,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 生成ポリシーの未レビュー項目とハッシュドリフトを運用で検出できるようにする。
 
-**主な変更先:** [policy_generator.rs](../src/legislator/policy_generator.rs)、[loader.rs](../src/policy/loader.rs)、[verifier](../src/verifier)、新規 `check` コマンド（[commands](../src/commands)、[cli](../src/cli)）。
+**主な変更先:** [policy_generator.rs](../../src/legislator/policy_generator.rs)、[loader.rs](../../src/policy/loader.rs)、[verifier](../../src/verifier)、新規 `check` コマンド（[commands](../../src/commands)、[cli](../../src/cli)）。
 
 **タスク**
 
@@ -576,14 +576,14 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 実装で残る限界を、設計上の境界・残存リスクとして利用者が読める形に固定する。
 
-**主な変更先:** 英日 [guide.md](guide.md)、[README.md](../README.md)、[policy-authoring.md](policy-authoring.md) 系、必要なら `docs/validation/` の記録。
+**主な変更先:** 英日 [guide.md](../guide.md)、[README.md](../../README.md)、[policy-authoring.md](../policy-authoring.md) 系、必要なら `docs/validation/` の記録。
 
 **タスク**
 
 - [x] TOCTOU（RPC 引数検査とサーバ内部動作の乖離）を設計上の境界として docs に固定する — FS は Landlock が `open()` 時点で強制するため実効的に緩和済み、という切り分けも書く。→ 英日ガイド §8.1 に固定。「検査→使用の形を閉じる経路」（Landlock/SBPL/AppContainer の open 時点強制・pin 済みオブジェクトの exec・unotify の connect エミュレート）と「検査時点に留まるもの」（非 FS 引数・OS 規則外オブジェクト・許可権限内のサーバー動作）を分離して記述。グローバル FS リストのみ OS 下限を持ち、ツール別 `filesystem` が macOS/Windows で Auditor-only である差も明記
-- [x] `npx` 系は entrypoint-hash＋インタプリタ同時ピンのガイドを強化する。→ 英日ガイド §8.2 に `launcher_or_module` の pin 境界（argv からはランチャー `argv[0]` のみ pin 可能・ペイロードは `code_identity.mutable` 行・entrypoint target は第 1 ペイロード引数か実行ファイルに限るためパッケージ名では束縛失敗する）を記述し、直起動＋`binary-hash`/`entrypoint-hash` 両 pin の例を KDL で提示。policy-authoring 英日の「Executing through a launcher」節を強化。実装照合: [identity.rs](../src/verifier/identity.rs) の kind 分類、[pin.rs](../src/verifier/hash/pin.rs) の snapshot/staging、[launch.rs](../src/runtime/launch.rs) の verify→bind→re-verify
-- [x] §1.7 の残存リスクを項目ごとに「現状・緩和・残存」を揃えて書く: DoH 回避（IP 層既定拒否で塞ぐが許可済み宛先兼リゾルバは残る）/ ECH（SNI 判定が効かない宛先）/ ハードコードリゾルバ（fail-closed 仕様）/ TTL レース / CNAME 委譲（対称評価の限界）/ 共有 IP（名前層の保証は解決名の範囲）/ プロキシ自体の信頼性。→ 英日ガイド §8.3 に 7 項目を「止められること／検知に留まること／残るもの」構造で記述。実装照合: `namespaced-run` の port-53 TCP/UDP インターセプト（[nat.rs](../src/warden/namespaced/nat.rs)・[stack.rs](../src/warden/namespaced/stack.rs)）、macOS CONNECT プロキシの 5 分固定 TTL キャップ（[macos_proxy/mod.rs](../src/warden/macos_proxy/mod.rs)）、SNI 非検査の警告（[ip_eval.rs](../src/warden/ip_eval.rs)）。※素のネイティブ `run` では名・IP 層は Auditor-only である前提を冒頭に明記
-- [x] 各リスクについて「検知できること」（監査のチェーン記録等）と「止められること」を分けて記述する。→ §8.3 の各項目で `sandbox.network_denied`/`sandbox.network_resolved` の `ttl_min`/`chain`/`grants_refused`/`protected_refused`/`basis=allowlist-grant`/`proxy_stats` を検知側に、deny/既定拒否・SERVFAIL・chain 再評価・grant 失効を停止側に分離して記述。合わせて JA §4.9 の陳腐化した記述（CNAME 末端未解決で grant 不発行→実装は全 chain-target 再評価＋拒否/未カバー/切詰で fail-closed）を [server.rs](../src/dnsgate/server.rs) と整合修正、EN §4.1 のハッシュ検証記述を pin.rs/launch.rs の現実装（Unix は fd/ステージ exec・Windows は share-mode ハンドル保持、遅延ロード名解決は live）に整合修正
+- [x] `npx` 系は entrypoint-hash＋インタプリタ同時ピンのガイドを強化する。→ 英日ガイド §8.2 に `launcher_or_module` の pin 境界（argv からはランチャー `argv[0]` のみ pin 可能・ペイロードは `code_identity.mutable` 行・entrypoint target は第 1 ペイロード引数か実行ファイルに限るためパッケージ名では束縛失敗する）を記述し、直起動＋`binary-hash`/`entrypoint-hash` 両 pin の例を KDL で提示。policy-authoring 英日の「Executing through a launcher」節を強化。実装照合: [identity.rs](../../src/verifier/identity.rs) の kind 分類、[pin.rs](../../src/verifier/hash/pin.rs) の snapshot/staging、[launch.rs](../../src/runtime/launch.rs) の verify→bind→re-verify
+- [x] §1.7 の残存リスクを項目ごとに「現状・緩和・残存」を揃えて書く: DoH 回避（IP 層既定拒否で塞ぐが許可済み宛先兼リゾルバは残る）/ ECH（SNI 判定が効かない宛先）/ ハードコードリゾルバ（fail-closed 仕様）/ TTL レース / CNAME 委譲（対称評価の限界）/ 共有 IP（名前層の保証は解決名の範囲）/ プロキシ自体の信頼性。→ 英日ガイド §8.3 に 7 項目を「止められること／検知に留まること／残るもの」構造で記述。実装照合: `namespaced-run` の port-53 TCP/UDP インターセプト（[nat.rs](../../src/warden/namespaced/nat.rs)・[stack.rs](../../src/warden/namespaced/stack.rs)）、macOS CONNECT プロキシの 5 分固定 TTL キャップ（[macos_proxy/mod.rs](../../src/warden/macos_proxy/mod.rs)）、SNI 非検査の警告（[ip_eval.rs](../../src/warden/ip_eval.rs)）。※素のネイティブ `run` では名・IP 層は Auditor-only である前提を冒頭に明記
+- [x] 各リスクについて「検知できること」（監査のチェーン記録等）と「止められること」を分けて記述する。→ §8.3 の各項目で `sandbox.network_denied`/`sandbox.network_resolved` の `ttl_min`/`chain`/`grants_refused`/`protected_refused`/`basis=allowlist-grant`/`proxy_stats` を検知側に、deny/既定拒否・SERVFAIL・chain 再評価・grant 失効を停止側に分離して記述。合わせて JA §4.9 の陳腐化した記述（CNAME 末端未解決で grant 不発行→実装は全 chain-target 再評価＋拒否/未カバー/切詰で fail-closed）を [server.rs](../../src/dnsgate/server.rs) と整合修正、EN §4.1 のハッシュ検証記述を pin.rs/launch.rs の現実装（Unix は fd/ステージ exec・Windows は share-mode ハンドル保持、遅延ロード名解決は live）に整合修正
 
 **検証:** T-DOC。文書の記述が実装の挙動と一致することを当該PRの検証記録と照合する。
 
@@ -599,7 +599,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** namespaced を優先し、利用不可なら要求を満たせる範囲で既存 Landlock＋seccomp を使う製品経路にする。UDP の明示許可と、制御できない要求を起動前に拒否する契約を維持する。
 
-**主な変更先:** PR-09 の成果物、[cli](../src/cli)、[launch.rs](../src/runtime/launch.rs)、[enforcement.rs](../src/enforcement.rs)、英日ガイド・[quickstart.md](quickstart.md)。
+**主な変更先:** PR-09 の成果物、[cli](../../src/cli)、[launch.rs](../../src/runtime/launch.rs)、[enforcement.rs](../../src/enforcement.rs)、英日ガイド・[quickstart.md](../quickstart.md)。
 
 **タスク**
 
@@ -607,11 +607,11 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 - [x] PR-09 の PoC を製品経路へ統合し、[Linux の方式選択](#linux-egress-selection) の自動選択と明示選択を実装する。CLI/ポリシーの指定方法・優先順位・従来設定の移行を確定し、既定の非特権起動で namespaced を優先する。→ `run`/`plan` に `--linux-mechanism auto|namespaced|native`（既定 `auto`、`src/execution.rs`・`src/cli/parse_run.rs`・`parse_plan.rs`）、選択は `warden::select`（`select_linux_mechanism`/`decide`）。指定は CLI のみで、ポリシー側の指定は設けていない。**残→PR-26 で解消（2026-10-17）:** 既定 `auto` の移行注記を guide 英日（§4.11「Migrating from pre-selection `run`」）と quickstart 英日（§10）に記載。ポリシー側指定の要否は**設けない**と判断 — 機構はホスト依存（カーネル・userns・TUN・Landlock ABI）でワークロード意味論ではなく、ポータブルなポリシー事実にできないため。判断記録は guide 英日の「Why mechanism selection is a flag, not a policy key」節
 - [x] 起動前に要求能力と実機の能力を照合する。native で満たせる場合の切り替え、UDP/IP 制御等の不足による起動拒否、明示 namespaced の失敗を区別する。起動前診断と実際のセットアップの結果を照合し、必須制御を `allow_degraded` で省略しない。→ `select.rs` の `native_policy_violations` が要求と能力を照合し、明示 `native` はプローブを省略（`7f28243`）。**残:** `allow_degraded` が選択時の Landlock ABI 検査を緩める点と、ABI 1〜3 で `auto` が native を選び起動時に EACCES になる点 → PR-18（§8.3 F-12）
-- [x] 選択方式・利用不可理由・適用するプロトコルと宛先粒度・残る制約を `plan` / `--report` / JSONL に同じ情報源から出力する。native の Landlock ポート制限を IP/CIDR 強制や UDP 対応として表示しない。→ `enforcement/json.rs`・`warden/plan/linux.rs` が同じ選択結果から出力し、拒否時は `linux_selection_refused` を立てる。一致の記録は [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) の *PR-16 product integration*。ただし native の AF_UNIX・シグナルについての過大表示は別件 → PR-18（§8.2 F-01）
+- [x] 選択方式・利用不可理由・適用するプロトコルと宛先粒度・残る制約を `plan` / `--report` / JSONL に同じ情報源から出力する。native の Landlock ポート制限を IP/CIDR 強制や UDP 対応として表示しない。→ `enforcement/json.rs`・`warden/plan/linux.rs` が同じ選択結果から出力し、拒否時は `linux_selection_refused` を立てる。一致の記録は [linux-namespaced-proxy.md](../validation/linux-namespaced-proxy.md) の *PR-16 product integration*。ただし native の AF_UNIX・シグナルについての過大表示は別件 → PR-18（§8.2 F-01）
 - [x] PR-09 の UDP 明示許可を製品のポリシー・継承・生成・export と各実行経路へ反映する。未対応 backend は要求を拒否し、UDP/QUIC を全開放する回避策を作らない。→ PR-26 で完結（2026-10-17）: `generate-policy` は `network` ノードや規則を出力せず、`build_network_section` が助言コメントのみを出す — TCP テンプレートと、send/receive syscall 証拠がある場合の UDP 注記。blocked 時は datagram syscall を REVIEW 行で開示 — UDP は推論せず、許可は常に利用者の明示記述が起点（`policy_generator.rs`）。継承は `egress_rules` の汎用マージで透過、export・KDL emit・parse の往復は回帰試験で固定（`policy_export`・generator 試験）。方式選択の無い従来経路（コンテナゲスト内 `mcp-secure-runner` が通る `linux_mechanism: None` ディスパッチ）は、`select.rs` の `dead_udp_allows_without_selection` 共有述語を `runtime/launch.rs` でゲートし、deny-all 下の UDP 許可を spawn 前に拒否（dead policy を黙って抱えない）。native の UDP 拒否は `native_policy_violations` が理由付きで行い、UDP/QUIC 全開放の回避策は作らない
 - [x] 中断・部分失敗・後始末のライフサイクル契約を製品化し、稼働中の制御喪失時はワークロードを停止する。障害時の native 再起動や直接通信への切り替えを行わない。→ 監査を閉じる前に proxy を停止し、稼働中の proxy 喪失は `SupervisionLost` でワークロードを停止（`src/runtime/wait.rs`）。通信中の proxy 強制終了は PR-26 の e2e で実機検証済み — `linux_mechanism_e2e::proxy_loss_during_active_udp_traffic_kills_workload` が故障注入（`MCP_WRIT_NS_PROXY_KILL_AFTER_MS`）で稼働中 UDP 通信中の proxy 終了を起こし、ワークロード kill・`run` exit 1・`proxy_lost=true`・`reason=supervision_lost` の監査閉鎖を確認
-- [x] 手動 CI/証跡収集へ登録する。→ PR-26 で完結（2026-10-17）: [linux_mechanism_e2e.rs](../tests/linux_mechanism_e2e.rs)（`MCP_WRIT_REQUIRE_E2E_TESTS` 対象・実機 6 レグ）を追加し、[linux-tests.yml](../.github/workflows/linux-tests.yml) の integration ステップと [test-matrix.md](test-matrix.md) に登録。`net_probe` fixture（`tests/fixtures/namespaced/`）で UDP echo/2先振分け/loop を実カーネル駆動し、既定 `auto` → namespaced 選択・UDP 許可の中継・native の UDP 拒否・充足不能ポリシーの無フォールバック拒否・稼働中 proxy 喪失の fail-closed を網羅
-- [x] §1.7 残存リスクの継続評価を本番化の受入条件に含める — プロキシ信頼性・DoH/ECH/共有 IP の残存を当該版で再評価して記録する。→ [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) の *§1.7 residual-risk re-evaluation (PR-16 acceptance)* に記録
+- [x] 手動 CI/証跡収集へ登録する。→ PR-26 で完結（2026-10-17）: [linux_mechanism_e2e.rs](../../tests/linux_mechanism_e2e.rs)（`MCP_WRIT_REQUIRE_E2E_TESTS` 対象・実機 6 レグ）を追加し、[linux-tests.yml](../../.github/workflows/linux-tests.yml) の integration ステップと [test-matrix.md](../test-matrix.md) に登録。`net_probe` fixture（`tests/fixtures/namespaced/`）で UDP echo/2先振分け/loop を実カーネル駆動し、既定 `auto` → namespaced 選択・UDP 許可の中継・native の UDP 拒否・充足不能ポリシーの無フォールバック拒否・稼働中 proxy 喪失の fail-closed を網羅
+- [x] §1.7 残存リスクの継続評価を本番化の受入条件に含める — プロキシ信頼性・DoH/ECH/共有 IP の残存を当該版で再評価して記録する。→ [linux-namespaced-proxy.md](../validation/linux-namespaced-proxy.md) の *§1.7 residual-risk re-evaluation (PR-16 acceptance)* に記録
 
 **検証:** T-BASE、T-POLICY、T-NATIVE、T-DOC、PR-09 の実機 e2e と性能基準。選択表の全行を試験し、特に「能力不足でも native で要求を満たす場合の起動」と「UDP 等の必須要求があり拒否する場合」を対にする。正常な既存 MCP ワークロード、起動中の障害、表示・監査の一致、後始末も確認する。
 
@@ -640,7 +640,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
   - memory/git の stage 5 が「起動失敗を記録として受理」している扱いを見直す。
   - 全段がスキップになった場合も失敗とする。
 - [x] CLI の全サブコマンドを、引数なしで parse する単体試験を追加する。`capability-matrix` が「最後に登録する」ことに依存している点を試験で固定する。可能であれば `finish()` への依存をやめる。
-- [x] `linux-tests.yml` に、`ci.yml` との差分の試験を登録する。対象は `capability_matrix`・`module_layering`・`manifest_fixtures`・`inspector_*`。`ebpf_e2e` の担当（特権ランナーか手動か）を [test-matrix.md](test-matrix.md) に明記する。
+- [x] `linux-tests.yml` に、`ci.yml` との差分の試験を登録する。対象は `capability_matrix`・`module_layering`・`manifest_fixtures`・`inspector_*`。`ebpf_e2e` の担当（特権ランナーか手動か）を [test-matrix.md](../test-matrix.md) に明記する。
 - [x] D-1（改善計画 §8.9）の結論に従い、PR トリガーの最小ジョブか、マージ前の検査スクリプトを追加する。
 - [x] root で実行すると失敗する 3 件を、`running_as_root()` で skip する。e2e の 1 件は `skip_e2e_test` を通し、REQUIRE モードでは失敗するようにする。
 - [x] `tool_enforcement_e2e` の汚染 tools/list ヘルパーで、応答 id を照合する。
@@ -997,7 +997,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 **タスク**
 
 - [x] PR-16 タスク 4: UDP の許可を、生成・export・コンテナ経路に反映する。ゲスト内の runner は方式選択の無い従来経路（native）で動くため、UDP の許可を拒否するかを決める。→ `generate-policy` はネットワーク規則を生成せず、`build_network_section` が助言コメントのみを出力（TCP テンプレート + send/recv syscall 証拠時の UDP 注記）。export・継承・KDL 往復は透過を回帰試験で固定。**ゲスト経路の決定: deny-all 下の UDP 許可は拒否する** — `runtime/launch.rs` が `linux_mechanism: None`（従来ディスパッチ＝ゲスト runner の経路）で `select::dead_udp_allows_without_selection` 違反を spawn 前に拒否。dead policy を黙って抱えず、UDP/QUIC 全開放もしない。launch 単体試験・select 試験で固定
-- [x] PR-16 タスク 6: `tests/linux_mechanism_e2e.rs`（`MCP_WRIT_REQUIRE_E2E_TESTS` 対象）を作り、`linux-tests.yml` と [test-matrix.md](test-matrix.md) に登録する。検証文書の未確認一覧にある「通信中の proxy 強制終了」もこの e2e に含める。→ 6 レグ実機検証: 既定 auto→namespaced 選択・UDP echo 中継・TCP allow/deny 振分け・native の UDP 拒否・充足不能の無フォールバック拒否・`MCP_WRIT_NS_PROXY_KILL_AFTER_MS` 故障注入による稼働中 proxy 喪失（kill・exit 1・`proxy_lost`・`supervision_lost`）。fixture `net_probe` は TUN を実際に通るようホスト実 IP 宛を使う（netns 内 loopback 回避）。文書側の未確認一覧と残存リスク節も更新済み（[linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md)）
+- [x] PR-16 タスク 6: `tests/linux_mechanism_e2e.rs`（`MCP_WRIT_REQUIRE_E2E_TESTS` 対象）を作り、`linux-tests.yml` と [test-matrix.md](../test-matrix.md) に登録する。検証文書の未確認一覧にある「通信中の proxy 強制終了」もこの e2e に含める。→ 6 レグ実機検証: 既定 auto→namespaced 選択・UDP echo 中継・TCP allow/deny 振分け・native の UDP 拒否・充足不能の無フォールバック拒否・`MCP_WRIT_NS_PROXY_KILL_AFTER_MS` 故障注入による稼働中 proxy 喪失（kill・exit 1・`proxy_lost`・`supervision_lost`）。fixture `net_probe` は TUN を実際に通るようホスト実 IP 宛を使う（netns 内 loopback 回避）。文書側の未確認一覧と残存リスク節も更新済み（[linux-namespaced-proxy.md](../validation/linux-namespaced-proxy.md)）
 - [x] Linux の `run` の既定が `auto` に変わったことについて、移行の注記を guide と quickstart に書く。方式をポリシー側でも指定できるようにするかを判断する。→ guide 英日 §4.11「Migrating from pre-selection `run`」（dead policy 解消・`/tmp` 私設化・`/run` マスク・部分強制の拒否化・`native` がロールバック経路）と quickstart 英日 §10 に注記。**ポリシー側指定は設けないと判断** — 機構はホスト依存（kernel・userns・TUN・Landlock ABI）でワークロード意味論ではなく、同一ポリシーが全ホストで同一権限を意味するには CLI 側に置くべきとの決定を guide 英日の「Why mechanism selection is a flag, not a policy key」節に記録
 - [x] 完了したら、本書の PR-16 節のタスク 4・6 にチェックを付ける。→ 実施済み（タスク 5 の proxy-kill 未確認注記とタスク 1 の残項目注記も解消済みへ更新）
 - [x] 任意: capability matrix に成熟度（stable / opt-in PoC）を加える（review1 の「安定版の境界を絞る」提案）。→ **判断: 追加しない。** カタログの `status` ボキャブラリ（`adopted`/`adopted-conditional`/`poc`/`none`、`src/enforcement/capability.rs`）が成熟度を既に表現し、namespaced 行は `adopted, conditional`・namespaced-run PoC 行は `poc` で区別済み。新フィールドは冗長になるため見送り（`capability_matrix` 6 件 pass で現行スキーマを再確認）
@@ -1020,7 +1020,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** namespaced 経路をデュアルスタック化し、IPv6 宛先の TCP/UDP 許可・拒否と DNS AAAA 連携を IPv4 と同等に強制する。検査不能な v6 要素は引き続き既定拒否とし、v6 を素通しする経路は作らない。ポリシー・評価器（`ip_eval` の `IpAddr` 汎用評価）・DNS ゲートの A/AAAA 制御面・ワークロード側 seccomp の `AF_INET6` 許可は PR-09 時点で対応済みのため、変更はデータプレーンと選択層に限定される。native 経路と選択契約（`auto`/`namespaced`/`native`）は変えない。
 
-**主な変更先:** [init.rs](../src/warden/namespaced/init.rs)、[stack.rs](../src/warden/namespaced/stack.rs)、[nat.rs](../src/warden/namespaced/nat.rs)、[probe.rs](../src/warden/namespaced/probe.rs)、[report.rs](../src/warden/namespaced/report.rs)、[select.rs](../src/warden/select.rs)、[dnsgate](../src/dnsgate)、[linux_mechanism_e2e.rs](../tests/linux_mechanism_e2e.rs)・[net_probe.rs](../tests/fixtures/namespaced/net_probe.rs)、英日ガイド・[linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md)・capability matrix。
+**主な変更先:** [init.rs](../../src/warden/namespaced/init.rs)、[stack.rs](../../src/warden/namespaced/stack.rs)、[nat.rs](../../src/warden/namespaced/nat.rs)、[probe.rs](../../src/warden/namespaced/probe.rs)、[report.rs](../../src/warden/namespaced/report.rs)、[select.rs](../../src/warden/select.rs)、[dnsgate](../../src/dnsgate)、[linux_mechanism_e2e.rs](../../tests/linux_mechanism_e2e.rs)・[net_probe.rs](../../tests/fixtures/namespaced/net_probe.rs)、英日ガイド・[linux-namespaced-proxy.md](../validation/linux-namespaced-proxy.md)・capability matrix。
 
 **タスク**
 
@@ -1035,7 +1035,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
   - 実施: `--dns-upstream`/`resolv.conf` は既に v6 受理可能で、`resolv_conf_upstream` が到達可能な先頭 nameserver（v4/v6）を選ぶよう更新。e2e は `[::1]` 上のモックリゾルバを `--dns-upstream [::1]:port` で渡し、ゲート上流側も実 v6 ソケットで検証。
 - [x] `namespaced_policy_violations` の v6 拒否を撤去し、`deny host="*"` が v6 も包含することを確認する。ホストに v6 到達性が無い場合の選択挙動（v6 要求を含むポリシーは理由付きで拒否）を `select` に反映する。
   - 実施: v6 一括拒否を撤去し、宛先ごとの `host_v6_reach`（UDP `connect` のルート解決）で条件化 — `EgressDest::Host` の v6 リテラルは到達不能なら違反、`cidr` はネットワークアドレスを probe（`::` 系ワイルドカードは `host_v6_any`）。`deny host="*"` は評価器が `IpAddr` 汎用のため両ファミリーに包含される。
-- [x] e2e を拡張する。`net_probe` に v6 モード（udp-echo・tcp-two・udp-loop の v6 版）を追加し、`::1` または ULA 宛のホストローカルレグで外部 v6 到達性に依存せずデータパスを検証、外部 v6 宛は環境依存レグとして分離する。`linux-tests.yml`・[test-matrix.md](test-matrix.md) を更新する。
+- [x] e2e を拡張する。`net_probe` に v6 モード（udp-echo・tcp-two・udp-loop の v6 版）を追加し、`::1` または ULA 宛のホストローカルレグで外部 v6 到達性に依存せずデータパスを検証、外部 v6 宛は環境依存レグとして分離する。`linux-tests.yml`・[test-matrix.md](../test-matrix.md) を更新する。
   - 実施: 追加モードは `udp6-echo`/`udp6-two`/`tcp6-echo`/`tcp6-two`/`udp6-loop`/`dns-aaaa`/`dns6-flow`。外部 v6 宛レグは `namespaced_ipv6_flows_allowed_on_v6_host`（host-owned 経路可能 v6 が無い環境では静かに skip — `REQUIRE_E2E` の失敗化対象外）。`linux-tests.yml` は対象 target を既に回しており変更不要、test-matrix.md は記述更新済み。
   - 統合で見つかった事象: glibc ≥ 2.36 は全 nameserver へ `sendmmsg` で並列問い合わせを行う — ポリシーの syscall allowlist に無いと `EPERM` で全解決が即死する（TUN に 1 パケットも出ない）。ポリシー記述側の事実として validation 文書に記録。
 - [x] 開示を更新する。report/probe の "IPv4 only" 表示、guide 英日・capability matrix・検証文書の限界記述を実装と照合して更新する。
@@ -1073,13 +1073,13 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 - [x] PR-23〜26（§8 の P1）のうち当該リリースに含める範囲を決め、マージ済み。PR-16 を含める場合は PR-26 のタスク 4・6 も完了している。PR-26a（namespaced の IPv6 対応）はリリース前対応として含める — 全て含める判断。merge #74〜#77（`1e3f61c`〜`3de2fa5`）と #78 PR-26a（`9da98ce`）を確認、PR-26 のタスク 4・6 は本節の記録どおり完了済み（2026-10-20）。加えて security-fix #79（`d904a34`）がマージ済み
 - [x] 判断事項 D-1〜D-6（§8.9）のうち、含める PR に関わるものの結論が記録されている — [改善計画 §8.9 の決定記録](improvement-plan-2026-10.ja.md)（2026-10-20）に6件の結論を記録。D-1〜D-4 は各PR節の記録を結論として確認、D-5 は推奨案（PR-24 運用後に判断）、D-6 は代替案（実装しない — コーパス全件クリーンを根拠。ツール単位の扱いを将来導入する場合は許可モデルの再設計として検討）
 - [x] 含める項目が確定した時点で版番号（`0.5.0` かそれ以降か）を決めた — **`0.5.0`**（2026-10-20）
-- [x] PR-15 の限界開示を含める場合、その記述が実装挙動と照合済み。PR-18 の IPC 限界の開示も同様 — ガイド §8.1〜8.4 を `9203e2c` 以降の実装変更を含む HEAD（`d904a34`）と照合: §8.4 の `unix=` opt-in（ABI v9 `ResolveUnix`・下位は選択拒否・`"*"` は全 family 開放）、Scope::Signal（ABI v6 以上・下位は `os.ipc.signal` = `not_applied`）、deny-all 下の `socket()` AF_INET/AF_INET6 ピンと `socketpair(AF_UNIX, SOCK_DGRAM)` 拒否、namespaced の family 絶対ピン・`unix=` 選択拒否・CLONE_NEWPID・`/run` マスクは [landlock_impl.rs](../src/warden/landlock_impl.rs)・[seccomp_impl.rs](../src/warden/seccomp_impl.rs)・[select.rs](../src/warden/select.rs)・[namespaced/init.rs](../src/warden/namespaced/init.rs) と一致。§8.1〜8.3 の検査境界・ランチャーピン・egress 残存リスクも `udp_audit_suppressed`・PDEATHSIG・`ttl_min`/`chain` 記録・`code_identity`（`launcher_or_module`）の実在を確認
+- [x] PR-15 の限界開示を含める場合、その記述が実装挙動と照合済み。PR-18 の IPC 限界の開示も同様 — ガイド §8.1〜8.4 を `9203e2c` 以降の実装変更を含む HEAD（`d904a34`）と照合: §8.4 の `unix=` opt-in（ABI v9 `ResolveUnix`・下位は選択拒否・`"*"` は全 family 開放）、Scope::Signal（ABI v6 以上・下位は `os.ipc.signal` = `not_applied`）、deny-all 下の `socket()` AF_INET/AF_INET6 ピンと `socketpair(AF_UNIX, SOCK_DGRAM)` 拒否、namespaced の family 絶対ピン・`unix=` 選択拒否・CLONE_NEWPID・`/run` マスクは [landlock_impl.rs](../../src/warden/landlock_impl.rs)・[seccomp_impl.rs](../../src/warden/seccomp_impl.rs)・[select.rs](../../src/warden/select.rs)・[namespaced/init.rs](../../src/warden/namespaced/init.rs) と一致。§8.1〜8.3 の検査境界・ランチャーピン・egress 残存リスクも `udp_audit_suppressed`・PDEATHSIG・`ttl_min`/`chain` 記録・`code_identity`（`launcher_or_module`）の実在を確認
 
 **バージョン更新の手順**
 
-- [x] [Cargo.toml](../Cargo.toml) の `version` を確定した版に更新し、`Cargo.lock` を再生成する — `0.5.0` を作業ツリーに反映済み・未コミット（2026-10-20）。`Cargo.lock` は `mcp-writ` の version 欄のみの 1 行差分
+- [x] [Cargo.toml](../../Cargo.toml) の `version` を確定した版に更新し、`Cargo.lock` を再生成する — `0.5.0` を作業ツリーに反映済み・未コミット（2026-10-20）。`Cargo.lock` は `mcp-writ` の version 欄のみの 1 行差分。→ `dc37f78`（chore(release): bump version to 0.5.0 and record release readiness）としてコミット済み
 - [x] 最新コミットで T-BASE・T-DOC・該当する実機記録を再確認する — HEAD（`d904a34`）＋バージョン更新の作業ツリーで実施（2026-10-20・WSL2 kernel 6.18.54.1・x86-64・rustc 1.99.0）: fmt / clippy `-D warnings` / lib+bins 2457 件 / doc / doc-test 0 件 / docs_check 12 件 / capability_matrix 6 件 全 pass。`cargo doc` は既存クラスの警告 3 件（`cli/mod.rs`・`policy_resolve.rs` の intra-doc link、`provenance.rs` の HTML タグ、いずれも未編集ファイル — PR-26 の記録と同じ状態）。実機記録: `linux_mechanism_e2e`（PR-26・実機 6 レグ）と PR-26a の v6 レグは各検証文書の記録どおり、`namespaced_ipv6_flows_allowed_on_v6_host` は外部 v6 到達性依存のため環境依存。OS 固有コードの T-BASE は platform-tests 等の当該 OS ワークフローの責務
-- [x] タグ `vX.Y.Z` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](releasing.md) 手順 2）
+- [x] タグ `v0.5.0` を付ける — タグ push が [release.yml](../../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](../releasing.md) 手順 2）。→ 上の T-BASE/T-DOC は `d904a34`＋未コミットツリーでの結果だったため、タグの完了はそれではなく、タグが指すコミット自体での Release 実行で判定した: 最終的なタグは `abea3c0`（`dc37f78` の後、`Cargo.toml` は `0.5.0`）を指し、Release 実行 39712089014（2026-10-22、success）が同コミットで 4 ワークフローの verify を通過。先に付けた `371a5f3`（merge #80）では Release が failure（実行 39707924983）となり、`abea3c0`（chore(ci): add release preflight script）を足してタグを付け直した
 - [ ] リリースノートに「この版で保証する制御」と「残る限界」（§1.7・§5.2 の対応状況）を明記する
 
 <a id="pr-27"></a>
@@ -1141,7 +1141,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **タスク**
 
-- [x] `clippy::undocumented_unsafe_blocks` を、境界のモジュール（`warden::namespaced` など）から順に deny にする。→ 第一段として `warden::namespaced` を対象化（2026-10-25）: [namespaced/mod.rs](../src/warden/namespaced/mod.rs) に `#![deny(clippy::undocumented_unsafe_blocks)]` をモジュール内側属性として設定 — lint レベルはサブツリーに継承されるため init/launch/nat/netlink/probe/report/spawn/stack を一括でカバーする。既存注記（`// Safety:` や `// SAFETY:` — 大小文字を問わず `safety:` を含むコメントが受理される）はそのまま通る。残りの warden 境界モジュールは後続で順次 — 現 HEAD で計測した未注記の残存は warden 全体で 180 件（unotify 110・env 13・child 10・ebpf 16・seccomp_impl/tests 15 など。macOS/Windows 系は当該 OS 上の clippy でないと件数・検証が取れない点に注意）
+- [x] `clippy::undocumented_unsafe_blocks` を、境界のモジュール（`warden::namespaced` など）から順に deny にする。→ 第一段として `warden::namespaced` を対象化（2026-10-25）: [namespaced/mod.rs](../../src/warden/namespaced/mod.rs) に `#![deny(clippy::undocumented_unsafe_blocks)]` をモジュール内側属性として設定 — lint レベルはサブツリーに継承されるため init/launch/nat/netlink/probe/report/spawn/stack を一括でカバーする。既存注記（`// Safety:` や `// SAFETY:` — 大小文字を問わず `safety:` を含むコメントが受理される）はそのまま通る。残りの warden 境界モジュールは後続で順次 — 現 HEAD で計測した未注記の残存は warden 全体で 180 件（unotify 110・env 13・child 10・ebpf 16・seccomp_impl/tests 15 など。macOS/Windows 系は当該 OS 上の clippy でないと件数・検証が取れない点に注意）
 - [x] 不足している Safety の注記を足す。→ namespaced サブツリーで lint に検出された 104 ブロック（init.rs 46・spawn.rs 23・probe.rs 22・netlink.rs 6・report.rs 3・stack.rs 3・launch.rs 1）に `// SAFETY:` 注記を追加 — 残る 1 ブロック（spawn.rs の `pre_exec` 登録）は既存の `// Safety:` で受理され、計 105 ブロックが注記済み。既存の `// nosemgrep:` 行の直上に、各ブロックが依拠する不変条件（ポインタ/長さが示す有効バッファ、fd の所有と一度限りの close、NUL 終端 C 文字列、single-threaded 前提の fork/`env::remove_var`、POD 構造体の `mem::zeroed`、SCM_RIGHTS の所有移転 等）を記述。`unsafe fn` 宣言自体は lint の対象外（ブロックのみ）で、コメントはステートメント直上で受理されることを確認済み
 
 **検証:** T-BASE。→ 実施（2026-10-25・WSL2 kernel 6.18.54.1・x86-64・rustc 1.99.0）: `cargo fmt --all -- --check` / `cargo clippy --locked --all-targets -- -D warnings`（`undocumented_unsafe_blocks` 違反は対象化前の 104 件 → 0 件、他警告なし）/ `cargo test --locked --lib --bins` 2512 件 / `cargo doc --locked --no-deps` / `cargo test --locked --doc` 0 件 全 pass。差分は注記・lint 属性に加えて probe.rs の失敗パスのみ実コード変更あり — 未検査だった pipe(2) 戻り値を検査し、pipe 失敗時は生成済みの端だけ close、fork 失敗時は errno を先に確保して全 6 端を close（従来は失敗した pipe の fd-0 プレースホルダをそのまま使い、fork 失敗時に fd がリークし得た）。成功パスの挙動は不変（「移行・戻し方」と整合）
@@ -1158,16 +1158,16 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 各サブコマンドの `--help` が、そのサブコマンド自身の Usage・オプション・位置引数・使用例を示すようにする。トップレベルの `--help` は従来どおり全サブコマンドを列挙する。
 
-**再現（2026-10-26・Windows ホスト・`41d23e3` のデバッグビルド）:** `mcp-writ run --help` は `Usage: mcp-writ ... run [OPTIONS] <COMMAND>` の後に `Commands:` として `plan`〜`policy` の 14 件を列挙し、その後ろに `run` のオプションを出す。`generate-policy --help` も同様に、後から登録された `capability-matrix`〜`policy` を列挙する。原因は [cli/mod.rs](../src/cli/mod.rs) `608-690` 行が全サブコマンドの `noargs::cmd(..).take()` を dispatch の前に無条件で実行していること — noargs は一致した cmd の後にログへ残った `Cmd` エントリを「Commands:」として描画する。`-- <command>` は noargs に渡す前に `parse_from` が分割している（`mod.rs:582-587`）ため、help のどこにも出ない。
+**再現（2026-10-26・Windows ホスト・`41d23e3` のデバッグビルド）:** `mcp-writ run --help` は `Usage: mcp-writ ... run [OPTIONS] <COMMAND>` の後に `Commands:` として `plan`〜`policy` の 14 件を列挙し、その後ろに `run` のオプションを出す。`generate-policy --help` も同様に、後から登録された `capability-matrix`〜`policy` を列挙する。原因は [cli/mod.rs](../../src/cli/mod.rs) `608-690` 行が全サブコマンドの `noargs::cmd(..).take()` を dispatch の前に無条件で実行していること — noargs は一致した cmd の後にログへ残った `Cmd` エントリを「Commands:」として描画する。`-- <command>` は noargs に渡す前に `parse_from` が分割している（`mod.rs:582-587`）ため、help のどこにも出ない。
 
-**主な変更先:** [cli/mod.rs](../src/cli/mod.rs)（dispatch）、[parse_run.rs](../src/cli/parse_run.rs)・[parse_gen_policy.rs](../src/cli/parse_gen_policy.rs)・[parse_check.rs](../src/cli/parse_check.rs)・[parse_plan.rs](../src/cli/parse_plan.rs)・[parse_inspect.rs](../src/cli/parse_inspect.rs)（位置引数の説明と使用例）、[tests_parse.rs](../src/cli/tests_parse.rs)、README 英日（サブコマンド表の例を help と揃える場合）
+**主な変更先:** [cli/mod.rs](../../src/cli/mod.rs)（dispatch）、[parse_run.rs](../../src/cli/parse_run.rs)・[parse_gen_policy.rs](../../src/cli/parse_gen_policy.rs)・[parse_check.rs](../../src/cli/parse_check.rs)・[parse_plan.rs](../../src/cli/parse_plan.rs)・[parse_inspect.rs](../../src/cli/parse_inspect.rs)（位置引数の説明と使用例）、[tests_parse.rs](../../src/cli/tests_parse.rs)、README 英日（サブコマンド表の例を help と揃える場合）
 
 **タスク**
 
-- [x] 修正前に失敗する再現試験を書く: `run --help` の出力に `Commands:` と兄弟サブコマンド名（`plan`、`run-image`、`policy` など）が含まれないこと、Usage 行が `run` 自身の形（`mcp-writ run [OPTIONS] -- <command> [args...]`）であること。`generate-policy --help`・`check --help`・`plan --help`・`inspect --help` も同様。トップレベル `--help`（`test_help_includes_all_subcommands`）と `capability-matrix --help`（`test_capability_matrix_help`）は現状維持を対で固定する。→ 実施（2026-10-26・WSL2・x86-64・rustc 1.99.0）: [tests_parse.rs](../src/cli/tests_parse.rs) に `test_run_help_shows_only_run`・`test_run_help_shows_quickstart_flow`・`test_generate_policy_help_shows_only_itself`・`test_check_help_shows_only_check`・`test_plan_help_shows_only_plan`・`test_inspect_help_shows_only_inspect`・`test_subcommand_help_documents_trailing_command`・`test_top_level_help_keeps_commands_section` を追加（`is_command_listing_line` ヘルパで「2 スペース字下げ + 裸のサブコマンド名」の列挙行の不在を固定 — `--policy` 等の語は doc 内に出るため名前の含有禁止ではなく列挙形で判定）。修正前は 7 件が `Commands:` 残留で失敗、修正後に全件 pass
+- [x] 修正前に失敗する再現試験を書く: `run --help` の出力に `Commands:` と兄弟サブコマンド名（`plan`、`run-image`、`policy` など）が含まれないこと、Usage 行が `run` 自身の形（`mcp-writ run [OPTIONS] -- <command> [args...]`）であること。`generate-policy --help`・`check --help`・`plan --help`・`inspect --help` も同様。トップレベル `--help`（`test_help_includes_all_subcommands`）と `capability-matrix --help`（`test_capability_matrix_help`）は現状維持を対で固定する。→ 実施（2026-10-26・WSL2・x86-64・rustc 1.99.0）: [tests_parse.rs](../../src/cli/tests_parse.rs) に `test_run_help_shows_only_run`・`test_run_help_shows_quickstart_flow`・`test_generate_policy_help_shows_only_itself`・`test_check_help_shows_only_check`・`test_plan_help_shows_only_plan`・`test_inspect_help_shows_only_inspect`・`test_subcommand_help_documents_trailing_command`・`test_top_level_help_keeps_commands_section` を追加（`is_command_listing_line` ヘルパで「2 スペース字下げ + 裸のサブコマンド名」の列挙行の不在を固定 — `--policy` 等の語は doc 内に出るため名前の含有禁止ではなく列挙形で判定）。修正前は 7 件が `Commands:` 残留で失敗、修正後に全件 pass
 - [x] `parse_from` の dispatch を「`cmd().take()` して一致したら即 dispatch」の逐次形に改める。一致した時点で残りの `cmd()` を登録しないので、noargs のログに後続の `Cmd` が残らず「Commands:」が消える。`mcp-writ --help`（どれも一致しない）は全部登録されるため従来どおり。`capability-matrix` の特例（`finish()` の command check が最後に take した cmd を見る N-01 回避、`mod.rs:632-640`・`716-740`）は、一致した cmd が常に最後の take になるため不要になる — 特例を外しても bare 起動と `--help` の試験が通ることを確認し、通らなければ特例を残す。→ 実施: 15 サブコマンドを `cmd().take().is_present()` で即 return する逐次 `if` チェーンに改めた（登録順は不変 — トップレベル help の列挙順を保つ）。capability-matrix の特例は撤去 — bare 起動・`--help`・stray 引数拒否（`unexpected argument '…' found`）がすべて `finish()` の通常経路で通ることを `test_bare_invocations_all_subcommands`・`test_bare_capability_matrix_rejects_stray_args`・`test_capability_matrix_help` で確認
 - [x] `-- <command> [args...]` を help に出す。`parse_from` は noargs より前に `--` で分割しているため noargs は `command` を知らない。`run`・`plan`・`generate-policy`・`check`・`inspect` の各 parser で help 用に位置引数の説明（noargs の `arg(..)` と `.doc()`、または `app_description` 末尾の Usage 補足）を登録し、値の取り込みは従来どおり分割済みの `command` を使う（解析結果は変えない）。どの描画にするかは noargs 0.4.3 の `arg().example()` の出力を見て担当PRで決める。→ 実施: 5 parser が `raw.metadata().help_mode` のときだけ `noargs::arg(..).doc(..)` を登録 — help mode の `Arg::take` は生引数を消費しないので解析結果は不変（`run stray` が従来どおり `unexpected argument` で落ちることを確認）。`arg().example()` は複数語が `"…"` に quote される描画のため不採用とし、`.doc()` 説明のみ登録。必須の `run`/`generate-policy` は `-- <command> [args...]`、選択の `plan`/`check`/`inspect` は `[-- <command> [args...]]` の表記（Usage は `mcp-writ ... <cmd> [OPTIONS] -- <command> [args...]` 形に出る）
-- [x] `run` と `generate-policy` の help 末尾に最小の流れを載せる（noargs の `.example()` による「Example:」節、または doc 末尾の固定文）。quickstart と同じ順にする: `generate-policy --live-discovery --output draft.kdl -- node server.js` → ドラフトをレビュー → `plan --policy draft.kdl -- node server.js` → `run --policy draft.kdl --dry-run --audit-log audit.jsonl -- node server.js` → `run --policy draft.kdl --audit-log audit.jsonl --report report.json -- node server.js`。→ 実施: noargs の `Example:` 節は entry ごとの `.example()` を空白連結するため `-- node server.js` のような複数語例を 1 トークンに quote してしまい使えない。`cli::QUICKSTART_FLOW` 定数（`Example:` 節 + 5 行）を [cli/mod.rs](../src/cli/mod.rs) に置き、両 parser が `finish()` の返す help 末尾に append する方式とした — `-h` の要約 help にも出る
+- [x] `run` と `generate-policy` の help 末尾に最小の流れを載せる（noargs の `.example()` による「Example:」節、または doc 末尾の固定文）。quickstart と同じ順にする: `generate-policy --live-discovery --output draft.kdl -- node server.js` → ドラフトをレビュー → `plan --policy draft.kdl -- node server.js` → `run --policy draft.kdl --dry-run --audit-log audit.jsonl -- node server.js` → `run --policy draft.kdl --audit-log audit.jsonl --report report.json -- node server.js`。→ 実施: noargs の `Example:` 節は entry ごとの `.example()` を空白連結するため `-- node server.js` のような複数語例を 1 トークンに quote してしまい使えない。`cli::QUICKSTART_FLOW` 定数（`Example:` 節 + 5 行）を [cli/mod.rs](../../src/cli/mod.rs) に置き、両 parser が `finish()` の返す help 末尾に append する方式とした — `-h` の要約 help にも出る
 - [x] 既存のコマンド名・フラグ名・短縮名は変えない。`run --help` に `--policy`・`--audit-log`・`--report`・`--dry-run`、`generate-policy --help` に `--live-discovery`・`--static-only`・`--output` の説明が出ることを試験で固定する（レポートの受け入れ条件）。→ 実施: コマンド名・フラグ名・短縮名・doc 文は一切変更せず、上記フラグの含有を新規試験で固定
 
 **検証:** T-BASE（`tests_parse.rs` は lib テスト）。加えて `tests/containerize_e2e.rs:221`・`tests/wrap_image_e2e.rs:94` の `--help` 試験、`tests/capability_matrix.rs` が通ること。→ 実施（2026-10-26・WSL2 kernel 6.18.54.1・x86-64・rustc 1.99.0）: `cargo fmt --all -- --check` / `cargo clippy --locked --all-targets -- -D warnings`（警告なし）/ `cargo test --locked --lib --bins` 2533 件 / `cargo doc --locked --no-deps` / `cargo test --locked --doc` 0 件 全 pass。`capability_matrix` 6 件・`containerize_e2e` / `wrap_image_e2e` の `--help` 試験も pass。実バイナリで bare `mcp-writ`（`command is not specified`）・未知名（`'foo' command is not defined`）・`run` の command 欠落・`run stray` の `unexpected argument` が変更前と同一であることを確認
@@ -1184,13 +1184,13 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 未解決の REVIEW 項目ごとに「なぜ判断が要るか」と「代表的な解消方法」を `check` が示す。ディスパッチャ型サーバーのドラフト冒頭で、静的に結び付かない理由と運用者が引き受ける確認事項を具体的に書く。`check` の判定（`status`・終了コード）と、ドラフトの KDL としての意味は変えない。
 
-**主な変更先:** [policy_generator.rs](../src/legislator/policy_generator.rs)（マーカー文面・冒頭 NOTE）、[policy/review.rs](../src/policy/review.rs)（種別台帳）、[commands/check.rs](../src/commands/check.rs)、[enforcement/check.rs](../src/enforcement/check.rs)（`ReviewMarkerRecord`）、guide 英日 §4.3・§4.15、policy-authoring 英日
+**主な変更先:** [policy_generator.rs](../../src/legislator/policy_generator.rs)（マーカー文面・冒頭 NOTE）、[policy/review.rs](../../src/policy/review.rs)（種別台帳）、[commands/check.rs](../../src/commands/check.rs)、[enforcement/check.rs](../../src/enforcement/check.rs)（`ReviewMarkerRecord`）、guide 英日 §4.3・§4.15、policy-authoring 英日
 
 **タスク**
 
-- [x] REVIEW マーカーの種別台帳を 1 箇所に置く（例: `policy::review::MarkerKind`）。現行テンプレートから起こす種別: `unbound-tool`（根拠なしで `deny=#true` 出力、`policy_generator.rs:261`・`334`・`366`）、`blocked-capability`（検出したが excess として遮断）、`schema-unsupported`（`args_schema` 省略、`145`）、`hash-pin-host`（ハッシュは生成ホストのもの、`424`）、`regenerate-on-update`（`427`）、`unbound-workload`（`unbound_reasons`、`445`）、`syscall-analysis`（`569`・`575`）、`syscall-blocked`（`653`・`665`）、`baseline-dropped`（`708`）、`interpreter-baseline`（`712`）、`non-linux-abi`（`718`）、`network-outbound`（`763`）、`datagram`（`784`）、`header`（`// REVIEW all entries before deploying`）、`custom`（一致なし）。各種別に `why`（判断が必要な理由）と `how`（代表的な解消方法。guide の節への参照を含めてよい）の固定文を持たせる。→ 実施（2026-10-26・WSL2・x86-64・rustc 1.99.0）: [policy/review.rs](../src/policy/review.rs) に `MarkerKind` enum を新設 — 上記 15 種別すべてを variant とし、各種別に kebab-case トークン（`as_str()`）、`why()`・`how()` 固定文、`comment(detail)` で `REVIEW: <token>: <detail>` 形を出す `comment()` を集約。`how` には該当する guide の節（§4.3・§8.2 等）への参照を含めた
+- [x] REVIEW マーカーの種別台帳を 1 箇所に置く（例: `policy::review::MarkerKind`）。現行テンプレートから起こす種別: `unbound-tool`（根拠なしで `deny=#true` 出力、`policy_generator.rs:261`・`334`・`366`）、`blocked-capability`（検出したが excess として遮断）、`schema-unsupported`（`args_schema` 省略、`145`）、`hash-pin-host`（ハッシュは生成ホストのもの、`424`）、`regenerate-on-update`（`427`）、`unbound-workload`（`unbound_reasons`、`445`）、`syscall-analysis`（`569`・`575`）、`syscall-blocked`（`653`・`665`）、`baseline-dropped`（`708`）、`interpreter-baseline`（`712`）、`non-linux-abi`（`718`）、`network-outbound`（`763`）、`datagram`（`784`）、`header`（`// REVIEW all entries before deploying`）、`custom`（一致なし）。各種別に `why`（判断が必要な理由）と `how`（代表的な解消方法。guide の節への参照を含めてよい）の固定文を持たせる。→ 実施（2026-10-26・WSL2・x86-64・rustc 1.99.0）: [policy/review.rs](../../src/policy/review.rs) に `MarkerKind` enum を新設 — 上記 15 種別すべてを variant とし、各種別に kebab-case トークン（`as_str()`）、`why()`・`how()` 固定文、`comment(detail)` で `REVIEW: <token>: <detail>` 形を出す `comment()` を集約。`how` には該当する guide の節（§4.3・§8.2 等）への参照を含めた
 - [x] 分類は `check` 側でマーカー本文の先頭一致で行うが、既知の種別を示す型トークンが一致した直後に明示的な区切り（行末・`:`・空白）がある場合に限りその種別とし、既知の接頭辞で始まるだけのカスタム文は `custom` に留める（`review.rs:130-140` が `REVIEW` トークンに `:`・空白の区切りを要求するのと同じ規則）。生成側も同じ台帳の文面でマーカーを出す。`// REVIEW:` の書式は変えない（走査規則を維持）。ユニットテストで、生成側の全テンプレートが意図した種別（`custom` 以外）に分類されること、および既知の文面の接頭辞で始まるカスタム文が `custom` のままであることを固定し、文面の変更が分類から漏れないようにする。→ 実施: `MarkerKind::classify()` が `REVIEW` トークン+区切りを剥がした本文について「既知トークン + 行末/`:`/空白の区切り」でのみ種別を返し、不一致は `custom` にフォールバック（`unbound-toolkit:` のような接頭辞似のカスタム文は `custom` のまま — 単体試験で固定）。`policy_generator.rs` の全 REVIEW 発行を `MarkerKind::comment()` 経由に統一し、生成テンプレート全件が非 `custom` に分類されることを `policy_generator/tests.rs` の新規試験で固定
-- [x] `check` の JSON の `review_markers[]` に `kind`・`why`・`how` を追加する。`schema_version` は `"1"` のまま（メンバー追加は互換、読み手は未知メンバーを許容する既存の規約）。guide §4.15 の Result JSON の説明に追記する。→ 実施: [enforcement/check.rs](../src/enforcement/check.rs) の `ReviewMarkerRecord` に `kind`・`why`・`how` を追加し [enforcement/json.rs](../src/enforcement/json.rs) で直列出力（`schema_version: "1"` 維持を `policy_check_e2e` で固定）。`commands/check.rs` のレコード構築で `classify()` を呼ぶ — 分類は sanitize 前の生テキストで行い、表示用 `text` のみ sanitize。guide 英日 §4.15 に新メンバーの説明を追記
+- [x] `check` の JSON の `review_markers[]` に `kind`・`why`・`how` を追加する。`schema_version` は `"1"` のまま（メンバー追加は互換、読み手は未知メンバーを許容する既存の規約）。guide §4.15 の Result JSON の説明に追記する。→ 実施: [enforcement/check.rs](../../src/enforcement/check.rs) の `ReviewMarkerRecord` に `kind`・`why`・`how` を追加し [enforcement/json.rs](../../src/enforcement/json.rs) で直列出力（`schema_version: "1"` 維持を `policy_check_e2e` で固定）。`commands/check.rs` のレコード構築で `classify()` を呼ぶ — 分類は sanitize 前の生テキストで行い、表示用 `text` のみ sanitize。guide 英日 §4.15 に新メンバーの説明を追記
 - [x] stderr の要約は、マーカーごとに `file:line: text` の次行に `why` と `how` を出す。同じ種別が多数あるときは種別ごとに件数と案内を 1 回にまとめる（表示上限の扱いは担当PRで決める）。全体の remediation（`check.rs:644-650`）は「種別ごとの次の判断」の列挙に置き換え、未解決項目ごとに次に何を決めればよいかが読めるようにする。→ 実施: 単独種別は `file:line: text` の次行に `kind:`/`why:`/`how:`、複数ある種別は `<kind> (N marker(s)):` ヘッダ＋位置一覧（8 件まで、超過は `… K more marker(s)`）＋案内 1 回に集約。remediation は種別の出現順に `<kind>: <how>` を列挙し、末尾に「解消した `// REVIEW` コメントは削除 — `MCP_WRIT_REVIEW_MODE=refuse` でマーカー付きポリシーはロード失敗」の全体指示を残す。グルーピング・件数・remediation 形を `policy_check_e2e` で固定
 - [x] ディスパッチャ型の冒頭 NOTE（`policy_generator.rs:83-88`）を具体化する: (1) ツール名が文字列リテラルとしてハンドラに結び付いていないため、能力分析（syscall・文字列・マニフェスト）をツール単位に対応付けられず `allowed`/`blocked` の判定を立てられない、(2) そのため許可判断はツール単位で運用者が行う — 必要なツールだけ `deny=#true` を外す、(3) 整合性の拠り所は `tools-list-hash` pin — `--live-discovery` で取得した一覧の digest が pin され、以後 `check`/`run` が一覧の変化を検知する。サーバー更新時は別ファイルに再生成して差分レビュー、(4) guide の該当節（Case C・§8.2）への参照。英日 guide §4.3 にも同じ説明を置く。→ 実施: (1)〜(4) すべてを冒頭 NOTE に記述 — `@server.call_tool()`/`setRequestHandler` による単一入口ディスパッチ、ツール単位の帰属不能、運用者の確認事項（per-tool 許可・`side_effect`・下位ポリシー）、`tools-list-hash` の役割、更新時の別ファイル再生成＋差分レビュー、guide §4.3 "Case C"・§8.2 参照。英日 guide §4.3 に同趣旨の段落を追加
 - [x] 全件 deny でない（部分的に根拠なし）ドラフトでも、根拠なしツールの件数を冒頭に出す（現状は全件のときだけ NOTE）。→ 実施: `build_tools_section` が `(ungrounded, emitted)` の組を返し、全件未根拠のときのみディスパッチャ型 NOTE、部分のときは `K/N tools in this draft carry no capability grounding` の件数 NOTE（全件とは断定しない文面）を出し分け — `policy_generator/tests.rs` で両形を固定
@@ -1211,7 +1211,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **前提（HEAD）:** `examples/policies/runtime/{node,python}.kdl` が雛形で、PR-21 以降の `generate-policy` は検出したインタプリタ（`WorkloadHashes.interpreter`）の seccomp ベースラインを同ファイルから無条件で投入する（`policy_generator.rs:511-535`・`668-700`）。`build_fs_section`（`470-508`）は二進の文字列分析由来のパス（`/usr/lib`・`/etc/ssl`・`/etc/pki`・`/lib`）しか出さず、`node.kdl` のコメントが「host policy が付けるべき」と列挙する読み取り先（実行ファイルのディレクトリと親、パッケージツリー、データディレクトリ）は出ない。`environment` ブロックは出ない。
 
-**主な変更先:** [policy_generator.rs](../src/legislator/policy_generator.rs)（`build_fs_section`、新 `build_environment_section`）、[source_bind/workload.rs](../src/legislator/source_bind/workload.rs)（`WorkloadHashes` に解決済みパス）、`examples/policies/runtime/*.kdl` の注記、guide 英日 §4.3、policy-authoring 英日
+**主な変更先:** [policy_generator.rs](../../src/legislator/policy_generator.rs)（`build_fs_section`、新 `build_environment_section`）、[source_bind/workload.rs](../../src/legislator/source_bind/workload.rs)（`WorkloadHashes` に解決済みパス）、`examples/policies/runtime/*.kdl` の注記、guide 英日 §4.3、policy-authoring 英日
 
 **タスク**
 
@@ -1234,7 +1234,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 許可リストに入れた環境変数が親環境に存在したか、値がパスを指す場合にそのパスが実在したかを、plan・起動レポート・監査に名前で残す。値は残さない。起動は止めない。
 
-**主な変更先:** [warden/env.rs](../src/warden/env.rs)、`src/warden/mod.rs`（`SpawnOptions` / spawn 結果）、[warden/plan/mod.rs](../src/warden/plan/mod.rs)（`launch.env` の理由文と観測）、[runtime/launch.rs](../src/runtime/launch.rs)（`server.connected` の details、stderr 警告）、[enforcement/model.rs](../src/enforcement/model.rs)（観測の構造化フィールドが必要な場合）、guide 英日 §4.8・監査スキーマ、`tests/environment_e2e.rs`、`tests/plan_report_e2e`
+**主な変更先:** [warden/env.rs](../../src/warden/env.rs)、`src/warden/mod.rs`（`SpawnOptions` / spawn 結果）、[warden/plan/mod.rs](../../src/warden/plan/mod.rs)（`launch.env` の理由文と観測）、[runtime/launch.rs](../../src/runtime/launch.rs)（`server.connected` の details、stderr 警告）、[enforcement/model.rs](../../src/enforcement/model.rs)（観測の構造化フィールドが必要な場合）、guide 英日 §4.8・監査スキーマ、`tests/environment_e2e.rs`、`tests/plan_report_e2e`
 
 **タスク**
 
@@ -1259,13 +1259,13 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 執行が設計どおりに働いた出来事が監査で `failure` に数えられないようにする。本物の検証失敗（ハッシュ不一致、blocked な `tools_list.verified`）は `failure` のまま。
 
-**主な変更先:** [proxy_tools_list.rs](../src/auditor/proxy_tools_list.rs)（`862-871` と同ファイルの tests）、`tests/tool_enforcement_e2e.rs`、`tests/real_servers_e2e.rs`、guide 英日（監査スキーマの `outcome` 行、`tools_list.filtered` の段落、outcome の値域表）、`docs/archive/migration.{md,ja.md}`
+**主な変更先:** [proxy_tools_list.rs](../../src/auditor/proxy_tools_list.rs)（`862-871` と同ファイルの tests）、`tests/tool_enforcement_e2e.rs`、`tests/real_servers_e2e.rs`、guide 英日（監査スキーマの `outcome` 行、`tools_list.filtered` の段落、outcome の値域表）、`docs/archive/migration.{md,ja.md}`
 
 **タスク**
 
 - [x] D-9 の推奨に従い、`tools_list.filtered` の outcome を `success` にする（通常実行: `action=denied`、`--dry-run`: `action=observed`）。severity・details は変えない。→ `proxy_tools_list.rs` の emit が `Outcome::Success`（通常 `Action::Denied` / dry-run `Action::Observed`）。`severity=info`・隠した名前列挙の details は従来どおり
 - [x] outcome の値域（`success` / `failure` / `unknown`）と各イベントでの意味を guide 英日の監査スキーマ節に表で固定する: `failure` は「要求された操作が完了しなかった」（`tool_call.denied`、`mcp_message.denied`、`hash.mismatch`、blocked な `tools_list.verified`、`sandbox.*_denied` など）、`success` は「操作が完了した」（`tool_call.allowed`、`tools_list.filtered` = 整形済み応答の送達 など）、`unknown` は観測不能。監視側への指針として「拒否の検出は `action=denied` で行い、`outcome=failure` を異常の指標にしない」を書く。→ guide.md `Audit log schema` / guide.ja.md `監査ログスキーマ` に値域表（`success`/`failure`/`unknown` × 割当イベント）と同指針を追加。guide.ja.md の `tools_list.filtered` 段落にも「`outcome` はいずれも `success`」を明記
-- [x] 新値 `enforced` は追加しない（D-9 の代替案 (a)）。追加する判断になった場合は `Outcome` の列挙（[audit_log/event.rs](../src/audit_log/event.rs) `151-165`）と JSON の値域（`guide.md:2521`）を同時に更新する。→ 不採用を確定 — `Outcome` 列挙は `success`/`failure`/`unknown` のまま変更なし
+- [x] 新値 `enforced` は追加しない（D-9 の代替案 (a)）。追加する判断になった場合は `Outcome` の列挙（[audit_log/event.rs](../../src/audit_log/event.rs) `151-165`）と JSON の値域（`guide.md:2521`）を同時に更新する。→ 不採用を確定 — `Outcome` 列挙は `success`/`failure`/`unknown` のまま変更なし
 - [x] 既存試験（`proxy_tools_list.rs:1358-1520`、`tool_enforcement_e2e.rs:1360`・`1537`、`real_servers_e2e.rs:1305`）の期待値を更新し、blocked な `tools_list.verified` が `failure` のままであることを対で固定する。→ 3 ファイルとも `outcome":"success"` 期待に更新。blocked `tools_list.verified` は `outcome=failure`/`action=observed`/`details` に `blocked=true` でコミットされることを対で固定（従来 emit の無かった blocked 記録自体も追加）
 - [x] PR-23 の `version=` → `revision=` と同様に、`docs/archive/migration.{md,ja.md}` に「`tools_list.filtered` の outcome が `failure` → `success`」を監査スキーマの表記変更として記録し、リリースノートに引き継ぐ。→ `docs/archive/migration.{md,ja.md}` に記録 — 消費者は `action=denied`（dry-run は `observed`）への切替を案内。blocked `tools_list.verified` のコミット追加も併記
 
@@ -1283,7 +1283,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** 拒否・失敗の判定は変えず、原因の切り分けに使える一文を加える。あわせて、起動前プローブが検査しない環境制約（proc の再マウント）を検査対象に加え、`auto` が設計表どおりに native へ回れるようにする（D-10）。
 
-**主な変更先:** [policy/mcp.rs](../src/policy/mcp.rs)（`DenyReason` の説明文）、[proxy_c2s/forward.rs](../src/auditor/proxy_c2s/forward.rs)（クライアント向けエラー文、`238`・`775`）、[proxy_s2c.rs](../src/auditor/proxy_s2c.rs)（`452` 付近の S2C 側 init-order）、[namespaced/spawn.rs](../src/warden/namespaced/spawn.rs)（`ERR <stage>` のヒント）、[namespaced/probe.rs](../src/warden/namespaced/probe.rs)・[namespaced/report.rs](../src/warden/namespaced/report.rs)・[warden/select.rs](../src/warden/select.rs)（D-10）、guide 英日（§7 障害切り分け表、§4.11）、`tests/mcp_wire_e2e`、`tests/linux_mechanism_e2e.rs`
+**主な変更先:** [policy/mcp.rs](../../src/policy/mcp.rs)（`DenyReason` の説明文）、[proxy_c2s/forward.rs](../../src/auditor/proxy_c2s/forward.rs)（クライアント向けエラー文、`238`・`775`）、[proxy_s2c.rs](../../src/auditor/proxy_s2c.rs)（`452` 付近の S2C 側 init-order）、[namespaced/spawn.rs](../../src/warden/namespaced/spawn.rs)（`ERR <stage>` のヒント）、[namespaced/probe.rs](../../src/warden/namespaced/probe.rs)・[namespaced/report.rs](../../src/warden/namespaced/report.rs)・[warden/select.rs](../../src/warden/select.rs)（D-10）、guide 英日（§7 障害切り分け表、§4.11）、`tests/mcp_wire_e2e`、`tests/linux_mechanism_e2e.rs`
 
 **タスク**
 
@@ -1307,12 +1307,12 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 
 **目的:** version 1 / 2 のポリシーを `check` したとき、version 3 で合成結果が変わる箇所の有無を情報として出す。移行の強制や自動書き換えはしない。
 
-**主な変更先:** [commands/policy_resolve.rs](../src/commands/policy_resolve.rs)（`compute_version_diff` / `VersionDiff` の共有化、`200-330`）、[commands/check.rs](../src/commands/check.rs)、[enforcement/check.rs](../src/enforcement/check.rs)（`CheckReport` に `migration`）、guide 英日 §4.15、`tests/policy_check_e2e.rs`
+**主な変更先:** [commands/policy_resolve.rs](../../src/commands/policy_resolve.rs)（`compute_version_diff` / `VersionDiff` の共有化、`200-330`）、[commands/check.rs](../../src/commands/check.rs)、[enforcement/check.rs](../../src/enforcement/check.rs)（`CheckReport` に `migration`）、guide 英日 §4.15、`tests/policy_check_e2e.rs`
 
 **タスク**
 
-- [x] `compute_version_diff` / `VersionDiff` を `check` から呼べる場所に移す（`commands` 内の共有モジュール、または `policy::version_diff`）。T-LAYER の依存方向を確認する。→ [policy/version_diff.rs](../src/policy/version_diff.rs) に新設 — 依存は `policy::kdl_loader`（同一モジュール）と layer-0 の `execution`/`termutil`/`error` のみで T-LAYER 適合（`module_layering` テスト通過）。引数の `PolicyResolveArgs`（cli 層）は `server: Option<&str>` に置き換え、`policy_resolve` は同じ selector を渡す。`comment_lines`/`effective_field_map` も同ファイルへ移動
-- [x] `check` で bound policy の `version < 3` のとき、v3 で再解決した差分を `migration` オブジェクトとして JSON に載せる: `{declared_version, candidate_version: 3, status: "unchanged" | "fields_differ" | "simulation_failed", fields: [{field, declared, simulated}], reason}`。`status`・`reason_code`・終了コードは変えない（`warnings` と同じ情報扱い）。version 3 のポリシーでは `migration` を `null` にする。→ [enforcement/check.rs](../src/enforcement/check.rs) に `MigrationRecord`/`MigrationStatus`/`MigrationFieldDiff` と `CheckReport.migration: Option<MigrationRecord>` を追加（`enforcement` は layer-0 で `policy` を参照できないため専用レコード型）。`evaluate` の `migration_preview` が `bound.version < 3` のとき `compute_version_diff` を実行し `VersionDiff` を変換（field 値は sanitize 済みで格納）。`reason` は `simulation_failed` 時のみ文字列、他は `null`。`emit_and_exit` の error フォールバックも `migration` を clone
+- [x] `compute_version_diff` / `VersionDiff` を `check` から呼べる場所に移す（`commands` 内の共有モジュール、または `policy::version_diff`）。T-LAYER の依存方向を確認する。→ [policy/version_diff.rs](../../src/policy/version_diff.rs) に新設 — 依存は `policy::kdl_loader`（同一モジュール）と layer-0 の `execution`/`termutil`/`error` のみで T-LAYER 適合（`module_layering` テスト通過）。引数の `PolicyResolveArgs`（cli 層）は `server: Option<&str>` に置き換え、`policy_resolve` は同じ selector を渡す。`comment_lines`/`effective_field_map` も同ファイルへ移動
+- [x] `check` で bound policy の `version < 3` のとき、v3 で再解決した差分を `migration` オブジェクトとして JSON に載せる: `{declared_version, candidate_version: 3, status: "unchanged" | "fields_differ" | "simulation_failed", fields: [{field, declared, simulated}], reason}`。`status`・`reason_code`・終了コードは変えない（`warnings` と同じ情報扱い）。version 3 のポリシーでは `migration` を `null` にする。→ [enforcement/check.rs](../../src/enforcement/check.rs) に `MigrationRecord`/`MigrationStatus`/`MigrationFieldDiff` と `CheckReport.migration: Option<MigrationRecord>` を追加（`enforcement` は layer-0 で `policy` を参照できないため専用レコード型）。`evaluate` の `migration_preview` が `bound.version < 3` のとき `compute_version_diff` を実行し `VersionDiff` を変換（field 値は sanitize 済みで格納）。`reason` は `simulation_failed` 時のみ文字列、他は `null`。`emit_and_exit` の error フォールバックも `migration` を clone
 - [x] stderr に情報行を 1 つ出す: `info: policy version 2 — N field(s) would compose differently under version 3 (see policy resolve --version-diff)`、差が無ければ `… composes identically under version 3`。→ `print_summary` 末尾に `info:` 行を追加（stdout/`--report` 両経路で 1 行）。`simulation_failed` は `info: policy version N — simulated version 3 load failed: <reason>` を追加
 - [x] guide 英日 §4.15 に `migration` の説明と「移行は任意。`policy resolve --version-diff` で差分を確認してから `policy version=3` に書き換える」を追記する。→ guide.md / guide.ja.md の Result JSON メンバ列挙に `migration` を追加し、`Version-3 migration preview` / `version-3 移行プレビュー` の段落を新設（3 status の意味・`policy resolve --version-diff` との同一計算・情報扱いで status/exit code 不変・移行は任意を記述）
 
