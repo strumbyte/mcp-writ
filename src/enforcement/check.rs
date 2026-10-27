@@ -128,6 +128,65 @@ pub struct ReviewMarkerRecord {
     pub how: &'static str,
 }
 
+/// Whether the bound policy's effective fields would compose
+/// differently under the candidate (v3) rules — the `migration.status`
+/// value of a [`CheckReport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MigrationStatus {
+    /// No effective field moves — the document may be declared `version=3`
+    /// without a semantics change.
+    Unchanged,
+    /// At least one effective field takes a different value under the
+    /// candidate rules — listed in `fields`.
+    FieldsDiffer,
+    /// The simulated candidate-rules load failed (e.g. strict-shape
+    /// validation) — `reason` names the failure, `fields` stays empty.
+    SimulationFailed,
+}
+
+impl MigrationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::FieldsDiffer => "fields_differ",
+            Self::SimulationFailed => "simulation_failed",
+        }
+    }
+}
+
+/// One effective-field difference between the declared-rules load and
+/// the simulated candidate-rules load — same shape as
+/// `policy resolve --version-diff`'s field rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationFieldDiff {
+    pub field: String,
+    /// Sorted effective value under the document's declared rules.
+    pub declared: Vec<String>,
+    /// Sorted effective value under the simulated candidate rules.
+    pub simulated: Vec<String>,
+}
+
+/// The `check` report's version-3 migration preview (PR-36): when the
+/// bound policy declares `version < 3`, the same documents are replayed
+/// under the v3 composition rules and the difference is reported
+/// in-band — informational like `warnings`, never moving `status`,
+/// `reason_code`, or the exit code. `None` when the policy already
+/// declares version 3 (or no policy loaded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationRecord {
+    /// The loaded document's declared `policy version=` (`1` or `2`).
+    pub declared_version: u32,
+    /// The composition-rules version the load was replayed under — `3`.
+    pub candidate_version: u32,
+    pub status: MigrationStatus,
+    /// Effective fields the candidate rules move — empty for
+    /// `unchanged` and `simulation_failed`.
+    pub fields: Vec<MigrationFieldDiff>,
+    /// The simulated load's failure when `status` is
+    /// `simulation_failed`; `null` otherwise.
+    pub reason: Option<String>,
+}
+
 /// One non-fatal finding a policy load raised — serialized from
 /// `policy::provenance::LoadWarning` so `plan`/`check`/`policy resolve`
 /// report the same warnings the enforcing loaders print to stderr.
@@ -180,6 +239,10 @@ pub struct CheckReport {
     /// replacements that dropped inherited entries, weakened
     /// postures. Informational: they never move `status`.
     pub warnings: Vec<PolicyWarningRecord>,
+    /// Version-3 migration preview — `Some` only when the bound policy
+    /// declares `version < 3`. Informational like `warnings`: it never
+    /// moves `status`.
+    pub migration: Option<MigrationRecord>,
     /// Ordered human next-steps for non-clean results.
     pub remediation: Vec<String>,
 }

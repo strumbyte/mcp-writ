@@ -1896,10 +1896,31 @@ policy) exits 2, and `error` (e.g. `--report` unwritable) exits 1 —
 a hand-written note / `why` — why the marker needs an operator
 decision / `how` — a representative resolution),
 `warnings[]` (the policy load's findings — `{kind, file, line,
-message}` — including `replaced` and `schema` kinds), and
-`remediation[]`. The JSON goes to stdout unless `--report` names a
+message}` — including `replaced` and `schema` kinds), `migration`
+(the version-3 preview described below — `null` for a `version=3`
+policy), and `remediation[]`. The JSON goes to stdout unless `--report` names a
 file; the human summary and remediation go to stderr either way, so
 stdout is always safe to consume as the JSON result.
+
+**Version-3 migration preview.** When the bound policy declares
+`version < 3`, `check` replays the same documents under the v3
+composition rules — the same computation `policy resolve
+--version-diff` performs — and reports the outcome as `migration`:
+`{declared_version, candidate_version: 3, status, fields[], reason}`.
+`status` is `unchanged` (no effective field moves — declaring
+`version=3` changes nothing), `fields_differ` (`fields[]` lists each
+moved field with its `declared` and `simulated` values), or
+`simulation_failed` (`reason` names the load error the v3 rules hit).
+stderr carries one `info: policy version N — …` line. The member is
+informational like `warnings`: it never moves `status`, `reason.code`,
+or the exit code. The preview re-reads and re-loads the documents —
+a file that changes between the two reads can produce a stale diff —
+and its member names differ from `--version-diff`'s JSON (`migration`
+uses `candidate_version`/`status`/`reason`; `version_diff` uses
+`simulated_version`/`simulated_error`) although both render the same
+computation. Migrating is optional — inspect the diff with
+`policy resolve --version-diff`, then rewrite the file to `policy
+version=3` when the composed result suits you.
 
 **Operating on drift:** a `drifted` result names what moved. For a
 `mismatch` or `unreadable` pin, compare the artifact — regenerate the

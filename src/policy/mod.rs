@@ -19,6 +19,7 @@ pub mod merge;
 mod outbound;
 pub mod review;
 pub mod validator;
+pub mod version_diff;
 
 pub use outbound::*;
 

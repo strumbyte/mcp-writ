@@ -33,6 +33,11 @@
 //! - `// REVIEW` markers left by `generate-policy` are reported in-band
 //!   (`review_markers`) — `check` never reads `MCP_WRIT_REVIEW_MODE`;
 //!   a marked policy is `drifted` here regardless.
+//! - a `version < 3` bound policy additionally carries a version-3
+//!   migration preview in-band (`migration`) — the same
+//!   [`crate::policy::version_diff::compute_version_diff`] computation
+//!   `policy resolve --version-diff` runs, informational like
+//!   `warnings` and never moving `status`/`reason_code`/the exit code.
 //!
 //! The machine-readable [`CheckReport`] goes to stdout, the human
 //! summary and remediation to stderr, and the process exits with the
@@ -45,13 +50,14 @@ use std::path::Path;
 use crate::audit_log::now_iso8601_millis;
 use crate::cli::CheckArgs;
 use crate::enforcement::{
-    CHECK_REPORT_SCHEMA_VERSION, CheckReport, CheckStatus, PinResult, PinStatus,
-    PolicyWarningRecord, ReviewMarkerRecord,
+    CHECK_REPORT_SCHEMA_VERSION, CheckReport, CheckStatus, MigrationFieldDiff, MigrationRecord,
+    MigrationStatus, PinResult, PinStatus, PolicyWarningRecord, ReviewMarkerRecord,
 };
 use crate::error::PolicyError;
 use crate::execution::ExecutionTarget;
 use crate::legislator::tools_list::{DiscoveryOptions, fetch_tools_list_detailed_with};
 use crate::policy::kdl_loader::load_kdl_policy_for_target_scanned;
+use crate::policy::version_diff::{VersionDiff, compute_version_diff};
 use crate::policy::{HashType, Policy};
 use crate::termutil::sanitize_for_terminal;
 
@@ -75,6 +81,7 @@ fn base_report() -> CheckReport {
         pins: Vec::new(),
         review_markers: Vec::new(),
         warnings: Vec::new(),
+        migration: None,
         remediation: Vec::new(),
     }
 }
@@ -178,11 +185,82 @@ async fn evaluate(args: CheckArgs) -> CheckReport {
         })
         .collect();
 
+    // Version-3 migration preview (PR-36): when the bound policy
+    // declares `version < 3`, replay the load under the v3 composition
+    // rules and report what would move — informational like `warnings`,
+    // never touching `status`/`reason_code`/the exit code.
+    report.migration = migration_preview(policy_path, &env, args.server.as_deref(), &bound);
+
     check_hash_pins(&bound, args.engine, &mut report.pins).await;
     check_launch_binding(&bound, &args.command, &mut report.pins);
     check_tools_list_pins(&bound, &args.command, &mut report.pins).await;
 
     finalize(report)
+}
+
+/// The version-3 migration preview — `None` when the bound policy
+/// already declares `version=3`. Otherwise the same
+/// [`compute_version_diff`] `policy resolve --version-diff` runs,
+/// pinned to candidate version 3: `unchanged` says the document can be
+/// declared `version=3` without a semantics change, `fields_differ`
+/// lists the effective fields that move, `simulation_failed` reports
+/// that the v3 rules cannot compose the document. Field values carry
+/// declared spellings — sanitize before they land in the report, same
+/// as the load warnings and marker text.
+fn migration_preview(
+    policy_path: &Path,
+    env: &str,
+    server: Option<&str>,
+    bound: &Policy,
+) -> Option<MigrationRecord> {
+    if bound.version >= 3 {
+        return None;
+    }
+    Some(
+        match compute_version_diff(policy_path, env, server, bound) {
+            VersionDiff::Diff {
+                declared,
+                simulated,
+                fields,
+            } => MigrationRecord {
+                declared_version: declared,
+                candidate_version: simulated,
+                status: if fields.is_empty() {
+                    MigrationStatus::Unchanged
+                } else {
+                    MigrationStatus::FieldsDiffer
+                },
+                fields: fields
+                    .into_iter()
+                    .map(|f| MigrationFieldDiff {
+                        field: sanitize_for_terminal(&f.field),
+                        declared: f
+                            .declared
+                            .iter()
+                            .map(|v| sanitize_for_terminal(v))
+                            .collect(),
+                        simulated: f
+                            .simulated
+                            .iter()
+                            .map(|v| sanitize_for_terminal(v))
+                            .collect(),
+                    })
+                    .collect(),
+                reason: None,
+            },
+            VersionDiff::SimFailed {
+                declared,
+                simulated,
+                reason,
+            } => MigrationRecord {
+                declared_version: declared,
+                candidate_version: simulated,
+                status: MigrationStatus::SimulationFailed,
+                fields: Vec::new(),
+                reason: Some(reason),
+            },
+        },
+    )
 }
 
 /// Every `hash_entries` pin, in policy order. `binary-hash` /
@@ -795,6 +873,29 @@ fn print_summary(report: &CheckReport) {
     for (i, step) in report.remediation.iter().enumerate() {
         eprintln!("  {}. {}", i + 1, sanitize_for_terminal(step));
     }
+    // The migration preview rides stderr as one information line —
+    // `status`/`reason_code`/exit code are unchanged either way.
+    if let Some(m) = &report.migration {
+        match m.status {
+            MigrationStatus::FieldsDiffer => eprintln!(
+                "info: policy version {} — {} field(s) would compose differently \
+                 under version {} (see policy resolve --version-diff)",
+                m.declared_version,
+                m.fields.len(),
+                m.candidate_version
+            ),
+            MigrationStatus::Unchanged => eprintln!(
+                "info: policy version {} — composes identically under version {}",
+                m.declared_version, m.candidate_version
+            ),
+            MigrationStatus::SimulationFailed => eprintln!(
+                "info: policy version {} — simulated version {} load failed: {}",
+                m.declared_version,
+                m.candidate_version,
+                sanitize_for_terminal(m.reason.as_deref().unwrap_or(""))
+            ),
+        }
+    }
 }
 
 /// Emit `report` and exit with [`CheckStatus::exit_code`].
@@ -831,6 +932,7 @@ fn emit_and_exit(report: &CheckReport, report_path: Option<&Path>) -> ! {
                 pins: report.pins.clone(),
                 review_markers: report.review_markers.clone(),
                 warnings: report.warnings.clone(),
+                migration: report.migration.clone(),
                 remediation: vec![format!(
                     "fix the --report destination '{}': {e}",
                     path.display()
