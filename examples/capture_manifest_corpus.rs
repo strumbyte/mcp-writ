@@ -1200,8 +1200,7 @@ defaults {
     filesystem {
 "#,
     );
-    let mut seen: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut allow = |mode: &str, path: String| {
         if seen.insert((mode.to_string(), path.clone())) {
             kdl.push_str(&format!("        allow \"{path}\" mode=\"{mode}\"\n"));
@@ -1754,11 +1753,7 @@ mod tests {
             policy.fs.denied_paths
         );
         assert!(
-            policy
-                .fs
-                .executable
-                .iter()
-                .any(|p| p == "/**" || p == "*"),
+            policy.fs.executable.iter().any(|p| p == "/**" || p == "*"),
             "exec stays open for arbitrary interpreter prefixes: {:?}",
             policy.fs.executable
         );

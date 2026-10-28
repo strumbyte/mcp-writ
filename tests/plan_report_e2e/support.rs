@@ -11,7 +11,10 @@ use tokio::time::{Duration, timeout};
 
 use crate::common;
 
-pub const TIMEOUT_SECS: u64 = 20;
+/// Process-level budget for one `plan`/`run` invocation. Loaded CI
+/// runners can take seconds just to spawn; the cap only bites on a
+/// real hang, so keep generous slack for parallel `cargo test` runs.
+pub const TIMEOUT_SECS: u64 = 60;
 
 pub fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_mcp-writ")

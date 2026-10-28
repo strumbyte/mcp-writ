@@ -167,8 +167,8 @@ mod tests {
     /// the same bytes are exported from a gate-satisfying location.
     fn stage_repo_policy(dir: &Path, rel: &str, name: &str) -> std::path::PathBuf {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
-        let body = std::fs::read_to_string(&src)
-            .unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
+        let body =
+            std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
         write_policy(dir, name, &body)
     }
 

@@ -20,10 +20,12 @@ mod reap;
 #[cfg(all(unix, test))]
 mod tests;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use reap::kill_proc_descendants;
 #[cfg(unix)]
 use reap::kill_unix_process_group;
+#[cfg(target_os = "linux")]
+use reap::{arm_child_subreaper, kill_orphan_descendants};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use reap::{collect_proc_descendants, kill_pids, kill_proc_descendants};
 
 /// A `std::process::Child` plus its per-launch lifetime boundary.
 ///
@@ -225,7 +227,13 @@ fn sweep_std_descendants(child: &StdChild, wait_mode: bool) {
                 );
             }
         } else {
+            // The leader is already gone: children it orphaned are
+            // reparented onto this guard (`PR_SET_CHILD_SUBREAPER`),
+            // where the orphan sweep still reaches them. The root
+            // walk stays for anything still parent-linked below the
+            // dead leader's id.
             kill_proc_descendants(pid as u32);
+            kill_orphan_descendants();
         }
     }
     #[cfg(target_os = "macos")]
@@ -476,20 +484,23 @@ impl RunningChild {
         if self.reaped {
             return;
         }
+        // Snapshot the tree *before* the group kill: while the leader
+        // is still alive a `setsid`/`setpgid` escapee is still
+        // ppid-linked and collectible — after the kill it reparents
+        // and a post-mortem walk can no longer name it.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let descendants = self.id().map(collect_proc_descendants).unwrap_or_default();
         if let Some(pgid) = self.process_group_id() {
             kill_unix_process_group(pgid);
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        kill_pids(&descendants);
         #[cfg(target_os = "linux")]
         if self.lifetime_cgroup.is_none() {
-            // No cgroup boundary: fall back to the /proc ancestry walk
-            // for descendants that escaped the process group.
-            if let Some(root) = self.id() {
-                kill_proc_descendants(root);
-            }
-        }
-        #[cfg(target_os = "macos")]
-        if let Some(root) = self.id() {
-            kill_proc_descendants(root);
+            // Anything orphaned onto this guard (subreaper) before or
+            // during the kill, plus descendants forked between the
+            // snapshot and the group kill.
+            kill_orphan_descendants();
         }
     }
 
@@ -830,6 +841,10 @@ pub(super) fn apply_unix_process_group(cmd: &mut std::process::Command) {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    // Arm once per spawn so a descendant orphaned later reparents to
+    // this guard, not init — the teardown sweep can still reach it.
+    #[cfg(target_os = "linux")]
+    arm_child_subreaper();
     let _ = cmd;
 }
 
@@ -838,5 +853,7 @@ pub(super) fn apply_unix_process_group_tokio(cmd: &mut tokio::process::Command) 
     {
         cmd.process_group(0);
     }
+    #[cfg(target_os = "linux")]
+    arm_child_subreaper();
     let _ = cmd;
 }

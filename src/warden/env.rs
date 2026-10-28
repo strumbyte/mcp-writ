@@ -95,9 +95,7 @@ pub(super) fn is_guard_env_var(key: &OsStr) -> bool {
     GUARD_ENV_VARS
         .iter()
         .any(|n| env_key_eq(key, OsStr::new(n)))
-        || key
-            .to_str()
-            .is_some_and(|k| k.starts_with("MCP_WRIT_NS_"))
+        || key.to_str().is_some_and(|k| k.starts_with("MCP_WRIT_NS_"))
 }
 
 /// Apply the [`SpawnOptions`] environment to an async command.

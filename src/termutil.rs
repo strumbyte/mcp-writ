@@ -33,6 +33,11 @@ fn is_bidi_or_format(c: char) -> bool {
 /// bounds the work a flooding child can cause.
 const STDERR_RELAY_CAP: usize = 64 * 1024;
 
+/// Emitted once when the relay starts dropping output — an over-cap
+/// flood must read as truncated, never as the child having gone quiet.
+const STDERR_TRUNCATED_NOTICE: &[u8] =
+    b"[mcp-writ] child stderr exceeded the relay cap; further output suppressed";
+
 /// Relay a spawned workload's stderr to ours in bounded chunks with
 /// terminal control characters escaped — a spawned MCP server is
 /// attacker-controlled, so its diagnostics cross as text, never raw
@@ -52,6 +57,7 @@ where
         use tokio::io::AsyncBufReadExt;
         let mut reader = tokio::io::BufReader::new(stderr);
         let mut budget = STDERR_RELAY_CAP;
+        let mut truncating = false;
         let mut pending: Vec<u8> = Vec::new();
         loop {
             let available = match reader.fill_buf().await {
@@ -67,6 +73,9 @@ where
                     &mut write_clean_stderr_line,
                 );
                 budget -= take;
+            } else if !truncating {
+                truncating = true;
+                write_clean_stderr_line(STDERR_TRUNCATED_NOTICE);
             }
             reader.consume(consumed);
         }
@@ -86,6 +95,7 @@ where
         use std::io::BufRead;
         let mut reader = std::io::BufReader::new(stderr);
         let mut budget = STDERR_RELAY_CAP;
+        let mut truncating = false;
         let mut pending: Vec<u8> = Vec::new();
         loop {
             let available = match reader.fill_buf() {
@@ -101,6 +111,9 @@ where
                     &mut write_clean_stderr_line,
                 );
                 budget -= take;
+            } else if !truncating {
+                truncating = true;
+                write_clean_stderr_line(STDERR_TRUNCATED_NOTICE);
             }
             reader.consume(consumed);
         }

@@ -461,7 +461,11 @@ fn response_parse_cname_short_rdata_fails_closed() {
     // alias is part of the answer's semantics, so the response fails
     // closed instead of silently dropping the record.
     for rdata in [&[][..], &[0xC0][..]] {
-        let pkt = response("web.example", 0, &[("web.example", RRTYPE_CNAME, 60, rdata)]);
+        let pkt = response(
+            "web.example",
+            0,
+            &[("web.example", RRTYPE_CNAME, 60, rdata)],
+        );
         let parsed = parse_response(&pkt, "web.example");
         assert!(!parsed.decoded);
         assert!(parsed.chain.is_empty());

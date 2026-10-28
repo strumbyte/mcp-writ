@@ -696,7 +696,6 @@ fn share_root_exemption_is_scoped_to_registered_descendants() {
     // The authorization resolve accepts the descendant — on a
     // shared-writable temp tree this is the only way it can pass.
     let spelling = workspace.display().to_string().replace('\\', "/");
-    resolve_for_authorization(&spelling).unwrap_or_else(|e| {
-        panic!("descendant of a registered share root must resolve: {e}")
-    });
+    resolve_for_authorization(&spelling)
+        .unwrap_or_else(|e| panic!("descendant of a registered share root must resolve: {e}"));
 }
