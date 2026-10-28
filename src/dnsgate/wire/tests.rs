@@ -412,6 +412,102 @@ fn response_parse_https_malformed_rdata_fails_closed() {
 }
 
 #[test]
+fn response_parse_cname_undecodable_target_fails_closed() {
+    // A CNAME whose target name does not decode (a compression pointer
+    // past the end of the packet) could hide a destination the walk
+    // never judged — the answer is refused as undecoded rather than
+    // relayed with the record silently dropped.
+    let pkt = response(
+        "web.example",
+        0,
+        &[("web.example", RRTYPE_CNAME, 60, &[0xC0, 0xFF])],
+    );
+    let parsed = parse_response(&pkt, "web.example");
+    assert!(!parsed.decoded);
+    assert!(parsed.chain.is_empty());
+}
+
+#[test]
+fn response_parse_alias_root_target_records_hop() {
+    // A one-byte RDATA of `\x00` decodes to the root: an alias to the
+    // DNS root is a real destination the walk must record — dropping
+    // the hop would leave a substitution invisible to policy
+    // re-judgment, the same failure as dropping the record.
+    let pkt = response(
+        "web.example",
+        0,
+        &[("web.example", RRTYPE_CNAME, 60, &[0x00])],
+    );
+    let parsed = parse_response(&pkt, "web.example");
+    assert!(parsed.decoded);
+    assert_eq!(parsed.chain, ["".to_string()]);
+
+    // Same for a DNAME whose target is the root: `x.evil.example`
+    // substitutes its owner suffix with the root — the hop `x` is a
+    // different name under a different zone and must be re-judged.
+    let pkt = response(
+        "x.evil.example",
+        0,
+        &[("evil.example", RRTYPE_DNAME, 60, &[0x00])],
+    );
+    let parsed = parse_response(&pkt, "x.evil.example");
+    assert!(parsed.decoded);
+    assert_eq!(parsed.chain, ["x".to_string()]);
+}
+
+#[test]
+fn response_parse_cname_short_rdata_fails_closed() {
+    // Empty and one-byte RDATA carry no decodable target either — the
+    // alias is part of the answer's semantics, so the response fails
+    // closed instead of silently dropping the record.
+    for rdata in [&[][..], &[0xC0][..]] {
+        let pkt = response("web.example", 0, &[("web.example", RRTYPE_CNAME, 60, rdata)]);
+        let parsed = parse_response(&pkt, "web.example");
+        assert!(!parsed.decoded);
+        assert!(parsed.chain.is_empty());
+    }
+}
+
+#[test]
+fn response_parse_cname_target_overrunning_rdata_fails_closed() {
+    // The RDATA name must end within the record: a target that decodes
+    // only by reading into the following record's bytes is malformed,
+    // and the answer fails closed instead of collecting whatever the
+    // overrun spelled out.
+    let a_rdata = [203u8, 0, 113, 5];
+    let pkt = response(
+        "web.example",
+        0,
+        &[
+            ("web.example", RRTYPE_CNAME, 60, &[1, b'x', 1, b'y']),
+            ("edge.example", 1, 50, &a_rdata),
+        ],
+    );
+    let parsed = parse_response(&pkt, "web.example");
+    assert!(!parsed.decoded);
+    assert!(parsed.chain.is_empty());
+}
+
+#[test]
+fn response_parse_dname_target_overrunning_rdata_fails_closed() {
+    // Same overrun rule for DNAME — the suffix-rewrite target is
+    // destination material and a record that reads past its RDATA is
+    // not partially trusted.
+    let a_rdata = [203u8, 0, 113, 5];
+    let pkt = response(
+        "www.a.example",
+        0,
+        &[
+            ("a.example", RRTYPE_DNAME, 60, &[1, b'x', 1, b'y']),
+            ("edge.example", 1, 50, &a_rdata),
+        ],
+    );
+    let parsed = parse_response(&pkt, "www.a.example");
+    assert!(!parsed.decoded);
+    assert!(parsed.chain.is_empty());
+}
+
+#[test]
 fn response_parse_https_root_target_not_a_hop() {
     // ServiceMode TargetName "." means the service lives at the
     // owner name — no new destination is revealed.

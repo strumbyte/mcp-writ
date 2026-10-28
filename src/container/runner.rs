@@ -1060,6 +1060,23 @@ async fn run_image_inner(
             layout.report_dir.to_string(),
         ));
     }
+    // Every host-mounted share root the guest sees. A bind mount
+    // reports as replaceable from inside by construction — only the
+    // host can retarget it, which is the mount contract — so policy
+    // grants beneath these roots could never pass the runner's
+    // authorization ancestry check. Declaring them lets the runner
+    // treat paths under a mount as boundary-stable; the variable is a
+    // launch channel, stripped before the workload spawns.
+    let share_roots = spec
+        .shares
+        .iter()
+        .map(|s| s.guest.clone())
+        .collect::<Vec<_>>()
+        .join(";");
+    if !share_roots.is_empty() {
+        spec.env
+            .push(("MCP_WRIT_SHARE_ROOTS".to_string(), share_roots));
+    }
     // Point the runner at the mounted policy file — the explicit
     // channel keeps the in-guest default from depending on the guest's
     // working directory.

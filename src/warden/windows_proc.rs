@@ -421,7 +421,7 @@ fn spawn_inner(
     // CREATE_UNICODE_ENVIRONMENT): a custom block is rejected at
     // CreateProcessW under a security environment, so the child runs on
     // the mechanism-managed environment.
-    let env_block = opts.and_then(encode_windows_env_block);
+    let env_block = opts.map(encode_windows_env_block);
     let env_ptr = env_block
         .as_ref()
         .map(|block| block.as_ptr() as *const c_void);

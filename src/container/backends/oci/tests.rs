@@ -80,6 +80,8 @@ fn hardening_prefix() -> Vec<&'static str> {
         "MCP_WRIT_TEMP_DIR=",
         "-e",
         "MCP_WRIT_ALLOW_REPLACEABLE_PATHS=",
+        "-e",
+        "MCP_WRIT_SHARE_ROOTS=",
     ]
 }
 

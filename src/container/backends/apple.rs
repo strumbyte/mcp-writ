@@ -171,10 +171,14 @@ pub(crate) fn apple_run_args(options: &[String], image: &str) -> Vec<String> {
     ];
     // Same reasoning as `container_run_args`: the channel path vars must
     // not survive into the workload's environment from a baked image ENV.
+    // The downgrade/boundary knobs are cleared the same way — only the
+    // launch's explicit settings may arm them, never a baked-in one.
     for var in [
         crate::container::guest_layout::LINUX.policy_path_env,
         crate::container::guest_layout::LINUX.audit_dir_env,
         crate::container::guest_layout::LINUX.temp_dir_env,
+        "MCP_WRIT_ALLOW_REPLACEABLE_PATHS",
+        "MCP_WRIT_SHARE_ROOTS",
     ] {
         args.push("-e".to_string());
         args.push(format!("{var}="));

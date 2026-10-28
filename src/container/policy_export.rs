@@ -73,6 +73,11 @@ impl std::error::Error for PolicyExportError {}
 /// accepts rules the `target` workload OS can represent, so a Windows host
 /// can validate a policy for a Linux container guest.
 ///
+/// The trusted-source gate runs between load and bind: the guest-side
+/// runner exempts the host-mounted contract path from its own ancestry
+/// check, so the *host-side* spelling and every file the load reached
+/// (root document, `extends`/`include`, `@file` schemas) must prove
+/// unreplaceable here or the export mints authority from a swapped tree.
 /// Does not inline schemas: callers that need to inspect the bound
 /// policy (e.g. docker-manifest-hash checks) run this before inlining.
 pub fn load_and_bind_policy(
@@ -81,6 +86,8 @@ pub fn load_and_bind_policy(
     target: &ExecutionTarget,
 ) -> Result<Policy, PolicyBindError> {
     let effective_policy = crate::policy::loader::load_policy_for_target(policy_path, target)
+        .map_err(|e| PolicyBindError::Load(e.to_string()))?;
+    crate::policy::loader::require_trusted_policy_sources(&effective_policy)
         .map_err(|e| PolicyBindError::Load(e.to_string()))?;
     effective_policy
         .bind_to_server(server)
@@ -147,13 +154,34 @@ mod tests {
         path
     }
 
+    /// `export_self_contained_kdl`/`load_and_bind_policy` refuse a
+    /// replaceable policy source — fixtures must satisfy the source-
+    /// trust gate, so tests live under `restricted_tempdir` and skip
+    /// when the host offers no write-restricted root.
+    fn fixture_dir() -> Option<tempfile::TempDir> {
+        crate::testutil::restricted_tempdir()
+    }
+
+    /// Copy a checked-in policy fixture into the restricted dir — the
+    /// repo checkout itself is not write-restricted on dev hosts, so
+    /// the same bytes are exported from a gate-satisfying location.
+    fn stage_repo_policy(dir: &Path, rel: &str, name: &str) -> std::path::PathBuf {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        let body = std::fs::read_to_string(&src)
+            .unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
+        write_policy(dir, name, &body)
+    }
+
     /// A per-destination allowlist (`allow host=...` while `deny_all_others`
     /// holds) is representable on a Linux guest — accepted even when the
     /// host OS doing the export is Windows. This is the core cross-target
     /// case: the guest contract, not `cfg!(windows)`, decides acceptance.
     #[test]
     fn linux_guest_accepts_per_destination_allowlist_on_any_host() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(dir) = fixture_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
         let path = write_policy(
             dir.path(),
             "policy.kdl",
@@ -176,7 +204,10 @@ server "test" {
     /// Windows — the per-destination allowlist is not representable there.
     #[test]
     fn windows_target_rejects_per_destination_allowlist() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(dir) = fixture_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
         let path = write_policy(
             dir.path(),
             "policy.kdl",
@@ -222,7 +253,10 @@ server "test" {
     /// representability error.
     #[test]
     fn missing_inline_schema_is_host_side_error_for_any_target() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(dir) = fixture_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
         let path = write_policy(
             dir.path(),
             "policy.kdl",
@@ -249,7 +283,10 @@ server "test" {
     /// target and accept for a Linux guest.
     #[test]
     fn inherited_constraint_is_validated_against_the_target() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(dir) = fixture_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
         write_policy(
             dir.path(),
             "parent.kdl",
@@ -291,7 +328,10 @@ server "test" {
     /// must keep it.
     #[test]
     fn explicit_empty_tool_filesystem_block_is_preserved_on_export() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(dir) = fixture_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
         let path = write_policy(
             dir.path(),
             "policy.kdl",
@@ -330,8 +370,15 @@ server "test" {
     /// rejects. The repo's container fixture is the canonical shape.
     #[test]
     fn fixture_with_read_only_tools_exports_for_linux_guest() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_container_policy.kdl");
+        let Some(dir) = fixture_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
+        let path = stage_repo_policy(
+            dir.path(),
+            "tests/fixtures/test_container_policy.kdl",
+            "test_container_policy.kdl",
+        );
         let kdl = export_self_contained_kdl(&path, None, &linux_target())
             .expect("fixture policy must export for a Linux guest");
         // No tool needs a network block (the defaults posture re-parses to
@@ -354,7 +401,11 @@ server "test" {
     /// deny-all default) and must export cleanly.
     #[test]
     fn example_policy_exports_for_linux_guest() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("policy.example.kdl");
+        let Some(dir) = fixture_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
+        let path = stage_repo_policy(dir.path(), "policy.example.kdl", "policy.example.kdl");
         export_self_contained_kdl(&path, None, &linux_target())
             .expect("policy.example.kdl must export for a Linux guest");
     }
@@ -364,7 +415,10 @@ server "test" {
     /// re-parse to the deny-all default and silently tighten the policy.
     #[test]
     fn open_outbound_posture_is_preserved_on_export() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(dir) = fixture_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
         let path = write_policy(
             dir.path(),
             "policy.kdl",
@@ -397,7 +451,10 @@ server "test" {
     /// transport, not enforcement).
     #[test]
     fn udp_allow_rule_round_trips_proto_port_and_dest() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(dir) = fixture_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
         let path = write_policy(
             dir.path(),
             "policy.kdl",
@@ -441,7 +498,10 @@ server "test" {
     /// so the child's export carries the parent's rule verbatim.
     #[test]
     fn udp_allow_survives_inheritance_on_export() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(dir) = fixture_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
         write_policy(
             dir.path(),
             "parent.kdl",
@@ -495,7 +555,10 @@ server "test" {
     /// must yield `proto="tcp"`, never `udp`/`any` coverage.
     #[test]
     fn tcp_allow_does_not_gain_udp_on_export() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(dir) = fixture_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
         let path = write_policy(
             dir.path(),
             "policy.kdl",

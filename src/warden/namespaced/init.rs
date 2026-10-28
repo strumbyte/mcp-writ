@@ -558,7 +558,15 @@ fn scrub_env_and_fds(extra_keep: &[i32]) {
     // pin descriptors init must hold open through the workload exec.
     let mut keep = keep_fds_from_env();
     keep.extend_from_slice(extra_keep);
-    for var in super::init_env::ALL {
+    // `GUARD_ENV_VARS` ride along: inherit mode hands init the parent's
+    // ambient env, and the launcher↔runner contract/downgrade names in
+    // it (e.g. `MCP_WRIT_ALLOW_REPLACEABLE_PATHS`) must not survive into
+    // the workload exec either.
+    for var in super::init_env::ALL
+        .iter()
+        .chain(super::super::env::GUARD_ENV_VARS.iter())
+        .copied()
+    {
         // SAFETY: single-threaded context — this runs in the pidns-init
         // child after fork() (only the calling thread survives), and the
         // init helper was dispatched before the tokio runtime started, so

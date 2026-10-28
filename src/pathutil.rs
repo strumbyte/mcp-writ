@@ -66,10 +66,16 @@ pub fn resolve_for_authorization_with_cwd(path: &str, cwd: &Path) -> Result<Stri
     // cannot outlive a component another principal can swap, so every
     // ancestor of the resolved object must be write-restricted. Same-
     // principal mutation is irreducible without handle passing and is
-    // the documented residual of this boundary. Operators who keep
-    // workspaces under intentionally group-shared trees can accept the
-    // swap race explicitly via `MCP_WRIT_ALLOW_REPLACEABLE_PATHS`.
-    if !replaceable_paths_permitted() {
+    // the documented residual of this boundary. Two documented
+    // relaxations: operators who keep workspaces under intentionally
+    // group-shared trees can accept the swap race explicitly via
+    // `MCP_WRIT_ALLOW_REPLACEABLE_PATHS`, and paths beneath a
+    // registered guest share root (a WSB mapped folder or container
+    // bind mount) skip the walk — a mount root is swappable only by
+    // the host that placed it, the already-trusted launcher's own
+    // channel, so the guest-side check can never pass there and never
+    // needed to.
+    if !replaceable_paths_permitted() && !crate::fspriv::path_under_share_root(&resolved) {
         crate::fspriv::require_parent_write_restricted(&resolved).map_err(|e| {
             format!(
                 "path '{}' resolves through a replaceable component: {e} \

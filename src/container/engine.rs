@@ -296,12 +296,16 @@ pub(crate) fn container_run_args_ext(
     // to a hostile in-image path, so every launch clears them; `options`
     // re-sets the mount-backed values. The trusted-source opt-out is
     // cleared the same way: only this launch's explicit setting may arm
-    // the documented downgrade, never a baked-in one.
+    // the documented downgrade, never a baked-in one. `MCP_WRIT_SHARE_ROOTS`
+    // likewise: an image-baked `/` would register the whole guest fs as
+    // a mount boundary and silence the ancestry check — only the
+    // launcher's declared mounts may arrive here.
     for var in [
         crate::container::guest_layout::LINUX.policy_path_env,
         crate::container::guest_layout::LINUX.audit_dir_env,
         crate::container::guest_layout::LINUX.temp_dir_env,
         "MCP_WRIT_ALLOW_REPLACEABLE_PATHS",
+        "MCP_WRIT_SHARE_ROOTS",
     ] {
         args.push("-e".to_string());
         args.push(format!("{var}="));

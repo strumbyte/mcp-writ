@@ -31,7 +31,9 @@
 //!
 //! Execution: every captured server — vendored or ephemeral — runs
 //! under the built `mcp-writ` binary with a deny-by-default policy
-//! (read+exec everywhere, no writes, `deny host="*"`, empty
+//! (read access enumerated to system/install roots — user profiles,
+//! `/tmp`, and `/mnt` are simply not granted, so secret paths have no
+//! grant to reach; exec everywhere; no writes; `deny host="*"`; empty
 //! environment allowlist) when a guard binary is available at
 //! `target/debug/mcp-writ` or `target/release/mcp-writ`, overridable
 //! via `MCP_CORPUS_GUARD=<path>`. The spawned process also receives a
@@ -948,7 +950,7 @@ struct StdioRpc {
 }
 
 impl StdioRpc {
-    fn spawn(argv: &[String], cwd: &Path) -> Result<Self, String> {
+    fn spawn(argv: &[String], cwd: &Path, guarded: bool) -> Result<Self, String> {
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..])
             .stdin(Stdio::piped())
@@ -956,6 +958,18 @@ impl StdioRpc {
             .stderr(Stdio::piped())
             .current_dir(cwd);
         minimal_env(&mut cmd);
+        if guarded {
+            // The corpus deliberately generates its policy and works
+            // under the operator's scratch tree, whose ACLs need not be
+            // write-restricted — the documented shared-tree opt-out
+            // belongs on the guard process so the spawned guard's
+            // trusted-source gate accepts the staged policy. It never
+            // reaches the workload: the guard strips every guard var
+            // from the child env, and `guarded == false` skips this
+            // entirely so an unsandboxed capture cannot inherit it
+            // into a nested launch either.
+            cmd.env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1");
+        }
         let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", argv[0]))?;
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, lines) = mpsc::channel();
@@ -1156,24 +1170,162 @@ fn guard_bin() -> Option<PathBuf> {
 }
 
 /// Deny-by-default capture policy: the interpreter and its modules must
-/// load (`read`/`exec` on everything — the install root and system libs
-/// are all read-only), nothing writes anywhere, no network flows, and an
-/// empty environment allowlist hands the child only PATH + system vars.
-/// Secret paths stay covered by the default overlay.
-fn corpus_policy() -> &'static str {
-    r#"policy version=2
+/// load: `exec` on everything (an interpreter can live anywhere), but
+/// `read` only on the roots [`corpus_read_roots`] enumerates — system
+/// trees, pseudo-devices, the resolved interpreter's own install
+/// prefix, the corpus scratch dir, and the repo checkout. Nothing
+/// writes anywhere, no network flows, and an empty environment
+/// allowlist hands the child only PATH + system vars.
+///
+/// The protection model is *absence of grant*, not deny rules: the
+/// fs grammar cannot carve a denied subpath out of a broad grant —
+/// Landlock's `path_beneath` rules are additive and refuse the policy
+/// at setup, and regular AppContainer has no deny ACEs at all — so a
+/// `read /**` + `deny` combination makes the guard launch refuse.
+/// Instead, read access is enumerated: `$HOME`/`USERPROFILE` (`~/.ssh`,
+/// `~/.aws`, `~/.npmrc`, `~/.env`, …), `/root`, `/tmp`, and `/mnt/*`
+/// (WSL's drvfs view of the Windows profiles) are simply not granted.
+/// `/etc` is included wholesale because the credential material there
+/// (`shadow`, `sudoers`) is already root-only at the DAC layer — a
+/// workload running as the capture user cannot open it regardless.
+/// `exec /**` stays broad on purpose: the execute right cannot read a
+/// file's contents, and interpreters resolve from arbitrary prefixes
+/// (`~/.nvm`, `/opt`, Homebrew). A captured package trying to open a
+/// secret path fails closed; a package needing a root we missed fails
+/// *visibly* — the capture comes back empty, never silently wider.
+fn corpus_policy(argv0: &str, cwd: &Path, scratch: &Path) -> String {
+    let mut kdl = String::from(
+        r#"policy version=2
 defaults {
     filesystem {
-        allow "/**" mode="read"
-        allow "/**" mode="exec"
+"#,
+    );
+    let mut seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut allow = |mode: &str, path: String| {
+        if seen.insert((mode.to_string(), path.clone())) {
+            kdl.push_str(&format!("        allow \"{path}\" mode=\"{mode}\"\n"));
+        }
+    };
+    for root in corpus_read_roots(argv0, cwd, scratch) {
+        // Grant only roots that exist: Landlock and AppContainer both
+        // fail policy construction on absent paths.
+        if Path::new(&root).exists() {
+            allow("read", root);
+        }
     }
+    allow("exec", "/**".to_string());
+    kdl.push_str(
+        r#"    }
     network {
         deny host="*"
     }
     environment {
     }
 }
-"#
+"#,
+    );
+    kdl
+}
+
+/// The read roots [`corpus_policy`] grants. Order is cosmetic — the set
+/// is deduplicated on emit — but the composition is the security
+/// contract above: everything a captured server legitimately reads,
+/// nothing under a user profile or a cross-OS mount.
+fn corpus_read_roots(argv0: &str, cwd: &Path, scratch: &Path) -> Vec<String> {
+    let spell = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    let mut roots: Vec<String> = if cfg!(windows) {
+        // The POSIX-side guard never wraps a Windows binary, but emit a
+        // sane set anyway so the policy parses and confines if run.
+        vec![
+            "C:/Windows".into(),
+            "C:/Program Files".into(),
+            "C:/Program Files (x86)".into(),
+        ]
+    } else {
+        vec![
+            "/usr".into(),
+            "/bin".into(),
+            "/sbin".into(),
+            "/lib".into(),
+            "/lib64".into(),
+            "/opt".into(),
+            "/snap".into(),
+            "/etc".into(),
+            // macOS resolves /etc through /private/etc.
+            "/private/etc".into(),
+            "/System".into(),
+            "/Library".into(),
+            "/Applications".into(),
+            // Pseudo-devices stdio/interpreters open. `/dev/fd` is a
+            // symlink into /proc/self/fd — `/proc/self` covers the
+            // resolved targets (the workload's own maps/environ only).
+            "/dev/null".into(),
+            "/dev/zero".into(),
+            "/dev/full".into(),
+            "/dev/urandom".into(),
+            "/dev/random".into(),
+            "/dev/tty".into(),
+            "/dev/fd".into(),
+            "/proc/self".into(),
+        ]
+    };
+    // npm/pypi install roots, the per-server work dir, and the policy
+    // dir itself all live under scratch.
+    roots.push(spell(scratch));
+    // Pinned fixtures keep the checkout cwd — `git --repository .`
+    // specs read .git, vendored servers read their own tree.
+    roots.push(spell(repo_root()));
+    // The launch cwd when it differs (pinned == repo_root; ephemeral ==
+    // a work dir under scratch — both already covered, dedup handles
+    // it, but spell it for the invariant).
+    roots.push(spell(cwd));
+    // Interpreters under user prefixes (nvm, pyenv, uv, venvs) sit
+    // outside every system root — grant their own install prefix
+    // without touching $HOME: `<env>/bin/<exe>` gets `<env>/bin` plus
+    // `<env>/{lib,lib64,libexec,include,share,Scripts,pyvenv.cfg}`.
+    if let Some(exe) = resolve_on_path(argv0, cwd)
+        && let Ok(real) = exe.canonicalize()
+        && let Some(dir) = real.parent()
+    {
+        roots.push(spell(dir));
+        if matches!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some("bin" | "sbin" | "Scripts" | "bin64")
+        ) && let Some(env_root) = dir.parent()
+        {
+            // Expand only when the parent really is an interpreter
+            // prefix (venv marker or npm's global root); an arbitrary
+            // `bin` directory like `~/.local/bin/foo` must not grant
+            // sibling trees under a profile root.
+            if env_root.join("pyvenv.cfg").is_file()
+                || env_root.join("lib").join("node_modules").is_dir()
+            {
+                for sub in ["lib", "lib64", "libexec", "include", "share", "Scripts"] {
+                    roots.push(spell(&env_root.join(sub)));
+                }
+                roots.push(spell(&env_root.join("pyvenv.cfg")));
+            }
+        }
+    }
+    roots
+}
+
+/// Resolve `argv0` to an executable path — an explicit `/`-bearing
+/// spelling resolves against `cwd`, otherwise the child's PATH search
+/// is replayed against this process's PATH (the guard launch inherits
+/// the same PATH the empty environment allowlist restores).
+fn resolve_on_path(argv0: &str, cwd: &Path) -> Option<PathBuf> {
+    if argv0.contains('/') || argv0.contains('\\') {
+        let p = PathBuf::from(argv0);
+        let p = if p.is_absolute() { p } else { cwd.join(p) };
+        return p.is_file().then_some(p);
+    }
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(argv0))
+            .find(|p| p.is_file())
+    })
 }
 
 /// Wrap `argv` in the guard and pick the launch cwd. Every captured
@@ -1186,7 +1338,7 @@ fn guard_wrap(
     spec: &ServerSpec,
     argv: &[String],
     scratch: &Path,
-) -> Result<(Vec<String>, PathBuf), String> {
+) -> Result<(Vec<String>, PathBuf, bool), String> {
     let work = scratch.join("work").join(spec.name);
     std::fs::create_dir_all(&work).map_err(|e| format!("mkdir {}: {e}", work.display()))?;
     let cwd = match spec.source {
@@ -1202,7 +1354,7 @@ fn guard_wrap(
                 "warning: {} running WITHOUT sandbox (MCP_CORPUS_UNSAFE_HOST=1)",
                 spec.name
             );
-            Ok((argv.to_vec(), cwd))
+            Ok((argv.to_vec(), cwd, false))
         } else {
             Err(format!(
                 "{}: no mcp-writ guard binary — build `cargo build --bin mcp-writ`, \
@@ -1220,7 +1372,7 @@ fn guard_wrap(
                  (MCP_CORPUS_UNSAFE_HOST=1)",
                 spec.name
             );
-            Ok((argv.to_vec(), cwd))
+            Ok((argv.to_vec(), cwd, false))
         } else {
             Err(format!(
                 "{}: Windows child cannot run under the POSIX guard — \
@@ -1233,7 +1385,7 @@ fn guard_wrap(
     std::fs::create_dir_all(&policy_dir)
         .map_err(|e| format!("mkdir {}: {e}", policy_dir.display()))?;
     let policy_path = policy_dir.join(format!("{}.kdl", spec.name));
-    std::fs::write(&policy_path, corpus_policy())
+    std::fs::write(&policy_path, corpus_policy(&argv[0], &cwd, scratch))
         .map_err(|e| format!("write {}: {e}", policy_path.display()))?;
     let mut wrapped = vec![
         guard.to_string_lossy().into_owned(),
@@ -1243,13 +1395,13 @@ fn guard_wrap(
         "--".into(),
     ];
     wrapped.extend(argv.iter().cloned());
-    Ok((wrapped, cwd))
+    Ok((wrapped, cwd, true))
 }
 
 fn capture(spec: &ServerSpec, scratch: &Path) -> Result<(Vec<String>, String, String), String> {
     let (argv, logical_argv, version) = argv_for(spec, scratch)?;
-    let (argv, cwd) = guard_wrap(spec, &argv, scratch)?;
-    let mut rpc = StdioRpc::spawn(&argv, &cwd)?;
+    let (argv, cwd, guarded) = guard_wrap(spec, &argv, scratch)?;
+    let mut rpc = StdioRpc::spawn(&argv, &cwd, guarded)?;
     let out = (|| {
         let init = rpc.request(
             1,
@@ -1576,4 +1728,69 @@ fn run() -> Result<(), String> {
     }
     println!("provenance -> {}", posix_rel(&prov_path, repo_root()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The generated corpus policy must parse under the real loader —
+    /// a KDL the validator rejects would turn every guarded capture
+    /// into a launch refusal. The assertions double as the contract
+    /// check: no deny rules (a deny under a broad grant is
+    /// unexpressible on Landlock/AppContainer and refuses the launch),
+    /// read access enumerated to system/install roots only, exec open.
+    #[test]
+    fn corpus_policy_parses_and_grants_no_secret_roots() {
+        let scratch = tempfile::tempdir().unwrap();
+        let kdl = corpus_policy("node", Path::new("/tmp/work"), scratch.path());
+        let path = scratch.path().join("corpus.kdl");
+        std::fs::write(&path, &kdl).unwrap();
+        let policy = mcp_writ::policy::loader::load_policy(&path)
+            .unwrap_or_else(|e| panic!("generated corpus policy must parse: {e}\n{kdl}"));
+        assert!(
+            policy.fs.denied_paths.is_empty(),
+            "deny rules are unexpressible under the launch mechanisms: {:?}",
+            policy.fs.denied_paths
+        );
+        assert!(
+            policy
+                .fs
+                .executable
+                .iter()
+                .any(|p| p == "/**" || p == "*"),
+            "exec stays open for arbitrary interpreter prefixes: {:?}",
+            policy.fs.executable
+        );
+        // No read root may spell a glob (a '*' root would widen the
+        // grant to every sibling — e.g. '/home/*' reaches every user's
+        // dotfiles), and the whole-home mounts themselves never appear.
+        for root in &policy.fs.read_only {
+            assert!(
+                !root.contains('*'),
+                "read root must be a concrete path, not a glob: {root}"
+            );
+        }
+        for forbidden in ["/home", "/root", "/mnt", "/tmp", "/Users", "C:/Users"] {
+            assert!(
+                !policy.fs.read_only.iter().any(|p| p == forbidden),
+                "read root must not grant {forbidden}: {:?}",
+                policy.fs.read_only
+            );
+        }
+        // The user's own profile dir is never a root — an interpreter
+        // under $HOME grants only its own install prefix, never the
+        // profile itself.
+        for var in ["HOME", "USERPROFILE"] {
+            if let Some(home) = std::env::var_os(var) {
+                let home = home.to_string_lossy().replace('\\', "/");
+                let home = home.trim_end_matches('/');
+                assert!(
+                    !policy.fs.read_only.iter().any(|p| p == home),
+                    "read root must not grant {home}: {:?}",
+                    policy.fs.read_only
+                );
+            }
+        }
+    }
 }

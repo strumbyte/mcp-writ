@@ -156,7 +156,14 @@ pub(crate) fn parse_response(buf: &[u8], forwarded_name: &str) -> ParsedResponse
         }
         let owner = canonical_name(&rr.name);
         match rr.rtype {
-            RRTYPE_CNAME if rr.rdata_len >= 2 => match decode_name(buf, rr.rdata_off, true) {
+            // Deliberate hardening (not a verbatim move of the pre-split
+            // parser): the alias target must decode *and* end within its
+            // own RDATA. A target that silently read into the next
+            // record's bytes used to be relayed as a chain hop; a name
+            // that failed to decode at all was dropped while the rest of
+            // the answer shipped. Both now mark the answer undecoded —
+            // the caller SERVFAILs rather than relay a partial read.
+            RRTYPE_CNAME => match decode_name(buf, rr.rdata_off, true) {
                 Some((target, end)) if end <= rr.rdata_off + rr.rdata_len => {
                     cnames.push((owner, canonical_name(&target), rr.ttl));
                 }
@@ -165,7 +172,7 @@ pub(crate) fn parse_response(buf: &[u8], forwarded_name: &str) -> ParsedResponse
                     break;
                 }
             },
-            RRTYPE_DNAME if rr.rdata_len >= 2 => match decode_name(buf, rr.rdata_off, true) {
+            RRTYPE_DNAME => match decode_name(buf, rr.rdata_off, true) {
                 Some((target, end)) if end <= rr.rdata_off + rr.rdata_len => {
                     dnames.push((owner, canonical_name(&target), rr.ttl));
                 }

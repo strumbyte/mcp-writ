@@ -666,3 +666,37 @@ fn f67_private_ancestors_still_resolve() {
     let resolved = resolve_for_authorization_with_cwd(&spelled, dir.path()).unwrap();
     assert!(resolved.ends_with("real/f"), "resolved={resolved}");
 }
+
+#[test]
+fn share_root_exemption_is_scoped_to_registered_descendants() {
+    // A host-mounted share root (a WSB mapped folder, a container
+    // bind mount) reports replaceable from inside the guest by
+    // contract — only the host can retarget it, and the host is the
+    // trusted launch party. Registering the root exempts paths
+    // beneath it from the ancestry walk; the exemption is
+    // component-scoped, never a string-prefix match.
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let parent = dir.path().parent().unwrap().to_path_buf();
+
+    crate::fspriv::register_share_root(dir.path());
+
+    let canonical = std::fs::canonicalize(&workspace).unwrap();
+    assert!(crate::fspriv::path_under_share_root(&canonical));
+    assert!(crate::fspriv::path_under_share_root(&workspace));
+    // The root's own parent and a suffix-sibling spelling must not
+    // match.
+    assert!(!crate::fspriv::path_under_share_root(&parent));
+    let prefix_sibling = parent.join(format!(
+        "{}2",
+        dir.path().file_name().unwrap().to_string_lossy()
+    ));
+    assert!(!crate::fspriv::path_under_share_root(&prefix_sibling));
+    // The authorization resolve accepts the descendant — on a
+    // shared-writable temp tree this is the only way it can pass.
+    let spelling = workspace.display().to_string().replace('\\', "/");
+    resolve_for_authorization(&spelling).unwrap_or_else(|e| {
+        panic!("descendant of a registered share root must resolve: {e}")
+    });
+}

@@ -344,6 +344,64 @@ pub(crate) fn replaceable_permitted_for(path: &Path) -> bool {
             .is_some_and(|canonical| set.contains(&canonical))
 }
 
+/// Guest-visible roots that name host-mounted share directories —
+/// WSB `<MappedFolder>`s and container bind mounts. From inside the
+/// guest such a root always reports as replaceable: the *host* can
+/// retarget it, and that is the mount's documented purpose (the host
+/// is the launcher — a principal already able to corrupt the launch
+/// without a rename race). No guest principal can rename or swap a
+/// mount point itself, so the ancestry walk
+/// [`resolve_for_authorization`](crate::pathutil::resolve_for_authorization)
+/// performs has nothing to prove *at that boundary*: paths beneath a
+/// registered share root are treated as boundary-stable, while the
+/// spelled-component check stays armed — a symlink the workload
+/// plants under the share is still refused. Registration is
+/// in-process only: only the guest runner registers, and only the
+/// roots its launch contract declares — never workload grant paths.
+static SHARE_ROOTS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn share_roots() -> &'static std::sync::Mutex<Vec<PathBuf>> {
+    SHARE_ROOTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Register `path` as a host-mounted share root for this process —
+/// see [`SHARE_ROOTS`]. The canonicalized spelling is stored when the
+/// root already exists so a check arriving under the canonical
+/// spelling still matches; a not-yet-created root is stored as
+/// spelled. Duplicates are ignored.
+pub fn register_share_root(path: &Path) {
+    if let Ok(mut roots) = share_roots().lock() {
+        let mut push = |p: PathBuf| {
+            if !roots.contains(&p) {
+                roots.push(p);
+            }
+        };
+        if let Ok(canonical) = fs::canonicalize(path) {
+            push(canonical);
+        }
+        push(path.to_path_buf());
+    }
+}
+
+/// Whether `path` is or descends from a root registered via
+/// [`register_share_root`]. Component-wise `starts_with` — a
+/// `relay-rw2` sibling does not match a `relay-rw` root.
+pub(crate) fn path_under_share_root(path: &Path) -> bool {
+    let Ok(roots) = share_roots().lock() else {
+        return false;
+    };
+    if roots.is_empty() {
+        return false;
+    }
+    if roots.iter().any(|root| path.starts_with(root)) {
+        return true;
+    }
+    fs::canonicalize(path)
+        .ok()
+        .is_some_and(|canonical| roots.iter().any(|root| canonical.starts_with(root)))
+}
+
 /// [`require_parent_write_restricted`] honoring the
 /// `MCP_WRIT_ALLOW_REPLACEABLE_PATHS` opt-out and registered path
 /// exemptions — the shared ancestry gate for a path a trusted read
