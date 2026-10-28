@@ -110,8 +110,11 @@ pub(crate) fn temp_root_abs(posix: &str) -> String {
     format!("{}{posix}", anchor.trim_end_matches('/'))
 }
 
+/// `crate::fspriv::pinned::replaceable_paths_permitted` re-bound — kept
+/// next to the authorization code that established the opt-out so the
+/// env spelling stays in one place.
 fn replaceable_paths_permitted() -> bool {
-    std::env::var_os("MCP_WRIT_ALLOW_REPLACEABLE_PATHS").is_some_and(|v| !v.is_empty() && v != "0")
+    crate::fspriv::replaceable_paths_permitted()
 }
 
 /// Refuse a spelled path whose symlink components sit under a shared-

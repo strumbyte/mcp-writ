@@ -128,6 +128,11 @@ fn spawn_fixture(
         .env(CHILD_LOG, log)
         .env(CHILD_MODE, mode)
         .env(CHILD_BEHAVIOR, behavior)
+        // The fixture audit path under %TEMP% can fail the sink's
+        // replaceable-ancestry gate on hosts whose temp ACL grants
+        // another principal replace access — host-ACL dependent, not
+        // the durability behavior under test.
+        .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()

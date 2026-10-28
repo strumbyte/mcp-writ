@@ -122,6 +122,55 @@ fn check_sandbox_prereqs() -> Option<String> {
     None
 }
 
+/// The product `run --isolation windows-sandbox` path resolves `wsb.exe`
+/// through the trusted-path contract — `MCP_WRIT_WSB_EXE`, System32, or
+/// the Store package `InstallLocation`. A host whose only `wsb.exe` is
+/// an App Execution Alias under `%LOCALAPPDATA%\WindowsApps` satisfies
+/// the relay tier (plain PATH lookup) but not the product contract —
+/// the launch refuses before any sandbox exists. Detect that here so
+/// the product legs take the same honest skip path as a missing
+/// feature instead of failing on a host-resolution detail.
+fn product_wsb_resolvable() -> Option<String> {
+    if cfg!(not(windows)) {
+        return None;
+    }
+    if std::env::var_os("MCP_WRIT_WSB_EXE").is_some() {
+        return None;
+    }
+    let sys32 = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+        .join("System32")
+        .join("wsb.exe");
+    if sys32.is_file() {
+        return None;
+    }
+    // The same Store-package query the management layer runs.
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-AppxPackage -Name 'Microsoft.WindowsSandbox*' | \
+             Select-Object -First 1).InstallLocation",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    let install = out
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|t| t.trim().to_string())
+        .unwrap_or_default();
+    if Path::new(&install).is_absolute() && Path::new(&install).join("wsb.exe").is_file() {
+        return None;
+    }
+    Some(
+        "wsb.exe is not resolvable through the product trusted-path \
+         contract (no MCP_WRIT_WSB_EXE override, no System32 wsb.exe, \
+         and the Store InstallLocation query answered empty)"
+            .into(),
+    )
+}
+
 /// Compile a std-only fixture once per test binary with plain `rustc` —
 /// same contract as `common::compiled_open_path_fixture` /
 /// `hyperv_vm_e2e::compiled_hyperv_probe`.

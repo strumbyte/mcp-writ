@@ -2,11 +2,14 @@
 //!
 //! Only what a relay needs: decode a client query's question,
 //! re-encode it under the canonical policy name for the upstream hop,
-//! walk an upstream answer's answer-section for CNAME/address records
-//! and TTLs (observational — the response body is relayed verbatim and
-//! never rewritten), and build refusal/truncated answers. This codec
-//! deliberately understands no record payload beyond CNAME/A/AAAA —
-//! inspecting content is not the gate's job (destination policy only).
+//! walk an upstream answer's answer-section for the destination
+//! material it reveals — CNAME/DNAME aliases, A/AAAA records, and
+//! SVCB/HTTPS target names with address hints — plus TTLs
+//! (observational — the response body is relayed verbatim and never
+//! rewritten), and build refusal/truncated answers. This codec
+//! deliberately understands no record payload beyond destination
+//! names and addresses — inspecting content is not the gate's job
+//! (destination policy only).
 
 /// DNS header length (fixed 12 octets).
 pub(crate) const HEADER_LEN: usize = 12;
@@ -25,6 +28,8 @@ pub(crate) const RRTYPE_CNAME: u16 = 5;
 pub(crate) const RRTYPE_DNAME: u16 = 39;
 pub(crate) const RRTYPE_AAAA: u16 = 28;
 pub(crate) const RRTYPE_OPT: u16 = 41;
+pub(crate) const RRTYPE_SVCB: u16 = 64;
+pub(crate) const RRTYPE_HTTPS: u16 = 65;
 
 /// A decoded client query — everything the pipeline needs to evaluate
 /// the name, rebuild an upstream query, and echo the question back in
@@ -382,6 +387,46 @@ pub(crate) struct ParsedResponse {
 /// malformed or malicious chains, not a policy limit.
 const MAX_CHAIN_DEPTH: usize = 16;
 
+/// SVCB/HTTPS `SvcParam` keys carrying destination material the name
+/// layer must judge: `ipv4hint`/`ipv6hint` hold addresses a client may
+/// dial without further lookups. Other params (alpn, port, ech,
+/// dohpath…) shape the connection, not its destination name/address,
+/// and stay uninterpreted.
+const SVC_PARAM_IPV4HINT: u16 = 4;
+const SVC_PARAM_IPV6HINT: u16 = 6;
+
+/// Decoded SVCB/HTTPS RDATA: `SvcPriority`, `TargetName`, and the
+/// `key/value` SvcParam list in wire order.
+type SvcbRdata = (u16, String, Vec<(u16, Vec<u8>)>);
+
+/// Decode an SVCB/HTTPS RDATA: `SvcPriority` + `TargetName` + the
+/// `key/len/value` SvcParam list. `None` on a truncated name, a
+/// param that overruns RDATA, or trailing bytes — an unparseable
+/// record is undecoded evidence, not a partially-trusted one.
+fn decode_svcb_rdata(buf: &[u8], off: usize, len: usize) -> Option<SvcbRdata> {
+    let end = off.checked_add(len)?;
+    let &hi = buf.get(off)?;
+    let &lo = buf.get(off + 1)?;
+    let priority = u16::from_be_bytes([hi, lo]);
+    let (target, mut pos) = decode_name(buf, off + 2, true)?;
+    if pos > end {
+        return None;
+    }
+    let mut params = Vec::new();
+    while pos < end {
+        let fixed = buf.get(pos..pos + 4)?;
+        let key = u16::from_be_bytes([fixed[0], fixed[1]]);
+        let plen = u16::from_be_bytes([fixed[2], fixed[3]]) as usize;
+        pos += 4;
+        if pos + plen > end {
+            return None;
+        }
+        params.push((key, buf[pos..pos + plen].to_vec()));
+        pos += plen;
+    }
+    Some((priority, target, params))
+}
+
 /// The hop a DNAME synthesizes for `head`: a DNAME rewrites only
 /// proper descendants of its owner (RFC 6672 — the owner itself is
 /// not rewritten), replacing the owner suffix with the target. The
@@ -437,6 +482,11 @@ pub(crate) fn parse_response(buf: &[u8], forwarded_name: &str) -> ParsedResponse
     // ordered along the alias chain.
     let mut cnames: Vec<(String, String, u32)> = Vec::new();
     let mut dnames: Vec<(String, String, u32)> = Vec::new();
+    // SVCB/HTTPS targets the answer reveals — `(owner, target, ttl)`
+    // for both AliasMode (priority 0) and ServiceMode (priority >0)
+    // records. Both modes name a destination the workload may next
+    // resolve or dial, so both join the policy chain.
+    let mut svc_targets: Vec<(String, String, u32)> = Vec::new();
     let mut addrs: Vec<(String, std::net::IpAddr, u32)> = Vec::new();
     let mut decoded = true;
     for _ in 0..an {
@@ -478,43 +528,117 @@ pub(crate) fn parse_response(buf: &[u8], forwarded_name: &str) -> ParsedResponse
                     rr.ttl,
                 ));
             }
+            RRTYPE_SVCB | RRTYPE_HTTPS if rr.rdata_len >= 3 => {
+                // The record carries a destination name (TargetName —
+                // an alias in AliasMode, the service endpoint name in
+                // ServiceMode) and may embed dialable addresses in
+                // ipv4hint/ipv6hint. Relaying it unjudged would let an
+                // allowed query name smuggle a denied destination past
+                // the name layer, so an undecodable payload fails the
+                // whole answer rather than passing a partial read.
+                match decode_svcb_rdata(buf, rr.rdata_off, rr.rdata_len) {
+                    Some((_priority, target, params)) => {
+                        let target = super::canonical_name(&target);
+                        if !target.is_empty() {
+                            svc_targets.push((owner.clone(), target, rr.ttl));
+                        }
+                        for (key, value) in params {
+                            match key {
+                                SVC_PARAM_IPV4HINT => {
+                                    if value.len() % 4 != 0 {
+                                        decoded = false;
+                                        break;
+                                    }
+                                    for b in value.as_chunks::<4>().0 {
+                                        addrs.push((
+                                            owner.clone(),
+                                            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                                                b[0], b[1], b[2], b[3],
+                                            )),
+                                            rr.ttl,
+                                        ));
+                                    }
+                                }
+                                SVC_PARAM_IPV6HINT => {
+                                    if value.len() % 16 != 0 {
+                                        decoded = false;
+                                        break;
+                                    }
+                                    for b in value.as_chunks::<16>().0 {
+                                        addrs.push((
+                                            owner.clone(),
+                                            std::net::IpAddr::V6(std::net::Ipv6Addr::from(*b)),
+                                            rr.ttl,
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    None => decoded = false,
+                }
+            }
             _ => {}
         }
     }
     out.decoded = decoded;
 
-    // Follow the alias chain from the query name — hop order is
-    // resolved by name, not by record position. A DNAME whose owner is
-    // an ancestor of the current head synthesizes the next hop by
-    // substituting its target for the owner suffix (RFC 6672); the
-    // longest matching owner wins, mirroring resolver behavior.
-    let mut head = forwarded_name.to_string();
-    let mut visited: std::collections::HashSet<String> = [head.clone()].into_iter().collect();
+    // Follow every destination the answer reveals from the query name
+    // — CNAME/DNAME alias hops and SVCB/HTTPS targets alike (an
+    // AliasMode record redirects like a CNAME; a ServiceMode record
+    // names the endpoint the workload connects to). Hop order is
+    // resolved by name, not record position, expanding breadth-first
+    // so every revealed name reaches the chain for policy re-judgment;
+    // its visited set is also what authorizes A/AAAA/hint minting.
+    // A DNAME whose owner is an ancestor of the current head
+    // synthesizes the next hop by substituting its target for the
+    // owner suffix (RFC 6672); the longest matching owner wins,
+    // mirroring resolver behavior.
+    let mut visited: std::collections::HashSet<String> =
+        [forwarded_name.to_string()].into_iter().collect();
+    let mut heads: std::collections::VecDeque<String> =
+        [forwarded_name.to_string()].into_iter().collect();
     let mut min_ttl: Option<u32> = None;
-    loop {
-        if out.chain.len() >= MAX_CHAIN_DEPTH {
-            // Only truncated when another hop actually remains.
-            if cnames.iter().any(|(owner, _, _)| *owner == head)
-                || dname_target(&dnames, &head).is_some()
-            {
-                out.chain_truncated = true;
-            }
-            break;
-        }
-        let Some((target, ttl)) = cnames
+    while let Some(head) = heads.pop_front() {
+        let mut candidates: Vec<(String, u32)> = Vec::new();
+        if let Some((target, ttl)) = cnames
             .iter()
             .find(|(owner, _, _)| *owner == head)
             .map(|(_, t, ttl)| (t.clone(), *ttl))
-            .or_else(|| dname_target(&dnames, &head))
-        else {
-            break;
-        };
-        out.chain.push(target.clone());
-        min_ttl = Some(min_ttl.map_or(ttl, |m: u32| m.min(ttl)));
-        if !visited.insert(target.clone()) {
-            break; // alias loop — stop following, keep what we saw
+        {
+            candidates.push((target, ttl));
         }
-        head = target;
+        if let Some((target, ttl)) = dname_target(&dnames, &head) {
+            candidates.push((target, ttl));
+        }
+        candidates.extend(
+            svc_targets
+                .iter()
+                .filter(|(owner, _, _)| *owner == head)
+                .map(|(_, t, ttl)| (t.clone(), *ttl)),
+        );
+        for (target, ttl) in candidates {
+            if out.chain.len() >= MAX_CHAIN_DEPTH {
+                out.chain_truncated = true;
+                break;
+            }
+            out.chain.push(target.clone());
+            min_ttl = Some(min_ttl.map_or(ttl, |m: u32| m.min(ttl)));
+            if visited.insert(target.clone()) {
+                heads.push_back(target);
+            }
+            // A previously visited target still records — the alias
+            // loop is evidence — but is never expanded twice.
+        }
+        if out.chain_truncated {
+            break;
+        }
+    }
+    if !heads.is_empty() {
+        // The walk stopped with unexpanded heads — the recorded chain
+        // is a prefix, never the whole alias/target sequence.
+        out.chain_truncated = true;
     }
     for (owner, addr, ttl) in addrs {
         if visited.contains(&owner) {
@@ -570,6 +694,7 @@ pub(crate) fn qtype_name(qtype: u16) -> String {
         46 => "RRSIG",
         47 => "NSEC",
         48 => "DNSKEY",
+        64 => "SVCB",
         65 => "HTTPS",
         255 => "ANY",
         _ => return format!("TYPE{qtype}"),
@@ -916,6 +1041,119 @@ mod tests {
         let parsed = parse_response(&pkt, "q.example");
         assert!(parsed.chain_truncated);
         assert_eq!(parsed.chain.len(), MAX_CHAIN_DEPTH);
+    }
+
+    /// SVCB/HTTPS wire helpers: RDATA = SvcPriority + TargetName +
+    /// SvcParams (`key u16 | len u16 | value`).
+    fn svcb_rdata(priority: u16, target: &str, params: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&priority.to_be_bytes());
+        if target.is_empty() {
+            // The root TargetName ("." on the wire) is a single zero
+            // byte — name_wire("") would emit it twice.
+            rdata.push(0);
+        } else {
+            rdata.extend_from_slice(&name_wire(target));
+        }
+        for (key, value) in params {
+            rdata.extend_from_slice(&key.to_be_bytes());
+            rdata.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            rdata.extend_from_slice(value);
+        }
+        rdata
+    }
+
+    #[test]
+    fn response_parse_https_service_target_and_hints() {
+        // HTTPS q → ServiceMode HTTPS(prio 1, target svc.example.net,
+        // ipv4hint 93.184.216.34, ipv6hint) + A(svc.example.net).
+        // The target name must join the chain for policy re-judgment
+        // and the hinted addresses must surface as destinations.
+        let hint4 = [93u8, 184, 216, 34];
+        let hint6: [u8; 16] = [
+            0x26, 0x06, 0x28, 0x00, 0x00, 0x20, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        let a_rdata = [203u8, 0, 113, 5];
+        let https = svcb_rdata(
+            1,
+            "svc.example.net",
+            &[(SVC_PARAM_IPV4HINT, &hint4), (SVC_PARAM_IPV6HINT, &hint6)],
+        );
+        let pkt = response(
+            "web.example",
+            0,
+            &[
+                ("web.example", RRTYPE_HTTPS, 60, &https),
+                ("svc.example.net", 1, 50, &a_rdata),
+            ],
+        );
+        let parsed = parse_response(&pkt, "web.example");
+        assert!(parsed.decoded);
+        assert_eq!(parsed.chain, vec!["svc.example.net"]);
+        assert!(!parsed.chain_truncated);
+        let got: Vec<std::net::IpAddr> = parsed.addrs.iter().map(|(a, _)| *a).collect();
+        assert!(got.contains(&"93.184.216.34".parse().unwrap()));
+        assert!(got.contains(&"2606:2800:20:1::1".parse().unwrap()));
+        assert!(got.contains(&"203.0.113.5".parse().unwrap()));
+        assert_eq!(parsed.min_ttl, Some(50));
+    }
+
+    #[test]
+    fn response_parse_svcb_alias_mode_redirects_chain() {
+        // AliasMode (priority 0) SVCB acts like a CNAME hop: the
+        // target joins the chain and is itself expanded.
+        let alias = svcb_rdata(0, "alias.example.net", &[]);
+        let svc = svcb_rdata(1, "svc.example.net", &[]);
+        let pkt = response(
+            "www.example",
+            0,
+            &[
+                ("www.example", RRTYPE_SVCB, 80, &alias),
+                ("alias.example.net", RRTYPE_SVCB, 70, &svc),
+            ],
+        );
+        let parsed = parse_response(&pkt, "www.example");
+        assert!(parsed.decoded);
+        assert_eq!(parsed.chain, vec!["alias.example.net", "svc.example.net"]);
+        assert_eq!(parsed.min_ttl, Some(70));
+    }
+
+    #[test]
+    fn response_parse_https_malformed_rdata_fails_closed() {
+        // A truncated SvcParam list — the record could hide hints the
+        // walk never saw, so the answer is undecoded, not partially
+        // trusted.
+        let mut bad = svcb_rdata(1, "svc.example.net", &[]);
+        bad.extend_from_slice(&[0, 4, 0, 10, 1, 2]); // key=4 len=10, 2 bytes only
+        let pkt = response("web.example", 0, &[("web.example", RRTYPE_HTTPS, 60, &bad)]);
+        let parsed = parse_response(&pkt, "web.example");
+        assert!(!parsed.decoded);
+    }
+
+    #[test]
+    fn response_parse_https_root_target_not_a_hop() {
+        // ServiceMode TargetName "." means the service lives at the
+        // owner name — no new destination is revealed.
+        let svc = svcb_rdata(1, "", &[]);
+        let pkt = response("web.example", 0, &[("web.example", RRTYPE_HTTPS, 60, &svc)]);
+        let parsed = parse_response(&pkt, "web.example");
+        assert!(parsed.decoded);
+        assert!(parsed.chain.is_empty());
+    }
+
+    #[test]
+    fn response_parse_svcb_off_chain_owner_ignored() {
+        // An HTTPS record for an unrelated owner reveals no
+        // destination for this query — same rule as stray A records.
+        let svc = svcb_rdata(1, "evil.example", &[]);
+        let pkt = response(
+            "web.example",
+            0,
+            &[("unrelated.example", RRTYPE_HTTPS, 60, &svc)],
+        );
+        let parsed = parse_response(&pkt, "web.example");
+        assert!(parsed.decoded);
+        assert!(parsed.chain.is_empty());
     }
 
     #[test]

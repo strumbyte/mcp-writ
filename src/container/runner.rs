@@ -1067,6 +1067,13 @@ async fn run_image_inner(
         layout.policy_path_env.to_string(),
         crate::container::guest_layout::policy_file(layout),
     ));
+    // No MCP_WRIT_ALLOW_REPLACEABLE_PATHS here: the guest-wide opt-out
+    // would also silence the trusted-source gate on the workload's
+    // entrypoint script. The runner instead exempts only its
+    // host-mounted contract paths (policy, audit, report) via
+    // `fspriv::permit_replaceable_path` — `container_run_args` still
+    // clears the name so an image-baked value cannot arm the global
+    // downgrade.
     spec.env.push((
         layout.temp_dir_env.to_string(),
         layout.workload_temp.to_string(),

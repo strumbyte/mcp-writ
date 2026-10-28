@@ -33,6 +33,8 @@ use mcp_writ::audit_log::{AuditLogger, AuditSyncMode};
 use mcp_writ::dnsgate::{DynamicAllowList, GateConfig, Refusal};
 use mcp_writ::policy::{OutboundPolicy, Policy};
 
+mod common;
+
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ─── Wire helpers (test-local; the crate's codec is crate-internal) ──
@@ -355,13 +357,15 @@ async fn start_gate(
     refusal: Refusal,
     allowlist_export: Option<PathBuf>,
     fail_closed: bool,
-) -> GateHandle {
+) -> Option<GateHandle> {
     let upstream = spawn_mock_upstream(upstream_table).await;
 
-    let tmp = tempfile::tempdir().unwrap();
-    // Real spelling: $TMPDIR may traverse a platform link (macOS
-    // `/var` → `/private/var`) that the audit sink's strict ancestor
-    // walk refuses.
+    // The in-process audit sink refuses replaceable ancestors — a
+    // shared %TEMP% root whose ACL grants another principal replace
+    // access fails the strict walk outright, so root the sink under a
+    // write-restricted base. `None` when the host has none (callers
+    // take the e2e skip path).
+    let tmp = common::restricted_tempdir()?;
     let audit_path = tmp.path().canonicalize().unwrap().join("audit.jsonl");
     let logger =
         AuditLogger::to_file_with_options(&audit_path, fail_closed, AuditSyncMode::Buffered)
@@ -425,7 +429,7 @@ async fn start_gate(
         panic!("dns gate could not claim a port after 32 tries");
     };
 
-    GateHandle {
+    Some(GateHandle {
         listen,
         allowlist,
         shutdown: tx,
@@ -434,7 +438,7 @@ async fn start_gate(
         audit_path,
         _tmp: tmp,
         _upstream: upstream,
-    }
+    })
 }
 
 /// Probe that the gate's UDP socket is bound — a 12-byte header with
@@ -560,14 +564,18 @@ async fn denied_name_is_refused_and_audited() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["allowed.example"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
 
     // Denied: not on the allow list under deny-all-others → REFUSED,
     // and upstream is never contacted (mock would answer NXDOMAIN for
@@ -617,14 +625,19 @@ async fn denied_name_is_refused_and_audited() {
 async fn deny_host_rule_wins_over_allow() {
     // deny wins even when an allow also covers the name — the same
     // precedence the Auditor applies to argument hosts.
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["*"], &["bad.example"], &[], &[], false)),
         HashMap::new(),
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "bad.example", 1))
         .await
         .unwrap();
@@ -655,14 +668,19 @@ async fn wildcard_covers_subdomain_not_bare() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["*.example.com"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "sub.example.com", 1))
         .await
         .unwrap();
@@ -680,14 +698,19 @@ async fn wildcard_covers_subdomain_not_bare() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nxdomain_refusal_rcode() {
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["allowed.example"], &[], &[], &[], true)),
         HashMap::new(),
         Refusal::Nxdomain,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "denied.example", 1))
         .await
         .unwrap();
@@ -723,14 +746,19 @@ async fn cname_chain_fully_allowed_mints_grants() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["*.allowed.example"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "www.allowed.example", 1))
         .await
         .expect("chain answer");
@@ -815,7 +843,7 @@ async fn cname_target_denied_refuses_and_mints_nothing() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(
             &["allowed.example", "*.allowed.example"],
             &["*.denied.example"],
@@ -828,7 +856,12 @@ async fn cname_target_denied_refuses_and_mints_nothing() {
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "www.allowed.example", 1))
         .await
         .expect("refusal answer");
@@ -887,14 +920,19 @@ async fn undeclared_chain_target_fails_under_default_deny() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["*.allowed.example"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "www.allowed.example", 1))
         .await
         .expect("refusal answer");
@@ -944,7 +982,7 @@ async fn dname_synthesized_target_denied_refuses() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(
             &["*.allowed.example"],
             &["*.denied.example"],
@@ -957,7 +995,12 @@ async fn dname_synthesized_target_denied_refuses() {
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "www.allowed.example", 1))
         .await
         .expect("refusal answer");
@@ -998,7 +1041,7 @@ async fn resolved_addr_explicit_deny_refuses() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(
             &["allowed.example"],
             &[],
@@ -1011,7 +1054,12 @@ async fn resolved_addr_explicit_deny_refuses() {
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "allowed.example", 1))
         .await
         .expect("refusal answer");
@@ -1059,7 +1107,7 @@ async fn protected_addr_mints_no_grant() {
             },
         );
     }
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(
             &[
                 "meta.example",
@@ -1077,7 +1125,12 @@ async fn protected_addr_mints_no_grant() {
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     for (i, name) in [
         "meta.example",
         "loop.example",
@@ -1138,7 +1191,7 @@ async fn protected_addr_opt_in_mints_grant() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(
             &["svc.example"],
             &[],
@@ -1151,7 +1204,12 @@ async fn protected_addr_opt_in_mints_grant() {
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "svc.example", 1))
         .await
         .expect("answer");
@@ -1218,7 +1276,7 @@ async fn overlong_alias_chain_is_servfail() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(
             &["allowed.example", "*.allowed.example"],
             &[],
@@ -1231,7 +1289,12 @@ async fn overlong_alias_chain_is_servfail() {
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "allowed.example", 1))
         .await
         .expect("servfail");
@@ -1271,14 +1334,19 @@ async fn idna_and_trailing_dot_normalize() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["example.com"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "EXAMPLE.com.", 1))
         .await
         .unwrap();
@@ -1310,14 +1378,19 @@ async fn tcp_transport_round_trip() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["allowed.example"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = tcp_query(gate.listen, &dns_query(1, "allowed.example", 1))
         .await
         .expect("tcp answer");
@@ -1352,14 +1425,19 @@ async fn tc_answer_retries_over_tcp() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["*.allowed.example"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "big.allowed.example", 1))
         .await
         .expect("full answer after TCP retry");
@@ -1381,14 +1459,19 @@ async fn upstream_timeout_is_servfail() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["*.allowed.example"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "slow.allowed.example", 1))
         .await
         .expect("servfail");
@@ -1405,14 +1488,19 @@ async fn upstream_timeout_is_servfail() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_query_is_formerr() {
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["*"], &[], &[], &[], false)),
         HashMap::new(),
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     // Opcode IQUERY (1) — not a standard query → NOTIMP.
     let mut pkt = dns_query(1, "x.example", 1);
     pkt[2] = 0x08 | (pkt[2] & 0x01); // opcode 1, keep RD
@@ -1452,14 +1540,19 @@ async fn fail_closed_audit_unavailable_refuses_allowed() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["allowed.example"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         None,
         true, // fail_closed
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     // Kill the sink: shutting the logger down makes the channel
     // unavailable; the next allowed query must fail closed.
     let _ = gate.logger.shutdown().await;
@@ -1513,14 +1606,19 @@ async fn ip_literal_query_evaluates_cidr_rules() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&[], &[], &["10.0.0.0/8"], &["10.9.0.0/16"], true)),
         table,
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "10.1.2.3", 1))
         .await
         .unwrap();
@@ -1562,14 +1660,19 @@ async fn allowlist_export_writes_snapshot() {
     );
     let tmp = tempfile::tempdir().unwrap();
     let export_path = tmp.path().join("allowlist.json");
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["allowed.example"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         Some(export_path.clone()),
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "allowed.example", 1))
         .await
         .unwrap();
@@ -1628,14 +1731,19 @@ async fn deny_all_empty_allow_list_refuses_all_names() {
     // fall-through relies on the OS sandbox behind it, and there is
     // nothing behind the gate — that carve-out would leave an open
     // resolver.
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&[], &[], &[], &[], true)),
         HashMap::new(),
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "anything.example", 1))
         .await
         .expect("deny-all refusal");
@@ -1673,14 +1781,19 @@ async fn open_posture_resolves_unlisted_names() {
             corrupt_id: false,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&[], &[], &[], &[], false)),
         table,
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = udp_query(gate.listen, &dns_query(1, "free.example", 1))
         .await
         .expect("open-posture answer");
@@ -1711,14 +1824,19 @@ async fn upstream_mismatch_is_servfail() {
             corrupt_id: true,
         },
     );
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["*.allowed.example"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let resp = tcp_query(gate.listen, &dns_query(1, "mismatch.allowed.example", 1))
         .await
         .expect("servfail on mismatched upstream");
@@ -1738,14 +1856,19 @@ async fn tcp_connection_capacity_refuses_overflow() {
     // MAX_TCP_CONNECTIONS (64) bounds simultaneous client connections —
     // a connection accepted past capacity is dropped immediately, not
     // served, and the gate itself keeps answering over UDP.
-    let gate = start_gate(
+    let Some(gate) = start_gate(
         policy_with(outbound(&["*"], &[], &[], &[], false)),
         HashMap::new(),
         Refusal::Refused,
         None,
         false,
     )
-    .await;
+    .await
+    else {
+        common::skip_e2e_test("no write-restricted audit root");
+        return;
+    };
+
     let mut held = Vec::new();
     for _ in 0..64 {
         held.push(

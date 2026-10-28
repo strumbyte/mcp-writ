@@ -1289,7 +1289,10 @@ mod tests {
     /// transition — the response never leaves and calls stay gated.
     #[tokio::test]
     async fn dead_audit_sink_blocks_verified_transitions() {
-        let (_dir, log_path, audit) = audit_log_fixture();
+        let Some((_dir, log_path, audit)) = audit_log_fixture() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         // Kill the sink before verification — the commit must refuse.
         shared.audit.shutdown().await.unwrap();
@@ -1324,7 +1327,10 @@ mod tests {
     /// in the stream.
     #[tokio::test]
     async fn verified_record_commits_before_client_emit() {
-        let (_dir, log_path, audit) = audit_log_fixture();
+        let Some((_dir, log_path, audit)) = audit_log_fixture() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
         st.bind_client("1".into(), String::new());
@@ -1371,17 +1377,20 @@ mod tests {
     }
 
     /// A fail-closed `AuditLogger` writing `audit.jsonl` inside a fresh
-    /// tempdir. Bind the `TempDir` (as `_dir` where unused) so the log
+    /// write-restricted tempdir — `to_file` refuses a replaceable
+    /// parent, so the fixture must satisfy the sink's own ancestry
+    /// gate. `None` when the host offers no restricted root; callers
+    /// skip. Bind the `TempDir` (as `_dir` where unused) so the log
     /// outlives `shared.audit.shutdown()` for the assertions below.
-    fn audit_log_fixture() -> (
+    fn audit_log_fixture() -> Option<(
         tempfile::TempDir,
         std::path::PathBuf,
         crate::audit_log::AuditLogger,
-    ) {
-        let dir = crate::testutil::real_tempdir().expect("tempdir");
+    )> {
+        let dir = crate::testutil::restricted_tempdir()?;
         let log_path = dir.path().join("audit.jsonl");
         let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
-        (dir, log_path, audit)
+        Some((dir, log_path, audit))
     }
 
     /// First audit-log line whose `"event_type"` field is `event_type`.
@@ -1407,7 +1416,10 @@ mod tests {
     /// already audited.
     #[tokio::test]
     async fn identical_revalidation_does_not_repeat_filtered_event() {
-        let (_dir, log_path, audit) = audit_log_fixture();
+        let Some((_dir, log_path, audit)) = audit_log_fixture() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
 
@@ -1434,7 +1446,10 @@ mod tests {
     /// advertised set changed still emits the filtered event.
     #[tokio::test]
     async fn changed_revalidation_logs_filtered_event() {
-        let (_dir, log_path, audit) = audit_log_fixture();
+        let Some((_dir, log_path, audit)) = audit_log_fixture() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
 
@@ -1472,7 +1487,10 @@ mod tests {
     /// `target_server` falls back to the single declared server identity.
     #[tokio::test]
     async fn dry_run_filtered_event_reports_would_be_hidden_and_declared_server() {
-        let (_dir, log_path, audit) = audit_log_fixture();
+        let Some((_dir, log_path, audit)) = audit_log_fixture() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let mut policy = policy_allowing("alpha");
         policy.tools[0].server = Some("bound-server".to_string());
         let (shared, _abort_rx) = shared_for_test_with(true, policy, audit);
@@ -1503,7 +1521,10 @@ mod tests {
     /// `target_server` — a synthetic name is never written.
     #[tokio::test]
     async fn filtered_event_without_declared_server_has_no_target() {
-        let (_dir, log_path, audit) = audit_log_fixture();
+        let Some((_dir, log_path, audit)) = audit_log_fixture() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
 
@@ -1528,7 +1549,10 @@ mod tests {
     /// records no `target_server` rather than guessing one.
     #[tokio::test]
     async fn filtered_event_with_multiple_declared_servers_has_no_target() {
-        let (_dir, log_path, audit) = audit_log_fixture();
+        let Some((_dir, log_path, audit)) = audit_log_fixture() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let mut policy = policy_allowing("alpha");
         policy.tools[0].server = Some("srv-a".to_string());
         let mut second = crate::policy::ToolPolicy::named("beta", true);
@@ -1560,7 +1584,10 @@ mod tests {
     /// complete; the filtering event above is `success` by contrast.
     #[tokio::test]
     async fn blocked_listing_commits_failure_verified_record() {
-        let (_dir, log_path, audit) = audit_log_fixture();
+        let Some((_dir, log_path, audit)) = audit_log_fixture() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let mut policy = policy_allowing("alpha");
         // A pin that cannot match the advertised set blocks verification.
         policy
@@ -1601,7 +1628,10 @@ mod tests {
     /// goes unrecorded.
     #[tokio::test]
     async fn uncanonicalizable_listing_commits_failure_verified_record() {
-        let (_dir, log_path, audit) = audit_log_fixture();
+        let Some((_dir, log_path, audit)) = audit_log_fixture() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
 
@@ -1634,7 +1664,10 @@ mod tests {
     async fn blocked_listing_on_dead_sink_still_aborts() {
         // `to_file` is the fail-closed logger: a closed channel refuses
         // every later commit.
-        let (_dir, _log_path, audit) = audit_log_fixture();
+        let Some((_dir, _log_path, audit)) = audit_log_fixture() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let mut policy = policy_allowing("alpha");
         policy
             .tools_list_hashes

@@ -29,6 +29,72 @@ pub fn real_tempdir() -> tempfile::TempDir {
         .expect("tempdir under the real temp base")
 }
 
+/// A `TempDir` under a root every ancestor of which passes the guard's
+/// own replaceable-ancestry gate (`mcp_writ::fspriv::require_parent_write_restricted`).
+/// The spawned binary evaluates the policy, audit, report, and
+/// entrypoint paths its fixtures hand it through the same checks a
+/// deployment runs — a shared %TEMP% or drvfs mount whose DACL grants
+/// another principal replace access is refused by design, so fixtures
+/// must live under a write-restricted root. `None` when no restricted
+/// root exists; callers take the [`skip_e2e_test`] path.
+/// Mirrors the crate-internal `testutil::restricted_tempdir`.
+pub fn restricted_tempdir() -> Option<tempfile::TempDir> {
+    let mut candidates = vec![real_temp_base()];
+    for var in ["USERPROFILE", "HOME"] {
+        if let Some(home) = std::env::var_os(var).map(PathBuf::from)
+            && !candidates.contains(&home)
+        {
+            candidates.push(home);
+        }
+    }
+    for base in candidates {
+        // `tempdir_in` spells the returned path through `base` as given —
+        // canonicalize it first so a linked env spelling cannot leave a
+        // link component in the fixture path the ancestry walk inspects.
+        let Ok(base) = base.canonicalize() else {
+            eprintln!("restricted tempdir: cannot canonicalize {}", base.display());
+            continue;
+        };
+        let base = plain_spelling(&base);
+        #[cfg(windows)]
+        if base.to_string_lossy().starts_with(r"\\") {
+            eprintln!("restricted tempdir: {} is a UNC path", base.display());
+            continue;
+        }
+        let dir = match tempfile::Builder::new().tempdir_in(&base) {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!(
+                    "restricted tempdir: cannot create under {}: {e}",
+                    base.display()
+                );
+                continue;
+            }
+        };
+        let real = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        // Inherited broad grants (a shared %TEMP%, an
+        // `Authenticated Users:(OI)(CI)(M)` volume root) make the new
+        // dir itself shared-writable — pin it owner-only first so the
+        // ancestry probe below measures the parents, not inheritance.
+        if let Err(e) = mcp_writ::fspriv::restrict_owner_only(&real) {
+            eprintln!(
+                "restricted tempdir: cannot restrict {}: {e}",
+                real.display()
+            );
+            continue;
+        }
+        // Probe a *child* path so the fixture dir itself counts among
+        // the ancestors the write-restriction walk inspects.
+        if mcp_writ::fspriv::require_parent_write_restricted(&real.join("probe")).is_ok() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
 /// Spell `posix` (a `/`-rooted test path) anchored on the filesystem
 /// root of [`real_temp_base`] — `C:/x` on Windows, `/x` on unix — so
 /// authorization resolution always hangs off a write-restricted root.
@@ -633,6 +699,12 @@ pub fn spawn_guard(
     cmd.args(child_argv);
     // A parent-level skip var must not leak into the evidence run.
     cmd.env_remove("MCP_WRIT_SKIP_SANDBOX");
+    // Fixture policy/audit paths live under %TEMP% — on hosts whose
+    // temp ACL grants another principal replace access the guard's
+    // ancestry gate would refuse them. That refusal is host-ACL
+    // dependent and not what these tests exercise, so they opt out the
+    // same way `tests/integration.rs` and `tool_enforcement_e2e` do.
+    cmd.env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

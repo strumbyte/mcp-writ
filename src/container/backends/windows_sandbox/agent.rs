@@ -474,6 +474,18 @@ fn spawn_runner(cfg: &Cfg) -> Result<Child, String> {
         // inherited value must not redirect the guest's own contract.
         .env("MCP_WRIT_ENV", "")
         .env("MCP_WRIT_SKIP_SANDBOX", "")
+        // An opt-out inherited from the agent's own environment must
+        // not reach the runner child either — remove it outright so
+        // the variable is absent, not merely empty: the runner
+        // exempts exactly the mounted contract paths it receives
+        // through the channel variables (policy file, audit sink,
+        // report destination) via `fspriv::permit_replaceable_path`,
+        // and also strips this variable itself. The guest FS is an
+        // ephemeral, agent-staged tree and `C:\relay-rw` is the
+        // host-mapped share — its guest-side DACL is synthetic and
+        // always permissive; the post-open entry-identity checks
+        // still catch a workload swapping the log entry.
+        .env_remove("MCP_WRIT_ALLOW_REPLACEABLE_PATHS")
         .env("MCP_WRIT_FAIL_ON", &cfg.fail_on)
         .env("MCP_WRIT_PROBE_LANDLOCK_ABI", "")
         .stdin(Stdio::piped())

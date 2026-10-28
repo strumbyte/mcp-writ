@@ -173,6 +173,24 @@ mod imp {
                 std::process::exit(1);
             }
         };
+        // A policy source a lower-trust principal could swap or rewrite
+        // grants launch authority the operator never reviewed —
+        // require trusted (owned, write-restricted, replacement-
+        // resistant) paths for the root document and every file it
+        // reached.
+        if let Err(e) = crate::policy::loader::require_trusted_policy_sources(&policy) {
+            let detail = format!("refusing launch: {e}");
+            eprintln!("Error: {detail}");
+            write_report("failed", Some(&detail), None, None);
+            lifecycle::prelaunch_abort(
+                args.audit_log.as_deref(),
+                &session_audit,
+                Some("load"),
+                &detail,
+            )
+            .await;
+            std::process::exit(1);
+        }
         let policy = match policy.bind_to_server(args.server.as_deref()) {
             Ok(p) => p,
             Err(e) => {
@@ -474,6 +492,9 @@ mod imp {
                     &resolved_exe,
                     &policy.hash_entries,
                     &audit_logger,
+                    // init bind-mounts the verified bytes over the
+                    // entrypoint path — the no-permission contract.
+                    true,
                 )
                 .map_err(|e| format!("supply chain verification failed at spawn: {e}"))
             };

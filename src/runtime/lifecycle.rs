@@ -349,8 +349,11 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn test_dir() -> PathBuf {
-        crate::testutil::real_tempdir().unwrap().keep()
+    /// `AuditLogger::to_file` refuses a replaceable parent — fixtures
+    /// must satisfy the sink's ancestry gate, so they live under
+    /// `restricted_tempdir` and skip when no restricted root exists.
+    fn test_dir() -> Option<PathBuf> {
+        crate::testutil::restricted_tempdir().map(|d| d.keep())
     }
 
     fn ctx_with_policy(policy_id: &str) -> SessionAuditContext {
@@ -378,7 +381,10 @@ mod tests {
     /// flushes the sink before returning.
     #[tokio::test]
     async fn teardown_emits_close_bracket_in_order() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
@@ -423,7 +429,10 @@ mod tests {
     /// identity label is not a server name.
     #[tokio::test]
     async fn default_policy_id_is_not_a_target_server() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("default");
@@ -442,7 +451,10 @@ mod tests {
     /// caller's session-level flags (sandbox bypass, dry-run).
     #[tokio::test]
     async fn guard_started_records_flags_and_identity() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
@@ -469,7 +481,10 @@ mod tests {
     /// context hash could not be computed.
     #[tokio::test]
     async fn policy_loaded_records_version_dial_and_source() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
@@ -501,7 +516,10 @@ mod tests {
     /// running under full configured control.
     #[tokio::test]
     async fn policy_loaded_records_allow_degraded_dial() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
@@ -518,7 +536,10 @@ mod tests {
     /// stage; a refused launch carries no `policy_*` fields.
     #[tokio::test]
     async fn policy_error_marks_stage_without_policy_context() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = SessionAuditContext::pre_policy(Uuid::now_v7(), "test-component");
@@ -540,7 +561,10 @@ mod tests {
     /// same correlation id, and the report's outcome words are reused.
     #[tokio::test]
     async fn session_bracket_shares_correlation_and_outcome() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
@@ -571,7 +595,10 @@ mod tests {
     /// the session sink would have used, under the launch correlation id.
     #[tokio::test]
     async fn prelaunch_abort_writes_policy_error_bracket() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let ctx = SessionAuditContext::pre_policy(Uuid::now_v7(), "test-component");
 
@@ -594,7 +621,10 @@ mod tests {
     /// the error — under the launch correlation either way.
     #[tokio::test]
     async fn audit_reopened_records_signal_and_outcome() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");

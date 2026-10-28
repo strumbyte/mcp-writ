@@ -1689,7 +1689,9 @@ pub fn spawn_sandboxed(
         .env("TEMP", tmpdir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        // The workload's stderr is attacker-controlled — piped through
+        // the sanitized relay, never raw to the terminal.
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     {
         cmd.process_group(0);
@@ -1699,7 +1701,15 @@ pub fn spawn_sandboxed(
         super::attach_fd_hygiene(&mut cmd, &[])
             .map_err(|e| WardenError::sandbox_setup(SandboxStage::Prepare, e.to_string()))?;
     }
-    let child = cmd.spawn().map_err(WardenError::ProcessSpawn)?;
+    let child = cmd
+        .spawn()
+        .map_err(WardenError::ProcessSpawn)
+        .map(|mut c| {
+            if let Some(err) = c.stderr.take() {
+                crate::termutil::relay_child_stderr_blocking(err);
+            }
+            c
+        })?;
     let pgid = child.id();
     Ok(MacosChild {
         child,

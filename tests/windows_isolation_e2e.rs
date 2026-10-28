@@ -1081,6 +1081,12 @@ fn product_run(
         // evaluated under a skipped sandbox.
         .env_remove("MCP_WRIT_SKIP_SANDBOX")
         .env_remove("MCP_WRIT_WINDOWS_LPAC")
+        // The fixture stages policy/audit under `target\winiso-e2e\`,
+        // which inherits the checkout ACL — on a host whose tree grants
+        // another principal replace access the trusted-source gate
+        // refuses it, which is host-ACL dependent and not what the
+        // mechanism contract exercises.
+        .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

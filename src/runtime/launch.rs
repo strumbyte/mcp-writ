@@ -482,11 +482,21 @@ pub async fn launch(
             return Err(LaunchError::BindLaunchedWorkload { source, report });
         }
         identity.mark_bound();
+        // The namespaced route mounts the verified entrypoint bytes
+        // over the script's path inside init's mount namespace — the
+        // trusted-source gate is skipped only on that route, where the
+        // handoff carries the guarantee instead.
+        #[cfg(target_os = "linux")]
+        let entrypoint_mount_handoff = warden.linux_selected_mechanism()
+            == Some(crate::execution::LinuxNativeMechanism::Namespaced);
+        #[cfg(not(target_os = "linux"))]
+        let entrypoint_mount_handoff = false;
         match hash::reverify_immediately_before_spawn(
             &argv,
             &resolved_exe,
             &policy.hash_entries,
             audit_logger,
+            entrypoint_mount_handoff,
         ) {
             Ok(pin) => spawn_pin = Some(pin),
             Err(source) => {

@@ -11,11 +11,10 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use windows::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT,
-    SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::Security::SECURITY_CAPABILITIES;
-use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -23,7 +22,7 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessId, INFINITE,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetProcessId, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
     ResumeThread, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject,
@@ -85,7 +84,8 @@ struct SpawnCleanup {
     stdin_write: Option<HANDLE>,
     stdout_read: Option<HANDLE>,
     stdout_write: Option<HANDLE>,
-    stderr_dup: Option<HANDLE>,
+    stderr_read: Option<HANDLE>,
+    stderr_write: Option<HANDLE>,
     /// Backing buffer of the initialized `LPPROC_THREAD_ATTRIBUTE_LIST`.
     /// Owned by the guard so `DeleteProcThreadAttributeList` always runs
     /// while the buffer is still alive, regardless of drop order.
@@ -117,7 +117,8 @@ impl Drop for SpawnCleanup {
                 self.stdin_write.take(),
                 self.stdout_read.take(),
                 self.stdout_write.take(),
-                self.stderr_dup.take(),
+                self.stderr_read.take(),
+                self.stderr_write.take(),
             ]
             .into_iter()
             .flatten()
@@ -232,50 +233,22 @@ fn spawn_inner(
         stdin_write: Some(stdin_write),
         stdout_read: None,
         stdout_write: None,
-        stderr_dup: None,
+        stderr_read: None,
+        stderr_write: None,
         attr_list_buf: None,
     };
     let (stdout_read, stdout_write) = create_pipe().map_err(at(WinStage::ProcessSetup))?;
     cleanup.stdout_read = Some(stdout_read);
     cleanup.stdout_write = Some(stdout_write);
+    // stderr gets a real pipe, never a dup of ours — the workload's
+    // diagnostics are attacker-controlled and cross to the terminal
+    // through the sanitized relay only.
+    let (stderr_read, stderr_write) = create_pipe().map_err(at(WinStage::ProcessSetup))?;
+    cleanup.stderr_read = Some(stderr_read);
+    cleanup.stderr_write = Some(stderr_write);
     set_handle_inheritable(stdin_read).map_err(at(WinStage::ProcessSetup))?;
     set_handle_inheritable(stdout_write).map_err(at(WinStage::ProcessSetup))?;
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let stderr_dup = match unsafe { GetStdHandle(STD_ERROR_HANDLE) } {
-        Ok(h) if !h.is_invalid() && h != HANDLE::default() => {
-            let mut dup = HANDLE::default();
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let current = unsafe { GetCurrentProcess() };
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            match unsafe {
-                DuplicateHandle(
-                    current,
-                    h,
-                    current,
-                    &mut dup,
-                    0,
-                    true,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            } {
-                Ok(()) => Some(dup),
-                Err(e) => {
-                    tracing::warn!(
-                        "DuplicateHandle for stderr failed: {e}; child stderr will be unavailable"
-                    );
-                    None
-                }
-            }
-        }
-        Ok(_) => None,
-        Err(e) => {
-            tracing::warn!(
-                "GetStdHandle(STD_ERROR_HANDLE) failed: {e}; child stderr will be unavailable"
-            );
-            None
-        }
-    };
-    cleanup.stderr_dup = stderr_dup;
+    set_handle_inheritable(stderr_write).map_err(at(WinStage::ProcessSetup))?;
 
     // The env handle the SECURITY_ENVIRONMENT attribute points at must
     // outlive `CreateProcessW` — a function-scope binding, never a
@@ -408,10 +381,7 @@ fn spawn_inner(
         }
     }
 
-    let mut inherit_handles: Vec<HANDLE> = vec![stdin_read, stdout_write];
-    if let Some(h) = stderr_dup {
-        inherit_handles.push(h);
-    }
+    let inherit_handles: Vec<HANDLE> = vec![stdin_read, stdout_write, stderr_write];
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         UpdateProcThreadAttribute(
@@ -443,13 +413,8 @@ fn spawn_inner(
 
     si_ex.StartupInfo.hStdInput = stdin_read;
     si_ex.StartupInfo.hStdOutput = stdout_write;
+    si_ex.StartupInfo.hStdError = stderr_write;
     si_ex.StartupInfo.dwFlags = windows::Win32::System::Threading::STARTF_USESTDHANDLES;
-    if let Some(h) = stderr_dup {
-        si_ex.StartupInfo.hStdError = h;
-        tracing::debug!("stderr handle duplicated for sandboxed child");
-    } else {
-        tracing::debug!("no stderr handle available; child stderr will be closed");
-    }
 
     let mut pi = PROCESS_INFORMATION::default();
     // `opts: None` is the PSEC contract — `lpEnvironment = NULL` (and no
@@ -496,7 +461,7 @@ fn spawn_inner(
             let _ = CloseHandle(h);
         }
     }
-    if let Some(h) = cleanup.stderr_dup.take() {
+    if let Some(h) = cleanup.stderr_write.take() {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let _ = CloseHandle(h);
@@ -575,6 +540,19 @@ fn spawn_inner(
         .stdout_read
         .take()
         .expect("parent stdout pipe still owned");
+    let stderr_read = cleanup
+        .stderr_read
+        .take()
+        .expect("parent stderr pipe still owned");
+    // The workload's stderr is attacker-controlled — relay it through
+    // the sanitizer, never raw to the terminal.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        use std::os::windows::io::FromRawHandle;
+        crate::termutil::relay_child_stderr_blocking(std::fs::File::from_raw_handle(
+            stderr_read.0 as std::os::windows::io::RawHandle,
+        ));
+    }
 
     // Construct WindowsChild with the real process handle and parent-side pipe handles.
     // Safety: pi.hProcess is a valid process handle from CreateProcessW.

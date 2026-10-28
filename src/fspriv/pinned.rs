@@ -279,6 +279,275 @@ pub fn require_parent_write_restricted(dir: &Path) -> io::Result<()> {
     ))
 }
 
+/// The operator opt-out shared by every replaceable-path refusal:
+/// `MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1` restores pre-hardening
+/// behavior for deployments that deliberately run under group-shared
+/// trees (a group-writable workspace, a drvfs mount reporting 0777) —
+/// every path bound by name then carries the swap race the callers
+/// refuse by default.
+pub(crate) fn replaceable_paths_permitted() -> bool {
+    std::env::var_os("MCP_WRIT_ALLOW_REPLACEABLE_PATHS").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Paths a controlling process exempts from the replaceable-path
+/// gates one name at a time — the scoped counterpart of
+/// `MCP_WRIT_ALLOW_REPLACEABLE_PATHS`. The in-guest runner uses it
+/// for the host-mounted contract paths (the read-only policy
+/// bind-mount and the writable audit/report channels): the mount
+/// reports the *host* uid, which no guest principal maps to under
+/// the VM/container backends' documented uid mapping, so the
+/// ownership requirement can never be satisfied there. Registering
+/// only those paths keeps the ownership and ancestry checks armed
+/// for everything else — the workload's entrypoint script included —
+/// where a guest-wide opt-out would silence them. Registration is
+/// in-process only: no image, config file, or environment variable
+/// can arm it.
+static REPLACEABLE_PATH_EXEMPTIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::OnceLock::new();
+
+fn replaceable_path_exemptions() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    REPLACEABLE_PATH_EXEMPTIONS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Register `path` — exactly that path — as carrying the documented
+/// host-mount exemption described at [`REPLACEABLE_PATH_EXEMPTIONS`].
+/// The canonicalized spelling is stored when the object exists so a
+/// check arriving under an equal-but-different spelling still
+/// matches; a not-yet-created path is stored as spelled.
+pub fn permit_replaceable_path(path: &Path) {
+    if let Ok(mut set) = replaceable_path_exemptions().lock() {
+        set.insert(path.to_path_buf());
+        if let Ok(canonical) = fs::canonicalize(path)
+            && canonical != *path
+        {
+            set.insert(canonical);
+        }
+    }
+}
+
+/// [`replaceable_paths_permitted`] for the whole process, or a
+/// per-path exemption registered via [`permit_replaceable_path`] —
+/// the gate every trusted-path check consults once it knows the path
+/// it guards.
+pub(crate) fn replaceable_permitted_for(path: &Path) -> bool {
+    if replaceable_paths_permitted() {
+        return true;
+    }
+    let Ok(set) = replaceable_path_exemptions().lock() else {
+        return false;
+    };
+    set.contains(path)
+        || fs::canonicalize(path)
+            .ok()
+            .is_some_and(|canonical| set.contains(&canonical))
+}
+
+/// [`require_parent_write_restricted`] honoring the
+/// `MCP_WRIT_ALLOW_REPLACEABLE_PATHS` opt-out and registered path
+/// exemptions — the shared ancestry gate for a path a trusted read
+/// or write binds by spelling (policy source, audit sink, report
+/// destination, entrypoint script).
+pub fn require_unreplaceable_ancestry(path: &Path) -> io::Result<()> {
+    if replaceable_permitted_for(path) {
+        return Ok(());
+    }
+    require_parent_write_restricted(path)
+}
+
+/// Refuse a *source* file `path` — a document read verbatim into
+/// trusted authority (a policy document, an `args_schema` `@file`, an
+/// interpreted entrypoint script) — when a lower-trust principal could
+/// substitute or rewrite it. On Unix the leaf must be a regular file
+/// owned by this euid or root carrying no group/other write bit, and
+/// every ancestor must pass [`require_parent_write_restricted`] — a
+/// foreign owner could rewrite the bytes outright, a group-writable
+/// file lets group members rewrite them in place, and a replaceable
+/// ancestor lets a directory or leaf be renamed away between the
+/// check and the read. Both the *spelled* path — the chain the
+/// use-time open actually re-traverses — and the canonicalized
+/// object are checked, so a symlink, `..`, or reparse component in
+/// the spelling cannot route the open around the verified ancestry:
+/// on Unix each link component must sit under a write-restricted
+/// parent, and on Windows the spelled chain must be reparse-free
+/// with the leaf not a reparse point itself. Windows proves the leaf
+/// contract through an owner/DACL that admits no untrusted write
+/// grant.
+///
+/// `MCP_WRIT_ALLOW_REPLACEABLE_PATHS` accepts the substitution risk
+/// explicitly — the documented downgrade for intentionally shared
+/// trees — and [`permit_replaceable_path`] registers the same
+/// exemption for one path at a time.
+#[cfg(unix)]
+pub fn require_trusted_source_file(path: &Path) -> io::Result<()> {
+    if replaceable_permitted_for(path) {
+        return Ok(());
+    }
+    use std::os::unix::fs::MetadataExt;
+    // Check the object the caller's read will actually open: a spelled
+    // path whose leaf is a link — or whose `..` components alias
+    // another directory — resolves elsewhere, so the metadata and
+    // ancestor checks must follow the resolution, not the spelling.
+    let resolved = fs::canonicalize(path)?;
+    let meta = fs::metadata(&resolved)?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("'{}' is not a regular file", path.display()),
+        ));
+    }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != 0 && meta.uid() != euid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing '{}': owned by foreign uid {} — that principal \
+                 can rewrite it between verification and use",
+                path.display(),
+                meta.uid()
+            ),
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing '{}': group/world-writable — another principal \
+                 can rewrite it between verification and use (set \
+                 MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1 to accept)",
+                path.display()
+            ),
+        ));
+    }
+    require_parent_write_restricted(&resolved)?;
+    // The resolved checks alone are not enough: the caller's open
+    // re-traverses the *spelled* path, whose lexical ancestry can
+    // contain a component the resolved chain never names — a symlink
+    // or `..` through a directory a lower-trust principal controls.
+    // Hold the spelled chain to the same ancestor standard, and refuse
+    // every link component that sits under a shared-writable
+    // directory: only that directory's write access protects the link
+    // from being retargeted after this check.
+    let spelled = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    require_parent_write_restricted(&spelled)?;
+    let mut cursor = PathBuf::new();
+    for component in spelled.components() {
+        cursor.push(component.as_os_str());
+        let meta = match fs::symlink_metadata(&cursor) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        if let Some(parent) = cursor.parent()
+            && dir_shared_writable(parent)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing '{}': component '{}' is a symbolic link under \
+                     shared-writable '{}' — it can be retargeted after \
+                     verification (set MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1 \
+                     to accept)",
+                    path.display(),
+                    cursor.display(),
+                    parent.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Windows counterpart of the Unix [`require_trusted_source_file`]: a
+/// source document must resolve through reparse-free ancestry whose
+/// DACLs deny untrusted principals replace access, and the leaf itself
+/// must be owned by a trusted principal with no DACL grant that lets
+/// an untrusted trustee write or delete it.
+#[cfg(windows)]
+pub fn require_trusted_source_file(path: &Path) -> io::Result<()> {
+    if replaceable_permitted_for(path) {
+        return Ok(());
+    }
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    // Resolve `..`/reparse components first so the ancestor walk and
+    // the owner/DACL checks below cover the object the caller's open
+    // will actually reach, not merely the spelled chain.
+    let resolved = fs::canonicalize(path)?;
+    super::winsec::require_no_reparse_ancestors(&resolved)?;
+    require_parent_write_restricted(&resolved)?;
+    // The resolved checks alone are not enough: the caller's open
+    // re-traverses the *spelled* path, so its chain is held to the
+    // same contract — reparse-free ancestors whose DACLs deny
+    // untrusted replace access, and a leaf that is not itself a
+    // reparse point an untrusted principal could retarget.
+    let spelled = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    super::winsec::require_no_reparse_ancestors(&spelled)?;
+    require_parent_write_restricted(&spelled)?;
+    if fs::symlink_metadata(&spelled)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing '{}': the spelled leaf is a reparse point — its \
+                 owner can retarget the open after verification (set \
+                 MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1 to accept)",
+                path.display()
+            ),
+        ));
+    }
+    let file = fs::File::open(&resolved)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("'{}' is not a regular file", path.display()),
+        ));
+    }
+    if !super::winsec::handle_owner_is_trusted(&file, true)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing '{}': owned by an untrusted principal",
+                path.display()
+            ),
+        ));
+    }
+    if super::winsec::dacl_grants_file_write(&resolved, true)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing '{}': its DACL grants write access to an untrusted \
+                 principal — another session could rewrite it between \
+                 verification and use (set MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1 \
+                 to accept)",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn require_trusted_source_file(path: &Path) -> io::Result<()> {
+    let _ = path;
+    Err(io::Error::other(
+        "source-file trust cannot be verified on this OS",
+    ))
+}
+
 /// True when `dir` grants write access to a principal other than its
 /// owner — group/other permission bits on Unix, a broad-trustee DACL
 /// allow on Windows. The auditor uses this to refuse authorization

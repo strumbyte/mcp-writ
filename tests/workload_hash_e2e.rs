@@ -55,6 +55,22 @@ fn mcp_writ() -> PathBuf {
     common::mcp_writ_bin()
 }
 
+/// The launch-time entrypoint gate (`require_trusted_source_file`)
+/// refuses a group/other-writable script — `fs::copy` preserves the
+/// source's mode, which a permissive checkout (drvfs, shared trees)
+/// reports as world-writable, so tighten each fixture copy to
+/// owner-only.
+fn restrict_script(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict script permissions");
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// `generate-policy` over `child_argv`; returns (stdout draft, stderr).
 async fn generate_policy(child_argv: &[String], extra: &[&str]) -> (String, String) {
     let mut cmd = Command::new(mcp_writ());
@@ -102,6 +118,12 @@ fn spawn_guard_args(
     cmd.arg("--");
     cmd.args(child_argv);
     cmd.env("MCP_WRIT_SKIP_SANDBOX", "1");
+    // Fixture policy/report paths under %TEMP% can fail the
+    // replaceable-ancestry gate on hosts whose temp ACL grants another
+    // principal replace access — host-ACL dependent, not what these
+    // tests exercise. The entrypoint's own perms are still tightened
+    // by `restrict_script` so the trust gate stays live where it can.
+    cmd.env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1");
     // A timed-out `wait_with_output` drops the Child mid-poll — the
     // process must not be left running.
     cmd.kill_on_drop(true);
@@ -430,6 +452,7 @@ async fn interpreted_entrypoint_hash_binds_and_tamper_fails() {
         .join("tests/fixtures/mcp_servers/scripted_stdio.py");
     let script = dir.path().join("server.py");
     std::fs::copy(&script_src, &script).expect("copy script fixture");
+    restrict_script(&script);
 
     let argv: Vec<String> = if cfg!(windows) {
         vec![
@@ -506,8 +529,11 @@ async fn interpreted_entrypoint_hash_multifile_esm() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_servers/esm_pkg");
     let index = dir.path().join("index.mjs");
     let tools = dir.path().join("tools.mjs");
+
     std::fs::copy(src.join("index.mjs"), &index).expect("copy index.mjs");
+    restrict_script(&index);
     std::fs::copy(src.join("tools.mjs"), &tools).expect("copy tools.mjs");
+    restrict_script(&tools);
 
     let argv = vec!["node".to_string(), index.to_string_lossy().into_owned()];
     let (draft, _stderr) = generate_policy(&argv, &["--static-only"]).await;
@@ -539,6 +565,7 @@ async fn interpreted_entrypoint_hash_single_file_cjs() {
         .join("tests/fixtures/mcp_servers/single_file.cjs");
     let script = dir.path().join("server.cjs");
     std::fs::copy(&src, &script).expect("copy server.cjs");
+    restrict_script(&script);
 
     let argv = vec!["node".to_string(), script.to_string_lossy().into_owned()];
     let (draft, _stderr) = generate_policy(&argv, &["--static-only"]).await;
@@ -660,6 +687,7 @@ async fn report_records_code_identity_checkpoints() {
         .join("tests/fixtures/mcp_servers/scripted_stdio.py");
     let script = dir.path().join("server.py");
     std::fs::copy(&script_src, &script).expect("copy script fixture");
+    restrict_script(&script);
 
     let argv: Vec<String> = if cfg!(windows) {
         vec![

@@ -3,15 +3,12 @@ use super::*;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-fn make_test_dir(label: &str) -> PathBuf {
-    let id = std::process::id();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = crate::testutil::real_temp_base().join(format!("mcp_writ_{label}_{id}_{ts}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// An audit-sink fixture root must satisfy the sink's own ancestry
+/// gate — a replaceable parent is exactly what `open_audit_sink`
+/// refuses — so fixtures live under `restricted_tempdir` and tests
+/// skip when the host offers no write-restricted root.
+fn make_test_dir(_label: &str) -> Option<PathBuf> {
+    crate::testutil::restricted_tempdir().map(|d| d.keep())
 }
 
 fn make_test_event() -> AuditEvent {
@@ -539,7 +536,10 @@ fn file_sink_logger(
         rx,
         writer,
         writer_failed.clone(),
-        None,
+        super::SinkAnchor {
+            dir: None,
+            leaf: None,
+        },
         AuditSyncMode::Buffered,
         path.to_path_buf(),
         reopen_rx,
@@ -558,7 +558,10 @@ fn file_sink_logger(
 
 #[tokio::test]
 async fn test_logger_to_file_writes_jsonl() {
-    let dir = make_test_dir("audit_new");
+    let Some(dir) = make_test_dir("audit_new") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("test_audit.jsonl");
 
     let logger = AuditLogger::to_file(&path).expect("should create logger");
@@ -583,7 +586,10 @@ async fn test_logger_to_file_writes_jsonl() {
 
 #[tokio::test]
 async fn test_logger_multiple_events() {
-    let dir = make_test_dir("audit_multi_new");
+    let Some(dir) = make_test_dir("audit_multi_new") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("multi.jsonl");
 
     let logger = AuditLogger::to_file(&path).expect("should create logger");
@@ -602,7 +608,10 @@ async fn test_logger_multiple_events() {
 
 #[tokio::test]
 async fn test_logger_channel_close_flushes() {
-    let dir = make_test_dir("audit_flush");
+    let Some(dir) = make_test_dir("audit_flush") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("flush.jsonl");
 
     let logger = AuditLogger::to_file(&path).expect("should create logger");
@@ -628,7 +637,10 @@ async fn test_logger_channel_close_flushes() {
 
 #[tokio::test]
 async fn test_logger_critical_event_triggers_flush() {
-    let dir = make_test_dir("audit_critical");
+    let Some(dir) = make_test_dir("audit_critical") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("critical.jsonl");
 
     let logger = AuditLogger::to_file(&path).expect("should create logger");
@@ -662,7 +674,10 @@ async fn test_logger_critical_event_triggers_flush() {
 /// periodic-flush window.
 #[tokio::test]
 async fn test_logger_high_severity_persists_immediately() {
-    let dir = make_test_dir("audit_high");
+    let Some(dir) = make_test_dir("audit_high") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("high.jsonl");
 
     let logger = AuditLogger::to_file(&path).expect("should create logger");
@@ -695,7 +710,10 @@ async fn test_logger_high_severity_persists_immediately() {
 /// the shutdown flush — never eagerly.
 #[tokio::test]
 async fn test_logger_medium_stays_buffered() {
-    let dir = make_test_dir("audit_medium");
+    let Some(dir) = make_test_dir("audit_medium") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("medium.jsonl");
 
     let logger = AuditLogger::to_file(&path).expect("should create logger");
@@ -726,7 +744,10 @@ async fn test_logger_medium_stays_buffered() {
 /// record as soon as the writer dequeues it — no buffered tail at all.
 #[tokio::test]
 async fn test_logger_every_event_syncs_info_records() {
-    let dir = make_test_dir("audit_sync_mode");
+    let Some(dir) = make_test_dir("audit_sync_mode") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("sync.jsonl");
 
     let logger = AuditLogger::to_file_with_options(&path, true, AuditSyncMode::EveryEvent)
@@ -763,7 +784,10 @@ fn test_severity_ordering() {
 
 #[tokio::test]
 async fn test_logger_backpressure_channel_full() {
-    let dir = make_test_dir("audit_bp");
+    let Some(dir) = make_test_dir("audit_bp") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("bp.jsonl");
 
     let (logger, _reopen_tx) = file_sink_logger(&path, 2, true);
@@ -783,7 +807,10 @@ async fn test_logger_backpressure_channel_full() {
 
 #[tokio::test]
 async fn test_logger_channel_full_best_effort_stays_available() {
-    let dir = make_test_dir("audit_bp_open");
+    let Some(dir) = make_test_dir("audit_bp_open") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("bp.jsonl");
 
     let (logger, _reopen_tx) = file_sink_logger(&path, 2, false);
@@ -824,7 +851,10 @@ async fn test_logger_to_tracing_no_panic() {
 async fn test_logger_log_ordered_enqueues_on_live_channel() {
     // The pre-forward record path: on a healthy fail-closed logger the
     // record is enqueued and reaches the file like any other event.
-    let dir = make_test_dir("audit_ord_live");
+    let Some(dir) = make_test_dir("audit_ord_live") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("ord.jsonl");
     let logger = AuditLogger::to_file(&path).unwrap();
     logger.log_ordered(make_test_event()).await.unwrap();
@@ -841,7 +871,10 @@ async fn test_logger_log_ordered_enqueues_on_live_channel() {
 async fn test_logger_log_ordered_refuses_after_shutdown() {
     // A closed channel refuses the forward instead of dropping the
     // record silently — and poisons the fail-closed session.
-    let dir = make_test_dir("audit_ord_dead");
+    let Some(dir) = make_test_dir("audit_ord_dead") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("ord.jsonl");
     let logger = AuditLogger::to_file(&path).unwrap();
     let _ = logger.shutdown().await;
@@ -856,7 +889,10 @@ async fn test_logger_log_ordered_refuses_after_shutdown() {
 
 #[tokio::test]
 async fn test_logger_shutdown_reports_clean_writer() {
-    let dir = make_test_dir("audit_sd_ok");
+    let Some(dir) = make_test_dir("audit_sd_ok") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("ok.jsonl");
     let logger = AuditLogger::to_file(&path).unwrap();
     logger.log(make_test_event());
@@ -869,7 +905,10 @@ async fn test_logger_shutdown_reports_writer_failure() {
     // A latched writer fault must surface in the shutdown result —
     // fail-closed callers fold it into the command outcome so a session
     // that lost audit records cannot report success.
-    let dir = make_test_dir("audit_sd_err");
+    let Some(dir) = make_test_dir("audit_sd_err") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("err.jsonl");
 
     let (logger, _reopen_tx) = file_sink_logger(&path, 2, true);
@@ -891,7 +930,10 @@ async fn test_logger_shutdown_reports_writer_failure() {
 async fn test_logger_failure_watch_fires_on_set() {
     // The idle-relay contract: a subscribed watch wakes the moment the
     // writer fault is recorded, not on the next logging call.
-    let dir = make_test_dir("audit_watch");
+    let Some(dir) = make_test_dir("audit_watch") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("watch.jsonl");
     let logger = AuditLogger::to_file(&path).unwrap();
     let mut watch = logger.failure_watch();
@@ -913,7 +955,10 @@ async fn test_logger_failure_watch_fires_on_set() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_audit_sink_refuses_symlink_leaf() {
-    let dir = make_test_dir("audit_sink_link");
+    let Some(dir) = make_test_dir("audit_sink_link") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let target = dir.join("sentinel.txt");
     std::fs::write(&target, b"sentinel").unwrap();
     let link = dir.join("audit.jsonl");
@@ -934,7 +979,10 @@ async fn test_audit_sink_refuses_symlink_leaf() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_audit_sink_refuses_symlinked_ancestor() {
-    let dir = make_test_dir("audit_sink_ancestor");
+    let Some(dir) = make_test_dir("audit_sink_ancestor") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let real_dir = dir.join("real");
     std::fs::create_dir(&real_dir).unwrap();
     let link_dir = dir.join("linked");
@@ -961,7 +1009,10 @@ async fn test_audit_sink_refuses_symlinked_ancestor() {
 #[tokio::test]
 async fn test_audit_sink_tightens_existing_perms() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = make_test_dir("audit_sink_perms");
+    let Some(dir) = make_test_dir("audit_sink_perms") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("audit.jsonl");
     std::fs::write(&path, b"").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -978,7 +1029,10 @@ async fn test_audit_sink_tightens_existing_perms() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_audit_sink_refuses_fifo() {
-    let dir = make_test_dir("audit_sink_fifo");
+    let Some(dir) = make_test_dir("audit_sink_fifo") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("audit.jsonl");
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -994,7 +1048,10 @@ async fn test_audit_sink_refuses_fifo() {
 /// full payload.
 #[tokio::test]
 async fn test_logger_bounds_wire_fields() {
-    let dir = make_test_dir("audit_bound_field");
+    let Some(dir) = make_test_dir("audit_bound_field") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("b.jsonl");
     let logger = AuditLogger::to_file(&path).unwrap();
 
@@ -1076,7 +1133,10 @@ fn test_encode_audit_field_value_output_alphabet() {
 /// fail-closed fault — not grow memory unboundedly.
 #[tokio::test]
 async fn test_logger_byte_budget_fail_closed() {
-    let dir = make_test_dir("audit_byte_budget");
+    let Some(dir) = make_test_dir("audit_byte_budget") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
 
     let (tx, rx) = mpsc::channel(64);
     let writer_failed = super::FailureFlag::new();
@@ -1137,7 +1197,10 @@ fn reopen_marker() -> ReopenMarker {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_logger_reopen_continues_to_new_file() {
-    let dir = make_test_dir("audit_reopen");
+    let Some(dir) = make_test_dir("audit_reopen") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("audit.jsonl");
     let rotated = dir.join("audit.jsonl.1");
 
@@ -1190,7 +1253,10 @@ async fn test_logger_reopen_continues_to_new_file() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_logger_reopen_failure_keeps_old_sink() {
-    let dir = make_test_dir("audit_reopen_fail");
+    let Some(dir) = make_test_dir("audit_reopen_fail") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("audit.jsonl");
     let rotated = dir.join("audit.jsonl.1");
 
@@ -1235,7 +1301,10 @@ async fn test_logger_reopen_failure_keeps_old_sink() {
 /// equivalent handle and loses nothing.
 #[tokio::test]
 async fn test_logger_reopen_same_path_loses_nothing() {
-    let dir = make_test_dir("audit_reopen_same");
+    let Some(dir) = make_test_dir("audit_reopen_same") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("audit.jsonl");
 
     let logger = AuditLogger::to_file(&path).unwrap();
@@ -1269,7 +1338,10 @@ async fn test_logger_reopen_without_file_sink() {
     assert!(!tracing_logger.reopen(reopen_marker()).await.unwrap());
     let _ = tracing_logger.shutdown().await;
 
-    let dir = make_test_dir("audit_reopen_dead");
+    let Some(dir) = make_test_dir("audit_reopen_dead") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
     let path = dir.join("audit.jsonl");
     let logger = AuditLogger::to_file(&path).unwrap();
     assert!(logger.has_file_sink());

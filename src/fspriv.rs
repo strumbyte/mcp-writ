@@ -23,8 +23,10 @@ pub use file_io::{
 };
 pub use pinned::{
     FileIdentity, PinnedDir, dir_shared_writable, file_identity, open_dir_pinned,
-    require_parent_write_restricted, running_as_root,
+    permit_replaceable_path, require_parent_write_restricted, require_trusted_source_file,
+    require_unreplaceable_ancestry, running_as_root,
 };
+pub(crate) use pinned::{replaceable_paths_permitted, replaceable_permitted_for};
 #[cfg(windows)]
 pub use tempdir::restrict_handle_owner_only;
 pub use tempdir::{create_private_tempdir, restrict_owner_only};

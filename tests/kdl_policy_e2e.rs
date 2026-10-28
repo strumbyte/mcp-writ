@@ -88,6 +88,12 @@ fn spawn_guard_with_options(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
     let audit_log = common::next_audit_log_path();
 
+    // Policy + audit fixtures under %TEMP% can be refused as
+    // replaceable, which is host-ACL dependent and not what these
+    // tests exercise — set the opt-out as a default so an explicit
+    // `envs` entry can still override it.
+    cmd.env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1");
+
     cmd.args([
         "run",
         "--transport",

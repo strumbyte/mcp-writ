@@ -491,3 +491,107 @@ fn dacl_trustee_matrix_flags_named_principals() {
         false
     ));
 }
+
+/// A trusted file reached through a *spelling* a lower-trust
+/// principal controls is refused: canonicalizing first inspects only
+/// the resolved target's chain, but the use-time open re-traverses
+/// the spelling — a shared-writable ancestor there retargets it.
+#[cfg(unix)]
+#[test]
+fn trusted_source_rejects_spelling_through_shared_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = create_private_tempdir("spelled-chain").unwrap();
+    let real = root.join("real.py");
+    fs::write(&real, b"entry\n").unwrap();
+    // Pin the leaf's mode so the no-group/other-write contract does
+    // not depend on the process umask.
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+    let shared = root.join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+    let link = shared.join("link.py");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(
+        require_trusted_source_file(&real).is_ok(),
+        "the resolved target is trusted and must pass"
+    );
+    assert!(
+        require_trusted_source_file(&link).is_err(),
+        "a spelling through a shared-writable ancestor must refuse"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A sticky shared directory (/tmp-style) passes the ancestor
+/// gate, yet a link inside it is still retargetable by its owner —
+/// the per-component check refuses it even though the leaf's
+/// resolved target is fully trusted.
+#[cfg(unix)]
+#[test]
+fn trusted_source_rejects_link_in_sticky_shared_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = create_private_tempdir("sticky-link").unwrap();
+    let real = root.join("real.py");
+    fs::write(&real, b"entry\n").unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+    let sticky = root.join("sticky");
+    fs::create_dir(&sticky).unwrap();
+    fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).unwrap();
+    let link = sticky.join("link.py");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(
+        require_trusted_source_file(&link).is_err(),
+        "a link under a shared-writable directory must refuse"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A link whose parent is write-restricted cannot be retargeted by
+/// any lower-trust principal — the spelled chain stays acceptable.
+#[cfg(unix)]
+#[test]
+fn trusted_source_allows_link_under_restricted_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = create_private_tempdir("private-link").unwrap();
+    let real = root.join("real.py");
+    fs::write(&real, b"entry\n").unwrap();
+    // Pin the leaf's mode so the is_ok assertion does not depend on
+    // the process umask granting group/other write bits.
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+    let link = root.join("link.py");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(
+        require_trusted_source_file(&link).is_ok(),
+        "a link whose parent only the owner can write is not replaceable"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// permit_replaceable_path exempts exactly the registered path —
+/// a sibling under the same replaceable ancestor still fails every
+/// gate. The registry is the in-guest runner's contract-path
+/// mechanism: host-mounted channels whose host-side uid cannot map
+/// to a guest principal.
+#[cfg(unix)]
+#[test]
+fn scoped_exemption_covers_only_the_registered_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = create_private_tempdir("scoped-exempt").unwrap();
+    let shared = root.join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+    let exempted = shared.join("registered.py");
+    let neighbor = shared.join("neighbor.py");
+    fs::write(&exempted, b"registered\n").unwrap();
+    fs::write(&neighbor, b"neighbor\n").unwrap();
+    permit_replaceable_path(&exempted);
+    assert!(
+        require_trusted_source_file(&exempted).is_ok(),
+        "the registered contract path is exempt"
+    );
+    assert!(
+        require_trusted_source_file(&neighbor).is_err(),
+        "an unregistered sibling under the same ancestor still refuses"
+    );
+    let _ = fs::remove_dir_all(&root);
+}

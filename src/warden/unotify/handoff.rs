@@ -76,16 +76,18 @@ pub(super) fn send_listener(sock: RawFd, listener: RawFd) -> io::Result<()> {
         msg.msg_iov = &iov as *const _ as *mut _;
         msg.msg_iovlen = 1;
         msg.msg_control = control.bytes.as_mut_ptr().cast();
-        msg.msg_controllen = control.bytes.len();
+        // `msg_controllen`/`cmsg_len` are `size_t` on glibc and
+        // `socklen_t` on musl — `as _` lands each field's own width.
+        msg.msg_controllen = control.bytes.len() as _;
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as usize;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
         std::ptr::write(libc::CMSG_DATA(cmsg).cast::<RawFd>(), listener);
-        msg.msg_controllen = libc::CMSG_SPACE(size_of::<RawFd>() as u32) as usize;
+        msg.msg_controllen = libc::CMSG_SPACE(size_of::<RawFd>() as u32) as _;
         if libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -202,7 +204,11 @@ impl UnotifyParent {
             msg.msg_iov = &mut iov as *mut _;
             msg.msg_iovlen = 1;
             msg.msg_control = control.bytes.as_mut_ptr().cast();
-            msg.msg_controllen = control.bytes.len();
+            // `msg_controllen`/`cmsg_len` are `size_t` on glibc and
+            // `socklen_t` on musl — `as _` lands the field width, and
+            // the length checks below compare in u64 where either
+            // width fits.
+            msg.msg_controllen = control.bytes.len() as _;
             let n = libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC);
             if n <= 0 {
                 return Err(if n == 0 {
@@ -214,7 +220,7 @@ impl UnotifyParent {
             // A truncated or undersized control block can never carry a
             // complete fd — reject before trusting the cmsg layout.
             if msg.msg_flags & libc::MSG_CTRUNC != 0
-                || msg.msg_controllen < libc::CMSG_LEN(size_of::<RawFd>() as u32) as usize
+                || (msg.msg_controllen as u64) < libc::CMSG_LEN(size_of::<RawFd>() as u32) as u64
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -225,7 +231,7 @@ impl UnotifyParent {
             if cmsg.is_null()
                 || (*cmsg).cmsg_level != libc::SOL_SOCKET
                 || (*cmsg).cmsg_type != libc::SCM_RIGHTS
-                || (*cmsg).cmsg_len < libc::CMSG_LEN(size_of::<RawFd>() as u32) as usize
+                || ((*cmsg).cmsg_len as u64) < libc::CMSG_LEN(size_of::<RawFd>() as u32) as u64
             {
                 // A datagram without an fd is a diagnostic byte the
                 // child sent instead of the listener (e.g. `b'N'` when

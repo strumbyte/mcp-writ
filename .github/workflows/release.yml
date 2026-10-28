@@ -65,12 +65,60 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # Authorization gate — any pushed `v*` tag triggers this workflow, so the
+  # publish path must not trust the tag alone. A tag is authorized only when
+  # (a) its commit is reachable from the default branch — releases publish
+  # reviewed mainline history, never a sideline commit — and (b) the tag
+  # pusher holds admin/maintain permission. Both checks run via the GitHub
+  # API and fail closed: an API error or an unexpected status denies.
+  # ---------------------------------------------------------------------------
+  release-gate:
+    name: Tag is authorized for release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Verify tag commit is on the default branch
+        run: |
+          base="$(gh api "repos/${{ github.repository }}" --jq .default_branch)"
+          # Compare against the pushed commit SHA, not the tag name — a
+          # branch sharing the tag's name would resolve the ref
+          # ambiguously and compare the wrong head.
+          status="$(gh api "repos/${{ github.repository }}/compare/${base}...${GITHUB_SHA}" --jq .status)"
+          echo "default_branch=$base tag=$GITHUB_REF_NAME sha=$GITHUB_SHA compare_status=$status"
+          case "$status" in
+            behind|identical) ;;
+            *)
+              echo "::error::tag $GITHUB_REF_NAME is not reachable from $base (compare status: $status) — release tags must point at mainline history"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify tag pusher is a maintainer
+        run: |
+          # `permission` is the coarse access level — a *maintain* role
+          # reports `write` there, so the fine-grained `role_name` is
+          # what identifies maintainers. `admin` passes on either field
+          # (role_name can name a custom role carrying admin access).
+          read -r perm role < <(gh api "repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission" --jq '"\(.permission) \(.role_name)"')
+          echo "actor=${{ github.actor }} permission=$perm role_name=$role"
+          case "$perm:$role" in
+            admin:*|*:admin|*:maintain) ;;
+            *)
+              echo "::error::actor ${{ github.actor }} holds '$perm/$role' — release tags must be pushed by an admin/maintain collaborator"
+              exit 1
+              ;;
+          esac
+
+  # ---------------------------------------------------------------------------
   # Build mcp-secure-runner for Linux only (arm64 + amd64)
   # The runner always executes inside Linux containers, so only Linux binaries
   # are needed regardless of the host OS.
   # ---------------------------------------------------------------------------
   build-runner:
-    needs: [version-check, verify, platform-tests, container-tests, go-runtime]
+    needs: [version-check, release-gate, verify, platform-tests, container-tests, go-runtime]
     name: Build runner (linux-${{ matrix.arch }})
     # Match the GNU runner build environment used by container-tests.
     runs-on: ubuntu-22.04
@@ -143,7 +191,7 @@ jobs:
   # arm64 Windows guests are out of contract — no artifact is produced.
   # ---------------------------------------------------------------------------
   build-runner-windows:
-    needs: [version-check, verify, platform-tests, container-tests, go-runtime]
+    needs: [version-check, release-gate, verify, platform-tests, container-tests, go-runtime]
     name: Build runner (windows-amd64)
     runs-on: windows-latest
     permissions:
@@ -212,7 +260,7 @@ jobs:
   # so they are only compiled for Linux targets.
   # ---------------------------------------------------------------------------
   build-writ:
-    needs: [version-check, verify, platform-tests, container-tests, go-runtime]
+    needs: [version-check, release-gate, verify, platform-tests, container-tests, go-runtime]
     name: Build writ (${{ matrix.os }}-${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -320,6 +368,13 @@ jobs:
     name: Package and Release
     needs: [build-runner, build-runner-windows, build-writ]
     runs-on: ubuntu-latest
+    # The `release` environment lets the repository require a final human
+    # approval before the publish job runs — configure required reviewers
+    # on it (docs/releasing.md). With no reviewers configured it passes
+    # immediately; the release-gate job above still enforces tag
+    # authorization in code.
+    environment:
+      name: release
     permissions:
       contents: write
     steps:

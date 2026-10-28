@@ -402,10 +402,14 @@ impl RunningChild {
     /// report", so `si_pid` distinguishes the two. EINTR is retried — a
     /// caught signal landing mid-probe is not evidence of state
     /// (`sweep_group_after_exit`'s blocking probe already retries it).
+    /// A probe failure such as ECHILD (the pid is not, or is no longer,
+    /// a waitable child) is surfaced as `Err`: it is not evidence of a
+    /// still-running leader, and reporting "running" for it would loop
+    /// a dead launch forever.
     #[cfg(unix)]
-    fn exited_unreaped(&self) -> bool {
+    fn exited_unreaped(&self) -> std::io::Result<bool> {
         let Some(pid) = self.id() else {
-            return false;
+            return Ok(false);
         };
         loop {
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -421,10 +425,11 @@ impl RunningChild {
             };
             if ret == 0 {
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                return unsafe { info.si_pid() } == pid as libc::pid_t;
+                return Ok(unsafe { info.si_pid() } == pid as libc::pid_t);
             }
-            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                return false;
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                return Err(e);
             }
         }
     }
@@ -677,19 +682,31 @@ impl RunningChild {
 
     /// Non-blocking poll for a natural exit (no SIGKILL).
     ///
-    /// Narrow gap a caller must accept: if the leader exits between the
-    /// probe below and the inner `try_wait` — i.e. the probe saw it
-    /// alive, then the inner call reaps it — the sweep never ran and
-    /// detached descendants can outlive the session (the freed pgid
-    /// must still never be signaled, so skipping is the safe direction).
-    /// Callers that must guarantee descendant cleanup use
-    /// [`Self::wait`] or [`Self::wait_for_natural_exit`].
+    /// On Unix the `WNOWAIT` probe is authoritative and the inner
+    /// `try_wait` runs only when it reports the leader *exited*: a
+    /// leader that exits between a "still running" probe and an
+    /// unconditional inner reap would free its pid — and the pgid the
+    /// sweep names — while no descendant sweep ever ran, letting
+    /// detached descendants outlive the session. The probe keeps the
+    /// zombie (`WNOWAIT`), so an exit that lands after the probe is
+    /// reported by the next poll instead: `exited → sweep while the
+    /// pgid is still pinned → reap` is the only order this method
+    /// produces.
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        // Probe for the exit without reaping first: a leader the inner
-        // `try_wait` already reaped frees its pid, and the recorded pgid
-        // may by then name a recycled group that must not be signaled.
         #[cfg(unix)]
-        if !self.reaped && self.exited_unreaped() {
+        if !self.reaped {
+            if !self.exited_unreaped()? {
+                // Leader alive at probe time: report "still running"
+                // rather than let the inner call reap an exit that
+                // landed after the probe. The zombie the next poll
+                // sees keeps the pgid reserved for the sweep. A probe
+                // that could not answer at all surfaces as `Err`
+                // above — it is not proof of life.
+                return Ok(None);
+            }
+            // The zombie pins its pid — and the pgid the group kill
+            // names — so the sweep provably targets this launch's
+            // descendants; the inner call reaps only after it ran.
             self.kill_descendants();
         }
         let status = match &mut self.inner {
@@ -1033,5 +1050,83 @@ mod tests {
         child.signal(libc::SIGKILL).expect("signal group");
         let status = natural_exit(&mut child).await;
         assert!(status.code().is_none(), "SIGKILL leaves no exit code");
+    }
+
+    /// A `waitid` probe failure must surface from `try_wait`, not read
+    /// as "still running" forever. `SA_NOCLDWAIT` makes children exit
+    /// without ever becoming waitable, so the probe fails `ECHILD`
+    /// once the leader is gone — the exact unanswerable-probe shape
+    /// the guard now propagates. The disposition is process-global, so
+    /// the scenario runs in a re-executed copy of this test binary
+    /// (`MCP_WRIT_TEST_NOCLDWAIT_INNER`) and never mutates the host
+    /// test process. Exit codes: 0 = probe error surfaced, 2 = the
+    /// host did not honor SA_NOCLDWAIT (outer skips), anything else =
+    /// failure.
+    const NOCLDWAIT_INNER_ENV: &str = "MCP_WRIT_TEST_NOCLDWAIT_INNER";
+    const NOCLDWAIT_RC_UNSUPPORTED: i32 = 2;
+
+    #[tokio::test]
+    async fn try_wait_surfaces_unanswerable_waitid_probe() {
+        if std::env::var_os(NOCLDWAIT_INNER_ENV).is_some() {
+            noclwait_inner().await;
+        }
+        let exe = std::env::current_exe().expect("current test binary"); // nosemgrep: rust.lang.security.current-exe.current-exe
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "warden::child::tests::try_wait_surfaces_unanswerable_waitid_probe",
+                "--test-threads=1",
+            ])
+            .env(NOCLDWAIT_INNER_ENV, "1")
+            .output()
+            .expect("spawn inner probe");
+        match out.status.code() {
+            Some(0) => {}
+            Some(c) if c == NOCLDWAIT_RC_UNSUPPORTED => {
+                eprintln!("skipping: host does not honor SA_NOCLDWAIT")
+            }
+            other => panic!(
+                "inner probe exited {other:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        }
+    }
+
+    /// Inner leg of [`try_wait_surfaces_unanswerable_waitid_probe`] —
+    /// runs inside the re-executed binary only. Never returns: each
+    /// outcome is reported by process exit.
+    async fn noclwait_inner() -> ! {
+        // SIGCHLD disposition with SA_NOCLDWAIT: children exit without
+        // becoming waitable zombies.
+        // SAFETY: `sigaction` is a POD struct — all-zero then the three
+        // public fields assigned below names a valid disposition; the
+        // handler is SIG_DFL, which is always sound.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        sa.sa_flags = libc::SA_NOCLDWAIT;
+        sa.sa_sigaction = libc::SIG_DFL;
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            libc::sigemptyset(&mut sa.sa_mask);
+            if libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut()) != 0 {
+                std::process::exit(NOCLDWAIT_RC_UNSUPPORTED);
+            }
+        }
+        let mut child = spawn_sh("exit 0");
+        for _ in 0..500 {
+            match child.try_wait() {
+                // The unanswerable probe surfaced — the fixed behavior.
+                Err(e) if e.raw_os_error() == Some(libc::ECHILD) => std::process::exit(0),
+                // A different probe failure is still a surfaced error —
+                // fail rather than accept a wrong errno silently.
+                Err(_) => std::process::exit(4),
+                // The exited child stayed waitable — SA_NOCLDWAIT was
+                // not honored on this host; outer skips.
+                Ok(Some(_)) => std::process::exit(NOCLDWAIT_RC_UNSUPPORTED),
+                Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        // Timed out with only "still running" answers — no verdict.
+        std::process::exit(3)
     }
 }

@@ -74,7 +74,10 @@ impl Warden {
             cmd.args(args)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit());
+                // The workload's stderr is attacker-controlled — pipe
+                // it through the sanitized relay, never raw to the
+                // terminal.
+                .stderr(std::process::Stdio::piped());
             apply_unix_process_group(&mut cmd);
             let apply_record = linux_spawn::attach_linux_pre_exec(&mut cmd, sandbox_bits);
 
@@ -113,7 +116,12 @@ impl Warden {
                 }
             }
             let child = spawned
-                .map(|c| ChildProcess::Standard(child::StdChild::spawned(c)))
+                .map(|mut c| {
+                    if let Some(err) = c.stderr.take() {
+                        crate::termutil::relay_child_stderr_blocking(err);
+                    }
+                    ChildProcess::Standard(child::StdChild::spawned(c))
+                })
                 .map_err(WardenError::ProcessSpawn)?;
             // Spawn returning means the pre_exec hooks ran: no_new_privs,
             // Landlock restrict_self (fail-closed), seccomp apply.
@@ -148,7 +156,9 @@ impl Warden {
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
+            // Unsandboxed does not mean trusted — the workload's
+            // stderr still crosses to the terminal sanitized.
+            .stderr(std::process::Stdio::piped());
         apply_unix_process_group(&mut cmd);
         // No sandbox does not mean the launcher's ambient descriptors
         // should leak — the child seals everything above stdio before
@@ -158,7 +168,12 @@ impl Warden {
             WardenError::sandbox_setup(crate::error::SandboxStage::Prepare, e.to_string())
         })?;
         cmd.spawn()
-            .map(|c| ChildProcess::Standard(child::StdChild::spawned(c)))
+            .map(|mut c| {
+                if let Some(err) = c.stderr.take() {
+                    crate::termutil::relay_child_stderr_blocking(err);
+                }
+                ChildProcess::Standard(child::StdChild::spawned(c))
+            })
             .map_err(WardenError::ProcessSpawn)
     }
 
@@ -561,7 +576,10 @@ impl Warden {
             macos_sandbox::apply_exec_a_wrapper(&mut cmd, program, command, args, opts);
             cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit());
+                // The sandbox-exec helper shares the workload's stderr
+                // — attacker-controlled bytes must cross sanitized,
+                // never raw to the terminal.
+                .stderr(std::process::Stdio::piped());
             let mut env_opts = opts.clone();
             if env_opts.tmpdir.is_none() {
                 env_opts.tmpdir = Some(tmpdir.path().to_path_buf());
@@ -676,6 +694,9 @@ impl Warden {
                             "failed to capture child stdout",
                         ))
                     });
+                    if let Some(err) = child.stderr.take() {
+                        crate::termutil::relay_child_stderr(err);
+                    }
                     match (stdin, stdout) {
                         (Ok(stdin), Ok(stdout)) => SpawnAttempt::ok(
                             report,
@@ -851,7 +872,10 @@ impl Warden {
             cmd.args(args)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit());
+                // The workload's stderr is attacker-controlled — pipe
+                // it through the sanitized relay, never raw to the
+                // terminal.
+                .stderr(std::process::Stdio::piped());
             apply_spawn_env(&mut cmd, opts);
             let env_applied = env_block_applies(opts);
             apply_unix_process_group_tokio(&mut cmd);
@@ -910,6 +934,9 @@ impl Warden {
                             "failed to capture child stdout",
                         ))
                     });
+                    if let Some(err) = child.stderr.take() {
+                        crate::termutil::relay_child_stderr(err);
+                    }
                     match (stdin, stdout) {
                         (Ok(stdin), Ok(stdout)) => {
                             // Collect the notification listener the
@@ -1179,7 +1206,9 @@ impl Warden {
         cmd.args(&argv[1..])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
+            // Same contract on the unsandboxed arm: attacker-controlled
+            // stderr crosses to the terminal sanitized.
+            .stderr(std::process::Stdio::piped());
         apply_spawn_env(&mut cmd, opts);
         #[cfg(target_os = "macos")]
         if let Some(exe) = python_executable_override(&argv[0], program) {
@@ -1217,6 +1246,9 @@ impl Warden {
                         "failed to capture child stdout",
                     ))
                 });
+                if let Some(err) = child.stderr.take() {
+                    crate::termutil::relay_child_stderr(err);
+                }
                 match (stdin, stdout) {
                     (Ok(stdin), Ok(stdout)) => {
                         #[cfg(target_os = "linux")]

@@ -163,16 +163,11 @@ mod integration_tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn make_test_dir(label: &str) -> PathBuf {
-        let id = std::process::id();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = crate::testutil::real_temp_base()
-            .join(format!("mcp_writ_tools_diff_{label}_{id}_{ts}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// `AuditLogger::to_file` refuses a replaceable parent — fixtures
+    /// must satisfy the sink's ancestry gate, so they live under
+    /// `restricted_tempdir` and skip when no restricted root exists.
+    fn make_test_dir(_label: &str) -> Option<PathBuf> {
+        crate::testutil::restricted_tempdir().map(|d| d.keep())
     }
 
     fn make_tools(specs: &[(&str, &str, Option<&str>)]) -> Vec<ToolDefinition> {
@@ -189,7 +184,10 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_verify_tools_list_hash_matches() {
-        let dir = make_test_dir("hash_match");
+        let Some(dir) = make_test_dir("") else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
 
         let tools = make_tools(&[("read_file", "Read a file", None)]);
@@ -215,7 +213,10 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_verify_tools_list_no_entry_warns() {
-        let dir = make_test_dir("no_entry");
+        let Some(dir) = make_test_dir("") else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
 
         let tools = make_tools(&[("read_file", "Read a file", None)]);
@@ -230,7 +231,10 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_verify_tools_list_description_change_blocks() {
-        let dir = make_test_dir("desc_change");
+        let Some(dir) = make_test_dir("") else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
 
         let baseline = make_tools(&[("send_email", "Send an email", None)]);
@@ -271,7 +275,10 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_verify_tools_list_tool_added_warns() {
-        let dir = make_test_dir("tool_added");
+        let Some(dir) = make_test_dir("") else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
 
         let baseline = make_tools(&[("read_file", "Read", None)]);

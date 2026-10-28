@@ -211,6 +211,21 @@ async fn main() {
         read_channel(GUEST.audit_dir_env).unwrap_or_else(|| PathBuf::from(GUEST.log_dir));
     let workload_tmpdir =
         read_channel(GUEST.temp_dir_env).or_else(|| Some(PathBuf::from(GUEST.workload_temp)));
+    // The host-mounted contract paths — the read-only policy
+    // bind-mount and the writable audit/report channels — carry the
+    // *host* uid, which no guest principal maps to under the
+    // VM/container backends' documented uid mapping, so the
+    // trusted-source ownership requirement can never be satisfied on
+    // them. Exempt exactly those paths, and only those: a guest-wide
+    // `MCP_WRIT_ALLOW_REPLACEABLE_PATHS` would also silence the
+    // ownership and ancestry checks on the workload's entrypoint
+    // script, which is image content the mount contract never covers.
+    mcp_writ::fspriv::permit_replaceable_path(&policy_path);
+    mcp_writ::fspriv::permit_replaceable_path(&audit_dir.join("audit.jsonl"));
+    if let Some(dir) = &report_dir {
+        mcp_writ::fspriv::permit_replaceable_path(&dir.join("report.pending.json"));
+        mcp_writ::fspriv::permit_replaceable_path(&guest_report_path(dir));
+    }
     // An image-baked MCP_WRIT_SKIP_SANDBOX is neutralized below, not
     // honored — but its presence is itself auditworthy, so note it for
     // `guard.started` before stripping.
@@ -230,6 +245,10 @@ async fn main() {
         std::env::remove_var("MCP_WRIT_ENV");
         std::env::remove_var("MCP_WRIT_SKIP_SANDBOX");
         std::env::remove_var("MCP_WRIT_LAUNCH_ID");
+        // An inherited or image-baked global opt-out would waive the
+        // trusted-source gate on the workload entrypoint too — only
+        // the per-path exemptions registered above may relax it.
+        std::env::remove_var("MCP_WRIT_ALLOW_REPLACEABLE_PATHS");
         std::env::remove_var("MCP_WRIT_MAX_FRAME_BYTES");
         std::env::remove_var(guest_report::REPORT_OUT_ENV);
         std::env::remove_var(GUEST.policy_path_env);
@@ -262,6 +281,24 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // The guest-side copy of the policy is only as trustworthy as the
+    // path it was read from: a workload-writable staging directory
+    // would let the sandboxed server replace the document between
+    // host export and guest enforcement.
+    if let Err(e) = mcp_writ::policy::loader::require_trusted_policy_sources(&policy) {
+        let detail = format!("refusing launch: {e}");
+        eprintln!("mcp-secure-runner: {detail}");
+        write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+        lifecycle::prelaunch_abort(
+            prelaunch_audit_log.as_deref(),
+            &session_audit,
+            Some("load"),
+            &detail,
+        )
+        .await;
+        std::process::exit(1);
+    }
 
     // 2. Initialize tracing with policy logging level to stderr
     let log_level = mcp_writ::policy::tracing_level_from_policy(&policy.logging.level);

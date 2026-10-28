@@ -822,6 +822,8 @@ mod tests {
             "MCP_WRIT_AUDIT_DIR=",
             "-e",
             "MCP_WRIT_TEMP_DIR=",
+            "-e",
+            "MCP_WRIT_ALLOW_REPLACEABLE_PATHS=",
         ]
     }
 

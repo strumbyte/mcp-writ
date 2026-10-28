@@ -25,7 +25,178 @@ use super::handle::{open_no_follow, real_path_of};
 /// renamed handle's real path must equal the literal spelling — a
 /// junction swapped into the chain after the checks fails the proof
 /// instead of landing the report at a redirected location.
+///
+/// Unix pins the destination *directory* to an open handle and
+/// performs the temp create, rename, and cleanup through `openat` /
+/// `renameat` / `unlinkat` on it — the parent is never resolved by
+/// name a second time, so replacing the directory between operations
+/// cannot redirect where the report lands. The pinned directory must
+/// be owned by this euid or root and carry no un-sticky group/other
+/// write, and its ancestors pass the shared write-restriction walk;
+/// `MCP_WRIT_ALLOW_REPLACEABLE_PATHS` waives those policy checks (not
+/// the pinned-fd mechanics) for intentionally shared trees.
 pub fn write_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        write_file_atomic_pinned(path, contents)
+    }
+    #[cfg(not(unix))]
+    {
+        write_file_atomic_rename(path, contents)
+    }
+}
+
+/// Unix publication through a pinned destination directory — see
+/// [`write_file_atomic`].
+#[cfg(unix)]
+fn write_file_atomic_pinned(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    // A bare file name has a `Some("")` parent — that spelling opens
+    // nothing under a dirfd, so normalize it (and a `None`) to `.`.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{}' has no final file name", path.display()),
+        )
+    })?;
+    let (dir, _identity) = super::pinned::open_dir_pinned(parent)?;
+    if !super::pinned::replaceable_permitted_for(path) {
+        let meta = dir.metadata()?;
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != 0 && meta.uid() != euid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to publish '{}': directory '{}' is owned by a \
+                     foreign principal — it controls where the report lands \
+                     (set MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1 to accept)",
+                    path.display(),
+                    parent.display()
+                ),
+            ));
+        }
+        let mode = meta.mode() & 0o1777;
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to publish '{}': directory '{}' is group/world-\
+                     writable without the sticky bit — another principal \
+                     could swap the destination (set \
+                     MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1 to accept)",
+                    path.display(),
+                    parent.display()
+                ),
+            ));
+        }
+        super::pinned::require_parent_write_restricted(parent)?;
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let mut tmp_os = std::ffi::OsString::from(".");
+    tmp_os.push(name);
+    tmp_os.push(format!(".tmp-{}-{nanos}", std::process::id()));
+    let c_tmp = CString::new(tmp_os.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "temp name contains NUL"))?;
+    let c_name = CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{}' contains a NUL byte", path.display()),
+        )
+    })?;
+
+    // `O_EXCL|O_NOFOLLOW` under the pinned dir: a planted entry at the
+    // temp name fails the create instead of being opened through.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_tmp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let result = (|| -> io::Result<()> {
+        file.write_all(contents)?;
+        file.sync_data()?;
+        // Same-directory rename through the pinned handle — a name
+        // swap at the destination replaces it outright (links are not
+        // written through), and the parent cannot be re-pointed under
+        // us because it is never resolved by path again.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if unsafe {
+            libc::renameat(
+                dir.as_raw_fd(),
+                c_tmp.as_ptr(),
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // Durability + identity proofs before success is reported:
+        // fsync the pinned directory so the rename's directory entry
+        // is durable with the contents, then prove the visible name
+        // still names the file just written — an entry swapped under
+        // it would carry a different inode.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if unsafe { libc::fstatat(dir.as_raw_fd(), c_name.as_ptr(), &mut st, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let ours = file.metadata()?;
+        // `dev_t` is `i32` on macOS — widen for the `u64` identity
+        // compare (deliberate no-op cast on Linux).
+        #[allow(clippy::unnecessary_cast)]
+        let same_object = st.st_dev as u64 == ours.dev() && st.st_ino == ours.ino();
+        if !same_object {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "'{}' was replaced during publication — the visible entry is not the verified file",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            libc::unlinkat(dir.as_raw_fd(), c_tmp.as_ptr(), 0);
+        }
+    }
+    result
+}
+
+/// The path-resolved rename implementation [`write_file_atomic`] uses
+/// on Windows and any platform without `openat`-style pinning.
+#[cfg(not(unix))]
+fn write_file_atomic_rename(path: &Path, contents: &[u8]) -> io::Result<()> {
     #[cfg(windows)]
     {
         super::winsec::require_no_reparse_ancestors(path)?;
@@ -68,8 +239,14 @@ pub fn write_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
         {
             // Owner+SYSTEM protected DACL applied to the open handle —
             // an inherited broad DACL on the temp name is replaced
-            // before the contents land at the destination.
-            super::tempdir::restrict_handle_owner_only(&file)?;
+            // before the contents land at the destination. Under the
+            // replaceable-paths opt-out a share that cannot store a
+            // DACL runs untightened — the same documented downgrade.
+            if let Err(e) = super::tempdir::restrict_handle_owner_only(&file)
+                && !super::pinned::replaceable_permitted_for(path)
+            {
+                return Err(e);
+            }
         }
         file.write_all(contents)?;
         file.sync_data()?;

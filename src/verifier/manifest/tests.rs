@@ -1378,21 +1378,20 @@ mod first_seen_hash_tests {
     use crate::policy::ToolsListHashEntry;
     use crate::verifier::tools_diff::{VerifyAction, hash_tools_list, verify_tools_list};
 
-    fn make_test_dir(label: &str) -> std::path::PathBuf {
-        let id = std::process::id();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = crate::testutil::real_temp_base()
-            .join(format!("mcp_writ_first_seen_{label}_{id}_{ts}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// `AuditLogger::to_file` refuses a replaceable parent — the
+    /// fixture root must satisfy the sink's own ancestry gate, so
+    /// tests live under `restricted_tempdir` and skip when the host
+    /// offers no write-restricted root.
+    fn make_test_dir(_label: &str) -> Option<std::path::PathBuf> {
+        crate::testutil::restricted_tempdir().map(|d| d.keep())
     }
 
     #[tokio::test]
     async fn hash_match_still_blocks_cc001() {
-        let dir = make_test_dir("cc001");
+        let Some(dir) = make_test_dir("") else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
         let tools = [ToolDefinition {
             name: "helper".into(),
@@ -1417,7 +1416,10 @@ mod first_seen_hash_tests {
 
     #[tokio::test]
     async fn hash_match_still_blocks_cc005() {
-        let dir = make_test_dir("cc005");
+        let Some(dir) = make_test_dir("") else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
         let tools = [ToolDefinition {
             name: "send".into(),
@@ -1445,7 +1447,10 @@ mod first_seen_hash_tests {
 
     #[tokio::test]
     async fn medium_findings_are_audit_only() {
-        let dir = make_test_dir("medium");
+        let Some(dir) = make_test_dir("") else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
         let tools = [ToolDefinition {
             name: "x".into(),
@@ -1468,6 +1473,13 @@ mod first_seen_hash_tests {
 mod fail_on_threshold_tests {
     use super::super::*;
     use crate::verifier::fail_on::FailOn;
+
+    /// `AuditLogger::to_file` refuses a replaceable parent — fixtures
+    /// must satisfy the sink's ancestry gate, so they live under
+    /// `restricted_tempdir` and skip when no restricted root exists.
+    fn audit_dir() -> Option<std::path::PathBuf> {
+        crate::testutil::restricted_tempdir().map(|d| d.keep())
+    }
 
     fn tool(name: &str, description: &str, schema: Option<&str>) -> ToolDefinition {
         let mut t = ToolDefinition::new(name, description);
@@ -1560,15 +1572,10 @@ mod fail_on_threshold_tests {
 
     #[tokio::test]
     async fn demoted_high_keeps_blocking_and_adds_effective_fields() {
-        let dir = crate::testutil::real_temp_base().join(format!(
-            "mcp_writ_fail_on_audit_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let Some(dir) = audit_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
         let findings = scan_manifest(&[cc005_tool()]);
         let logger = AuditLogger::to_file(&audit_path).unwrap();
@@ -1587,15 +1594,10 @@ mod fail_on_threshold_tests {
 
     #[tokio::test]
     async fn none_demotes_critical_in_audit() {
-        let dir = crate::testutil::real_temp_base().join(format!(
-            "mcp_writ_fail_on_none_audit_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let Some(dir) = audit_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
         let findings = scan_manifest(&[cc001_tool()]);
         let logger = AuditLogger::to_file(&audit_path).unwrap();
@@ -1613,15 +1615,10 @@ mod fail_on_threshold_tests {
 
     #[tokio::test]
     async fn unresolved_server_records_no_target_server() {
-        let dir = crate::testutil::real_temp_base().join(format!(
-            "mcp_writ_no_server_audit_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let Some(dir) = audit_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
         // A Medium finding is audit-only, so the event is written without
         // blocking the listing.

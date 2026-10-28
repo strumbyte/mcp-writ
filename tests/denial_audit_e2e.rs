@@ -225,6 +225,10 @@ async fn scenario_a_denied_rpc_requests_are_audited() {
         ])
         .args(common::scripted_stdio_argv("tools_call_ok"))
         .env("MCP_WRIT_SKIP_SANDBOX", "1")
+        // workdir paths under %TEMP% can fail the replaceable-ancestry
+        // gate on hosts whose temp ACL grants another principal replace
+        // access — host-ACL dependent, not what the denial audit tests.
+        .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -476,6 +480,7 @@ fn scenario_b_direct_443_egress_denied_and_audited() {
         .arg(&probe)
         .arg("192.0.2.1:443")
         .current_dir(&dir)
+        .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let run = run_with_timeout(&mut cmd);
@@ -703,6 +708,7 @@ fn spawn_dns_gate(
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
             .spawn()
             .expect("spawn mcp-writ dns-gate");
         let _stdout_rx = drain(child.stdout.take().unwrap());

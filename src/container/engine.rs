@@ -294,11 +294,14 @@ pub(crate) fn container_run_args_ext(
     // The guest-contract channel paths (policy mount, audit dir, workload
     // temp) are channel vars too — a baked value could redirect the runner
     // to a hostile in-image path, so every launch clears them; `options`
-    // re-sets the mount-backed values.
+    // re-sets the mount-backed values. The trusted-source opt-out is
+    // cleared the same way: only this launch's explicit setting may arm
+    // the documented downgrade, never a baked-in one.
     for var in [
         crate::container::guest_layout::LINUX.policy_path_env,
         crate::container::guest_layout::LINUX.audit_dir_env,
         crate::container::guest_layout::LINUX.temp_dir_env,
+        "MCP_WRIT_ALLOW_REPLACEABLE_PATHS",
     ] {
         args.push("-e".to_string());
         args.push(format!("{var}="));

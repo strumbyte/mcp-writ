@@ -412,12 +412,76 @@ async fn test_reverify_respells_normalized_entrypoint_path() {
     let spelled = format!("{}/./server.py", dir.display());
     let argv = vec!["python3".to_string(), spelled];
     let logger = AuditLogger::to_tracing();
-    let pin = reverify_immediately_before_spawn(&argv, &exe, &entries, &logger).unwrap();
+    let pin = reverify_immediately_before_spawn(&argv, &exe, &entries, &logger, true).unwrap();
     let plan = pin.fd_exec_plan(&argv, &exe).unwrap();
     let rewritten = plan.exec_argv(&argv);
     assert_eq!(rewritten[1], script.display().to_string());
     drop(plan);
     drop(pin);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The re-verifier holds the interpreter's *spelled* payload path —
+/// not only its canonicalized target — to the trusted-source gate:
+/// a fully trusted script reached through a shared-writable ancestor
+/// is refused, because the child's open after spawn would re-resolve
+/// the retargetable spelling. A link under a write-restricted
+/// directory cannot be swapped by a lower-trust principal and stays
+/// acceptable.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_reverify_rejects_payload_spelled_through_shared_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = make_test_dir("pin_shared_spell");
+    // Restrictive fixture modes keep the trusted-source gate the
+    // only variable under test — a permissive process umask must not
+    // make the directory or script group-writable.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let exe = dir.join("python3");
+    let script = dir.join("server.py");
+    std::fs::write(&exe, b"interp bytes").unwrap();
+    std::fs::write(&script, b"entry").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let shared = dir.join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let link = shared.join("link.py");
+    std::os::unix::fs::symlink(&script, &link).unwrap();
+
+    let entries = vec![
+        HashEntry {
+            server_name: "s".to_string(),
+            hash_type: HashType::Binary,
+            hash_value: hash_file(&exe).unwrap(),
+            target: exe.to_string_lossy().into_owned(),
+            approved: None,
+        },
+        HashEntry {
+            server_name: "s".to_string(),
+            hash_type: HashType::Entrypoint,
+            hash_value: hash_file(&script).unwrap(),
+            target: script.to_string_lossy().into_owned(),
+            approved: None,
+        },
+    ];
+    let logger = AuditLogger::to_tracing();
+    let argv = vec!["python3".to_string(), link.to_string_lossy().into_owned()];
+    assert!(
+        reverify_immediately_before_spawn(&argv, &exe, &entries, &logger, false).is_err(),
+        "a payload spelling through a replaceable ancestor must refuse"
+    );
+
+    // A link under the private test root cannot be retargeted by a
+    // lower-trust principal — the same spelling is acceptable.
+    let private_link = dir.join("private_link.py");
+    std::os::unix::fs::symlink(&script, &private_link).unwrap();
+    let argv = vec![
+        "python3".to_string(),
+        private_link.to_string_lossy().into_owned(),
+    ];
+    reverify_immediately_before_spawn(&argv, &exe, &entries, &logger, false)
+        .expect("a link under a write-restricted parent stays acceptable");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -584,9 +648,21 @@ mod integration_tests {
         dir
     }
 
+    /// An `AuditLogger::to_file` fixture must satisfy the sink's own
+    /// ancestry gate — a replaceable parent is exactly what
+    /// `open_audit_sink` refuses — so audit tests live under
+    /// `restricted_tempdir` and skip when the host offers no
+    /// write-restricted root.
+    fn audit_dir() -> Option<PathBuf> {
+        crate::testutil::restricted_tempdir().map(|d| d.keep())
+    }
+
     #[tokio::test]
     async fn test_verify_server_hashes_all_match() {
-        let dir = make_test_dir("all_match");
+        let Some(dir) = audit_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
         let bin_path = dir.join("server-bin");
         std::fs::write(&bin_path, b"binary content").unwrap();
@@ -616,7 +692,10 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_verify_server_hashes_mismatch_blocks() {
-        let dir = make_test_dir("mismatch");
+        let Some(dir) = audit_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
         let bin_path = dir.join("server-bin");
         std::fs::write(&bin_path, b"modified binary").unwrap();
@@ -648,7 +727,10 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_verify_server_hashes_no_entries_warns() {
-        let dir = make_test_dir("no_entries");
+        let Some(dir) = audit_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
 
         let entries: Vec<HashEntry> = vec![];
@@ -668,7 +750,10 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_verify_server_hashes_file_not_found_blocks() {
-        let dir = make_test_dir("file_missing");
+        let Some(dir) = audit_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
 
         let entries = vec![HashEntry {
@@ -694,7 +779,10 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_verify_server_hashes_filters_by_server() {
-        let dir = make_test_dir("filter_server");
+        let Some(dir) = audit_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
         let bin_path = dir.join("server-bin");
         std::fs::write(&bin_path, b"content").unwrap();
@@ -734,7 +822,10 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_verify_server_hashes_multiple_entries() {
-        let dir = make_test_dir("multi_entry");
+        let Some(dir) = audit_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
         let lock_path = dir.join("package-lock.json");
         let entry_path = dir.join("index.js");
@@ -776,7 +867,10 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_verify_server_hashes_stops_on_first_mismatch() {
-        let dir = make_test_dir("first_mismatch");
+        let Some(dir) = audit_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let audit_path = dir.join("audit.jsonl");
         let lock_path = dir.join("package-lock.json");
         let entry_path = dir.join("index.js");

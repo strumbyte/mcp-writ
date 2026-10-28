@@ -81,6 +81,29 @@ pub fn load_policy_or_default_for_resolver(
     }
 }
 
+/// Fail closed when any file this load read could be substituted or
+/// rewritten by a lower-trust local principal — a replaced root
+/// document, `extends`/`include` ancestor, or `@file` schema would
+/// mint Warden/Auditor authority the operator never reviewed.
+/// Enforcement paths call this between the load and the launch;
+/// analysis commands (`check`, `plan`, `policy resolve`) do not —
+/// they report on the file the operator named rather than composing
+/// it into launch authority. No-op for a policy built without a file
+/// load (the embedded default). `MCP_WRIT_ALLOW_REPLACEABLE_PATHS`
+/// accepts the substitution risk explicitly for intentionally shared
+/// trees.
+pub fn require_trusted_policy_sources(policy: &super::Policy) -> Result<(), PolicyError> {
+    for source in policy.source_files() {
+        crate::fspriv::require_trusted_source_file(&source).map_err(|e| {
+            PolicyError::FileRead(std::io::Error::new(
+                e.kind(),
+                format!("policy source '{}' is not trusted: {e}", source.display()),
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

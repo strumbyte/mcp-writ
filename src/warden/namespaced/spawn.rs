@@ -244,7 +244,9 @@ fn await_ready(sock: &mut std::fs::File) -> Result<std::fs::File, String> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg.as_mut_ptr() as *mut _;
-    msg.msg_controllen = cmsg.len();
+    // `msg_controllen` is `size_t` on glibc and `socklen_t` on musl —
+    // `as _` lands the field's own width on either ABI.
+    msg.msg_controllen = cmsg.len() as _;
     // SAFETY: `msg` is fully initialized — `iov` names the writable
     // 512-byte `data` and msg_control the CMSG_SPACE-sized `cmsg` — so
     // recvmsg writes stay inside live buffers.
@@ -293,10 +295,12 @@ fn await_ready(sock: &mut std::fs::File) -> Result<std::fs::File, String> {
     // — it dereferences nothing.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd_payload = unsafe { libc::CMSG_LEN(fd_size as u32) } as usize;
+    // `cmsg_len`/`msg_controllen` are `size_t` on glibc and `socklen_t`
+    // on musl — compare in u64, where either width fits.
     if hdr.cmsg_level != libc::SOL_SOCKET
         || hdr.cmsg_type != libc::SCM_RIGHTS
-        || hdr.cmsg_len < fd_payload
-        || hdr.cmsg_len > msg.msg_controllen
+        || (hdr.cmsg_len as u64) < fd_payload as u64
+        || (hdr.cmsg_len as u64) > msg.msg_controllen as u64
     {
         return Err("READY ancillary data is not a complete SCM_RIGHTS fd".to_string());
     }
@@ -336,17 +340,21 @@ fn build_init_command(
     match stdio {
         // Inherit stdio — to the workload this is an ordinary stdio
         // MCP session (same contract as `unotify-run`); only its
-        // network sits inside the namespace.
+        // network sits inside the namespace. Stderr is piped in both
+        // modes: the workload's diagnostics are attacker-controlled
+        // bytes and cross to the terminal through the sanitized
+        // relay, never raw.
         SpawnStdio::Inherit => {
             cmd.stdin(std::process::Stdio::inherit())
                 .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit());
+                .stderr(std::process::Stdio::piped());
         }
-        // The `run` route proxies stdin/stdout; stderr still inherits.
+        // The `run` route proxies stdin/stdout; stderr is piped for
+        // the same sanitized relay.
         SpawnStdio::Piped => {
             cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit());
+                .stderr(std::process::Stdio::piped());
         }
     }
     if let Some(env) = &cfg.env {
@@ -440,7 +448,12 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
     let mut cmd = build_init_command(cfg, &policy_path, child_sock, SpawnStdio::Inherit);
     // The child end must survive the exec into the init binary.
     let child = match cmd.spawn() {
-        Ok(c) => c,
+        Ok(mut c) => {
+            if let Some(err) = c.stderr.take() {
+                crate::termutil::relay_child_stderr_blocking(err);
+            }
+            c
+        }
         Err(e) => {
             // SAFETY: the spawn failed, so no child inherited
             // `child_sock` — both socketpair ends are still owned by
@@ -514,7 +527,12 @@ pub fn spawn_namespaced_child_tokio(cfg: &SpawnConfig) -> Result<NamespacedChild
     let cmd = build_init_command(cfg, &policy_path, child_sock, SpawnStdio::Piped);
     let mut cmd = tokio::process::Command::from(cmd);
     let mut child = match cmd.spawn() {
-        Ok(c) => c,
+        Ok(mut c) => {
+            if let Some(err) = c.stderr.take() {
+                crate::termutil::relay_child_stderr(err);
+            }
+            c
+        }
         Err(e) => {
             // SAFETY: the spawn failed, so no child inherited
             // `child_sock` — both socketpair ends are still owned by

@@ -66,7 +66,11 @@ async fn build_proxy_command(
     super::super::macos_sandbox::apply_exec_a_wrapper(&mut cmd, program, command, args, opts);
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        // stdin/stdout are the supervised passthrough — the workload
+        // is the stdio endpoint here. Stderr is attacker-controlled
+        // diagnostics: piped through the sanitized relay, never raw
+        // to the terminal.
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut env_opts = opts.clone();
     if env_opts.tmpdir.is_none() {
@@ -114,6 +118,9 @@ pub(crate) async fn spawn_proxy_child(
         WardenError::sandbox_setup(crate::error::SandboxStage::Prepare, e.to_string())
     })?;
     let mut child = cmd.spawn().map_err(WardenError::ProcessSpawn)?;
+    if let Some(err) = child.stderr.take() {
+        crate::termutil::relay_child_stderr(err);
+    }
     // Pin the pgid before the liveness probe — the probe may reap a
     // leader that exits inside the window, after which `id()` can no
     // longer resolve.

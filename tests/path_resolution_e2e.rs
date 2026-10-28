@@ -66,11 +66,14 @@ struct Layout {
     c_secret_text: String,
 }
 
-fn layout() -> Layout {
-    let temp = tempfile::Builder::new()
-        .prefix("mcp_writ_p3b_")
-        .tempdir()
-        .expect("tempdir");
+fn layout() -> Option<Layout> {
+    // `auditor_resolved` evaluates `resolve_for_authorization` in this
+    // process, which refuses replaceable ancestors — a shared %TEMP%
+    // root on a host whose ACL grants another principal replace access
+    // fails every interpretation. Root the fixture under a
+    // write-restricted base; `None` when the host has none (callers
+    // take the e2e skip path).
+    let temp = common::restricted_tempdir()?;
     // Canonicalize once so resolved paths compare cleanly with the fixture's
     // `std::fs::canonicalize` output (8.3 short names on Windows temp paths).
     // `temp` keeps ownership so cleanup still runs at drop.
@@ -102,7 +105,7 @@ fn layout() -> Layout {
     std::fs::write(&b_marker, format!("{b_marker_text}\n")).expect("write B marker");
     std::fs::write(&c_secret, format!("{c_secret_text}\n")).expect("write C data");
 
-    Layout {
+    Some(Layout {
         _root: temp,
         a_dir,
         a_sibling_dir,
@@ -116,7 +119,7 @@ fn layout() -> Layout {
         a_sibling_text,
         b_marker_text,
         c_secret_text,
-    }
+    })
 }
 
 fn marker_nanos() -> u128 {
@@ -414,7 +417,10 @@ async fn interpretation_agrees_on_common_forms() {
     let Some(exe) = compiled_fixture() else {
         return;
     };
-    let lay = layout();
+    let Some(lay) = layout() else {
+        common::skip_e2e_test("no write-restricted fixture root");
+        return;
+    };
     let Some(mut fx) = FixtureSession::spawn(&exe, &lay.a_dir, &[]).await else {
         return;
     };
@@ -546,7 +552,10 @@ async fn interpretation_records_encoding_divergences() {
     let Some(exe) = compiled_fixture() else {
         return;
     };
-    let lay = layout();
+    let Some(lay) = layout() else {
+        common::skip_e2e_test("no write-restricted fixture root");
+        return;
+    };
     let Some(mut fx) = FixtureSession::spawn(&exe, &lay.a_dir, &[]).await else {
         return;
     };
@@ -652,7 +661,10 @@ async fn symlink_resolution_and_wait_file_barrier() {
     let Some(exe) = compiled_fixture() else {
         return;
     };
-    let lay = layout();
+    let Some(lay) = layout() else {
+        common::skip_e2e_test("no write-restricted fixture root");
+        return;
+    };
     let link = lay.a_dir.join("link.txt");
     if !make_symlink(&lay.b_marker, &link) {
         common::skip_e2e_test("symlink creation unavailable (privilege/developer mode)");
@@ -766,7 +778,10 @@ async fn windows_verbatim_and_plain_drive_forms() {
     let Some(exe) = compiled_fixture() else {
         return;
     };
-    let lay = layout();
+    let Some(lay) = layout() else {
+        common::skip_e2e_test("no write-restricted fixture root");
+        return;
+    };
     let Some(mut fx) = FixtureSession::spawn(&exe, &lay.a_dir, &[]).await else {
         return;
     };
@@ -819,7 +834,10 @@ async fn windows_junction_and_drive_relative_forms() {
     let Some(exe) = compiled_fixture() else {
         return;
     };
-    let lay = layout();
+    let Some(lay) = layout() else {
+        common::skip_e2e_test("no write-restricted fixture root");
+        return;
+    };
     let Some(mut fx) = FixtureSession::spawn(&exe, &lay.a_dir, &[]).await else {
         return;
     };
@@ -1017,7 +1035,10 @@ async fn sandboxed_os_boundary_and_process_shared_access() {
     let Some(exe) = compiled_fixture() else {
         return;
     };
-    let lay = layout();
+    let Some(lay) = layout() else {
+        common::skip_e2e_test("no write-restricted fixture root");
+        return;
+    };
 
     // Runbook precondition: C is readable by the ordinary user pre-sandbox.
     assert!(

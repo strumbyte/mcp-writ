@@ -13,16 +13,38 @@
 //!   (populate them first with `tests/fixtures/real_servers/setup.sh` /
 //!   `setup.ps1`). The installed version is read back from the vendored
 //!   package's own metadata and must match the spec pin.
-//! - `npm`: ephemeral `npm install` of the pinned version into a scratch
-//!   dir under `target/manifest-corpus/` (kept on the data drive per
-//!   `AGENTS.md` disk hygiene; removed after the run).
-//! - `pypi`: ephemeral venv + `pip install` of the pinned version, same
-//!   root.
+//! - `npm`: integrity-locked `npm install` of the pinned version into a
+//!   scratch dir under `target/manifest-corpus/` (kept on the data drive
+//!   per `AGENTS.md` disk hygiene; removed after the run). The pin is
+//!   written to a scratch `package.json`, `npm install
+//!   --package-lock-only` mints a lockfile covering the whole resolved
+//!   graph, and `npm ci --ignore-scripts` installs exactly the locked,
+//!   integrity-verified tree — registry drift cannot substitute a
+//!   different transitive dependency than what was resolved.
+//! - `pypi`: ephemeral venv + integrity-locked install, same root. The
+//!   pinned requirement is resolved once with `pip download
+//!   --only-binary :all: --report`, every downloaded wheel is hashed
+//!   (sha256), the locked set is written to `requirements.txt`, and
+//!   `pip install --no-index --find-links --require-hashes` installs
+//!   exactly those verified artifacts. Wheels only — an sdist's
+//!   `setup.py` is unfixed registry code and is never executed.
+//!
+//! Execution: every captured server — vendored or ephemeral — runs
+//! under the built `mcp-writ` binary with a deny-by-default policy
+//! (read+exec everywhere, no writes, `deny host="*"`, empty
+//! environment allowlist) when a guard binary is available at
+//! `target/debug/mcp-writ` or `target/release/mcp-writ`, overridable
+//! via `MCP_CORPUS_GUARD=<path>`. The spawned process also receives a
+//! scrubbed environment (PATH + home/temp/system vars only) and an
+//! empty per-server working directory, never the checkout. When no
+//! guard exists (Windows binary under WSL, or binary not yet built)
+//! the capture refuses unless `MCP_CORPUS_UNSAFE_HOST=1` explicitly
+//! opts into running the registry package on the host.
 //!
 //! Requirements: `node` + `npm` on PATH for npm sources, a `venv`-capable
-//! `python3` (or a Windows `py` launcher under WSL) for pypi sources.
-//! Under WSL, Windows `node.exe`/`python.exe` fixtures run through
-//! interop and path arguments are translated via `wslpath`.
+//! `python3` with pip >= 22.2 (or a Windows `py` launcher under WSL) for
+//! pypi sources. Under WSL, Windows `node.exe`/`python.exe` fixtures run
+//! through interop and path arguments are translated via `wslpath`.
 //!
 //! Usage:
 //!   cargo run --example capture_manifest_corpus                # all
@@ -32,6 +54,7 @@
 //! [`SERVERS`] allowlist — they select which predefined specs to
 //! capture and are never forwarded to a spawned command line.
 
+use sha2::Digest;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -279,13 +302,47 @@ fn node_bin() -> Result<PathBuf, String> {
         .ok_or_else(|| "node not found on PATH (needed for npm/pinned servers)".to_string())
 }
 
+/// Scrub `cmd`'s environment to the small set installers and captured
+/// servers legitimately need. Registry-supplied code must never see the
+/// developer's API keys, tokens, SSH agent state, or editor vars.
+fn minimal_env(cmd: &mut Command) {
+    const KEEP: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SystemRoot",
+        "SystemDrive",
+        "windir",
+        "ComSpec",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "WSLENV",
+        "WSL_INTEROP",
+    ];
+    let saved: Vec<(std::ffi::OsString, std::ffi::OsString)> = KEEP
+        .iter()
+        .filter_map(|k| std::env::var_os(k).map(|v| (std::ffi::OsString::from(k), v)))
+        .collect();
+    cmd.env_clear();
+    for (k, v) in saved {
+        cmd.env(k, v);
+    }
+}
+
 /// Run `cmd` to completion under a deadline; kill it on timeout so a
-/// wedged install cannot hang the capture.
+/// wedged install cannot hang the capture. The child always gets the
+/// scrubbed environment — installs and launches alike.
 fn run_timeout(
     cmd: &mut Command,
     budget: Duration,
     what: &str,
 ) -> Result<std::process::ExitStatus, String> {
+    minimal_env(cmd);
     let mut child = cmd.spawn().map_err(|e| format!("{what}: spawn: {e}"))?;
     let end = Instant::now() + budget;
     loop {
@@ -354,71 +411,102 @@ fn npm_install(prefix: &Path, spec: &str) -> Result<(), String> {
     };
     let npm = which_any(names).ok_or("npm not found on PATH")?;
     let npm_s = npm.to_string_lossy().to_lowercase();
-    if npm_s.ends_with(".cmd") {
-        // Drive npm-cli.js with node directly and skip cmd entirely —
-        // npm.cmd sits next to node_modules/npm/bin in the standard Node
-        // layout, and cmd's /c quote-stripping mangles spaced paths.
-        let npm_cli = npm
-            .parent()
-            .unwrap_or(npm.as_path())
-            .join("node_modules/npm/bin/npm-cli.js");
-        if npm_cli.is_file() {
-            let node = node_bin()?;
-            let win = is_windows_binary(&node);
-            let status = run_timeout(
-                Command::new(&node)
-                    .arg(child_path(&npm_cli, win)?)
-                    .arg("install")
-                    .arg("--prefix")
-                    .arg(child_path(prefix, win)?)
-                    .args(["--ignore-scripts", "--no-save"])
-                    .arg(spec),
-                INSTALL_TIMEOUT,
-                "npm install",
-            )?;
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(format!("npm install {spec} exited {status}"))
-            };
-        }
-    }
     // A `npm` resolved under a drvfs mount (or a `.cmd`/`.exe` shim) is
     // Windows code reached through WSL interop: hand it a Windows prefix
     // path. Native `npm`/`npm.cmd` on Windows already takes native paths.
     let windows_npm =
         wsl() && (npm_s.contains("/mnt/") || npm_s.ends_with(".cmd") || npm_s.ends_with(".exe"));
-    let prefix_arg = child_path(prefix, windows_npm)?;
-    let args = [
-        "install".to_string(),
-        "--prefix".into(),
-        prefix_arg,
-        "--ignore-scripts".into(),
-        "--no-save".into(),
-        spec.to_string(),
-    ];
-    let status = if npm_s.ends_with(".cmd") {
-        // Batch shims need a Windows shell — `cmd.exe` resolves through
-        // WSL interop as well, and wants a Windows-spelled npm path.
-        let npm_arg = child_path(&npm, wsl())?;
-        let inner = std::iter::once(npm_arg)
-            .chain(args.iter().cloned())
-            .map(|a| cmd_quote(&a))
-            .collect::<Vec<_>>()
-            .join(" ");
-        run_timeout(&mut cmd_c(&inner), INSTALL_TIMEOUT, "npm install")?
-    } else {
-        run_timeout(
-            Command::new(&npm).args(&args),
-            INSTALL_TIMEOUT,
-            "npm install",
-        )?
+    let run_npm = |args: &[String], what: &str| -> Result<(), String> {
+        let status = if npm_s.ends_with(".cmd") {
+            let npm_cli = npm
+                .parent()
+                .unwrap_or(npm.as_path())
+                .join("node_modules/npm/bin/npm-cli.js");
+            if npm_cli.is_file() {
+                // Drive npm-cli.js with node directly and skip cmd
+                // entirely — npm.cmd sits next to node_modules/npm/bin
+                // in the standard Node layout, and cmd's /c
+                // quote-stripping mangles spaced paths.
+                let node = node_bin()?;
+                let win = is_windows_binary(&node);
+                run_timeout(
+                    Command::new(&node)
+                        .arg(child_path(&npm_cli, win)?)
+                        .args(args),
+                    INSTALL_TIMEOUT,
+                    what,
+                )?
+            } else {
+                // Batch shims need a Windows shell — `cmd.exe` resolves
+                // through WSL interop as well, and wants a
+                // Windows-spelled npm path.
+                let npm_arg = child_path(&npm, wsl())?;
+                let inner = std::iter::once(npm_arg)
+                    .chain(args.iter().cloned())
+                    .map(|a| cmd_quote(&a))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                run_timeout(&mut cmd_c(&inner), INSTALL_TIMEOUT, what)?
+            }
+        } else {
+            run_timeout(Command::new(&npm).args(args), INSTALL_TIMEOUT, what)?
+        };
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{what} exited {status}"))
+        }
     };
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("npm install {spec} exited {status}"))
-    }
+
+    // Integrity-locked install: the pin lands in the scratch manifest,
+    // `npm install --package-lock-only` resolves the complete graph and
+    // records integrity hashes for every resolved package, and `npm ci`
+    // then installs exactly that locked set — registry drift cannot
+    // substitute a different transitive dependency than what the
+    // resolution recorded. `--ignore-scripts` keeps package code
+    // unexecuted on every phase.
+    let (pkg, ver) = spec
+        .rsplit_once('@')
+        .ok_or_else(|| format!("npm spec {spec} carries no @version pin"))?;
+    std::fs::create_dir_all(prefix).map_err(|e| format!("mkdir {}: {e}", prefix.display()))?;
+    let json_str = |s: &str| -> String {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', " ")
+    };
+    std::fs::write(
+        prefix.join("package.json"),
+        format!(
+            "{{\"name\":\"corpus-scratch\",\"private\":true,\"dependencies\":{{\"{}\":\"{}\"}}}}",
+            json_str(pkg),
+            json_str(ver)
+        ),
+    )
+    .map_err(|e| format!("write {}: {e}", prefix.join("package.json").display()))?;
+    let prefix_arg = child_path(prefix, windows_npm)?;
+    run_npm(
+        &[
+            "install".into(),
+            "--prefix".into(),
+            prefix_arg.clone(),
+            "--package-lock-only".into(),
+            "--ignore-scripts".into(),
+            "--no-audit".into(),
+            "--no-fund".into(),
+        ],
+        "npm install --package-lock-only",
+    )?;
+    run_npm(
+        &[
+            "ci".into(),
+            "--prefix".into(),
+            prefix_arg,
+            "--ignore-scripts".into(),
+            "--no-audit".into(),
+            "--no-fund".into(),
+        ],
+        "npm ci",
+    )
 }
 
 /// Install `spec` into an isolated venv under `prefix`; return its
@@ -503,15 +591,94 @@ fn pypi_install(prefix: &Path, spec: &str) -> Result<PathBuf, String> {
             "could not create a venv for pypi capture (no ensurepip / no py launcher)".into(),
         );
     };
+    // Integrity-locked install. `pip download --only-binary :all:`
+    // resolves the complete graph and fetches wheels only — an sdist's
+    // `setup.py` is unfixed registry code and must never run. Each
+    // downloaded artifact is hashed, the locked set is written to
+    // requirements.txt, and `pip install --no-index --require-hashes`
+    // installs exactly those verified bytes. Name and version come
+    // from the wheel filename (`{name}-{version}-…`) itself — no
+    // pip-version-specific report format is assumed.
+    let py_win = is_windows_binary(&python);
+    let dl = prefix.join("wheels");
+    std::fs::create_dir_all(&dl).map_err(|e| format!("mkdir {}: {e}", dl.display()))?;
     let status = run_timeout(
-        Command::new(&python).args(["-m", "pip", "install", "--quiet", spec]),
+        Command::new(&python).args([
+            "-m".into(),
+            "pip".into(),
+            "download".into(),
+            "--dest".into(),
+            child_path(&dl, py_win)?,
+            "--only-binary".into(),
+            ":all:".into(),
+            "--quiet".into(),
+            spec.to_string(),
+        ]),
+        INSTALL_TIMEOUT,
+        "pip download",
+    )?;
+    if !status.success() {
+        return Err(format!("pip download {spec} exited {status}"));
+    }
+    // `dl` holds only this run's downloads; wheel filenames are
+    // `{name}-{version}(-{build})?-{py}-{abi}-{plat}.whl` with `-`
+    // forbidden inside the name/version fields (PEP 427 normalization
+    // replaces it with `_`). Sorted for a deterministic lockfile.
+    let mut wheels: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&dl).map_err(|e| format!("read {}: {e}", dl.display()))? {
+        let entry = entry.map_err(|e| format!("read {}: {e}", dl.display()))?;
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if file_name.ends_with(".whl") {
+            wheels.push(file_name);
+        }
+    }
+    wheels.sort();
+    let mut reqs = String::new();
+    let mut count = 0usize;
+    for file_name in &wheels {
+        let stem = &file_name[..file_name.len() - ".whl".len()];
+        let mut fields = stem.split('-');
+        let (Some(name), Some(version)) = (fields.next(), fields.next()) else {
+            return Err(format!(
+                "wheel '{file_name}' is not a '<name>-<version>-…' filename"
+            ));
+        };
+        let artifact = dl.join(file_name);
+        let bytes =
+            std::fs::read(&artifact).map_err(|e| format!("read {}: {e}", artifact.display()))?;
+        // sha2 0.11's digest output does not implement LowerHex.
+        let mut hex = String::with_capacity(64);
+        for b in sha2::Sha256::digest(&bytes) {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        reqs.push_str(&format!("{name}=={version} --hash=sha256:{hex}\n"));
+        count += 1;
+    }
+    if count == 0 {
+        return Err(format!("pip download {spec} produced no artifacts"));
+    }
+    let req_path = prefix.join("requirements.txt");
+    std::fs::write(&req_path, &reqs).map_err(|e| format!("write {}: {e}", req_path.display()))?;
+    let status = run_timeout(
+        Command::new(&python).args([
+            "-m".into(),
+            "pip".into(),
+            "install".into(),
+            "--no-index".into(),
+            "--find-links".into(),
+            child_path(&dl, py_win)?,
+            "--require-hashes".into(),
+            "-r".into(),
+            child_path(&req_path, py_win)?,
+            "--quiet".into(),
+        ]),
         INSTALL_TIMEOUT,
         "pip install",
     )?;
     if status.success() {
         Ok(python)
     } else {
-        Err(format!("pip install {spec} exited {status}"))
+        Err(format!("pip install -r requirements.txt exited {status}"))
     }
 }
 
@@ -592,6 +759,7 @@ fn package_bin(pkg_root: &Path) -> Result<PathBuf, String> {
 /// drains the pipe while the child runs — output bigger than the pipe
 /// buffer would otherwise block the child's write and hit the timeout.
 fn run_stdout(cmd: &mut Command, budget: Duration, what: &str) -> Result<String, String> {
+    minimal_env(cmd);
     let mut child = cmd
         .stdout(Stdio::piped())
         .spawn()
@@ -781,14 +949,14 @@ struct StdioRpc {
 
 impl StdioRpc {
     fn spawn(argv: &[String], cwd: &Path) -> Result<Self, String> {
-        let mut child = Command::new(&argv[0])
-            .args(&argv[1..])
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .current_dir(cwd)
-            .spawn()
-            .map_err(|e| format!("spawn {}: {e}", argv[0]))?;
+            .current_dir(cwd);
+        minimal_env(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", argv[0]))?;
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, lines) = mpsc::channel();
         std::thread::spawn(move || {
@@ -958,9 +1126,130 @@ fn error_detail(line: &str) -> Option<String> {
     member(json.value(), "error").map(|v| v.as_raw_str().to_string())
 }
 
+/// The guard binary every captured server runs under — `mcp-writ run`
+/// wraps the workload in the deny-by-default policy below. Defaults to
+/// the locally built binary; `MCP_CORPUS_GUARD=<path>` overrides.
+fn guard_bin() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("MCP_CORPUS_GUARD") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+        eprintln!(
+            "warning: MCP_CORPUS_GUARD={} is not a file — ignoring",
+            p.display()
+        );
+        return None;
+    }
+    let exe = if cfg!(windows) {
+        "mcp-writ.exe"
+    } else {
+        "mcp-writ"
+    };
+    for profile in ["debug", "release"] {
+        let cand = repo_root().join("target").join(profile).join(exe);
+        if is_executable(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Deny-by-default capture policy: the interpreter and its modules must
+/// load (`read`/`exec` on everything — the install root and system libs
+/// are all read-only), nothing writes anywhere, no network flows, and an
+/// empty environment allowlist hands the child only PATH + system vars.
+/// Secret paths stay covered by the default overlay.
+fn corpus_policy() -> &'static str {
+    r#"policy version=2
+defaults {
+    filesystem {
+        allow "/**" mode="read"
+        allow "/**" mode="exec"
+    }
+    network {
+        deny host="*"
+    }
+    environment {
+    }
+}
+"#
+}
+
+/// Wrap `argv` in the guard and pick the launch cwd. Every captured
+/// server runs inside `mcp-writ run --policy <deny-all>` — the registry
+/// package is the workload, not a trusted tool. Ephemeral sources also
+/// get an empty per-server work dir as cwd; pinned fixtures keep the
+/// checkout cwd because specs like `git --repository .` resolve their
+/// arguments there (the policy still confines them to read+exec).
+fn guard_wrap(
+    spec: &ServerSpec,
+    argv: &[String],
+    scratch: &Path,
+) -> Result<(Vec<String>, PathBuf), String> {
+    let work = scratch.join("work").join(spec.name);
+    std::fs::create_dir_all(&work).map_err(|e| format!("mkdir {}: {e}", work.display()))?;
+    let cwd = match spec.source {
+        Source::Pinned => repo_root().to_path_buf(),
+        _ => work,
+    };
+    let unsafe_host = std::env::var_os("MCP_CORPUS_UNSAFE_HOST")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let Some(guard) = guard_bin() else {
+        return if unsafe_host {
+            eprintln!(
+                "warning: {} running WITHOUT sandbox (MCP_CORPUS_UNSAFE_HOST=1)",
+                spec.name
+            );
+            Ok((argv.to_vec(), cwd))
+        } else {
+            Err(format!(
+                "{}: no mcp-writ guard binary — build `cargo build --bin mcp-writ`, \
+                 set MCP_CORPUS_GUARD=<path>, or opt into unsandboxed capture with \
+                 MCP_CORPUS_UNSAFE_HOST=1",
+                spec.name
+            ))
+        };
+    };
+    // A Windows binary cannot exec under the POSIX-side guard.
+    if is_windows_binary(Path::new(&argv[0])) {
+        return if unsafe_host {
+            eprintln!(
+                "warning: {} is a Windows binary — running WITHOUT sandbox \
+                 (MCP_CORPUS_UNSAFE_HOST=1)",
+                spec.name
+            );
+            Ok((argv.to_vec(), cwd))
+        } else {
+            Err(format!(
+                "{}: Windows child cannot run under the POSIX guard — \
+                 set MCP_CORPUS_UNSAFE_HOST=1 to capture unsandboxed",
+                spec.name
+            ))
+        };
+    }
+    let policy_dir = scratch.join("policies");
+    std::fs::create_dir_all(&policy_dir)
+        .map_err(|e| format!("mkdir {}: {e}", policy_dir.display()))?;
+    let policy_path = policy_dir.join(format!("{}.kdl", spec.name));
+    std::fs::write(&policy_path, corpus_policy())
+        .map_err(|e| format!("write {}: {e}", policy_path.display()))?;
+    let mut wrapped = vec![
+        guard.to_string_lossy().into_owned(),
+        "run".into(),
+        "--policy".into(),
+        policy_path.to_string_lossy().into_owned(),
+        "--".into(),
+    ];
+    wrapped.extend(argv.iter().cloned());
+    Ok((wrapped, cwd))
+}
+
 fn capture(spec: &ServerSpec, scratch: &Path) -> Result<(Vec<String>, String, String), String> {
     let (argv, logical_argv, version) = argv_for(spec, scratch)?;
-    let mut rpc = StdioRpc::spawn(&argv, repo_root())?;
+    let (argv, cwd) = guard_wrap(spec, &argv, scratch)?;
+    let mut rpc = StdioRpc::spawn(&argv, &cwd)?;
     let out = (|| {
         let init = rpc.request(
             1,

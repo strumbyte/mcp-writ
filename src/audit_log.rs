@@ -192,8 +192,10 @@ impl AuditLogger {
         // to owner-only access. For a file this call creates, the
         // returned parent-directory handle is the fsync anchor — the
         // directory entry must be durable before the first completion
-        // notification or a crash could lose the whole log.
-        let sink_open::OpenedSink { file, dir } = sink_open::open_audit_sink(path)?;
+        // notification or a crash could lose the whole log — and the
+        // leaf name lets the writer re-verify the entry still names
+        // the opened object before committing acknowledgments.
+        let sink_open::OpenedSink { file, dir, leaf } = sink_open::open_audit_sink(path)?;
         let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (reopen_tx, reopen_rx) = mpsc::channel(REOPEN_QUEUE_CAPACITY);
@@ -203,7 +205,7 @@ impl AuditLogger {
             rx,
             writer,
             writer_failed.clone(),
-            dir,
+            SinkAnchor { dir, leaf },
             sync_mode,
             path.to_path_buf(),
             reopen_rx,
@@ -663,6 +665,34 @@ fn sync_audit_dir(dir: Option<&std::fs::File>) -> std::io::Result<()> {
     dir.sync_all()
 }
 
+/// `true` while the sink's leaf under its pinned parent still names
+/// the open file — a committed record behind a swapped-out entry is
+/// hidden from the reader the operator named, so a `false` here is an
+/// audit failure, not an acknowledgment.
+/// The pinned parent handle + leaf name the sink's visible-entry
+/// proof re-resolves under — carried alongside the writer so commit
+/// acknowledgments and shutdown can still verify the entry names the
+/// opened object, and the parent stays live for entry fsyncs.
+struct SinkAnchor {
+    dir: Option<std::fs::File>,
+    leaf: Option<std::ffi::OsString>,
+}
+
+fn sink_entry_visible(
+    writer: &std::io::BufWriter<std::fs::File>,
+    dir: Option<&std::fs::File>,
+    leaf: Option<&std::ffi::OsStr>,
+    path: &Path,
+) -> bool {
+    match sink_open::entry_names_opened_file(dir, path, leaf, writer.get_ref()) {
+        Ok(visible) => visible,
+        Err(e) => {
+            tracing::error!("Audit log entry verification failed: {e}");
+            false
+        }
+    }
+}
+
 /// The reopen sequence behind signal-driven rotation: the buffered
 /// tail must be durable in the *old* file before the handle is
 /// swapped, so the flush and fsync run while `writer` still names the
@@ -676,7 +706,7 @@ fn sync_audit_dir(dir: Option<&std::fs::File>) -> std::io::Result<()> {
 fn reopen_sink(
     writer: &mut std::io::BufWriter<std::fs::File>,
     path: &Path,
-    new_file_dir: &mut Option<std::fs::File>,
+    anchor: &mut SinkAnchor,
     dir_synced: &mut bool,
 ) -> std::io::Result<()> {
     writer.flush()?;
@@ -686,19 +716,21 @@ fn reopen_sink(
     // must already be durable, or a crash could lose the rotated file
     // the reopen was meant to preserve.
     if !*dir_synced {
-        sync_audit_dir(new_file_dir.as_ref())?;
+        sync_audit_dir(anchor.dir.as_ref())?;
         *dir_synced = true;
     }
-    let sink_open::OpenedSink { file, dir } = sink_open::open_audit_sink(path)?;
+    let sink_open::OpenedSink { file, dir, leaf } = sink_open::open_audit_sink(path)?;
     *writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
     // A freshly created rotated file's directory entry needs the same
     // one-time fsync a launch-time create does — done here, in the
     // reopen path, so the `audit.reopened` marker that follows can
     // never outrun its own entry. The handle replaces the retired
     // anchor so a failed sync can still be retried by the periodic
-    // arm — `dir_synced` now tracks the *new* entry's durability.
-    *new_file_dir = dir;
-    match sync_audit_dir(new_file_dir.as_ref()) {
+    // arm — `dir_synced` now tracks the *new* entry's durability, and
+    // the leaf tracks the name its visible-entry proof re-resolves.
+    anchor.dir = dir;
+    anchor.leaf = leaf;
+    match sync_audit_dir(anchor.dir.as_ref()) {
         Ok(()) => {
             *dir_synced = true;
             Ok(())
@@ -714,14 +746,17 @@ async fn file_writer_task(
     mut rx: mpsc::Receiver<AuditItem>,
     mut writer: std::io::BufWriter<std::fs::File>,
     writer_failed: FailureFlag,
-    mut new_file_dir: Option<std::fs::File>,
+    mut anchor: SinkAnchor,
     sync_mode: AuditSyncMode,
     audit_path: PathBuf,
     mut reopen_rx: mpsc::Receiver<ReopenRequest>,
 ) {
-    // Only a newly created file needs its directory entry fsynced —
-    // once, before the first completion notification.
-    let mut dir_synced = new_file_dir.is_none();
+    // The parent handle is retained for every open so the entry can be
+    // re-verified at commit-ack time; its fsync runs once before the
+    // first completion notification — required for a freshly created
+    // file's entry, redundant for a durable existing one. `None`
+    // (Windows, which carries no parent capability) counts as synced.
+    let mut dir_synced = anchor.dir.is_none();
     // A closed reopen channel (every sender gone) parks the arm — a
     // `None` recv must not spin the loop.
     let mut reopen_open = true;
@@ -789,7 +824,7 @@ async fn file_writer_task(
                             // directory entry is too — a failure is an
                             // audit error, not an ack.
                             if ok && !dir_synced {
-                                match sync_audit_dir(new_file_dir.as_ref()) {
+                                match sync_audit_dir(anchor.dir.as_ref()) {
                                     Ok(()) => dir_synced = true,
                                     Err(e) => {
                                         tracing::error!(
@@ -799,6 +834,26 @@ async fn file_writer_task(
                                         ok = false;
                                     }
                                 }
+                            }
+                            // An acknowledged record must still be
+                            // reachable under the name the operator
+                            // opened — a swapped-out directory entry
+                            // would hide the evidence behind a
+                            // substitute, so a hidden entry is an
+                            // audit failure, not an ack.
+                            if ok
+                                && !sink_entry_visible(
+                                    &writer,
+                                    anchor.dir.as_ref(),
+                                    anchor.leaf.as_deref(),
+                                    &audit_path,
+                                )
+                            {
+                                tracing::error!(
+                                    "Audit log entry no longer names the opened file"
+                                );
+                                writer_failed.set();
+                                ok = false;
                             }
                             // A dropped receiver is the ack for failure —
                             // never signal success on a failed write.
@@ -823,9 +878,23 @@ async fn file_writer_task(
                             writer_failed.set();
                         }
                         if !dir_synced
-                            && let Err(e) = sync_audit_dir(new_file_dir.as_ref())
+                            && let Err(e) = sync_audit_dir(anchor.dir.as_ref())
                         {
                             tracing::error!("Audit log directory sync failed: {e}");
+                            writer_failed.set();
+                        }
+                        // Shutdown is the last place a hidden entry can
+                        // be reported — committed records behind a
+                        // swapped-out entry fail the session flag.
+                        if !sink_entry_visible(
+                            &writer,
+                            anchor.dir.as_ref(),
+                            anchor.leaf.as_deref(),
+                            &audit_path,
+                        ) {
+                            tracing::error!(
+                                "Audit log entry no longer names the opened file at shutdown"
+                            );
                             writer_failed.set();
                         }
                         return;
@@ -842,7 +911,7 @@ async fn file_writer_task(
                         let result = reopen_sink(
                             &mut writer,
                             &audit_path,
-                            &mut new_file_dir,
+                            &mut anchor,
                             &mut dir_synced,
                         );
                         if let Err(e) = &result {
@@ -888,7 +957,7 @@ async fn file_writer_task(
                             marker_result = Err(e);
                         }
                         if marker_result.is_ok() && !dir_synced {
-                            match sync_audit_dir(new_file_dir.as_ref()) {
+                            match sync_audit_dir(anchor.dir.as_ref()) {
                                 Ok(()) => dir_synced = true,
                                 Err(e) => {
                                     tracing::error!(
@@ -898,6 +967,27 @@ async fn file_writer_task(
                                     marker_result = Err(e);
                                 }
                             }
+                        }
+                        // An acknowledged reopen means the new sink is
+                        // durable *and* still reachable under the audit
+                        // path — a rotator or co-located actor that
+                        // swapped the entry mid-rotation hides the
+                        // reopened file from the operator's reader.
+                        if marker_result.is_ok()
+                            && !sink_entry_visible(
+                                &writer,
+                                anchor.dir.as_ref(),
+                                anchor.leaf.as_deref(),
+                                &audit_path,
+                            )
+                        {
+                            tracing::error!(
+                                "Audit log entry no longer names the reopened file"
+                            );
+                            writer_failed.set();
+                            marker_result = Err(std::io::Error::other(
+                                "audit log entry no longer names the opened file",
+                            ));
                         }
                         // `and` keeps the reopen_sink error primary —
                         // when both fail, the caller hears why the path
@@ -923,7 +1013,7 @@ async fn file_writer_task(
                     writer_failed.set();
                 }
                 if !dir_synced {
-                    match sync_audit_dir(new_file_dir.as_ref()) {
+                    match sync_audit_dir(anchor.dir.as_ref()) {
                         Ok(()) => dir_synced = true,
                         Err(e) => {
                             tracing::error!("Audit log directory sync failed: {e}");
