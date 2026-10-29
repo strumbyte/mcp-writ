@@ -474,6 +474,65 @@ fn spawn_runner(cfg: &Cfg) -> Result<Child, String> {
         // inherited value must not redirect the guest's own contract.
         .env("MCP_WRIT_ENV", "")
         .env("MCP_WRIT_SKIP_SANDBOX", "")
+        // An opt-out inherited from the agent's own environment must
+        // not reach the runner child either — remove it outright so
+        // the variable is absent, not merely empty: the runner
+        // exempts exactly the mounted contract paths it receives
+        // through the channel variables (policy file, audit sink,
+        // report destination) via `fspriv::permit_replaceable_path`,
+        // and also strips this variable itself. The guest FS is an
+        // ephemeral, agent-staged tree and `C:\relay-rw` is the
+        // host-mapped share — its guest-side DACL is synthetic and
+        // always permissive; the post-open entry-identity checks
+        // still catch a workload swapping the log entry.
+        .env_remove("MCP_WRIT_ALLOW_REPLACEABLE_PATHS")
+        // The guest's host-mounted share roots. Policy grants
+        // legitimately point into them (the `relay-rw` workspace is
+        // the writable channel the share exists for), and from inside
+        // the guest a mapped folder always reports as replaceable —
+        // only the host can retarget it, which is the mount contract
+        // itself. Declaring the roots lets the runner's authorization
+        // ancestry check treat paths beneath them as boundary-stable
+        // instead of refusing every grant the policy writes there;
+        // the runner strips the variable before the workload spawns.
+        // The loopback tier runs the agent on the host itself, so its
+        // staging, deny-zone and temp dirs are host-side launcher
+        // channels under the harness's own root — declare those too
+        // or the same check refuses grants that point at them.
+        .env("MCP_WRIT_SHARE_ROOTS", {
+            let mut roots = vec![
+                cfg.ro_dir.display().to_string(),
+                cfg.rw_dir.display().to_string(),
+            ];
+            if cfg.guest {
+                // Inside the sandbox every object on the VHD is either
+                // host-provisioned (image, mapped folders) or created by
+                // the contract processes — the single guest user is the
+                // launch contract's own principal, so the ancestry walk
+                // has no cross-principal swap left to prove (it flags
+                // `C:\` itself). Declare each configured dir's drive
+                // root as the boundary; the AppContainer DACL layer is
+                // what actually isolates the workload there.
+                for dir in [&cfg.stage_dir, &cfg.deny_dir, &cfg.temp_dir] {
+                    if let Some(root) = dir.is_absolute().then(|| dir.ancestors().last()).flatten()
+                    {
+                        let root = root.display().to_string();
+                        if !roots.contains(&root) {
+                            roots.push(root);
+                        }
+                    }
+                }
+            } else {
+                // Loopback tier runs the agent on the host itself — its
+                // staging, deny-zone and temp dirs are host-side launcher
+                // channels under the harness's own root. Declare them
+                // individually; the host drive root stays checked.
+                for dir in [&cfg.stage_dir, &cfg.deny_dir, &cfg.temp_dir] {
+                    roots.push(dir.display().to_string());
+                }
+            }
+            roots.join(";")
+        })
         .env("MCP_WRIT_FAIL_ON", &cfg.fail_on)
         .env("MCP_WRIT_PROBE_LANDLOCK_ABI", "")
         .stdin(Stdio::piped())

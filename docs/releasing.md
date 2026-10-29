@@ -58,9 +58,16 @@ Windows, or macOS.
    non-zero unless all six workflows have a successful run on that exact
    commit, and prints the run links to record. Per-test ownership of these
    workflows is listed in the [test matrix](test-matrix.md).
-3. Push a matching `v<version>` tag when ready to publish. The Release workflow
-   runs verification before building the platform binaries and publishing archives.
-   Pushing this tag triggers publication; an ordinary branch push does not.
+3. Push a matching `v<version>` tag when ready to publish. The tag commit must
+   be reachable from the default branch, and the pusher must hold admin/maintain
+   permission — the Release workflow's `release-gate` job checks both through
+   the GitHub API and fails closed, so a tag on unmerged history or pushed by
+   a non-maintainer cannot publish. The publish job also runs under the
+   `release` environment: configure that environment with required reviewers
+   so publication additionally waits for a recorded human approval. The
+   Release workflow then runs verification before building the platform
+   binaries and publishing archives. Pushing this tag triggers publication;
+   an ordinary branch push does not.
 4. Inspect the resulting archives and SHA-256 checksum files
    (`checksums-sha256.txt` for the archives, `runners-checksums-sha256.txt`
    for the embedded runners). Each archive must contain the CLI, a Linux

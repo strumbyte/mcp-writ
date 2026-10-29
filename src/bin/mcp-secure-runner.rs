@@ -211,6 +211,39 @@ async fn main() {
         read_channel(GUEST.audit_dir_env).unwrap_or_else(|| PathBuf::from(GUEST.log_dir));
     let workload_tmpdir =
         read_channel(GUEST.temp_dir_env).or_else(|| Some(PathBuf::from(GUEST.workload_temp)));
+    // The host-mounted contract paths — the read-only policy
+    // bind-mount and the writable audit/report channels — carry the
+    // *host* uid, which no guest principal maps to under the
+    // VM/container backends' documented uid mapping, so the
+    // trusted-source ownership requirement can never be satisfied on
+    // them. Exempt exactly those paths, and only those: a guest-wide
+    // `MCP_WRIT_ALLOW_REPLACEABLE_PATHS` would also silence the
+    // ownership and ancestry checks on the workload's entrypoint
+    // script, which is image content the mount contract never covers.
+    mcp_writ::fspriv::permit_replaceable_path(&policy_path);
+    mcp_writ::fspriv::permit_replaceable_path(&audit_dir.join("audit.jsonl"));
+    if let Some(dir) = &report_dir {
+        mcp_writ::fspriv::permit_replaceable_path(&dir.join("report.pending.json"));
+        mcp_writ::fspriv::permit_replaceable_path(&guest_report_path(dir));
+    }
+    // The launcher declares every host-mounted share root through
+    // `MCP_WRIT_SHARE_ROOTS` (`;`-separated guest paths — `;` because
+    // Windows paths carry `:`). A mapped folder or bind mount reports
+    // as replaceable from in here by construction: only the host can
+    // retarget it, and the host is the launch contract's trusted
+    // party, so the authorization ancestry walk treats paths beneath
+    // these roots as boundary-stable. Read before the strip below —
+    // the variable is a contract channel, never workload input.
+    if let Some(roots) = std::env::var_os("MCP_WRIT_SHARE_ROOTS") {
+        for root in roots
+            .to_string_lossy()
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            mcp_writ::fspriv::register_share_root(Path::new(root));
+        }
+    }
     // An image-baked MCP_WRIT_SKIP_SANDBOX is neutralized below, not
     // honored — but its presence is itself auditworthy, so note it for
     // `guard.started` before stripping.
@@ -222,6 +255,16 @@ async fn main() {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // The argv-logging consent is a launcher-side knob — honored below
+    // when the host sets it, but an image-baked `MCP_WRIT_LOG_ARGV=1`
+    // must not reach the workload or a nested launch's own consent
+    // check. Capture it, then strip.
+    let log_argv_consent = std::env::var_os("MCP_WRIT_LOG_ARGV").is_some_and(|v| v == "1");
+    // The launcher's failure dial: `resolve_from_process_env` reads
+    // `MCP_WRIT_FAIL_ON` from the process environment, and the strip
+    // below removes it before the workload can see it. Evaluate now
+    // and consume the Result after the policy load.
+    let fail_on = FailOn::resolve_from_process_env(None);
     // SAFETY: no other threads have been spawned yet besides the tokio runtime;
     // inherited image ENV must not skip the sandbox, override the host
     // server bind, or leak the channel variables into the workload.
@@ -230,11 +273,59 @@ async fn main() {
         std::env::remove_var("MCP_WRIT_ENV");
         std::env::remove_var("MCP_WRIT_SKIP_SANDBOX");
         std::env::remove_var("MCP_WRIT_LAUNCH_ID");
+        // An inherited or image-baked global opt-out would waive the
+        // trusted-source gate on the workload entrypoint too — only
+        // the per-path exemptions registered above may relax it.
+        std::env::remove_var("MCP_WRIT_ALLOW_REPLACEABLE_PATHS");
         std::env::remove_var("MCP_WRIT_MAX_FRAME_BYTES");
         std::env::remove_var(guest_report::REPORT_OUT_ENV);
         std::env::remove_var(GUEST.policy_path_env);
         std::env::remove_var(GUEST.audit_dir_env);
         std::env::remove_var(GUEST.temp_dir_env);
+        // The remaining guard-contract/downgrade names — the same set
+        // `warden::env::GUARD_ENV_VARS` strips from every host-side
+        // workload spawn. A baked copy would let guest content steer a
+        // nested launch (server bind, runner image, digest pins) or
+        // re-arm an opt-out; none of them is a runner input after this
+        // point.
+        for var in [
+            "MCP_WRIT_SERVER",
+            "MCP_WRIT_FAIL_ON",
+            "MCP_WRIT_PROBE_LANDLOCK_ABI",
+            "MCP_WRIT_RUNNER_CAPS",
+            "MCP_WRIT_WSB_HOST_IP",
+            "MCP_WRIT_SHARE_ROOTS",
+            "MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS",
+            "MCP_WRIT_LOG_ARGV",
+            "MCP_WRIT_REVIEW_MODE",
+            "MCP_WRIT_WINDOWS_LPAC",
+            "MCP_WRIT_WSL_EXE",
+            "MCP_WRIT_WSLC_EXE",
+            "MCP_WRIT_REG_EXE",
+            "MCP_WRIT_WSB_EXE",
+            "MCP_WRIT_PWSH_EXE",
+            "MCP_WRIT_DOCKER_EXE",
+            "MCP_WRIT_PODMAN_EXE",
+            "MCP_WRIT_BUILDAH_EXE",
+            "MCP_WRIT_CONTAINER_EXE",
+            "MCP_WRIT_RUNNER_SHA256",
+            "MCP_WRIT_WSB_RUNNER_SHA256",
+            "MCP_WRIT_WSB_RELAY_SHA256",
+            "MCP_SECURE_RUNNER_PATH",
+            // `namespaced::init_env::ALL` — ambient NS_* control vars
+            // must not ride an image ENV into the workload either.
+            "MCP_WRIT_NS_SOCKFD",
+            "MCP_WRIT_NS_EXE",
+            "MCP_WRIT_NS_POLICY",
+            "MCP_WRIT_NS_SKIP_SANDBOX",
+            "MCP_WRIT_NS_KEEPFDS",
+            "MCP_WRIT_NS_ENTRYPIN_FD",
+            "MCP_WRIT_NS_ENTRYPIN_TARGET",
+            "MCP_WRIT_NS_ENTRYPIN_SHA",
+            "MCP_WRIT_NS_PROXY_KILL_AFTER_MS",
+        ] {
+            std::env::remove_var(var);
+        }
     }
     let launch_id = guest_launch_id.unwrap_or_else(uuid::Uuid::now_v7);
     let mut session_audit = SessionAuditContext::pre_policy(launch_id, "mcp-secure-runner");
@@ -263,13 +354,31 @@ async fn main() {
         }
     };
 
+    // The guest-side copy of the policy is only as trustworthy as the
+    // path it was read from: a workload-writable staging directory
+    // would let the sandboxed server replace the document between
+    // host export and guest enforcement.
+    if let Err(e) = mcp_writ::policy::loader::require_trusted_policy_sources(&policy) {
+        let detail = format!("refusing launch: {e}");
+        eprintln!("mcp-secure-runner: {detail}");
+        write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+        lifecycle::prelaunch_abort(
+            prelaunch_audit_log.as_deref(),
+            &session_audit,
+            Some("load"),
+            &detail,
+        )
+        .await;
+        std::process::exit(1);
+    }
+
     // 2. Initialize tracing with policy logging level to stderr
     let log_level = mcp_writ::policy::tracing_level_from_policy(&policy.logging.level);
     mcp_writ::commands::tracing_init::init_tracing_with_level(log_level);
 
     tracing::info!("Policy loaded (version {})", policy.version);
 
-    let fail_on = match FailOn::resolve_from_process_env(None) {
+    let fail_on = match fail_on {
         Ok(v) => v,
         Err(e) => {
             let detail = e.to_string();
@@ -402,7 +511,7 @@ async fn main() {
         argv.first().map(String::as_str).unwrap_or("(empty)"),
         argv.len()
     );
-    if std::env::var_os("MCP_WRIT_LOG_ARGV").is_some_and(|v| v == "1") {
+    if log_argv_consent {
         tracing::debug!("Restored argv: {argv:?}");
     }
 
@@ -480,6 +589,7 @@ async fn main() {
         policy.version,
         fail_on.as_str(),
         policy.sandbox.allow_degraded,
+        policy.sandbox.require_lifetime_boundary,
         &policy_source,
     );
 

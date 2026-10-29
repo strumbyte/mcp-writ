@@ -67,7 +67,7 @@ server "filesystem" {
 
 `extends` のパスは書かれたファイルからの相対パスで解決され、多段も機能します。各例は `runtime/node.kdl` または `runtime/python.kdl` を継承しています。このポリシーを `/opt/mcp-config/policy.kdl` に保存する場合は、`examples/policies/filesystem.kdl` とそれが継承する `examples/policies/runtime/` を `/opt/mcp-config/` 配下に配置してください。これらの runtime ファイルに入っているのは、実測したインタプリタの syscall 許可リスト（`defaults.syscalls` — Linux seccomp 用で、macOS／Windows には適用されません。両 OS では sandbox-exec プロファイルと AppContainer 付与が代わりに強制します）と、ホスト側で追加すべき読み取りパスの一覧（コメント）です。runtime ポリシーはそのまま共有し、サーバポリシーがツール一覧を固定し、ホストポリシーがパスを与える分担です。
 
-マージはフィールド単位です — `extends` は親の実効ポリシーに子の文書を重ね、`include` は取り込むファイルのサブツリー全体（その祖先やマッチした `when` 由来の値を含む）を重ね、マッチした `when` ブロックが最後に適用されます。マージの結果として、確立済みの fail-secure 設定が弱まる場合 — `confused_deputy_protection`、`trajectory`、既定以外に選んだ `logging level` や `fail_closed`、`sandbox allow_degraded`、`secret-overlay`、`deny host="*"` の外向き posture、`inbound` リスナ許可、`environment` 制限 — には、ローダーが弱化を宣言したファイル名入りの `Warning:` 行を出します。include したサブツリーが黙って姿勢を下げることはありません。
+マージはフィールド単位です — `extends` は親の実効ポリシーに子の文書を重ね、`include` は取り込むファイルのサブツリー全体（その祖先やマッチした `when` 由来の値を含む）を重ね、マッチした `when` ブロックが最後に適用されます。マージの結果として、確立済みの fail-secure 設定が弱まる場合 — `confused_deputy_protection`、`trajectory`、既定以外に選んだ `logging level` や `fail_closed`、`sandbox allow_degraded`、`sandbox require_lifetime_boundary` の解除、`secret-overlay`、`deny host="*"` の外向き posture、`inbound` リスナ許可、`environment` 制限 — には、ローダーが弱化を宣言したファイル名入りの `Warning:` 行を出します。include したサブツリーが黙って姿勢を下げることはありません。
 
 `scripts/check-server.sh` / `scripts/check-server.ps1` は Cargo なしで結果を健全性確認します — dry-run のハンドシェイクと `tools/list`、サンドボックス下での同じやり取り、任意で `tools/call` 1 回を実行し、いずれかが失敗すれば非ゼロで終了します。[開発ガイド](development.md#real-mcp-server-verification)を参照してください。
 

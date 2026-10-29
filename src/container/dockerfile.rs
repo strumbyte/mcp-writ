@@ -55,7 +55,7 @@ impl EntrypointValue {
 /// divert it into probe mode. The launch re-sets the real values with
 /// `-e` (`engine::container_run_args` clears this same set before
 /// re-introducing the launch's own).
-pub(crate) const CHANNEL_CLEAR_ENVS: &str = "MCP_WRIT_ENV=\"\" MCP_WRIT_SERVER=\"\" MCP_WRIT_SKIP_SANDBOX=\"\" MCP_WRIT_FAIL_ON=\"\" MCP_WRIT_POLICY_PATH=\"\" MCP_WRIT_AUDIT_DIR=\"\" MCP_WRIT_TEMP_DIR=\"\" MCP_WRIT_LAUNCH_ID=\"\" MCP_WRIT_REPORT_OUT=\"\" MCP_WRIT_PROBE_LANDLOCK_ABI=\"\" MCP_WRIT_MAX_FRAME_BYTES=\"\"";
+pub(crate) const CHANNEL_CLEAR_ENVS: &str = "MCP_WRIT_ENV=\"\" MCP_WRIT_SERVER=\"\" MCP_WRIT_SKIP_SANDBOX=\"\" MCP_WRIT_FAIL_ON=\"\" MCP_WRIT_POLICY_PATH=\"\" MCP_WRIT_AUDIT_DIR=\"\" MCP_WRIT_TEMP_DIR=\"\" MCP_WRIT_LAUNCH_ID=\"\" MCP_WRIT_REPORT_OUT=\"\" MCP_WRIT_PROBE_LANDLOCK_ABI=\"\" MCP_WRIT_MAX_FRAME_BYTES=\"\" MCP_WRIT_ALLOW_REPLACEABLE_PATHS=\"\" MCP_WRIT_SHARE_ROOTS=\"\"";
 
 /// Template for generating a secure-runner–wrapped Dockerfile.
 pub struct DockerfileTemplate {
@@ -352,6 +352,7 @@ mod tests {
                 "MCP_WRIT_LAUNCH_ID",
                 "MCP_WRIT_REPORT_OUT",
                 "MCP_WRIT_PROBE_LANDLOCK_ABI",
+                "MCP_WRIT_SHARE_ROOTS",
             ] {
                 assert!(
                     df.contains(&format!("{var}=\"\"")),

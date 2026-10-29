@@ -243,8 +243,19 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
         }
     ));
 
-    if policy.sandbox.allow_degraded {
-        out.push_str("sandbox allow_degraded=#true\n\n");
+    if policy.sandbox.allow_degraded || !policy.sandbox.require_lifetime_boundary {
+        out.push_str("sandbox");
+        if policy.sandbox.allow_degraded {
+            out.push_str(" allow_degraded=#true");
+        }
+        // `require_lifetime_boundary` defaults on; the emitted value is
+        // the waiver (`#false`) — emitting `#true` would be the default
+        // anyway, while dropping `#false` would silently re-arm the
+        // requirement on re-parse.
+        if !policy.sandbox.require_lifetime_boundary {
+            out.push_str(" require_lifetime_boundary=#false");
+        }
+        out.push_str("\n\n");
     }
 
     // Tools grouped by server

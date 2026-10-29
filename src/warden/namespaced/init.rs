@@ -114,20 +114,23 @@ fn send_ready_with_fd(sock: RawFd, fd: RawFd) -> std::io::Result<()> {
     // `cmsghdr` carries the required alignment in its element type;
     // two headers always cover `CMSG_SPACE(sizeof(RawFd))` on both
     // 32- and 64-bit.
-    let mut cmsg_buf = [libc::cmsghdr {
-        cmsg_len: 0,
-        cmsg_level: 0,
-        cmsg_type: 0,
-    }; 2];
-    let mut msg = libc::msghdr {
-        msg_name: std::ptr::null_mut(),
-        msg_namelen: 0,
-        msg_iov: &mut iov,
-        msg_iovlen: 1,
-        msg_control: cmsg_buf.as_mut_ptr() as *mut _,
-        msg_controllen: std::mem::size_of_val(&cmsg_buf),
-        msg_flags: 0,
-    };
+    // SAFETY: `cmsghdr`/`msghdr` carry private padding fields on musl,
+    // so a literal cannot name every member portably — the all-zero
+    // bit pattern is the valid "unset" value on either ABI and every
+    // field the kernel reads is assigned explicitly below.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let mut cmsg_buf: [libc::cmsghdr; 2] = unsafe { std::mem::zeroed() };
+    // SAFETY: same reasoning as `cmsg_buf` — all-zero is a valid
+    // "unset" `msghdr`, and the pointer fields are bound to live
+    // locals immediately below before any use.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
+    // `msg_controllen` is `size_t` on glibc and `socklen_t` on musl —
+    // `as _` lands the field's own width on either ABI.
+    msg.msg_controllen = std::mem::size_of_val(&cmsg_buf) as _;
     // SAFETY: `msg` is an initialized msghdr whose msg_control names the
     // two-cmsghdr `cmsg_buf`, so msg_controllen ≥ sizeof(cmsghdr) and
     // CMSG_FIRSTHDR returns an in-bounds, aligned, non-null header.
@@ -141,7 +144,7 @@ fn send_ready_with_fd(sock: RawFd, fd: RawFd) -> std::io::Result<()> {
     unsafe {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
         std::ptr::copy_nonoverlapping(
             &fd as *const RawFd as *const u8,
             libc::CMSG_DATA(cmsg),
@@ -555,7 +558,15 @@ fn scrub_env_and_fds(extra_keep: &[i32]) {
     // pin descriptors init must hold open through the workload exec.
     let mut keep = keep_fds_from_env();
     keep.extend_from_slice(extra_keep);
-    for var in super::init_env::ALL {
+    // `GUARD_ENV_VARS` ride along: inherit mode hands init the parent's
+    // ambient env, and the launcher↔runner contract/downgrade names in
+    // it (e.g. `MCP_WRIT_ALLOW_REPLACEABLE_PATHS`) must not survive into
+    // the workload exec either.
+    for var in super::init_env::ALL
+        .iter()
+        .chain(super::super::env::GUARD_ENV_VARS.iter())
+        .copied()
+    {
         // SAFETY: single-threaded context — this runs in the pidns-init
         // child after fork() (only the calling thread survives), and the
         // init helper was dispatched before the tokio runtime started, so

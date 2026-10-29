@@ -508,49 +508,11 @@ fn spawn_server(
 /// Relay a discovery child's stderr to ours in bounded chunks with
 /// terminal control characters escaped and a hard byte cap — the server
 /// being probed is attacker-controlled, so its diagnostics cross as
-/// text, never raw bytes. The cap also keeps a flooding child from
-/// unbounded work: once the budget is spent the relay stops writing but
-/// keeps draining until the child closes the pipe, so stderr can never
-/// back up into the child's writes.
+/// text, never raw bytes. Shared implementation:
+/// [`crate::termutil::relay_child_stderr`].
 fn relay_discovery_stderr(stderr: Option<tokio::process::ChildStderr>) {
-    const RELAY_CAP: usize = 64 * 1024;
     let Some(stderr) = stderr else { return };
-    tokio::spawn(async move {
-        use std::io::Write;
-        use tokio::io::AsyncBufReadExt;
-        let mut reader = BufReader::new(stderr);
-        let mut budget = RELAY_CAP;
-        // A line split across reads is carried here — bounded by
-        // `budget`, so a newline-free flood can never grow it the way
-        // `next_line` accumulated an entire line unboundedly.
-        let mut pending: Vec<u8> = Vec::new();
-        loop {
-            let available = match reader.fill_buf().await {
-                Ok([]) | Err(_) => break,
-                Ok(bytes) => bytes,
-            };
-            let consumed = available.len();
-            if budget > 0 {
-                let take = consumed.min(budget);
-                let mut chunk = &available[..take];
-                while let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
-                    pending.extend_from_slice(&chunk[..nl]);
-                    let line = std::mem::take(&mut pending);
-                    let clean =
-                        crate::termutil::sanitize_for_terminal(&String::from_utf8_lossy(&line));
-                    let _ = writeln!(std::io::stderr().lock(), "{clean}");
-                    chunk = &chunk[nl + 1..];
-                }
-                pending.extend_from_slice(chunk);
-                budget -= take;
-            }
-            reader.consume(consumed);
-        }
-        if !pending.is_empty() {
-            let clean = crate::termutil::sanitize_for_terminal(&String::from_utf8_lossy(&pending));
-            let _ = writeln!(std::io::stderr().lock(), "{clean}");
-        }
-    });
+    crate::termutil::relay_child_stderr(stderr);
 }
 
 async fn shutdown_child(child: &mut tokio::process::Child) {

@@ -449,13 +449,25 @@ fn apply_overrides_from_doc(
     }
 
     // sandbox override
-    if let Some(sandbox_node) = doc.get("sandbox")
-        && let Some(val) = sandbox_node.get("allow_degraded")
-    {
-        policy.sandbox.allow_degraded = val.as_bool().ok_or_else(|| {
-            PolicyError::KdlParse("'sandbox.allow_degraded' must be a boolean".into())
-        })?;
-        prov.set("sandbox", path, node_line(content, sandbox_node));
+    if let Some(sandbox_node) = doc.get("sandbox") {
+        let mut wrote = false;
+        if let Some(val) = sandbox_node.get("allow_degraded") {
+            policy.sandbox.allow_degraded = val.as_bool().ok_or_else(|| {
+                PolicyError::KdlParse("'sandbox.allow_degraded' must be a boolean".into())
+            })?;
+            wrote = true;
+        }
+        if let Some(val) = sandbox_node.get("require_lifetime_boundary") {
+            policy.sandbox.require_lifetime_boundary = val.as_bool().ok_or_else(|| {
+                PolicyError::KdlParse(
+                    "'sandbox.require_lifetime_boundary' must be a boolean".into(),
+                )
+            })?;
+            wrote = true;
+        }
+        if wrote {
+            prov.set("sandbox", path, node_line(content, sandbox_node));
+        }
     }
 
     // confused_deputy_protection override

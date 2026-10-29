@@ -370,12 +370,12 @@ pub fn bind_launched_workload(
 /// only moves the failure to the sibling imports) or a staged copy in
 /// an empty directory cannot carry the launch. The script's exec-time
 /// guarantee is `verify_spawn_path`'s same-object + stamp re-check as
-/// the last gate before spawn — the same assurance level the
-/// workload's own imports have always lived at — or, on the Linux
-/// namespaced route, the stronger anchoring the init helper gives
-/// that path inside its mount namespace (the pinned object's bytes
-/// re-hashed, staged onto the namespace's private tmpfs, and mounted
-/// over the path).
+/// the last gate before spawn, on a path the pin's
+/// `require_trusted_source_file` gate proved no lower-trust principal
+/// can swap or rewrite — or, on the Linux namespaced route, the
+/// stronger anchoring the init helper gives that path inside its
+/// mount namespace (the pinned object's bytes re-hashed, staged onto
+/// the namespace's private tmpfs, and mounted over the path).
 pub struct SpawnPin {
     exe: std::fs::File,
     exe_stamp: OpenStamp,
@@ -569,12 +569,17 @@ impl SpawnPin {
     /// guarantee is the pin itself: `verify_spawn_path`'s
     /// same-object + stamp re-check is the last gate before the
     /// spawn, and the residual — the interpreter's `open(2)` after
-    /// process creation — is the window every import the workload
-    /// loads at run time has always lived at. The Linux namespaced
-    /// route closes even that residual: init re-hashes the pinned
-    /// object and mounts a verified copy over the script's path
-    /// inside its mount namespace, so the spelling resolves to the
-    /// pinned content whatever the host pathname later names. On
+    /// process creation — is closed by the trust contract
+    /// `reverify_immediately_before_spawn` requires of the script's
+    /// path: owner/root-owned without group/other write, over
+    /// write-restricted ancestors, so no lower-trust principal can
+    /// swap the path nor rewrite the object in that window (the same
+    /// contract a policy source stands under — see
+    /// `fspriv::require_trusted_source_file`). The Linux namespaced
+    /// route needs no permission argument at all: init re-hashes the
+    /// pinned object and mounts a verified copy over the script's
+    /// path inside its mount namespace, so the spelling resolves to
+    /// the pinned content whatever the host pathname later names. On
     /// Windows the session-held share-mode pin also makes the object
     /// at that path unswappable.
     ///
@@ -1049,13 +1054,23 @@ pub(super) fn simplify_verbatim(path: PathBuf) -> PathBuf {
 /// last so a retargeted path fails the launch rather than silently
 /// mismatching `argv`'s own resolution. Code the workload loads at
 /// run time stays unpinned.
+///
+/// `entrypoint_mount_handoff` marks that namespaced route: the caller
+/// asserts init will bind the verified copy over the script's path
+/// inside the child's mount namespace, so the host-side trusted-source
+/// contract is not load-bearing for this launch and is skipped (the
+/// pin, re-hash, and mount handoff still bind the bytes). Every other
+/// route passes `false` and keeps the full gate.
 pub fn reverify_immediately_before_spawn(
     argv: &[String],
     resolved_exe: &Path,
     hash_entries: &[HashEntry],
     audit_logger: &AuditLogger,
+    entrypoint_mount_handoff: bool,
 ) -> Result<SpawnPin, VerifyError> {
     bind_launched_workload(argv, resolved_exe, hash_entries, audit_logger)?;
+    #[cfg(not(unix))]
+    let _ = entrypoint_mount_handoff;
 
     let identity_entries: Vec<&HashEntry> = hash_entries
         .iter()
@@ -1135,6 +1150,35 @@ pub fn reverify_immediately_before_spawn(
             continue;
         }
         let payload_path = payload_path.expect("payload_match implies a payload arg");
+        // The interpreter re-opens the script by path *after* the
+        // spawn — the held fd cannot close that residual natively
+        // (the Linux namespaced route mounts a re-verified copy over
+        // the path; Windows's held share mode blocks every mutation).
+        // On a native Unix launch the guarantee that the child's open
+        // sees the verified bytes is that no lower-trust principal can
+        // swap the path nor rewrite the object between
+        // `verify_spawn_path` and that open — the file must be
+        // owner/root-owned without group/other write, and every
+        // ancestor of the *spelled* payload path — the chain the
+        // interpreter's open re-traverses — as well as the resolved
+        // object's chain must deny untrusted replacement, the same
+        // contract a policy source stands under. A script a
+        // lower-trust principal could replace carries unverified
+        // bytes past the pin — refuse rather than narrow the window.
+        // The Linux namespaced route is the documented exception:
+        // init's verified bind-mount over the path closes the window
+        // without a permission argument, so the gate is skipped
+        // there.
+        #[cfg(unix)]
+        if !entrypoint_mount_handoff {
+            crate::fspriv::require_trusted_source_file(&payload_path).map_err(|error| {
+                VerifyError::FileError {
+                    hash_type: HashType::Entrypoint,
+                    target: entry.target.clone(),
+                    error,
+                }
+            })?;
+        }
         let mut file = open_pinned(&payload_path).map_err(|error| VerifyError::FileError {
             hash_type: HashType::Entrypoint,
             target: entry.target.clone(),

@@ -227,7 +227,11 @@ pub(crate) async fn spawn_namespaced_attempt(
         Ok(f) => f,
         Err(e) => {
             kill_init_group(child_pid, &lifetime_cgroup);
-            let _ = launched.child.start_kill();
+            // `kill()` awaits the reap — the root stays registered
+            // until the child is collected, so a concurrent orphan
+            // sweep can never see it unprotected mid-teardown.
+            let _ = launched.child.kill().await;
+            super::super::child::unregister_launch_root(child_pid as u32);
             refuse!(
                 controls,
                 grants,
@@ -307,11 +311,21 @@ pub(crate) async fn spawn_namespaced_attempt(
         Ok(Ok(l)) => l,
         Ok(Err((detail, mut l))) => {
             kill_init_group(l.pid(), &lifetime_cgroup);
-            let _ = l.child.start_kill();
+            // Await the reap before unregistering — same contract as
+            // the tun-clone arm.
+            let _ = l.child.kill().await;
+            super::super::child::unregister_launch_root(child_pid as u32);
             proxy_task.abort();
             refuse!(controls, grants, spawn_err_msg(&detail));
         }
         Err(e) => {
+            // The handshake task panicked with the child handle inside —
+            // tear the half-launched session down by pid (group + cgroup
+            // sweep via kill_init_group, proxy task aborted), then drop
+            // the registration once nothing registered-path is left.
+            kill_init_group(child_pid, &lifetime_cgroup);
+            proxy_task.abort();
+            super::super::child::unregister_launch_root(child_pid as u32);
             refuse!(
                 controls,
                 grants,
@@ -342,7 +356,8 @@ pub(crate) async fn spawn_namespaced_attempt(
         (Some(s), Some(o)) => (s, o),
         _ => {
             kill_init_group(child_pid, &lifetime_cgroup);
-            let _ = launched.child.start_kill();
+            let _ = launched.child.kill().await;
+            super::super::child::unregister_launch_root(child_pid as u32);
             proxy_task.abort();
             refuse!(
                 controls,

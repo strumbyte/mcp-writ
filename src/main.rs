@@ -272,6 +272,24 @@ async fn real_main() {
             std::process::exit(1);
         }
     };
+    // A policy source a lower-trust principal could swap or rewrite
+    // grants launch authority the operator never reviewed — require
+    // trusted (owned, write-restricted, replacement-resistant) paths
+    // for the root document and every file it reached before the
+    // policy binds into launch authority.
+    if let Err(e) = mcp_writ::policy::loader::require_trusted_policy_sources(&policy) {
+        let detail = format!("refusing launch: {e}");
+        eprintln!("Error: {detail}");
+        write_prelaunch_failure(detail.clone(), None);
+        lifecycle::prelaunch_abort(
+            args.audit_log.as_deref(),
+            &session_audit,
+            Some("load"),
+            &detail,
+        )
+        .await;
+        std::process::exit(1);
+    }
     let policy = match policy.bind_to_server(args.server.as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -462,6 +480,7 @@ async fn real_main() {
         policy.version,
         fail_on.as_str(),
         policy.sandbox.allow_degraded,
+        policy.sandbox.require_lifetime_boundary,
         &policy_source,
     );
 

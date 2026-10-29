@@ -195,7 +195,11 @@ async fn copy_test_policy(
         None => container_kernel_below_landlock_v4(engine).await,
     };
     if degraded {
-        text.push_str("sandbox allow_degraded=#true\n");
+        // A guest kernel that only partially enforces the ruleset also
+        // cannot meet `require_lifetime_boundary` — the fs rule pinning
+        // a member cgroup needs full enforcement — so the degraded case
+        // declares both waivers.
+        text.push_str("sandbox allow_degraded=#true require_lifetime_boundary=#false\n");
     }
     std::fs::write(dst, text).map_err(|e| format!("failed to write test policy: {e}"))
 }

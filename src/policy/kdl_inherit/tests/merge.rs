@@ -632,6 +632,10 @@ fn test_security_posture_weakened_and_message() {
             after_side_effect: crate::policy::SideEffect::ReadOnly,
             deny_next: crate::policy::SideEffect::Network,
         }],
+        sandbox: crate::policy::SandboxPolicy {
+            require_lifetime_boundary: true,
+            ..Default::default()
+        },
         logging: crate::policy::LoggingPolicy {
             level: "warn".to_string(),
             ..Default::default()
@@ -654,6 +658,7 @@ fn test_security_posture_weakened_and_message() {
     after.logging.level = "info".to_string();
     after.logging.fail_closed = false;
     after.sandbox.allow_degraded = true;
+    after.sandbox.require_lifetime_boundary = false;
     after.fs.secret_overlay = false;
     after.network.outbound.deny_all_others = false;
     after.network.inbound.allow_listen = true;
@@ -665,6 +670,7 @@ fn test_security_posture_weakened_and_message() {
         WeakenedPosture::LoggingLevel(String::new()),
         WeakenedPosture::LoggingFailClosed,
         WeakenedPosture::SandboxAllowDegraded,
+        WeakenedPosture::SandboxRequireLifetimeBoundary,
         WeakenedPosture::SecretOverlay,
         WeakenedPosture::OutboundPosture,
         WeakenedPosture::InboundListen,

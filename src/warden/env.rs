@@ -15,9 +15,95 @@ use std::path::PathBuf;
 
 use super::SpawnOptions;
 
+/// Guard-internal environment names a workload must never carry.
+///
+/// These are the launcher↔runner contract channels and the
+/// security-downgrade knobs: a workload inheriting one could steer a
+/// *nested* `mcp-writ` launch — `MCP_WRIT_ALLOW_REPLACEABLE_PATHS`
+/// re-arms the trusted-source opt-out, `MCP_WRIT_SKIP_SANDBOX` skips
+/// sandboxing, the `MCP_WRIT_POLICY_PATH`-family channel vars point a
+/// nested runner at workload-chosen files, and the binary/pin
+/// overrides redirect which executables and digests a nested launch
+/// trusts. The namespaced launch already strips its `MCP_WRIT_NS_*`
+/// control vars for the same reason; this is the guard-wide contract.
+/// Neither the allowlist pass nor full inheritance may forward them —
+/// a policy `allowed_names` entry is not an exemption.
+///
+/// `mcp-secure-runner`'s startup strip (`src/bin/mcp-secure-runner.rs`)
+/// removes the same names from the guest image env — keep the two
+/// lists aligned.
+pub(super) const GUARD_ENV_VARS: &[&str] = &[
+    // Container/sandbox launch-channel variables (the same set
+    // `docker run -e X=` clears and `mcp-secure-runner` removes).
+    "MCP_WRIT_ENV",
+    "MCP_WRIT_SERVER",
+    "MCP_WRIT_SKIP_SANDBOX",
+    "MCP_WRIT_FAIL_ON",
+    "MCP_WRIT_POLICY_PATH",
+    "MCP_WRIT_AUDIT_DIR",
+    "MCP_WRIT_TEMP_DIR",
+    "MCP_WRIT_LAUNCH_ID",
+    "MCP_WRIT_REPORT_OUT",
+    "MCP_WRIT_PROBE_LANDLOCK_ABI",
+    "MCP_WRIT_MAX_FRAME_BYTES",
+    "MCP_WRIT_RUNNER_CAPS",
+    "MCP_WRIT_WSB_HOST_IP",
+    // Launcher→runner declaration of the guest's host-mounted share
+    // roots; a workload that kept it could widen a nested runner's
+    // ancestry exemptions.
+    "MCP_WRIT_SHARE_ROOTS",
+    // Opt-out / steering knobs a nested guard would honor.
+    "MCP_WRIT_ALLOW_REPLACEABLE_PATHS",
+    "MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS",
+    "MCP_WRIT_LOG_ARGV",
+    "MCP_WRIT_REVIEW_MODE",
+    "MCP_WRIT_WINDOWS_LPAC",
+    // Driver/engine binary overrides — a nested launch resolves its
+    // container engine and host utilities through these.
+    "MCP_WRIT_WSL_EXE",
+    "MCP_WRIT_WSLC_EXE",
+    "MCP_WRIT_REG_EXE",
+    "MCP_WRIT_WSB_EXE",
+    "MCP_WRIT_PWSH_EXE",
+    "MCP_WRIT_DOCKER_EXE",
+    "MCP_WRIT_PODMAN_EXE",
+    "MCP_WRIT_BUILDAH_EXE",
+    "MCP_WRIT_CONTAINER_EXE",
+    "MCP_WRIT_RUNNER_SHA256",
+    "MCP_WRIT_WSB_RUNNER_SHA256",
+    "MCP_WRIT_WSB_RELAY_SHA256",
+    "MCP_SECURE_RUNNER_PATH",
+    // Parent→init control channel of the namespaced launch
+    // (`namespaced::init_env::ALL`, Linux-only). Mirrored here so a
+    // *native* workload that somehow carries ambient `MCP_WRIT_NS_*`
+    // values cannot forward a control channel — most importantly the
+    // `MCP_WRIT_NS_SKIP_SANDBOX` debug hatch — into a nested
+    // namespaced launch. `is_guard_env_var` also prefix-matches
+    // `MCP_WRIT_NS_` for future names in this family.
+    "MCP_WRIT_NS_SOCKFD",
+    "MCP_WRIT_NS_EXE",
+    "MCP_WRIT_NS_POLICY",
+    "MCP_WRIT_NS_SKIP_SANDBOX",
+    "MCP_WRIT_NS_KEEPFDS",
+    "MCP_WRIT_NS_ENTRYPIN_FD",
+    "MCP_WRIT_NS_ENTRYPIN_TARGET",
+    "MCP_WRIT_NS_ENTRYPIN_SHA",
+    "MCP_WRIT_NS_PROXY_KILL_AFTER_MS",
+];
+
+pub(super) fn is_guard_env_var(key: &OsStr) -> bool {
+    GUARD_ENV_VARS
+        .iter()
+        .any(|n| env_key_eq(key, OsStr::new(n)))
+        || key.to_str().is_some_and(|k| k.starts_with("MCP_WRIT_NS_"))
+}
+
 /// Apply the [`SpawnOptions`] environment to an async command.
 ///
-/// `None` (inherit parent) leaves the command untouched: no `env_clear`.
+/// `None` (inherit parent) leaves the command untouched except for the
+/// guard-internal names in [`GUARD_ENV_VARS`]: they are removed from the
+/// inherited block rather than `env_clear`ed, so ordinary passthrough
+/// still skips building an explicit block.
 /// `exec_dyld_fallback` applies either way — it is exec plumbing the
 /// launcher derives (a staged executable's relocated rpath lookup), not
 /// parent-environment passthrough subject to the restriction. When the
@@ -31,6 +117,10 @@ pub(crate) fn apply_spawn_env(cmd: &mut tokio::process::Command, opts: &SpawnOpt
         cmd.env_clear();
         for (key, value) in p {
             cmd.env(key, value);
+        }
+    } else {
+        for var in GUARD_ENV_VARS {
+            cmd.env_remove(var);
         }
     }
     if !opts.exec_dyld_fallback.is_empty()
@@ -127,13 +217,19 @@ fn merged_dyld_fallback_dirs(inherited: Option<OsString>, dirs: &[PathBuf]) -> V
 /// [`unotify-run`'s supervised spawn](crate::warden::unotify) is the only
 /// caller; other `std::process::Command` spawns keep the no-env contract.
 ///
-/// `None` (inherit parent) leaves the command untouched: no `env_clear`.
+/// `None` (inherit parent) still strips [`GUARD_ENV_VARS`]: the child is
+/// a workload, so inherited guard-contract/downgrade names never reach
+/// it — same rule as [`apply_spawn_env`].
 #[cfg(target_os = "linux")]
 pub(crate) fn apply_spawn_env_sync(cmd: &mut std::process::Command, opts: &SpawnOptions) {
     if let Some(pairs) = spawn_env_pairs(opts) {
         cmd.env_clear();
         for (key, value) in pairs {
             cmd.env(key, value);
+        }
+    } else {
+        for var in GUARD_ENV_VARS {
+            cmd.env_remove(var);
         }
     }
 }
@@ -294,9 +390,11 @@ pub(crate) fn env_block_applies(opts: &SpawnOptions) -> bool {
 
 /// Environment entries applied to a sandboxed child.
 ///
-/// `None` means inherit the parent environment (and do not override TMPDIR).
+/// `None` means inherit the parent environment (and do not override TMPDIR)
+/// minus the guard-internal names in [`GUARD_ENV_VARS`].
 /// `Some` is the complete environment block: restricted allow-list, or a
-/// snapshot of the parent with TMPDIR/TMP/TEMP overridden.
+/// snapshot of the parent — same names stripped — with TMPDIR/TMP/TEMP
+/// overridden.
 pub(crate) fn spawn_env_pairs(opts: &SpawnOptions) -> Option<Vec<(OsString, OsString)>> {
     if !env_block_applies(opts) {
         return None;
@@ -304,7 +402,12 @@ pub(crate) fn spawn_env_pairs(opts: &SpawnOptions) -> Option<Vec<(OsString, OsSt
     let mut pairs = if opts.restrict_environment {
         restricted_base_env(&opts.allowed_names).0
     } else {
-        std::env::vars_os().collect()
+        let mut pairs: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        // Inherit-all keeps the same rule the restricted block and the
+        // namespaced `MCP_WRIT_NS_*` strip apply: guard-contract and
+        // downgrade names never reach a workload through env passthrough.
+        pairs.retain(|(k, _)| !is_guard_env_var(k));
+        pairs
     };
     if let Some(ref tmp) = opts.tmpdir {
         let tmp = tmp.as_os_str().to_os_string();
@@ -369,6 +472,13 @@ fn consult_allowlist(allowed_names: &[String]) -> (Vec<(OsString, OsString)>, En
     };
     for name in allowed_names {
         if name.is_empty() || name.contains('=') || name.contains('\0') {
+            continue;
+        }
+        // Guard-internal names are ineligible for the workload block —
+        // an allowlist entry that names one is skipped before lookup,
+        // so it lands in neither `present` nor `missing`. The report
+        // cannot then claim a stripped variable reaches the child.
+        if is_guard_env_var(OsStr::new(name)) {
             continue;
         }
         let key = OsString::from(name);
@@ -987,5 +1097,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Guard-internal names never reach the workload env block. In
+    /// inherit mode (explicit block via tmpdir override) a parent-set
+    /// guard var is filtered out; in restricted mode an `allowed_names`
+    /// entry naming one is skipped before the parent lookup, so it
+    /// lands in neither the block nor the contract report — the
+    /// diagnosis never claims a stripped variable reaches the child.
+    #[test]
+    fn guard_env_vars_never_reach_the_workload_block() {
+        let _env = lock_process_env();
+        // Inherit path: names whose setting cannot weaken a concurrent
+        // assertion — a channel var and a consent var — stand in for the
+        // whole GUARD_ENV_VARS list.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::set_var("MCP_WRIT_WSB_HOST_IP", "10.0.0.2");
+            std::env::set_var("MCP_WRIT_LOG_ARGV", "1");
+        }
+        let tmp_fixture = crate::testutil::real_tempdir().expect("tempdir");
+        let inherit_opts = SpawnOptions {
+            tmpdir: Some(tmp_fixture.path().to_path_buf()),
+            ..Default::default()
+        };
+        let pairs = spawn_env_pairs(&inherit_opts).expect("tmpdir override");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::remove_var("MCP_WRIT_WSB_HOST_IP");
+            std::env::remove_var("MCP_WRIT_LOG_ARGV");
+        }
+        assert!(
+            pairs.iter().all(|(k, _)| !is_guard_env_var(k)),
+            "inherited block must drop guard-internal vars: {pairs:?}"
+        );
+
+        // Restricted path: the allowlist lookup skips guard names
+        // before consulting the parent env, so the check is
+        // deterministic without mutating real opt-out variables.
+        let opts = SpawnOptions {
+            restrict_environment: true,
+            allowed_names: vec![
+                "MCP_WRIT_ALLOW_REPLACEABLE_PATHS".to_string(),
+                "MCP_WRIT_SKIP_SANDBOX".to_string(),
+            ],
+            ..Default::default()
+        };
+        let pairs = spawn_env_pairs(&opts).expect("restricted env is explicit");
+        assert!(
+            pairs.iter().all(|(k, _)| !is_guard_env_var(k)),
+            "allowlist must not inject guard vars: {pairs:?}"
+        );
+        let report = env_contract_report(&opts).expect("restricted env is consulted");
+        assert!(
+            report
+                .present
+                .iter()
+                .all(|n| !GUARD_ENV_VARS.contains(&n.as_str()))
+                && report
+                    .missing
+                    .iter()
+                    .all(|n| !GUARD_ENV_VARS.contains(&n.as_str())),
+            "report must not claim a stripped var reaches the child: {report:?}"
+        );
     }
 }

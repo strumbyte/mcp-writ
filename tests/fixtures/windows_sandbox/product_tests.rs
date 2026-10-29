@@ -20,6 +20,10 @@ impl Product {
             common::skip_wsb_test(&reason);
             return None;
         }
+        if let Some(reason) = product_wsb_resolvable() {
+            common::skip_wsb_test(&reason);
+            return None;
+        }
         let probe = compiled_probe()?;
         let dirs = session_dirs();
         std::fs::copy(probe, dirs.ro.join("server.exe")).unwrap();
@@ -47,6 +51,10 @@ impl Product {
             .args(["--", "server.exe"])
             // Product must keep enforcement even when this host override exists.
             .env("MCP_WRIT_SKIP_SANDBOX", "1")
+            // Session fixtures stage under `target\`, whose checkout ACL
+            // can grant another principal replace access — host-ACL
+            // dependent, not what the product contract exercises.
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(std::fs::File::create(dirs.rw.join("product-stderr.log")).unwrap())

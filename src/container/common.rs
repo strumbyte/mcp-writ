@@ -1285,8 +1285,14 @@ mod tests {
 
     #[test]
     fn test_build_context_copy_policy() {
-        let tmp = make_temp_dir("copy_policy");
-        let policy = tmp.join("test.kdl");
+        // `copy_policy` loads and binds the source — the trusted-source
+        // gate applies, so the fixture must sit under a write-
+        // restricted root, not shared %TEMP%.
+        let Some(tmp) = crate::testutil::restricted_tempdir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
+        let policy = tmp.path().join("test.kdl");
         fs::write(&policy, "policy version=1").unwrap();
 
         let ctx = BuildContext::new("test_cp_policy").unwrap();
@@ -1298,7 +1304,6 @@ mod tests {
         assert!(ctx.dir().join("policy.kdl").exists());
 
         ctx.cleanup();
-        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1673,7 +1678,13 @@ mod tests {
 
     #[test]
     fn test_copy_policy_exports_self_contained_kdl() {
-        let tmp = make_temp_dir("copy_policy_self_contained");
+        // Same trusted-source gate as `copy_policy` above — the
+        // extends/schema tree must live under a write-restricted root.
+        let Some(tmp) = crate::testutil::restricted_tempdir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for policy fixture");
+            return;
+        };
+        let tmp = tmp.path();
         let parent_kdl = tmp.join("parent.kdl");
         fs::write(
             &parent_kdl,
@@ -1729,7 +1740,5 @@ server "test" {
         let loaded = crate::policy::loader::load_policy(&generated_policy_file).unwrap();
         assert_eq!(loaded.tools.len(), 2);
         assert_eq!(loaded.fs.read_only, vec!["/base/path"]);
-
-        let _ = fs::remove_dir_all(&tmp);
     }
 }

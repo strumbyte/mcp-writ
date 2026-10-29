@@ -14,9 +14,20 @@ use windows::Win32::Globalization::{
 
 use super::SpawnOptions;
 
-pub(super) fn encode_windows_env_block(opts: &SpawnOptions) -> Option<Vec<u16>> {
-    let mut pairs = super::env::spawn_env_pairs(opts)?;
-    Some(encode_env_pairs(&mut pairs))
+pub(super) fn encode_windows_env_block(opts: &SpawnOptions) -> Vec<u16> {
+    // Inherit mode yields no explicit pairs — but `lpEnvironment = NULL`
+    // would hand the child the launcher's *entire* environment, guard
+    // contract/downgrade names included (`std::process::Command`
+    // applies `env_remove` to those names on the other spawn arms).
+    // Encode the parent block minus the guard-internal set so a
+    // `Some(opts)` spawn never forwards them. `opts: None` — the PSEC
+    // contract — never reaches this function and still maps to NULL.
+    let mut pairs = super::env::spawn_env_pairs(opts).unwrap_or_else(|| {
+        std::env::vars_os()
+            .filter(|(k, _)| !super::env::is_guard_env_var(k))
+            .collect()
+    });
+    encode_env_pairs(&mut pairs)
 }
 
 fn encode_env_pairs(pairs: &mut Vec<(std::ffi::OsString, std::ffi::OsString)>) -> Vec<u16> {
@@ -91,7 +102,7 @@ mod tests {
             tmpdir: Some(tmp),
             ..Default::default()
         };
-        let block = encode_windows_env_block(&opts).expect("inherited env with tmpdir");
+        let block = encode_windows_env_block(&opts);
         let keys = decode_env_block_keys(&block);
         use std::cmp::Ordering;
         for pair in keys.windows(2) {

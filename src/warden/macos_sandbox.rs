@@ -1569,7 +1569,7 @@ impl MacosChild {
     /// allocated; sweeping after `wait` has already reaped could signal a
     /// recycled, unrelated process group.
     pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        if !self.reaped && self.leader_exited_unreaped(true) {
+        if !self.reaped && self.leader_exited_unreaped(true).unwrap_or(false) {
             // Leader is a zombie still pinning the group — sweep the
             // surviving descendants, then the real wait reaps it below.
             self.kill_group();
@@ -1582,9 +1582,10 @@ impl MacosChild {
     }
 
     /// True when the leader has exited but not yet been reaped — see
-    /// [`exited_unreaped`] for the probe semantics.
+    /// [`exited_unreaped`] for the probe semantics. A probe failure
+    /// surfaces as `Err`.
     #[cfg(unix)]
-    fn leader_exited_unreaped(&self, blocking: bool) -> bool {
+    fn leader_exited_unreaped(&self, blocking: bool) -> std::io::Result<bool> {
         exited_unreaped(self.child.id(), blocking)
     }
 
@@ -1608,19 +1609,30 @@ impl MacosChild {
         self.child.kill()
     }
 
-    /// Non-blocking poll that reaps on `Some`. Probes the exit without
-    /// reaping first: a leader the inner `try_wait` already reaped frees
-    /// its pid, and the recorded pgid may by then name a recycled group
-    /// that must not be signaled — so the sweep runs only while the
-    /// zombie still pins it. Narrow gap a caller must accept: if the
-    /// leader exits between the probe and the inner call — the probe saw
-    /// it alive — the sweep never ran and detached descendants can
-    /// outlive the session (the freed pgid must still never be signaled,
-    /// so skipping is the safe direction; `wait` closes the gap with a
-    /// blocking probe).
+    /// Non-blocking poll that reaps on `Some`. The `WNOWAIT` probe is
+    /// authoritative: a *confirmed* "still running" report returns
+    /// `None` *without* ever letting the inner call reap — an exit
+    /// landing after the probe is the next poll's report, so `probe →
+    /// sweep while the pgid is pinned → reap` is the only order this
+    /// method produces. A probe that cannot answer surfaces as `Err`
+    /// *without* reaping: letting the inner call reap there could mark
+    /// `reaped` while `kill_group` never ran — stranding the leader's
+    /// descendants and pinning the sweep behind a flag that says the
+    /// group is already gone. A reaped leader delegates to the inner
+    /// call so its cached status is preserved.
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        if !self.reaped && self.leader_exited_unreaped(false) {
-            self.kill_group();
+        if self.reaped {
+            return self.child.try_wait();
+        }
+        match self.leader_exited_unreaped(false) {
+            Ok(false) => return Ok(None),
+            Err(e) => return Err(e),
+            Ok(true) => {
+                // Leader is a zombie still pinning the group — sweep
+                // the surviving descendants, then the inner call
+                // reaps it.
+                self.kill_group();
+            }
         }
         let status = self.child.try_wait();
         if matches!(status, Ok(Some(_))) {
@@ -1689,7 +1701,9 @@ pub fn spawn_sandboxed(
         .env("TEMP", tmpdir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        // The workload's stderr is attacker-controlled — piped through
+        // the sanitized relay, never raw to the terminal.
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     {
         cmd.process_group(0);
@@ -1699,7 +1713,15 @@ pub fn spawn_sandboxed(
         super::attach_fd_hygiene(&mut cmd, &[])
             .map_err(|e| WardenError::sandbox_setup(SandboxStage::Prepare, e.to_string()))?;
     }
-    let child = cmd.spawn().map_err(WardenError::ProcessSpawn)?;
+    let child = cmd
+        .spawn()
+        .map_err(WardenError::ProcessSpawn)
+        .map(|mut c| {
+            if let Some(err) = c.stderr.take() {
+                crate::termutil::relay_child_stderr_blocking(err);
+            }
+            c
+        })?;
     let pgid = child.id();
     Ok(MacosChild {
         child,
@@ -1709,17 +1731,20 @@ pub fn spawn_sandboxed(
     })
 }
 
-/// True when `pid` exited but has not yet been reaped. The `WNOWAIT`
-/// waitid reports the exit while keeping the zombie, so the pid — and
-/// the process-group id a sweep names — stays reserved until a real
-/// wait consumes it. `blocking` omits `WNOHANG` so the probe itself
-/// waits for the exit (used by `MacosChild::wait`); callers polling
-/// pass `WNOHANG`. `waitid` is the call where `WNOWAIT` is specified;
-/// under `WNOHANG` it returns 0 for both a report and "nothing to
-/// report", so `si_pid` distinguishes the two. EINTR is retried — a
-/// caught signal landing mid-probe is not evidence of state.
+/// `Ok(true)` when `pid` exited but has not yet been reaped, `Ok(false)`
+/// when it is confirmed still running. The `WNOWAIT` waitid reports the
+/// exit while keeping the zombie, so the pid — and the process-group id
+/// a sweep names — stays reserved until a real wait consumes it.
+/// `blocking` omits `WNOHANG` so the probe itself waits for the exit
+/// (used by `MacosChild::wait`); callers polling pass `WNOHANG`.
+/// `waitid` is the call where `WNOWAIT` is specified; under `WNOHANG` it
+/// returns 0 for both a report and "nothing to report", so `si_pid`
+/// distinguishes the two. EINTR is retried — a caught signal landing
+/// mid-probe is not evidence of state. Any other wait error surfaces
+/// as `Err` so callers can tell "confirmed running" apart from
+/// "unanswerable probe".
 #[cfg(unix)]
-fn exited_unreaped(pid: u32, blocking: bool) -> bool {
+fn exited_unreaped(pid: u32, blocking: bool) -> std::io::Result<bool> {
     let flags = libc::WEXITED | libc::WNOWAIT | if blocking { 0 } else { libc::WNOHANG };
     loop {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -1728,10 +1753,14 @@ fn exited_unreaped(pid: u32, blocking: bool) -> bool {
         let ret = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
         if ret == 0 {
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            return unsafe { info.si_pid() } == pid as libc::pid_t;
+            return Ok(unsafe { info.si_pid() } == pid as libc::pid_t);
         }
-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return false;
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINTR) {
+            // A probe that could not answer (ECHILD — not or no longer
+            // a waitable child) is surfaced, not read as "running":
+            // treating it as alive would poll a dead launch forever.
+            return Err(e);
         }
     }
 }
@@ -1781,7 +1810,7 @@ pub(super) async fn initial_exit_check(child: &mut tokio::process::Child) -> Spa
     loop {
         #[cfg(unix)]
         if let Some(pid) = child.id()
-            && exited_unreaped(pid, false)
+            && exited_unreaped(pid, false).unwrap_or(false)
         {
             // Leader is a zombie pinning the group — descendants it
             // spawned still hold the pgid and must not outlive the

@@ -225,6 +225,10 @@ async fn scenario_a_denied_rpc_requests_are_audited() {
         ])
         .args(common::scripted_stdio_argv("tools_call_ok"))
         .env("MCP_WRIT_SKIP_SANDBOX", "1")
+        // workdir paths under %TEMP% can fail the replaceable-ancestry
+        // gate on hosts whose temp ACL grants another principal replace
+        // access — host-ACL dependent, not what the denial audit tests.
+        .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -476,6 +480,7 @@ fn scenario_b_direct_443_egress_denied_and_audited() {
         .arg(&probe)
         .arg("192.0.2.1:443")
         .current_dir(&dir)
+        .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let run = run_with_timeout(&mut cmd);
@@ -703,6 +708,7 @@ fn spawn_dns_gate(
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
             .spawn()
             .expect("spawn mcp-writ dns-gate");
         let _stdout_rx = drain(child.stdout.take().unwrap());
@@ -900,13 +906,10 @@ fn kernel_probe_policy(dir: &Path, probe: &Path) -> PathBuf {
     // Grant the fixture's own directory so the image loads; the probe's
     // target paths deliberately sit outside every grant.
     let fs_allows = common::sandbox_fs_allows(&[dir], &[], probe);
-    let mut text = common::sandboxed_policy(&fs_allows, "server \"probe\" {\n}\n");
-    if common::linux_below_landlock_v4() {
-        // Kernel < 6.7 (e.g. WSL2's 5.15) enforces Landlock ABI V1
-        // partially; a fail-closed spawn would refuse. The denials this
-        // test needs — fs rules and the syscall baseline — exist in V1.
-        text.push_str("sandbox allow_degraded=#true\n");
-    }
+    // `sandboxed_policy` already merges this host's waivers into one
+    // `sandbox` node — an old kernel gets `allow_degraded` plus the
+    // boundary waiver, a boundary-less platform the waiver alone.
+    let text = common::sandboxed_policy(&fs_allows, "server \"probe\" {\n}\n");
     let policy = dir.join("policy.kdl");
     std::fs::write(&policy, text).unwrap();
     policy
@@ -1110,12 +1113,11 @@ fn pr18_probe_policy(dir: &Path, probe: &Path, version: u8, network_rules: &str)
     let mut text = format!(
         "policy version={version}\ndefaults {{\n    filesystem {{\n        secret-overlay #true\n{fs_allows}    }}\n{baseline}        allow \"socket\" \"socketpair\" \"connect\" \"sendto\" \"sendmsg\" \"bind\" \"getsockname\" \"getpeername\" \"listen\" \"accept\" \"accept4\" \"tgkill\" \"pidfd_send_signal\" \"pidfd_open\"\n    }}\n    network {{\n        {network_rules}\n    }}\n}}\nlogging fail_closed=#false\n\nserver \"probe\" {{\n    tool \"probe\"\n}}\n"
     );
-    if common::linux_below_landlock_v4() {
-        // Kernel < 6.7 enforces Landlock ABI V1 partially; a
-        // fail-closed spawn would refuse. The denials the socket legs
-        // need are seccomp's, which never depended on the Landlock ABI.
-        text.push_str("sandbox allow_degraded=#true\n");
-    }
+    // Same host waivers as `sandboxed_policy` would merge: on a pre-ABI-4
+    // kernel `allow_degraded` plus the boundary waiver (the flag cannot
+    // be satisfied there either); seccomp denials exercised here never
+    // depended on the Landlock ABI.
+    text.push_str(&common::sandbox_waiver_node(""));
     let policy = dir.join(format!("policy-{version}-{}.kdl", network_rules.len()));
     std::fs::write(&policy, text).unwrap();
     policy

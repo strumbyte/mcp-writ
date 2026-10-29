@@ -75,7 +75,8 @@ pub mod spawn;
 pub mod supervisor;
 pub mod sys;
 
+pub use crate::warden::cgroup::cgroup_write_grant_conflict;
 pub use probe::check_support;
-pub use runtime::{PrepareError, Runtime, cgroup_write_grant_conflict};
+pub use runtime::{PrepareError, Runtime};
 pub(crate) use spawn::{resolve_workload_cred, spawn_supervised};
 pub use supervisor::{Drain, DrainConfig, DrainEnd, DrainExit, DrainStats, sync_grants_once};

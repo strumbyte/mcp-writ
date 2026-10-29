@@ -23,6 +23,18 @@ impl Warden {
 
         #[cfg(target_os = "macos")]
         {
+            // macOS has no kernel-enforced descendant-lifetime boundary
+            // (no cgroup, no subreaper) — under `require_lifetime_boundary`
+            // the supervised launch is refused before the helper even
+            // spawns, rather than run on the best-effort sweep alone.
+            if self.policy.sandbox.require_lifetime_boundary {
+                return Err(WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Policy,
+                    "sandbox.require_lifetime_boundary: macOS provides no \
+                     kernel-enforced descendant-lifetime boundary — the \
+                     supervised launch is refused rather than run unbounded",
+                ));
+            }
             // `sandbox-exec` does not expose whether the kernel accepted
             // the profile — this states the spawn mechanism, not kernel
             // confirmation.
@@ -69,16 +81,63 @@ impl Warden {
 
         #[cfg(target_os = "linux")]
         {
-            let sandbox_bits = linux_spawn::prepare_linux_child_sandbox(&self.policy)?;
+            let mut sandbox_bits = linux_spawn::prepare_linux_child_sandbox(&self.policy)?;
             let mut cmd = std::process::Command::new(command);
             cmd.args(args)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit());
-            apply_unix_process_group(&mut cmd);
+                // The workload's stderr is attacker-controlled — pipe
+                // it through the sanitized relay, never raw to the
+                // terminal.
+                .stderr(std::process::Stdio::piped());
+            let launch_tag = apply_unix_process_group(&mut cmd);
+            // The lifetime cgroup is created *before* spawn so the
+            // child joins it in `pre_exec` — no window where the
+            // workload can fork outside the subtree, which the
+            // post-spawn `try_adopt` write left open. Under
+            // `require_lifetime_boundary` the join goes through the
+            // apply pipeline's CGROUP stage (a failed write aborts the
+            // spawn pre-exec); otherwise a best-effort hook runs it
+            // and the post-spawn membership check below decides.
+            let lifetime_cgroup = match cgroup::cgroup_write_grant_conflict(
+                self.policy.write_grant_spellings(),
+                "escape the descendant-lifetime boundary",
+            ) {
+                // A write grant covering the hierarchy makes any armed
+                // cgroup escapable — under the flag that refuses the
+                // launch; otherwise adoption is skipped rather than
+                // recording a hollow boundary.
+                Some(conflict) if self.policy.sandbox.require_lifetime_boundary => {
+                    return Err(WardenError::sandbox_setup(
+                        crate::error::SandboxStage::Policy,
+                        format!("sandbox.require_lifetime_boundary: {conflict}"),
+                    ));
+                }
+                Some(_) => None,
+                None => cgroup::LifetimeCgroup::create_with_writer("run").map(|(cg, writer)| {
+                    if self.policy.sandbox.require_lifetime_boundary {
+                        sandbox_bits.cgroup_procs = Some(writer);
+                    } else {
+                        cg.attach_join(&mut cmd, writer, false);
+                    }
+                    cg
+                }),
+            };
+            // `require_lifetime_boundary` with no writable hierarchy
+            // has no boundary to attach at all — refuse before spawn
+            // rather than creating a child only to tear it down.
+            if self.policy.sandbox.require_lifetime_boundary && lifetime_cgroup.is_none() {
+                return Err(WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Policy,
+                    "sandbox.require_lifetime_boundary: cgroup v2 hierarchy \
+                     unavailable or unwritable — no kernel-enforced \
+                     descendant-lifetime boundary is available for this \
+                     launch, so it is refused",
+                ));
+            }
             let apply_record = linux_spawn::attach_linux_pre_exec(&mut cmd, sandbox_bits);
 
-            let spawned = cmd.spawn();
+            let spawned = child::spawn_and_register(|| cmd.spawn(), |c| c.id(), launch_tag);
             // The shared record holds the kernel-reported apply result
             // the pre-exec child wrote. This sync path has no launch
             // report to feed it to (`spawn_child_async_impl` does), so
@@ -113,8 +172,43 @@ impl Warden {
                 }
             }
             let child = spawned
-                .map(|c| ChildProcess::Standard(child::StdChild::spawned(c)))
-                .map_err(WardenError::ProcessSpawn)?;
+                .map(|mut c| {
+                    if let Some(err) = c.stderr.take() {
+                        crate::termutil::relay_child_stderr_blocking(err);
+                    }
+                    c
+                })
+                .map_err(WardenError::ProcessSpawn)
+                .and_then(|c| {
+                    // The in-child join already ran (pre-exec) — the
+                    // member check proves it landed; a best-effort
+                    // write that failed degrades to `skipped` plus the
+                    // fallback sweep, not a false `verified` grant.
+                    let verified = lifetime_cgroup.filter(|cg| cg.member(c.id()));
+                    let std_child = child::StdChild::spawned(c, verified);
+                    // `require_lifetime_boundary` refuses a launch that
+                    // runs on the best-effort sweep alone — the child
+                    // was already spawned, so tear it down the same way
+                    // any post-spawn failure does.
+                    if self.policy.sandbox.require_lifetime_boundary
+                        && !std_child.has_lifetime_boundary()
+                    {
+                        let mut proc = ChildProcess::Standard(std_child);
+                        let _ = proc.kill();
+                        // Reap the leader — `kill` only signals; leaving
+                        // the zombie behind would keep the guard's child
+                        // table dirty for the rest of the session.
+                        let _ = proc.wait();
+                        return Err(WardenError::sandbox_setup(
+                            crate::error::SandboxStage::Policy,
+                            "sandbox.require_lifetime_boundary: private cgroup \
+                             v2 adoption failed — no kernel-enforced \
+                             descendant-lifetime boundary is available for \
+                             this launch, so it is refused",
+                        ));
+                    }
+                    Ok(ChildProcess::Standard(std_child))
+                })?;
             // Spawn returning means the pre_exec hooks ran: no_new_privs,
             // Landlock restrict_self (fail-closed), seccomp apply.
             tracing::info!("Warden: spawned child with Linux sandbox applied in pre_exec");
@@ -144,12 +238,34 @@ impl Warden {
         args: &[String],
     ) -> Result<ChildProcess, WardenError> {
         tracing::info!("Warden: sandbox skipped (dry-run or skip requested)");
+        // `require_lifetime_boundary` does not gate this route — an
+        // explicitly unsandboxed launch already waived every other
+        // enforcement, so the flag's scope is supervised launches only.
+        // The cgroup arming below stays best-effort (a failed join
+        // degrades to the lineage sweep rather than refusing).
         let mut cmd = std::process::Command::new(command);
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
-        apply_unix_process_group(&mut cmd);
+            // Unsandboxed does not mean trusted — the workload's
+            // stderr still crosses to the terminal sanitized.
+            .stderr(std::process::Stdio::piped());
+        let launch_tag = apply_unix_process_group(&mut cmd);
+        // The cgroup must exist (and its `cgroup.procs` writer be open)
+        // *before* the fd-hygiene snapshot so the writer lands in the
+        // child's seal list — it stays writable for the pre-exec join
+        // and dies at `execve`, never reaching the workload. The join
+        // itself runs in `pre_exec`, closing the spawn→adopt window a
+        // post-spawn `try_adopt` would leave.
+        #[cfg(target_os = "linux")]
+        let lifetime_cgroup =
+            cgroup::LifetimeCgroup::create_with_writer("run").map(|(cg, writer)| {
+                // Best-effort by design: the unsandboxed route is
+                // outside `require_lifetime_boundary`'s scope, so a
+                // failed join degrades rather than refusing.
+                cg.attach_join(&mut cmd, writer, false);
+                cg
+            });
         // No sandbox does not mean the launcher's ambient descriptors
         // should leak — the child seals everything above stdio before
         // exec drops them.
@@ -157,9 +273,24 @@ impl Warden {
         attach_fd_hygiene(&mut cmd, &[]).map_err(|e| {
             WardenError::sandbox_setup(crate::error::SandboxStage::Prepare, e.to_string())
         })?;
-        cmd.spawn()
-            .map(|c| ChildProcess::Standard(child::StdChild::spawned(c)))
+        child::spawn_and_register(|| cmd.spawn(), |c| c.id(), launch_tag)
+            .map(|mut c| {
+                if let Some(err) = c.stderr.take() {
+                    crate::termutil::relay_child_stderr_blocking(err);
+                }
+                c
+            })
             .map_err(WardenError::ProcessSpawn)
+            .map(|c| {
+                #[cfg(target_os = "linux")]
+                let verified = lifetime_cgroup.filter(|cg| cg.member(c.id()));
+                let std_child = child::StdChild::spawned(
+                    c,
+                    #[cfg(target_os = "linux")]
+                    verified,
+                );
+                ChildProcess::Standard(std_child)
+            })
     }
 
     /// Spawn a sandboxed child process and wrap it for async I/O.
@@ -506,6 +637,22 @@ impl Warden {
                 (&'static str, WardenError),
             >;
             let prepared = (|| -> Prepared {
+                // The policy refusal reuses the same report arm as a
+                // prepare failure: macOS carries no descendant-lifetime
+                // boundary mechanism, so `require_lifetime_boundary`
+                // stops the launch before the helper spawns.
+                if self.policy.sandbox.require_lifetime_boundary {
+                    return Err((
+                        "no kernel-enforced descendant-lifetime boundary on macOS",
+                        WardenError::sandbox_setup(
+                            crate::error::SandboxStage::Policy,
+                            "sandbox.require_lifetime_boundary: macOS provides \
+                             no kernel-enforced descendant-lifetime boundary \
+                             — the supervised launch is refused rather than \
+                             run unbounded",
+                        ),
+                    ));
+                }
                 let helper = sandbox_exec::sandbox_exec_path()
                     .map_err(|e| ("sandbox-exec helper validation failed", e))?;
                 let tmpdir = macos_sandbox::create_private_tmpdir()
@@ -561,7 +708,10 @@ impl Warden {
             macos_sandbox::apply_exec_a_wrapper(&mut cmd, program, command, args, opts);
             cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit());
+                // The sandbox-exec helper shares the workload's stderr
+                // — attacker-controlled bytes must cross sanitized,
+                // never raw to the terminal.
+                .stderr(std::process::Stdio::piped());
             let mut env_opts = opts.clone();
             if env_opts.tmpdir.is_none() {
                 env_opts.tmpdir = Some(tmpdir.path().to_path_buf());
@@ -571,7 +721,7 @@ impl Warden {
             if let Some(exe) = python_executable_override(command, program) {
                 cmd.env("PYTHONEXECUTABLE", exe);
             }
-            apply_unix_process_group_tokio(&mut cmd);
+            let launch_tag = apply_unix_process_group_tokio(&mut cmd);
             // fd hygiene + fd-exec handoff: the child's pre_exec seals
             // every ambient descriptor above stdio, then uncloaks the
             // pin's dup'd descriptors so they survive sandbox-exec's
@@ -603,7 +753,8 @@ impl Warden {
                 };
                 return SpawnAttempt::err(report, source);
             }
-            let mut spawned = cmd.spawn();
+            let mut spawned =
+                child::spawn_and_register(|| cmd.spawn(), |c| c.id().unwrap_or(0), launch_tag);
             // Pin the pid before the liveness probe: the probe reaps a
             // leader that exits inside the window, after which `id()`
             // can no longer resolve — and the pgid (`process_group(0)`
@@ -676,6 +827,9 @@ impl Warden {
                             "failed to capture child stdout",
                         ))
                     });
+                    if let Some(err) = child.stderr.take() {
+                        crate::termutil::relay_child_stderr(err);
+                    }
                     match (stdin, stdout) {
                         (Ok(stdin), Ok(stdout)) => SpawnAttempt::ok(
                             report,
@@ -851,10 +1005,13 @@ impl Warden {
             cmd.args(args)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit());
+                // The workload's stderr is attacker-controlled — pipe
+                // it through the sanitized relay, never raw to the
+                // terminal.
+                .stderr(std::process::Stdio::piped());
             apply_spawn_env(&mut cmd, opts);
             let env_applied = env_block_applies(opts);
-            apply_unix_process_group_tokio(&mut cmd);
+            let launch_tag = apply_unix_process_group_tokio(&mut cmd);
             // fd-exec handoff: the pin's CLOEXEC dups uncloak inside the
             // child's apply pipeline (before the policy seccomp filter
             // can deny `fcntl`).
@@ -862,8 +1019,89 @@ impl Warden {
             // PR-18: the `restrict_self` level alone cannot say which
             // rights were requested — the report lists them.
             let requested_rights = sandbox_bits.requested_rights.clone();
+            // Same in-child join contract as the sync arm: the cgroup
+            // exists before spawn and the child writes its own pid in
+            // `pre_exec`, so no descendant can be born outside the
+            // subtree. `require_lifetime_boundary` routes the write
+            // through the apply pipeline (hard-fail); otherwise a
+            // best-effort hook does it and the membership check below
+            // decides.
+            // A write grant covering the cgroup hierarchy makes any
+            // armed boundary escapable by policy, not only by residual
+            // — under `require_lifetime_boundary` that refuses; off it,
+            // adoption is skipped and the grant reports the conflict.
+            let boundary_conflict = cgroup::cgroup_write_grant_conflict(
+                self.policy.write_grant_spellings(),
+                "escape the descendant-lifetime boundary",
+            );
+            let mut grant_mode = LifetimeGrantMode::Confined;
+            let lifetime_cgroup = match &boundary_conflict {
+                Some(conflict) if self.policy.sandbox.require_lifetime_boundary => {
+                    let source = WardenError::sandbox_setup(
+                        crate::error::SandboxStage::Policy,
+                        format!("sandbox.require_lifetime_boundary: {conflict}"),
+                    );
+                    plan::fail_os_controls(&mut controls, "lifetime boundary refused", &source);
+                    let report = WardenReport {
+                        plan: EnforcementPlan {
+                            mechanism: self.mechanism_record(),
+                            controls,
+                            grants,
+                            tools: plan::tools_table(&self.policy),
+                            limitations,
+                            egress_layers: Some(plan::egress_layers_plan(
+                                &self.policy,
+                                self.windows_mechanism,
+                            )),
+                        },
+                        observations: Vec::new(),
+                    };
+                    return SpawnAttempt::err(report, source);
+                }
+                Some(_) => {
+                    grant_mode = LifetimeGrantMode::GrantConflict;
+                    None
+                }
+                None => cgroup::LifetimeCgroup::create_with_writer("run").map(|(cg, writer)| {
+                    if self.policy.sandbox.require_lifetime_boundary {
+                        sandbox_bits.cgroup_procs = Some(writer);
+                    } else {
+                        cg.attach_join_tokio(&mut cmd, writer, false);
+                    }
+                    cg
+                }),
+            };
+            // `require_lifetime_boundary` with no writable hierarchy
+            // cannot be satisfied by any join — refuse before spawn,
+            // reporting the policy refusal like the neighboring arms.
+            if self.policy.sandbox.require_lifetime_boundary && lifetime_cgroup.is_none() {
+                let source = WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Policy,
+                    "sandbox.require_lifetime_boundary: cgroup v2 hierarchy \
+                     unavailable or unwritable — no kernel-enforced \
+                     descendant-lifetime boundary is available for this \
+                     launch, so it is refused",
+                );
+                plan::fail_os_controls(&mut controls, "lifetime boundary unavailable", &source);
+                let report = WardenReport {
+                    plan: EnforcementPlan {
+                        mechanism: self.mechanism_record(),
+                        controls,
+                        grants,
+                        tools: plan::tools_table(&self.policy),
+                        limitations,
+                        egress_layers: Some(plan::egress_layers_plan(
+                            &self.policy,
+                            self.windows_mechanism,
+                        )),
+                    },
+                    observations: Vec::new(),
+                };
+                return SpawnAttempt::err(report, source);
+            }
             let apply_record = linux_spawn::attach_linux_pre_exec_tokio(&mut cmd, sandbox_bits);
-            let spawned = cmd.spawn();
+            let spawned =
+                child::spawn_and_register(|| cmd.spawn(), |c| c.id().unwrap_or(0), launch_tag);
             // The pre-exec child's own apply record — readable now that
             // spawn returned, unforgeable by the exec'd workload.
             let apply_snapshot = apply_record.as_ref().map(|r| r.snapshot());
@@ -910,6 +1148,9 @@ impl Warden {
                             "failed to capture child stdout",
                         ))
                     });
+                    if let Some(err) = child.stderr.take() {
+                        crate::termutil::relay_child_stderr(err);
+                    }
                     match (stdin, stdout) {
                         (Ok(stdin), Ok(stdout)) => {
                             // Collect the notification listener the
@@ -936,6 +1177,11 @@ impl Warden {
                                             }
                                         }
                                         let _ = child.kill().await;
+                                        // The launch never left the
+                                        // spawn boundary — a stale
+                                        // registration would shield a
+                                        // recycled pid.
+                                        child::unregister_launch_root(pid as u32);
                                         return SpawnAttempt::err(
                                             report,
                                             WardenError::ProcessSpawn(e),
@@ -944,9 +1190,65 @@ impl Warden {
                                 },
                                 None => None,
                             };
+                            // The join already ran in the child's
+                            // `pre_exec` — membership is the proof; a
+                            // failed best-effort write reads as
+                            // `skipped` (fallback sweep), never as a
+                            // boundary that is not there.
                             let lifetime_cgroup =
-                                cgroup::LifetimeCgroup::try_adopt("run", child.id().unwrap_or(0));
-                            report.plan.grants.push(lifetime_grant(&lifetime_cgroup));
+                                lifetime_cgroup.filter(|cg| cg.member(child.id().unwrap_or(0)));
+                            // `Verified` requires the member's own
+                            // `cgroup.procs` writes to be restrained —
+                            // only a `FullyEnforced` Landlock stage
+                            // proves that. A degraded/absent ruleset
+                            // (or an unreadable apply record) leaves
+                            // ambient write access, so the armed
+                            // boundary reports `PartiallyApplied`, not
+                            // `Verified`.
+                            let grant_mode = match grant_mode {
+                                LifetimeGrantMode::Confined
+                                    if apply_snapshot.map(|s| s.landlock)
+                                        != Some(linux_spawn::landlock_level::FULL) =>
+                                {
+                                    LifetimeGrantMode::Unconfined
+                                }
+                                m => m,
+                            };
+                            report
+                                .plan
+                                .grants
+                                .push(lifetime_grant(&lifetime_cgroup, grant_mode));
+                            // `require_lifetime_boundary`: without the
+                            // cgroup subtree the fallback sweep cannot
+                            // prove descendant containment — refuse the
+                            // launch (group-killed and reaped like any
+                            // post-spawn failure) instead of running it
+                            // unbounded.
+                            if self.policy.sandbox.require_lifetime_boundary
+                                && lifetime_cgroup.is_none()
+                            {
+                                let pid = child.id().unwrap_or(0) as libc::pid_t;
+                                if pid > 0 {
+                                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                                    unsafe {
+                                        libc::kill(-pid, libc::SIGKILL);
+                                        libc::kill(pid, libc::SIGKILL);
+                                    }
+                                }
+                                let _ = child.kill().await;
+                                child::unregister_launch_root(pid as u32);
+                                return SpawnAttempt::err(
+                                    report,
+                                    WardenError::sandbox_setup(
+                                        crate::error::SandboxStage::Policy,
+                                        "sandbox.require_lifetime_boundary: \
+                                         private cgroup v2 adoption failed — \
+                                         no kernel-enforced descendant-lifetime \
+                                         boundary is available for this launch, \
+                                         so it is refused",
+                                    ),
+                                );
+                            }
                             SpawnAttempt::ok(
                                 report,
                                 RunningChild {
@@ -983,6 +1285,7 @@ impl Warden {
                                 }
                             }
                             let _ = child.kill().await;
+                            child::unregister_launch_root(pid as u32);
                             SpawnAttempt::err(report, e)
                         }
                     }
@@ -1164,6 +1467,11 @@ impl Warden {
             };
         }
 
+        // Every route reaching this point spawns a plain `Command`
+        // child with no kernel-enforced descendant-lifetime boundary —
+        // but `require_lifetime_boundary` does not gate it: an
+        // explicitly unsandboxed launch already waived every other
+        // enforcement, so the flag's scope is supervised launches only.
         let mut cmd = match program {
             Some(p) => {
                 #[allow(unused_mut)]
@@ -1179,20 +1487,40 @@ impl Warden {
         cmd.args(&argv[1..])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
+            // Same contract on the unsandboxed arm: attacker-controlled
+            // stderr crosses to the terminal sanitized.
+            .stderr(std::process::Stdio::piped());
         apply_spawn_env(&mut cmd, opts);
         #[cfg(target_os = "macos")]
         if let Some(exe) = python_executable_override(&argv[0], program) {
             cmd.env("PYTHONEXECUTABLE", exe);
         }
-        apply_unix_process_group_tokio(&mut cmd);
+        // `spawn_and_register` consumes the tag only on unix — the
+        // underscore keeps the unused binding quiet off unix.
+        let _launch_tag = apply_unix_process_group_tokio(&mut cmd);
+        // Same pre-spawn cgroup contract as the sync arm: the writer
+        // fd must exist before the hygiene snapshot so the child copy
+        // is sealed (dies at `execve`), and the join write runs in
+        // `pre_exec` — before the workload can fork — so no descendant
+        // is ever outside the subtree.
+        #[cfg(target_os = "linux")]
+        let lifetime_cgroup =
+            cgroup::LifetimeCgroup::create_with_writer("run").map(|(cg, writer)| {
+                // Same scope as the sync arm: the flag does not gate
+                // unsandboxed launches, so the join is best-effort —
+                // a failed write degrades to the lineage sweep.
+                cg.attach_join_tokio(&mut cmd, writer, false);
+                cg
+            });
         // fd hygiene + fd-exec handoff on the unsandboxed arm: no
         // sandbox does not mean the launcher's ambient descriptors
         // should leak — the child seals everything above stdio except
         // the fd-exec pins, which it uncloaks in the same pre_exec.
         #[cfg(unix)]
         let spawned = match attach_fd_hygiene_tokio(&mut cmd, &opts.exec_uncloak_fds) {
-            Ok(()) => cmd.spawn(),
+            Ok(()) => {
+                child::spawn_and_register(|| cmd.spawn(), |c| c.id().unwrap_or(0), _launch_tag)
+            }
             Err(e) => Err(e),
         };
         #[cfg(not(unix))]
@@ -1217,13 +1545,23 @@ impl Warden {
                         "failed to capture child stdout",
                     ))
                 });
+                if let Some(err) = child.stderr.take() {
+                    crate::termutil::relay_child_stderr(err);
+                }
                 match (stdin, stdout) {
                     (Ok(stdin), Ok(stdout)) => {
                         #[cfg(target_os = "linux")]
                         {
+                            // The pre-exec join already ran — verify
+                            // membership rather than trusting the hook;
+                            // a failed best-effort write reports
+                            // `skipped`, not a boundary that is absent.
                             let lifetime_cgroup =
-                                cgroup::LifetimeCgroup::try_adopt("run", child.id().unwrap_or(0));
-                            report.plan.grants.push(lifetime_grant(&lifetime_cgroup));
+                                lifetime_cgroup.filter(|cg| cg.member(child.id().unwrap_or(0)));
+                            report.plan.grants.push(lifetime_grant(
+                                &lifetime_cgroup,
+                                LifetimeGrantMode::Unconfined,
+                            ));
                             SpawnAttempt::ok(
                                 report,
                                 RunningChild {
@@ -1240,21 +1578,23 @@ impl Warden {
                             )
                         }
                         #[cfg(not(target_os = "linux"))]
-                        SpawnAttempt::ok(
-                            report,
-                            RunningChild {
-                                stdin: Some(Box::new(stdin)),
-                                stdout: Some(Box::new(stdout)),
-                                #[cfg(unix)]
-                                pgid: child.id().unwrap_or(0),
-                                #[cfg(unix)]
-                                reaped: false,
-                                unotify_listener: None,
-                                inner: RunningChildInner::Tokio(Box::new(child)),
-                                #[cfg(target_os = "macos")]
-                                _tmpdir: None,
-                            },
-                        )
+                        {
+                            SpawnAttempt::ok(
+                                report,
+                                RunningChild {
+                                    stdin: Some(Box::new(stdin)),
+                                    stdout: Some(Box::new(stdout)),
+                                    #[cfg(unix)]
+                                    pgid: child.id().unwrap_or(0),
+                                    #[cfg(unix)]
+                                    reaped: false,
+                                    unotify_listener: None,
+                                    inner: RunningChildInner::Tokio(Box::new(child)),
+                                    #[cfg(target_os = "macos")]
+                                    _tmpdir: None,
+                                },
+                            )
+                        }
                     }
                     (Err(e), _) | (_, Err(e)) => {
                         // A spawned child whose stdio we cannot capture
@@ -1275,6 +1615,36 @@ impl Warden {
                                     libc::kill(pid, libc::SIGKILL);
                                 }
                             }
+                            // Sync context: reap via raw waitpid so the
+                            // registration outlives the child's reap —
+                            // EINTR is retried (a caught signal mid-wait
+                            // is not a reap report) and ECHILD means
+                            // already collected. The `pid > 0` guard
+                            // doubles as the waitpid guard (pid 0 would
+                            // wait on any child in this process's own
+                            // group).
+                            // SAFETY: pid guarded > 0; null status is
+                            // allowed; only ever our own child.
+                            #[cfg(target_os = "linux")]
+                            if pid > 0 {
+                                loop {
+                                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                                    let ret =
+                                        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                                    if ret == pid {
+                                        break;
+                                    }
+                                    let err = std::io::Error::last_os_error().raw_os_error();
+                                    if err == Some(libc::EINTR) {
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            }
+                            // The launch never left the spawn boundary
+                            // — its registration must not outlive it.
+                            #[cfg(target_os = "linux")]
+                            child::unregister_launch_root(pid as u32);
                         }
                         let _ = child.start_kill();
                         SpawnAttempt::err(report, e)

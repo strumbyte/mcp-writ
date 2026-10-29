@@ -151,12 +151,18 @@ pub fn guard_stopped(
 /// (`sandbox.allow_degraded=#true` tolerates partial OS enforcement);
 /// its absence means the policy accepted no degraded state — a
 /// partially-enforced spawn refuses rather than degrades.
+/// `require_lifetime_boundary` records the waiver of the launch-shaping
+/// dial — the requirement defaults on (a supervised launch refuses
+/// without a kernel-enforced descendant boundary), so only an explicit
+/// `sandbox require_lifetime_boundary=#false` is noteworthy enough to
+/// leave on the record.
 pub fn policy_loaded(
     logger: &AuditLogger,
     ctx: &SessionAuditContext,
     version: u32,
     fail_on: &str,
     allow_degraded: bool,
+    require_lifetime_boundary: bool,
     source: &str,
 ) {
     let mut event = lifecycle_event(ctx, EventType::PolicyLoaded, Outcome::Success);
@@ -170,8 +176,13 @@ pub fn policy_loaded(
     } else {
         ""
     };
+    let boundary = if require_lifetime_boundary {
+        ""
+    } else {
+        " require_lifetime_boundary=false"
+    };
     event.details = Some(format!(
-        "version={version} hash={hash} fail_on={fail_on}{degraded} source={source} session_id={}",
+        "version={version} hash={hash} fail_on={fail_on}{degraded}{boundary} source={source} session_id={}",
         logger.session_id()
     ));
     logger.log(event);
@@ -349,8 +360,11 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn test_dir() -> PathBuf {
-        crate::testutil::real_tempdir().unwrap().keep()
+    /// `AuditLogger::to_file` refuses a replaceable parent — fixtures
+    /// must satisfy the sink's ancestry gate, so they live under
+    /// `restricted_tempdir` and skip when no restricted root exists.
+    fn test_dir() -> Option<PathBuf> {
+        crate::testutil::restricted_tempdir().map(|d| d.keep())
     }
 
     fn ctx_with_policy(policy_id: &str) -> SessionAuditContext {
@@ -378,7 +392,10 @@ mod tests {
     /// flushes the sink before returning.
     #[tokio::test]
     async fn teardown_emits_close_bracket_in_order() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
@@ -423,7 +440,10 @@ mod tests {
     /// identity label is not a server name.
     #[tokio::test]
     async fn default_policy_id_is_not_a_target_server() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("default");
@@ -442,7 +462,10 @@ mod tests {
     /// caller's session-level flags (sandbox bypass, dry-run).
     #[tokio::test]
     async fn guard_started_records_flags_and_identity() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
@@ -469,7 +492,10 @@ mod tests {
     /// context hash could not be computed.
     #[tokio::test]
     async fn policy_loaded_records_version_dial_and_source() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
@@ -480,6 +506,7 @@ mod tests {
             2,
             "none",
             false,
+            true,
             "/etc/mcp-secure/policy.kdl",
         );
         logger.shutdown().await.unwrap();
@@ -490,8 +517,37 @@ mod tests {
         assert!(content.contains("fail_on=none"), "got: {content}");
         assert!(content.contains("source=/etc/mcp-secure/policy.kdl"));
         assert!(content.contains(&format!("session_id={}", logger.session_id())));
-        // The default dial stays silent: only an opted-in weakening
-        // leaves a token on the record.
+        // The strict defaults stay silent: only an opted-in weakening
+        // or boundary waiver leaves a token on the record.
+        assert!(!content.contains("allow_degraded"), "got: {content}");
+        assert!(
+            !content.contains("require_lifetime_boundary"),
+            "got: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sandbox.require_lifetime_boundary=#false` waives the
+    /// launch-shaping dial — the record carries the waiver next to
+    /// `allow_degraded` so an unbounded launch never reads as bounded.
+    #[tokio::test]
+    async fn policy_loaded_records_lifetime_boundary_dial() {
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
+        let path = dir.join("audit.jsonl");
+        let logger = AuditLogger::to_file(&path).unwrap();
+        let ctx = ctx_with_policy("srv");
+
+        policy_loaded(&logger, &ctx, 1, "high", false, false, "default");
+        logger.shutdown().await.unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("require_lifetime_boundary=false"),
+            "got: {content}"
+        );
         assert!(!content.contains("allow_degraded"), "got: {content}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -501,12 +557,15 @@ mod tests {
     /// running under full configured control.
     #[tokio::test]
     async fn policy_loaded_records_allow_degraded_dial() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
 
-        policy_loaded(&logger, &ctx, 1, "high", true, "default");
+        policy_loaded(&logger, &ctx, 1, "high", true, false, "default");
         logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -518,7 +577,10 @@ mod tests {
     /// stage; a refused launch carries no `policy_*` fields.
     #[tokio::test]
     async fn policy_error_marks_stage_without_policy_context() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = SessionAuditContext::pre_policy(Uuid::now_v7(), "test-component");
@@ -540,7 +602,10 @@ mod tests {
     /// same correlation id, and the report's outcome words are reused.
     #[tokio::test]
     async fn session_bracket_shares_correlation_and_outcome() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
@@ -571,7 +636,10 @@ mod tests {
     /// the session sink would have used, under the launch correlation id.
     #[tokio::test]
     async fn prelaunch_abort_writes_policy_error_bracket() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let ctx = SessionAuditContext::pre_policy(Uuid::now_v7(), "test-component");
 
@@ -594,7 +662,10 @@ mod tests {
     /// the error — under the launch correlation either way.
     #[tokio::test]
     async fn audit_reopened_records_signal_and_outcome() {
-        let dir = test_dir();
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
         let path = dir.join("audit.jsonl");
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");

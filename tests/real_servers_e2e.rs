@@ -600,15 +600,14 @@ fn host_policy_base(base: &Path, version: u32, argv0: &str, extra_kdl: &str) -> 
         common::host_defaults_kdl(argv0),
         extra_kdl
     );
-    #[cfg(target_os = "linux")]
-    if common::linux_below_landlock_v4() {
-        // Kernel < 6.7 (e.g. WSL2's 5.15) supports only Landlock ABI V1, so
-        // the ruleset applies partially and a fail-closed spawn would refuse
-        // to launch. V1 still denies the read/write ops these stages
-        // exercise; CI (kernel >= 6.7) runs fully enforced. Recorded in
-        // docs/archive/stdio-hardening-results.ja.md.
-        out.push_str("sandbox allow_degraded=#true\n");
-    }
+    // Host waivers an operator would declare: kernel < 6.7 (e.g. WSL2's
+    // 5.15) enforces Landlock ABI V1 partially — `allow_degraded` keeps
+    // the launch (V1 still denies the ops these stages exercise) — and
+    // `require_lifetime_boundary` defaults on, so a host without a
+    // boundary mechanism needs that waiver too. CI (kernel >= 6.7)
+    // runs fully enforced. Recorded in
+    // docs/archive/stdio-hardening-results.ja.md.
+    out.push_str(&common::sandbox_waiver_node(""));
     out
 }
 

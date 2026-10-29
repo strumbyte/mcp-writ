@@ -87,6 +87,7 @@ async fn run_audit_lifecycle_brackets_session() {
         .arg("run")
         .args(&args)
         .env_remove("MCP_WRIT_SKIP_SANDBOX")
+        .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -313,6 +314,7 @@ async fn run_audit_skip_sandbox_is_recorded() {
             .arg("run")
             .args(&args)
             .env("MCP_WRIT_SKIP_SANDBOX", "1")
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -366,10 +368,9 @@ async fn run_audit_allow_degraded_is_recorded() {
     let policy_path = dir.path().join("policy.kdl");
     std::fs::write(
         &policy_path,
-        format!(
-            "{}\nsandbox allow_degraded=#true\n",
-            common::sandboxed_policy("", "")
-        ),
+        // Merged into one `sandbox` node — a standalone second node
+        // would be ignored by the parser.
+        common::sandboxed_policy_with_sandbox("", "", "allow_degraded=#true"),
     )
     .expect("write policy");
     let audit_log = dir.path().join("audit.jsonl");
@@ -391,6 +392,7 @@ async fn run_audit_allow_degraded_is_recorded() {
             .arg("run")
             .args(&args)
             .env_remove("MCP_WRIT_SKIP_SANDBOX")
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -440,6 +442,7 @@ async fn run_audit_fail_on_none_is_recorded() {
             .args(&args)
             .env_remove("MCP_WRIT_SKIP_SANDBOX")
             .env("MCP_WRIT_FAIL_ON", "none")
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

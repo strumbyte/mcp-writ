@@ -111,6 +111,10 @@ fn spawn_guard(policy: &Path, audit_log: &Path, argv: &[String], skip_sandbox: b
     } else {
         cmd.env_remove("MCP_WRIT_SKIP_SANDBOX");
     }
+    // Policy + audit fixtures under %TEMP% can be refused as
+    // replaceable, which is host-ACL dependent and not what these
+    // diagnostics exercise.
+    cmd.env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1");
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -456,6 +460,7 @@ async fn spawn_failure_is_audited_as_server_error_and_off_stdout() {
             non_exe.to_str().expect("non-exe path utf-8"),
         ])
         .env("MCP_WRIT_SKIP_SANDBOX", "1")
+        .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

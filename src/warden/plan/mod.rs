@@ -468,6 +468,18 @@ pub(super) fn build_plan(
                 .to_string(),
         );
     }
+    if policy.sandbox.require_lifetime_boundary {
+        limitations.push(
+            "sandbox.require_lifetime_boundary (default on): supervised launches \
+             refuse unless a kernel-enforced descendant-lifetime boundary is \
+             established — satisfied by a private cgroup v2 or the namespaced \
+             PID namespace on Linux and by the mandatory job object on Windows; \
+             platforms with no such mechanism refuse. `=#false` is the explicit \
+             waiver, and unsandboxed launches (dry-run/skip) are outside the \
+             flag's scope and run best-effort"
+                .to_string(),
+        );
+    }
     let grants;
     match sandbox_skip {
         Some(reason) => {
@@ -521,6 +533,15 @@ pub(super) fn build_plan_namespaced(
             "Ambient environment inheritance is enabled (`environment { inherit-parent \
              #true }`): the child receives every launcher variable — secrets in the \
              launcher's environment reach the workload."
+                .to_string(),
+        );
+    }
+    if policy.sandbox.require_lifetime_boundary {
+        limitations.push(
+            "sandbox.require_lifetime_boundary (default on): satisfied here — \
+             the namespaced launch's own PID namespace is the boundary: \
+             ns-init's death kills every member, so detached descendants \
+             cannot outlive the session"
                 .to_string(),
         );
     }

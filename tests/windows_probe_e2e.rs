@@ -81,14 +81,20 @@ fn compiled_stub() -> Option<PathBuf> {
 /// the CLI names the probes resolve. `tools` names the *installed*
 /// CLIs — an env override pointing at a missing file reads as absent,
 /// which is how "not installed" stays deterministic on every host.
-fn scenario_dir(stub: &Path, scenario: &str, tools: &[&str]) -> TempDir {
-    let dir = tempfile::tempdir().expect("scenario tempdir");
+fn scenario_dir(stub: &Path, scenario: &str, tools: &[&str]) -> Option<TempDir> {
+    // The `MCP_WRIT_*_EXE` overrides bind each stub at the Caller trust
+    // class, which still walks every ancestor — under a shared %TEMP%
+    // whose ACL grants another principal replace access the stubs
+    // resolve as untrusted and the probes read as absent. Root the
+    // scenario under a write-restricted base; `None` when the host has
+    // none (callers take the e2e skip path).
+    let dir = common::restricted_tempdir()?;
     std::fs::write(dir.path().join("scenario.txt"), scenario).expect("write scenario");
     for tool in tools {
         std::fs::copy(stub, dir.path().join(format!("{tool}.exe")))
             .unwrap_or_else(|e| panic!("copy stub as {tool}.exe: {e}"));
     }
-    dir
+    Some(dir)
 }
 
 fn write_policy(dir: &TempDir) -> PathBuf {
@@ -116,6 +122,12 @@ async fn plan_wslc(scenario: &TempDir, policy: &Path) -> std::process::Output {
     .env("MCP_WRIT_WSLC_EXE", scenario.path().join("wslc.exe"))
     .env("MCP_WRIT_REG_EXE", scenario.path().join("reg.exe"))
     .env("MCP_WRIT_PWSH_EXE", scenario.path().join("powershell.exe"))
+    // Scenario/policy fixtures under %TEMP% can fail the trusted-path
+    // gates (driver overrides and the policy source alike) on hosts
+    // whose temp ACL grants another principal replace access —
+    // host-ACL dependent, not what the probe diagnostics exercise.
+    .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
+    .env("MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS", "1")
     .env_remove("MCP_WRIT_SKIP_SANDBOX")
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
@@ -144,6 +156,8 @@ async fn plan_wsb_fail_on(
         "server.exe",
     ])
     .env("MCP_WRIT_PWSH_EXE", scenario.path().join("powershell.exe"))
+    .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
+    .env("MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS", "1")
     .env_remove("MCP_WRIT_SKIP_SANDBOX")
     .env_remove("MCP_WRIT_FAIL_ON")
     .stdin(Stdio::null())
@@ -363,7 +377,10 @@ async fn wslc_plan_records_environment_and_refuses_launch() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, GOOD, &["wsl", "wslc", "reg", "powershell"]);
+    let Some(scenario) = scenario_dir(&stub, GOOD, &["wsl", "wslc", "reg", "powershell"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -470,7 +487,10 @@ async fn wslc_plan_legacy_wsl_fails_product_version() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, OLD_WSL, &["wsl"]);
+    let Some(scenario) = scenario_dir(&stub, OLD_WSL, &["wsl"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -503,7 +523,10 @@ async fn wslc_plan_below_floor_wsl_is_blocked() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, BELOW_FLOOR, &["wsl"]);
+    let Some(scenario) = scenario_dir(&stub, BELOW_FLOOR, &["wsl"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -527,7 +550,10 @@ async fn wslc_plan_missing_wslc_binary_fails_wslc_cli() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, NO_WSLC, &["wsl"]);
+    let Some(scenario) = scenario_dir(&stub, NO_WSLC, &["wsl"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -550,7 +576,10 @@ async fn wslc_plan_disabled_feature_reports_not_enabled() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, DISABLED, &["wsl", "wslc"]);
+    let Some(scenario) = scenario_dir(&stub, DISABLED, &["wsl", "wslc"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -573,7 +602,10 @@ async fn wslc_plan_unknown_version_fails_closed() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, UNKNOWN_VERSION, &["wsl", "wslc"]);
+    let Some(scenario) = scenario_dir(&stub, UNKNOWN_VERSION, &["wsl", "wslc"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -603,7 +635,10 @@ async fn wslc_plan_utf16_output_parses() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, UTF16, &["wsl", "wslc"]);
+    let Some(scenario) = scenario_dir(&stub, UTF16, &["wsl", "wslc"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -626,7 +661,10 @@ async fn wslc_plan_flooding_output_reports_limit_not_timeout() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, FLOOD, &["wsl"]);
+    let Some(scenario) = scenario_dir(&stub, FLOOD, &["wsl"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -656,7 +694,10 @@ async fn native_plan_never_invokes_windows_probes() {
         return;
     };
     // All four CLIs "installed" — if any probe ran, calls.txt appears.
-    let scenario = scenario_dir(&stub, GOOD, &["wsl", "wslc", "reg", "powershell"]);
+    let Some(scenario) = scenario_dir(&stub, GOOD, &["wsl", "wslc", "reg", "powershell"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -675,6 +716,8 @@ async fn native_plan_never_invokes_windows_probes() {
             .env("MCP_WRIT_WSLC_EXE", scenario.path().join("wslc.exe"))
             .env("MCP_WRIT_REG_EXE", scenario.path().join("reg.exe"))
             .env("MCP_WRIT_PWSH_EXE", scenario.path().join("powershell.exe"))
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS", "1")
             .env_remove("MCP_WRIT_SKIP_SANDBOX")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -704,7 +747,10 @@ async fn windows_sandbox_plan_records_store_package_version() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, GOOD, &["powershell"]);
+    let Some(scenario) = scenario_dir(&stub, GOOD, &["powershell"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -721,6 +767,8 @@ async fn windows_sandbox_plan_records_store_package_version() {
                 "server.exe",
             ])
             .env("MCP_WRIT_PWSH_EXE", scenario.path().join("powershell.exe"))
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS", "1")
             .env_remove("MCP_WRIT_SKIP_SANDBOX")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -749,7 +797,10 @@ async fn windows_sandbox_plan_records_fail_on_dial() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, GOOD, &["powershell"]);
+    let Some(scenario) = scenario_dir(&stub, GOOD, &["powershell"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -776,7 +827,10 @@ async fn wslc_plan_zero_distros_reads_as_none_registered() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, ZERO_DISTROS, &["wsl", "wslc"]);
+    let Some(scenario) = scenario_dir(&stub, ZERO_DISTROS, &["wsl", "wslc"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -798,7 +852,10 @@ async fn wslc_plan_unparseable_distro_rows_warns() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, UNPARSEABLE_LIST, &["wsl", "wslc"]);
+    let Some(scenario) = scenario_dir(&stub, UNPARSEABLE_LIST, &["wsl", "wslc"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 
@@ -819,7 +876,10 @@ async fn wslc_plan_stdout_error_detail_surfaces() {
     let Some(stub) = compiled_stub() else {
         return;
     };
-    let scenario = scenario_dir(&stub, STDOUT_ERROR, &["wsl"]);
+    let Some(scenario) = scenario_dir(&stub, STDOUT_ERROR, &["wsl"]) else {
+        common::skip_e2e_test("no write-restricted fixture root for probe stubs");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let policy = write_policy(&dir);
 

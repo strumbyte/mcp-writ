@@ -1,5 +1,4 @@
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
@@ -8,6 +7,7 @@ mod emit;
 mod event;
 mod sink_guard;
 mod sink_open;
+mod writer;
 
 use emit::generate_session_id;
 pub use emit::{now_iso8601, now_iso8601_millis, write_event_jsonl};
@@ -20,6 +20,7 @@ pub use sink_guard::{
     audit_sink_write_conflict, policy_source_write_conflict, report_write_conflict,
     snapshot_write_conflict,
 };
+use writer::{SinkAnchor, file_writer_task, tracing_writer_task};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // AuditLogger (mpsc channel + dedicated writer task)
@@ -192,8 +193,10 @@ impl AuditLogger {
         // to owner-only access. For a file this call creates, the
         // returned parent-directory handle is the fsync anchor — the
         // directory entry must be durable before the first completion
-        // notification or a crash could lose the whole log.
-        let sink_open::OpenedSink { file, dir } = sink_open::open_audit_sink(path)?;
+        // notification or a crash could lose the whole log — and the
+        // leaf name lets the writer re-verify the entry still names
+        // the opened object before committing acknowledgments.
+        let sink_open::OpenedSink { file, dir, leaf } = sink_open::open_audit_sink(path)?;
         let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (reopen_tx, reopen_rx) = mpsc::channel(REOPEN_QUEUE_CAPACITY);
@@ -203,7 +206,7 @@ impl AuditLogger {
             rx,
             writer,
             writer_failed.clone(),
-            dir,
+            SinkAnchor { dir, leaf },
             sync_mode,
             path.to_path_buf(),
             reopen_rx,
@@ -646,318 +649,5 @@ impl Drop for AuditLoggerInner {
         }
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Writer Tasks
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// fsync the directory handle a freshly created log's entry lives in —
-/// the file's own `sync_all` commits its data but not the directory
-/// entry naming it, so a crash between create and commit could lose the
-/// whole file. `None` means either a pre-existing file (its entry is
-/// already durable) or a platform with no directory-fsync boundary —
-/// Windows commits the entry through the file's own flush, so the sink
-/// open hands no handle over.
-fn sync_audit_dir(dir: Option<&std::fs::File>) -> std::io::Result<()> {
-    let Some(dir) = dir else { return Ok(()) };
-    dir.sync_all()
-}
-
-/// The reopen sequence behind signal-driven rotation: the buffered
-/// tail must be durable in the *old* file before the handle is
-/// swapped, so the flush and fsync run while `writer` still names the
-/// previous object. The path is then re-opened through the same
-/// trust-boundary `open_audit_sink` the launch used — a link planted
-/// since launch, a non-regular leaf, or a file a rotator recreated
-/// under another uid fails the reopen exactly as it would have failed
-/// the launch. The swap itself happens as soon as the new handle is
-/// verified — a failed directory-entry fsync afterwards still reports
-/// `Err`, but records keep reaching the correctly named file.
-fn reopen_sink(
-    writer: &mut std::io::BufWriter<std::fs::File>,
-    path: &Path,
-    new_file_dir: &mut Option<std::fs::File>,
-    dir_synced: &mut bool,
-) -> std::io::Result<()> {
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-    // A launch-created log whose directory entry is still unsynced is
-    // synced before the swap — after the handle is released the entry
-    // must already be durable, or a crash could lose the rotated file
-    // the reopen was meant to preserve.
-    if !*dir_synced {
-        sync_audit_dir(new_file_dir.as_ref())?;
-        *dir_synced = true;
-    }
-    let sink_open::OpenedSink { file, dir } = sink_open::open_audit_sink(path)?;
-    *writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
-    // A freshly created rotated file's directory entry needs the same
-    // one-time fsync a launch-time create does — done here, in the
-    // reopen path, so the `audit.reopened` marker that follows can
-    // never outrun its own entry. The handle replaces the retired
-    // anchor so a failed sync can still be retried by the periodic
-    // arm — `dir_synced` now tracks the *new* entry's durability.
-    *new_file_dir = dir;
-    match sync_audit_dir(new_file_dir.as_ref()) {
-        Ok(()) => {
-            *dir_synced = true;
-            Ok(())
-        }
-        Err(e) => {
-            *dir_synced = false;
-            Err(e)
-        }
-    }
-}
-
-async fn file_writer_task(
-    mut rx: mpsc::Receiver<AuditItem>,
-    mut writer: std::io::BufWriter<std::fs::File>,
-    writer_failed: FailureFlag,
-    mut new_file_dir: Option<std::fs::File>,
-    sync_mode: AuditSyncMode,
-    audit_path: PathBuf,
-    mut reopen_rx: mpsc::Receiver<ReopenRequest>,
-) {
-    // Only a newly created file needs its directory entry fsynced —
-    // once, before the first completion notification.
-    let mut dir_synced = new_file_dir.is_none();
-    // A closed reopen channel (every sender gone) parks the arm — a
-    // `None` recv must not spin the loop.
-    let mut reopen_open = true;
-    let mut events_since_flush: u32 = 0;
-    let mut flush_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    let mut fsync_interval = tokio::time::interval(std::time::Duration::from_secs(5));
-
-    // Consume initial ticks (tokio intervals fire immediately on first tick)
-    flush_interval.tick().await;
-    fsync_interval.tick().await;
-
-    loop {
-        tokio::select! {
-            biased;
-
-            event = rx.recv() => {
-                match event {
-                    Some((evt, ack, _permit)) => {
-                        // A record skips the buffered tail when a caller
-                        // waits on its durability (the fail-closed ack),
-                        // when `--audit-sync` syncs every record, or when
-                        // its severity reaches IMMEDIATE_SYNC_SEVERITY —
-                        // a denial or failure is exactly the evidence a
-                        // forced kill most wants to shed.
-                        let must_sync = ack.is_some()
-                            || matches!(sync_mode, AuditSyncMode::EveryEvent)
-                            || evt.severity >= IMMEDIATE_SYNC_SEVERITY;
-                        let json = write_event_jsonl(&evt);
-                        // A failed write gates the durable path below:
-                        // the record may never have reached the buffer,
-                        // so a later successful flush must not be
-                        // reported as its ack.
-                        // One `write_all` per record: `writeln!`'s
-                        // multi-`write_str` calls could straddle a
-                        // buffer flush boundary and leave a partial
-                        // line in the file — a concurrent reader must
-                        // only ever see whole records.
-                        let mut ok = true;
-                        let mut line = json;
-                        line.push('\n');
-                        if let Err(e) = writer.write_all(line.as_bytes()) {
-                            tracing::error!("Audit log write failed: {e}");
-                            writer_failed.set();
-                            ok = false;
-                        }
-                        events_since_flush += 1;
-
-                        if must_sync {
-                            // The durable path: flush the buffer, fsync
-                            // the file, then — for a freshly created log
-                            // — fsync the parent so the directory entry
-                            // survives a crash too.
-                            if let Err(e) = writer.flush() {
-                                tracing::error!("Audit log sync flush failed: {e}");
-                                writer_failed.set();
-                                ok = false;
-                            }
-                            events_since_flush = 0;
-                            if ok && let Err(e) = writer.get_ref().sync_all() {
-                                tracing::error!("Audit log sync fsync failed: {e}");
-                                writer_failed.set();
-                                ok = false;
-                            }
-                            // The record is durable only once the parent
-                            // directory entry is too — a failure is an
-                            // audit error, not an ack.
-                            if ok && !dir_synced {
-                                match sync_audit_dir(new_file_dir.as_ref()) {
-                                    Ok(()) => dir_synced = true,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Audit log directory sync failed: {e}"
-                                        );
-                                        writer_failed.set();
-                                        ok = false;
-                                    }
-                                }
-                            }
-                            // A dropped receiver is the ack for failure —
-                            // never signal success on a failed write.
-                            if ok && let Some(ack) = ack {
-                                let _ = ack.send(());
-                            }
-                        } else if events_since_flush >= FLUSH_EVENT_THRESHOLD {
-                            if let Err(e) = writer.flush() {
-                                tracing::error!("Audit log flush failed: {e}");
-                                writer_failed.set();
-                            }
-                            events_since_flush = 0;
-                        }
-                    }
-                    None => {
-                        if let Err(e) = writer.flush() {
-                            tracing::error!("Audit log final flush failed: {e}");
-                            writer_failed.set();
-                        }
-                        if let Err(e) = writer.get_ref().sync_all() {
-                            tracing::error!("Audit log final sync failed: {e}");
-                            writer_failed.set();
-                        }
-                        if !dir_synced
-                            && let Err(e) = sync_audit_dir(new_file_dir.as_ref())
-                        {
-                            tracing::error!("Audit log directory sync failed: {e}");
-                            writer_failed.set();
-                        }
-                        return;
-                    }
-                }
-            }
-            // The record arm is polled first under `biased`, so every
-            // event queued ahead of a pending request is already
-            // written to the old file — rotation can never interleave
-            // a pre-signal record into the new file.
-            req = reopen_rx.recv(), if reopen_open => {
-                match req {
-                    Some(ReopenRequest { reply, marker }) => {
-                        let result = reopen_sink(
-                            &mut writer,
-                            &audit_path,
-                            &mut new_file_dir,
-                            &mut dir_synced,
-                        );
-                        if let Err(e) = &result {
-                            tracing::error!("Audit log reopen failed: {e}");
-                            writer_failed.set();
-                        } else {
-                            tracing::info!("Audit log reopened at {}", audit_path.display());
-                        }
-                        // The rotation marker is written in-band, ahead
-                        // of any record a relay may have queued while
-                        // the reopen ran — on success it is the first
-                        // record of the new file; on failure it lands
-                        // on whatever handle survived (the old sink, or
-                        // the swapped-in one when the dir fsync failed
-                        // post-swap). Synced before the reply so an
-                        // acknowledged reopen means the evidence is
-                        // durable, not merely buffered — a marker that
-                        // cannot be persisted fails the reply too.
-                        let mut evt =
-                            marker(result.as_ref().err().map(|e| e.to_string()));
-                        evt.bound_wire_fields();
-                        let mut line = write_event_jsonl(&evt);
-                        line.push('\n');
-                        let mut marker_result = Ok(());
-                        if let Err(e) = writer.write_all(line.as_bytes()) {
-                            tracing::error!("Audit log reopen marker write failed: {e}");
-                            writer_failed.set();
-                            marker_result = Err(e);
-                        }
-                        events_since_flush = 0;
-                        if marker_result.is_ok()
-                            && let Err(e) = writer.flush()
-                        {
-                            tracing::error!("Audit log reopen marker flush failed: {e}");
-                            writer_failed.set();
-                            marker_result = Err(e);
-                        }
-                        if marker_result.is_ok()
-                            && let Err(e) = writer.get_ref().sync_all()
-                        {
-                            tracing::error!("Audit log reopen marker fsync failed: {e}");
-                            writer_failed.set();
-                            marker_result = Err(e);
-                        }
-                        if marker_result.is_ok() && !dir_synced {
-                            match sync_audit_dir(new_file_dir.as_ref()) {
-                                Ok(()) => dir_synced = true,
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Audit log directory sync failed: {e}"
-                                    );
-                                    writer_failed.set();
-                                    marker_result = Err(e);
-                                }
-                            }
-                        }
-                        // `and` keeps the reopen_sink error primary —
-                        // when both fail, the caller hears why the path
-                        // could not be re-opened, not the secondary
-                        // marker fault on the surviving handle.
-                        let _ = reply.send(result.and(marker_result));
-                    }
-                    None => reopen_open = false,
-                }
-            }
-            _ = flush_interval.tick() => {
-                if events_since_flush > 0 {
-                    if let Err(e) = writer.flush() {
-                        tracing::error!("Audit log periodic flush failed: {e}");
-                        writer_failed.set();
-                    }
-                    events_since_flush = 0;
-                }
-            }
-            _ = fsync_interval.tick() => {
-                if let Err(e) = writer.get_ref().sync_all() {
-                    tracing::error!("Audit log fsync failed: {e}");
-                    writer_failed.set();
-                }
-                if !dir_synced {
-                    match sync_audit_dir(new_file_dir.as_ref()) {
-                        Ok(()) => dir_synced = true,
-                        Err(e) => {
-                            tracing::error!("Audit log directory sync failed: {e}");
-                            writer_failed.set();
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn tracing_writer_task(mut rx: mpsc::Receiver<AuditItem>, sink_durable: bool) {
-    while let Some((evt, ack, _permit)) = rx.recv().await {
-        let json = write_event_jsonl(&evt);
-        match evt.severity {
-            Severity::Critical | Severity::High => {
-                tracing::error!(target: "audit", "{}", json);
-            }
-            Severity::Medium => {
-                tracing::warn!(target: "audit", "{}", json);
-            }
-            Severity::Low | Severity::Info => {
-                tracing::info!(target: "audit", "{}", json);
-            }
-        }
-        // stderr delivery is no durability proof — a fail-closed sink
-        // (`sink_durable == false`) drops the completion instead of
-        // acknowledging it, so the waiter fails closed.
-        if sink_durable && let Some(ack) = ack {
-            let _ = ack.send(());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests;

@@ -12,15 +12,25 @@
 //! escapes `kill(-pgid)`.
 //!
 //! Creating the subtree needs write access to the v2 hierarchy (a
-//! delegated subtree or privilege); [`LifetimeCgroup::try_adopt`]
+//! delegated subtree or privilege); [`LifetimeCgroup::create_with_writer`]
 //! returns `None` when the hierarchy is absent or unwritable, and the
-//! caller falls back to the process-group + `/proc` sweep. That
-//! fallback cannot reach a descendant that already left the group and
-//! reparented — the residual is recorded on the launch report's
-//! `process_lifetime` grant entry.
+//! caller falls back to the process-group + `/proc` sweep. Adoption
+//! happens *in the child*: a `pre_exec` hook writes the child's own
+//! pid into `cgroup.procs` before `execve` — membership can never be
+//! outrun by an early `fork`, which the post-spawn `try_adopt` write
+//! allowed. The parent verifies the join via `/proc/<pid>/cgroup`
+//! ([`LifetimeCgroup::member`]); a failed best-effort join degrades to
+//! the fallback with an honest `skipped` grant, while
+//! `sandbox.require_lifetime_boundary` makes a failed or impossible
+//! join refuse the launch. The fallback still names a reparented
+//! descendant while it carries the launch's lineage marker; the
+//! descendant that escapes it must leave the group, rewrite the
+//! marker, and reparent — the residual is recorded on the launch
+//! report's `process_lifetime` grant entry.
 
 use std::fs::File;
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// cgroup v2 root the private cgroup is created under.
@@ -65,6 +75,66 @@ pub(crate) fn cgroup_body_covers(dir: &Path, root: &str, body: &str) -> bool {
     })
 }
 
+/// Fail-closed overlap check between the policy's effective fs write
+/// grants and the cgroup v2 hierarchy the private cgroup lives under.
+///
+/// A workload that can write `cgroup.procs` of a cgroup outside its
+/// private subtree (`/sys/fs/cgroup` or an ancestor — `/sys`, `/`, or
+/// any covering glob) migrates itself or a child out of the armed
+/// boundary entirely. Any grant spelling covering the v2 root — or
+/// inside it, where it could still name `cgroup.procs` or
+/// `cgroup.subtree_control` of a sibling branch — conflicts. A
+/// root-glob spelling (`/*`, `/**`) reduces to an empty base every
+/// grant builder skips — it grants nothing and is skipped here too.
+/// Any other unresolvable spelling conflicts: "cannot prove disjoint"
+/// stays on the refuse side.
+///
+/// `write_grants` is the workload's effective write-grant spellings
+/// (`Policy::write_grant_spellings`), enumerated by the caller so this
+/// leaf does not depend on `policy` — the same leaf shape
+/// `audit_log::sink_guard` uses. `escape_effect` names what the
+/// boundary migration would break on the caller's route (e.g. "shed
+/// the connect hooks" on `ebpf-run`, "escape the descendant-lifetime
+/// boundary" on ordinary launches).
+pub fn cgroup_write_grant_conflict(
+    write_grants: impl IntoIterator<Item = String>,
+    escape_effect: &str,
+) -> Option<String> {
+    let root = match crate::fsoverlap::resolve_grant_spelling(CGROUP_ROOT) {
+        Some(r) => r,
+        None => {
+            return Some(format!("cannot resolve the cgroup v2 root '{CGROUP_ROOT}'"));
+        }
+    };
+    for grant in write_grants {
+        match crate::fsoverlap::resolve_grant_spelling(&grant) {
+            Some(g) => {
+                if crate::fsoverlap::path_covers(&g, &root)
+                    || crate::fsoverlap::path_covers(&root, &g)
+                {
+                    return Some(format!(
+                        "fs write grant '{grant}' (resolves to '{}') overlaps the cgroup v2 \
+                         hierarchy at '{}' — a workload could move itself out of the \
+                         enforced cgroup and {escape_effect}",
+                        g.display(),
+                        root.display()
+                    ));
+                }
+            }
+            None => {
+                if crate::fsoverlap::reduces_to_empty_base(&grant) {
+                    continue;
+                }
+                return Some(format!(
+                    "fs write grant '{grant}' cannot be resolved against the cgroup v2 \
+                     hierarchy — refusing rather than assuming disjoint"
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn mono_nanos() -> u64 {
     let mut t = libc::timespec {
         tv_sec: 0,
@@ -95,6 +165,98 @@ impl LifetimeCgroup {
     /// pre_exec cooperation needed.
     pub(crate) fn adopt(&self, pid: u32) -> io::Result<()> {
         std::fs::write(self.dir.join("cgroup.procs"), pid.to_string())
+    }
+
+    /// Create the private cgroup *before* spawn and return it with a
+    /// pre-opened `cgroup.procs` write fd — the hand-off for in-child
+    /// adoption (see [`Self::attach_join`] / `cgroup_procs` in
+    /// `linux_spawn`). `None` when the v2 hierarchy is absent or
+    /// unwritable: the caller falls back to the best-effort sweep.
+    ///
+    /// This closes the window the parent-side [`Self::try_adopt`]
+    /// leaves open: a child writes its own pid in `pre_exec`, before
+    /// `execve` runs the workload's first instruction, so no descendant
+    /// can ever exist outside the subtree.
+    pub(crate) fn create_with_writer(tag: &str) -> Option<(Self, File)> {
+        if !Path::new(CGROUP_ROOT).join("cgroup.controllers").exists() {
+            return None;
+        }
+        let cg = Self::create(tag).ok()?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .open(cg.dir.join("cgroup.procs"))
+        {
+            Ok(w) => Some((cg, w)),
+            Err(_) => {
+                // The drop-side rmdir removes the unused dir.
+                None
+            }
+        }
+    }
+
+    /// Whether `pid` currently sits inside this cgroup subtree —
+    /// the post-spawn verification that the child's pre-exec join
+    /// write actually landed. Reads `/proc/<pid>/cgroup`, same shape
+    /// as [`CgroupView::pid_is_member`].
+    pub(crate) fn member(&self, pid: u32) -> bool {
+        let Ok(body) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+            return false;
+        };
+        cgroup_body_covers(&self.dir, CGROUP_ROOT, &body)
+    }
+
+    /// Attach a `pre_exec` hook that moves the child into this cgroup
+    /// before `execve` — the unsandboxed-route counterpart of the
+    /// sandbox bits' `cgroup_procs` stage. `writer` is the
+    /// [`Self::create_with_writer`] fd; `required` selects the failure
+    /// contract: a failed join aborts the spawn under a policy that
+    /// requires the boundary, and otherwise yields to the post-spawn
+    /// [`Self::member`] check, which reports the unadopted launch
+    /// honestly (`skipped` grant + fallback sweep).
+    ///
+    /// The `writer` fd must already exist when the arm's fd-hygiene
+    /// snapshot runs so the child copy is CLOEXEC-sealed — it stays
+    /// writable for the join and dies at `execve` (the workload must
+    /// never inherit a `cgroup.procs` write fd).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn attach_join(
+        &self,
+        cmd: &mut std::process::Command,
+        writer: File,
+        required: bool,
+    ) {
+        use std::os::unix::process::CommandExt;
+        // Safety: the closure performs a single `write(2)` on a live
+        // fd and returns a Result — async-signal-safe, no heap.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            cmd.pre_exec(
+                move || match super::linux_spawn::write_self_pid(writer.as_raw_fd()) {
+                    Err(e) if required => Err(e),
+                    _ => Ok(()),
+                },
+            );
+        }
+    }
+
+    /// Tokio variant of [`Self::attach_join`].
+    #[cfg(target_os = "linux")]
+    pub(crate) fn attach_join_tokio(
+        &self,
+        cmd: &mut tokio::process::Command,
+        writer: File,
+        required: bool,
+    ) {
+        // Safety: same contract as `attach_join`.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            cmd.pre_exec(
+                move || match super::linux_spawn::write_self_pid(writer.as_raw_fd()) {
+                    Err(e) if required => Err(e),
+                    _ => Ok(()),
+                },
+            );
+        }
     }
 
     /// Create a private cgroup and move `pid` into it, or `None` when
@@ -252,5 +414,87 @@ impl Drop for LifetimeCgroup {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grants(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn grant_covering_the_hierarchy_root_conflicts() {
+        // Write access to the v2 root itself names every
+        // `cgroup.procs` — including a parent's — so the workload can
+        // migrate itself out of its private subtree.
+        for spelling in ["/sys/fs/cgroup", "/sys", "/"] {
+            let conflict = cgroup_write_grant_conflict(grants(&[spelling]), "test escape");
+            assert!(
+                conflict.is_some(),
+                "grant '{spelling}' covering the hierarchy must conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_inside_the_hierarchy_conflicts() {
+        // A grant *under* the root reaches a sibling branch's
+        // `cgroup.procs` / `cgroup.subtree_control` just as surely as
+        // a covering grant does.
+        for spelling in [
+            "/sys/fs/cgroup/user.slice",
+            "/sys/fs/cgroup/mcp-writ-other-1",
+        ] {
+            let conflict = cgroup_write_grant_conflict(grants(&[spelling]), "test escape");
+            assert!(
+                conflict.is_some(),
+                "grant '{spelling}' inside the hierarchy must conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn disjoint_grant_is_clean() {
+        let conflict = cgroup_write_grant_conflict(
+            grants(&["/nonexistent-mcp-writ-test-workdir"]),
+            "test escape",
+        );
+        assert!(conflict.is_none());
+    }
+
+    #[test]
+    fn root_glob_grants_nothing_and_stays_clean() {
+        // `/*`, `/**` reduce to an empty base every grant builder
+        // skips — they must not trip the conflict check.
+        for spelling in ["/*", "/**", "/*/*"] {
+            let conflict = cgroup_write_grant_conflict(grants(&[spelling]), "test escape");
+            assert!(
+                conflict.is_none(),
+                "root glob '{spelling}' grants nothing and must not conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolvable_spelling_stays_on_the_refuse_side() {
+        // A mid-path wildcard cannot be proven disjoint from the
+        // hierarchy — the conflict check refuses rather than assume.
+        let conflict = cgroup_write_grant_conflict(grants(&["/sys/*/grant"]), "test escape");
+        assert!(conflict.is_some());
+    }
+
+    #[test]
+    fn empty_grant_list_never_conflicts() {
+        assert!(cgroup_write_grant_conflict(Vec::new(), "test escape").is_none());
+    }
+
+    #[test]
+    fn conflict_message_names_the_escape_effect() {
+        let conflict = cgroup_write_grant_conflict(grants(&["/sys"]), "shed the connect hooks")
+            .expect("a covering grant must conflict");
+        assert!(conflict.contains("shed the connect hooks"));
     }
 }

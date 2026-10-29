@@ -91,6 +91,7 @@ included), and a matching `when` block applies last. When a merge
 leaves a fail-secure setting weaker than the posture already
 established — `confused_deputy_protection`, `trajectory`, a
 non-default `logging level` or `fail_closed`, `sandbox allow_degraded`,
+`sandbox require_lifetime_boundary` dropped back off,
 `secret-overlay`, the `deny host="*"` outbound posture, an `inbound`
 listener grant, or the `environment` restriction — the loader prints a
 `Warning:` line naming the file whose declarations weakened it, so an

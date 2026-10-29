@@ -71,6 +71,22 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
             std::process::exit(1);
         }
     };
+    // A policy source a lower-trust principal could swap or rewrite
+    // grants name-layer authority the operator never reviewed —
+    // require trusted (owned, write-restricted, replacement-resistant)
+    // paths for the root document and every file it reached.
+    if let Err(e) = crate::policy::loader::require_trusted_policy_sources(&policy) {
+        let detail = format!("refusing launch: {e}");
+        eprintln!("Error: {detail}");
+        lifecycle::prelaunch_abort(
+            args.audit_log.as_deref(),
+            &session_audit,
+            Some("load"),
+            &detail,
+        )
+        .await;
+        std::process::exit(1);
+    }
     let policy = match policy.bind_to_server(args.server.as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -176,6 +192,7 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
         policy.version,
         fail_on.as_str(),
         policy.sandbox.allow_degraded,
+        policy.sandbox.require_lifetime_boundary,
         &args
             .policy
             .as_ref()

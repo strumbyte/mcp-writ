@@ -103,6 +103,13 @@ Channel discipline, matching the runner's existing contract:
   on the RW share via the runner's own `MCP_WRIT_REPORT_OUT` /
   `MCP_WRIT_AUDIT_DIR` channel variables — the same variables the
   Hyper-V validation uses.
+- **Share roots** → the agent also sets `MCP_WRIT_SHARE_ROOTS` for the
+  runner: the guest-visible roots that are host-mediated (the two
+  mapped folders, plus each configured dir's drive root inside the
+  sandbox). The runner registers them so the authorization ancestry
+  check treats paths beneath as boundary-stable — a mapped folder
+  always reports as replaceable in-guest, and only the host can
+  retarget it. The variable is stripped before the workload spawns.
 
 ## Wire protocol (v1)
 

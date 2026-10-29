@@ -82,6 +82,11 @@ pub fn spawn_guard_with_args(
     cmd.arg("--");
     cmd.args(argv)
         .env("MCP_WRIT_SKIP_SANDBOX", "1")
+        // Fixture policy/audit paths under %TEMP% can fail the
+        // replaceable-ancestry gate on hosts whose temp ACL grants
+        // another principal replace access — host-ACL dependent, not
+        // what these wire tests exercise.
+        .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

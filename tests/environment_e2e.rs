@@ -108,6 +108,11 @@ fn spawn_guard(
     cwd: Option<&Path>,
 ) -> tokio::process::Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
+    // Policy + audit fixtures under %TEMP% can be refused as
+    // replaceable, which is host-ACL dependent and not what these
+    // tests exercise — set the opt-out as a default so an explicit
+    // `extra_env` entry can still override it.
+    cmd.env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1");
     cmd.args([
         "run",
         "--transport",
@@ -653,13 +658,12 @@ async fn environment_applies_under_sandbox() {
     let mut policy_text = format!(
         "policy version=1\n{defaults}logging level=\"info\" fail_closed=#false\nserver \"env-probe\" {{\n    tool \"env_probe\" {{\n        filesystem {{\n            allow none=#true\n            require-path #false\n        }}\n    }}\n}}\n"
     );
-    #[cfg(target_os = "linux")]
-    if common::linux_below_landlock_v4() {
-        // Kernel < 6.7 (WSL2's 5.15) applies Landlock ABI V1 partially; a
-        // fail-closed spawn would refuse. V1 still enforces the fs ops this
-        // test needs; environment restriction is orthogonal to the sandbox.
-        policy_text.push_str("sandbox allow_degraded=#true\n");
-    }
+    // Host waivers an operator would declare: a pre-ABI-4 kernel (WSL2's
+    // 5.15) needs `allow_degraded` for its partial ruleset plus the
+    // boundary waiver — with `require_lifetime_boundary` defaulting on
+    // it cannot satisfy the flag either; macOS needs the boundary
+    // waiver outright. Capable hosts append nothing.
+    policy_text.push_str(&common::sandbox_waiver_node(""));
     let policy = write_policy(dir.path(), &policy_text);
 
     let argv = vec![py.clone(), f(&script), "env_probe".to_string()];

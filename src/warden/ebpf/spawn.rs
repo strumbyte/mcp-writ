@@ -204,7 +204,11 @@ pub(crate) fn spawn_supervised(
     cmd.args(&exec_args_storage[1..])
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        // stdin/stdout are the supervised passthrough — the workload
+        // is the stdio endpoint here. Stderr is attacker-controlled
+        // diagnostics: piped through the sanitized relay, never raw
+        // to the terminal.
+        .stderr(std::process::Stdio::piped());
     env::apply_spawn_env_sync(&mut cmd, &env_opts);
     // Own process group so teardown can kill the whole supervised tree.
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
@@ -218,7 +222,12 @@ pub(crate) fn spawn_supervised(
         })?;
     }
     match cmd.spawn() {
-        Ok(c) => Ok(c),
+        Ok(mut c) => {
+            if let Some(err) = c.stderr.take() {
+                crate::termutil::relay_child_stderr_blocking(err);
+            }
+            Ok(c)
+        }
         Err(e) => {
             let detail = record
                 .as_ref()

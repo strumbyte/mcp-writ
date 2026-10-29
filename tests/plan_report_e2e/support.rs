@@ -11,7 +11,10 @@ use tokio::time::{Duration, timeout};
 
 use crate::common;
 
-pub const TIMEOUT_SECS: u64 = 20;
+/// Process-level budget for one `plan`/`run` invocation. Loaded CI
+/// runners can take seconds just to spawn; the cap only bites on a
+/// real hang, so keep generous slack for parallel `cargo test` runs.
+pub const TIMEOUT_SECS: u64 = 60;
 
 pub fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_mcp-writ")
@@ -42,6 +45,11 @@ pub async fn run_with_report(args: &[String]) -> std::process::Output {
             .arg("run")
             .args(args)
             .env_remove("MCP_WRIT_SKIP_SANDBOX")
+            // Fixture policy/audit/report paths under %TEMP% can fail
+            // the replaceable-ancestry gate on hosts whose temp ACL
+            // grants another principal replace access — host-ACL
+            // dependent, not what the lifecycle tests exercise.
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

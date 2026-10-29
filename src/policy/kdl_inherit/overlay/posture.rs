@@ -12,7 +12,8 @@ use crate::policy::{Policy, TrajectoryRule};
 /// a posture the including file never asked about: `confused_deputy_
 /// protection #false`, `trajectory #false` or dropped trajectory
 /// rules, a different non-default `logging level`, `fail_closed
-/// #false`, `sandbox allow_degraded=#true`, `secret-overlay #false`,
+/// #false`, `sandbox allow_degraded=#true`, `sandbox
+/// require_lifetime_boundary` dropped back off, `secret-overlay #false`,
 /// an open `allow host="*"` outbound posture, an `inbound` listener
 /// grant, or a relaxed `environment` restriction. The same applies to
 /// an extending file's own declarations, which the operator reviewing
@@ -28,6 +29,7 @@ pub(in crate::policy::kdl_inherit) struct SecurityPosture {
     logging_level: String,
     logging_fail_closed: bool,
     sandbox_allow_degraded: bool,
+    sandbox_require_lifetime_boundary: bool,
     secret_overlay: bool,
     deny_all_others: bool,
     allow_listen: bool,
@@ -44,6 +46,7 @@ impl SecurityPosture {
             logging_level: policy.logging.level.clone(),
             logging_fail_closed: policy.logging.fail_closed,
             sandbox_allow_degraded: policy.sandbox.allow_degraded,
+            sandbox_require_lifetime_boundary: policy.sandbox.require_lifetime_boundary,
             secret_overlay: policy.fs.secret_overlay,
             deny_all_others: policy.network.outbound.deny_all_others,
             allow_listen: policy.network.inbound.allow_listen,
@@ -83,6 +86,9 @@ impl SecurityPosture {
         }
         if !self.sandbox_allow_degraded && after.sandbox.allow_degraded {
             weakened.push(WeakenedPosture::SandboxAllowDegraded);
+        }
+        if self.sandbox_require_lifetime_boundary && !after.sandbox.require_lifetime_boundary {
+            weakened.push(WeakenedPosture::SandboxRequireLifetimeBoundary);
         }
         if self.secret_overlay && !after.fs.secret_overlay {
             weakened.push(WeakenedPosture::SecretOverlay);
@@ -131,6 +137,9 @@ pub(in crate::policy::kdl_inherit) enum WeakenedPosture {
     LoggingLevel(String),
     LoggingFailClosed,
     SandboxAllowDegraded,
+    /// `sandbox require_lifetime_boundary=#true` lifted — launches
+    /// may again run with only the best-effort descendant sweep.
+    SandboxRequireLifetimeBoundary,
     SecretOverlay,
     /// `deny host="*"` posture opened to `allow host="*"`.
     OutboundPosture,
@@ -179,6 +188,8 @@ impl WeakenedPosture {
             }
             Self::SandboxAllowDegraded => (policy.sandbox.allow_degraded)
                 .then(|| "enables 'sandbox allow_degraded'".to_string()),
+            Self::SandboxRequireLifetimeBoundary => (!policy.sandbox.require_lifetime_boundary)
+                .then(|| "disables 'sandbox require_lifetime_boundary'".to_string()),
             Self::SecretOverlay => {
                 (!policy.fs.secret_overlay).then(|| "disables 'secret-overlay'".to_string())
             }

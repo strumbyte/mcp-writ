@@ -92,7 +92,11 @@ pub fn spawn_supervised(
     cmd.args(&exec_args_storage[1..])
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        // stdin/stdout are the supervised passthrough — the workload
+        // is the stdio endpoint here. Stderr is attacker-controlled
+        // diagnostics: piped through the sanitized relay, never raw
+        // to the terminal.
+        .stderr(std::process::Stdio::piped());
     env::apply_spawn_env_sync(&mut cmd, &env_opts);
     // Own process group so the fail-closed teardown can kill the whole
     // supervised tree, not just the exec'd image.
@@ -112,7 +116,12 @@ pub fn spawn_supervised(
         })?;
     }
     let mut child = match cmd.spawn() {
-        Ok(c) => c,
+        Ok(mut c) => {
+            if let Some(err) = c.stderr.take() {
+                crate::termutil::relay_child_stderr_blocking(err);
+            }
+            c
+        }
         Err(e) => {
             // Fold the child's apply record into the error text — the
             // recorded stage/errno is the only signal a pre_exec failure

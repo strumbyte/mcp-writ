@@ -138,6 +138,24 @@ mod imp {
                 std::process::exit(1);
             }
         };
+        // A policy source a lower-trust principal could swap or rewrite
+        // grants launch authority the operator never reviewed —
+        // require trusted (owned, write-restricted, replacement-
+        // resistant) paths for the root document and every file it
+        // reached.
+        if let Err(e) = crate::policy::loader::require_trusted_policy_sources(&policy) {
+            let detail = format!("refusing launch: {e}");
+            eprintln!("Error: {detail}");
+            write_report("failed", Some(&detail), None, None, None, &[]);
+            lifecycle::prelaunch_abort(
+                args.audit_log.as_deref(),
+                &session_audit,
+                Some("load"),
+                &detail,
+            )
+            .await;
+            std::process::exit(1);
+        }
         let policy = match policy.bind_to_server(args.server.as_deref()) {
             Ok(p) => p,
             Err(e) => {
@@ -352,6 +370,7 @@ mod imp {
             policy.version,
             fail_on.as_str(),
             policy.sandbox.allow_degraded,
+            policy.sandbox.require_lifetime_boundary,
             &args
                 .policy
                 .as_ref()
@@ -416,7 +435,10 @@ mod imp {
         // overlapping the cgroup v2 hierarchy would let the workload
         // migrate out and shed the attached programs. Refuse before any
         // cgroup/BPF state exists.
-        if let Some(conflict) = ebpf::cgroup_write_grant_conflict(&policy) {
+        if let Some(conflict) = ebpf::cgroup_write_grant_conflict(
+            policy.write_grant_spellings(),
+            "shed the connect hooks",
+        ) {
             eprintln!("Error: {conflict}");
             write_report(
                 "invalid-policy",
@@ -588,6 +610,9 @@ mod imp {
                     &resolved_exe,
                     &policy.hash_entries,
                     &audit_logger,
+                    // No mount handoff on this route — the entrypoint's
+                    // trusted-source gate stays required.
+                    false,
                 )
                 .map_err(|e| format!("supply chain verification failed at spawn: {e}"))
             };
