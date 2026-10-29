@@ -27,6 +27,39 @@ use reap::{arm_child_subreaper, kill_orphan_descendants};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use reap::{collect_proc_descendants, kill_pids, kill_proc_descendants};
 
+/// Unregister a torn-down launch's leader pid — the orphan sweep
+/// skips registered leaders, so a stale entry would shield a
+/// recycled pid. `pub(crate)` for spawn paths whose post-registration
+/// failure arms tear a child down outside `StdChild`/`RunningChild`.
+#[cfg(target_os = "linux")]
+pub(crate) fn unregister_launch_root(pid: u32) {
+    reap::unregister_launch_root(pid);
+}
+
+/// `Command::spawn` + launch-root registration under the orphan-sweep
+/// lock — see [`reap::spawn_and_register`]. `launch_tag` is the value
+/// `apply_unix_process_*` stamped into the child's environment and
+/// returned to the caller. No-op registration off unix (no orphan
+/// sweep exists there).
+#[cfg(unix)]
+pub(crate) fn spawn_and_register<T>(
+    spawn: impl FnOnce() -> std::io::Result<T>,
+    pid: impl FnOnce(&T) -> u32,
+    launch_tag: u64,
+) -> std::io::Result<T> {
+    reap::spawn_and_register(spawn, pid, launch_tag)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn spawn_and_register<T>(
+    spawn: impl FnOnce() -> std::io::Result<T>,
+    pid: impl FnOnce(&T) -> u32,
+    launch_tag: u64,
+) -> std::io::Result<T> {
+    let _ = (pid, launch_tag);
+    spawn()
+}
+
 /// A `std::process::Child` plus its per-launch lifetime boundary.
 ///
 /// On Linux, `lifetime_cgroup` is `Some` when the launch adopted the
@@ -39,6 +72,23 @@ pub struct StdChild {
     child: std::process::Child,
     #[cfg(target_os = "linux")]
     lifetime_cgroup: Option<LifetimeCgroup>,
+    /// Set once `sweep_std_descendants` has run — keeps `Drop` from
+    /// re-signaling a pgid the leader's reap may already have freed.
+    #[cfg(unix)]
+    teardown_done: bool,
+}
+
+#[cfg(unix)]
+impl Drop for StdChild {
+    fn drop(&mut self) {
+        // A StdChild released without wait/kill still owns its
+        // descendants: run the same teardown so nothing outlives the
+        // handle and the leader's registry entry cannot shield a
+        // recycled pid.
+        if !self.teardown_done {
+            sweep_std_descendants(self, false);
+        }
+    }
 }
 
 impl StdChild {
@@ -46,9 +96,16 @@ impl StdChild {
     /// when the v2 hierarchy allows — the non-escapable descendant
     /// boundary the group kill alone cannot give.
     pub fn spawned(child: std::process::Child) -> Self {
+        // Re-registration is redundant on spawn_and_register paths —
+        // `entry().or_insert` keeps the real launch tag, so the `0`
+        // here only marks a leader that was never stamped.
+        #[cfg(target_os = "linux")]
+        reap::register_launch_root(child.id(), 0);
         Self {
             #[cfg(target_os = "linux")]
             lifetime_cgroup: LifetimeCgroup::try_adopt("run", child.id()),
+            #[cfg(unix)]
+            teardown_done: false,
             child,
         }
     }
@@ -188,8 +245,9 @@ impl ChildProcess {
 /// naturally must not leave orphans behind, and a *reaped* leader's
 /// freed pgid must never be signaled).
 #[cfg(unix)]
-fn sweep_std_descendants(child: &StdChild, wait_mode: bool) {
+fn sweep_std_descendants(child: &mut StdChild, wait_mode: bool) {
     let pid = child.child.id() as libc::pid_t;
+    child.teardown_done = true;
     if wait_mode {
         // Block until the leader reports exit while keeping the zombie
         // — mirrors `sweep_group_after_exit`; EINTR is retried.
@@ -211,6 +269,8 @@ fn sweep_std_descendants(child: &StdChild, wait_mode: bool) {
             if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                 // Could not observe the exit (already reaped, not our
                 // child): skip the sweep — the pgid may be recycled.
+                #[cfg(target_os = "linux")]
+                unregister_launch_root(pid as u32);
                 return;
             }
         }
@@ -229,15 +289,20 @@ fn sweep_std_descendants(child: &StdChild, wait_mode: bool) {
         } else {
             // The leader is already gone: children it orphaned are
             // reparented onto this guard (`PR_SET_CHILD_SUBREAPER`),
-            // where the orphan sweep still reaches them. The root
-            // walk stays for anything still parent-linked below the
-            // dead leader's id.
+            // where the group-scoped orphan sweep still reaches them.
+            // The root walk stays for anything still parent-linked
+            // below the dead leader's id.
             kill_proc_descendants(pid as u32);
-            kill_orphan_descendants();
+            kill_orphan_descendants(pid as u32);
         }
     }
     #[cfg(target_os = "macos")]
     kill_proc_descendants(pid as u32);
+    // The session's teardown ran: the leader no longer needs the
+    // orphan sweep's protection (or its pid could shield a recycled
+    // one).
+    #[cfg(target_os = "linux")]
+    unregister_launch_root(pid as u32);
 }
 
 /// PR-16 — the supervision state a namespaced launch owns beside the
@@ -499,8 +564,10 @@ impl RunningChild {
         if self.lifetime_cgroup.is_none() {
             // Anything orphaned onto this guard (subreaper) before or
             // during the kill, plus descendants forked between the
-            // snapshot and the group kill.
-            kill_orphan_descendants();
+            // snapshot and the group kill — scoped to foreign-group
+            // children so a plainly spawned child of this process is
+            // never touched.
+            kill_orphan_descendants(self.pgid);
         }
     }
 
@@ -823,6 +890,8 @@ impl Drop for RunningChild {
         }
         #[cfg(unix)]
         self.kill_descendants();
+        #[cfg(target_os = "linux")]
+        unregister_launch_root(self.pgid);
         match &mut self.inner {
             RunningChildInner::Tokio(child) => {
                 let _ = child.start_kill();
@@ -835,25 +904,77 @@ impl Drop for RunningChild {
     }
 }
 
-pub(super) fn apply_unix_process_group(cmd: &mut std::process::Command) {
+/// Put the child in its own process group and, on Linux, stamp the
+/// per-launch lineage marker plus the subreaper arm. Returns the
+/// launch tag the caller must pass to [`spawn_and_register`] so the
+/// orphan sweep can attribute this session's reparented escapees by
+/// marker *value*, not mere presence (off Linux the tag is `0` —
+/// unused, no sweep exists).
+pub(super) fn apply_unix_process_group(cmd: &mut std::process::Command) -> u64 {
+    #[cfg(target_os = "linux")]
+    let launch_tag = reap::launch_tag();
+    #[cfg(not(target_os = "linux"))]
+    let launch_tag = 0u64;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+        #[cfg(target_os = "linux")]
+        {
+            // Lineage marker inherited by every workload descendant —
+            // the orphan sweep's attribution signal for processes that
+            // escaped the launch's process group.
+            cmd.env(reap::SPAWN_TAG, launch_tag.to_string());
+            // Arm the *leader* as this launch's subreaper in pre_exec:
+            // workload orphans reparent to the leader while it lives,
+            // so the pre-kill descendant snapshot sees even `setsid`
+            // escapees under it — and another session's orphans never
+            // reach this guard's own child list mid-session.
+            // Best-effort: a prctl failure degrades to the guard-side
+            // arm alone.
+            // Safety: pre_exec closures must be async-signal-safe — a
+            // scalar-arg prctl is.
+            unsafe {
+                cmd.pre_exec(|| {
+                    let _ = libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+                    Ok(())
+                });
+            }
+        }
     }
-    // Arm once per spawn so a descendant orphaned later reparents to
-    // this guard, not init — the teardown sweep can still reach it.
+    // Arm once per spawn so a descendant orphaned after its leader
+    // died reparents to this guard, not init — the teardown sweep can
+    // still reach it.
     #[cfg(target_os = "linux")]
     arm_child_subreaper();
     let _ = cmd;
+    launch_tag
 }
 
-pub(super) fn apply_unix_process_group_tokio(cmd: &mut tokio::process::Command) {
+/// Tokio variant of [`apply_unix_process_group`] — same contract, same
+/// returned launch tag.
+pub(super) fn apply_unix_process_group_tokio(cmd: &mut tokio::process::Command) -> u64 {
+    #[cfg(target_os = "linux")]
+    let launch_tag = reap::launch_tag();
+    #[cfg(not(target_os = "linux"))]
+    let launch_tag = 0u64;
     #[cfg(unix)]
     {
         cmd.process_group(0);
+        #[cfg(target_os = "linux")]
+        {
+            cmd.env(reap::SPAWN_TAG, launch_tag.to_string());
+            // Safety: same contract as `apply_unix_process_group`.
+            unsafe {
+                cmd.pre_exec(|| {
+                    let _ = libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+                    Ok(())
+                });
+            }
+        }
     }
     #[cfg(target_os = "linux")]
     arm_child_subreaper();
     let _ = cmd;
+    launch_tag
 }

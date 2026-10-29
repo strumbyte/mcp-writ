@@ -208,9 +208,10 @@ fn lifetime_grant(cg: &Option<cgroup::LifetimeCgroup>) -> crate::enforcement::Pr
         (
             ControlState::Skipped,
             "cgroup v2 unavailable or unwritable — teardown sweeps the \
-             process group and /proc ancestry only; a descendant that \
-             left the group and reparented before the sweep can outlive \
-             the session"
+             process group plus marker-attributed orphans reparented \
+             onto this process; a descendant that left the group, \
+             rewrote its launch lineage marker, and reparented cannot \
+             be told apart from a host child and can outlive the session"
                 .to_string(),
         )
     };

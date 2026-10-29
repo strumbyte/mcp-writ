@@ -428,7 +428,6 @@ fn build_init_command(
             .env(super::init_env::ENTRYPIN_TARGET, target.as_os_str())
             .env(super::init_env::ENTRYPIN_SHA, sha);
     }
-    super::super::child::apply_unix_process_group(&mut cmd);
     cmd
 }
 
@@ -446,27 +445,31 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
     let policy_path = format!("/proc/self/fd/{policy_fd_num}");
 
     let mut cmd = build_init_command(cfg, &policy_path, child_sock, SpawnStdio::Inherit);
+    // The lineage tag is bound beside the spawn so registration can
+    // attribute this session's orphaned escapees by marker value.
+    let launch_tag = super::super::child::apply_unix_process_group(&mut cmd);
     // The child end must survive the exec into the init binary.
-    let child = match cmd.spawn() {
-        Ok(mut c) => {
-            if let Some(err) = c.stderr.take() {
-                crate::termutil::relay_child_stderr_blocking(err);
+    let child =
+        match super::super::child::spawn_and_register(|| cmd.spawn(), |c| c.id(), launch_tag) {
+            Ok(mut c) => {
+                if let Some(err) = c.stderr.take() {
+                    crate::termutil::relay_child_stderr_blocking(err);
+                }
+                c
             }
-            c
-        }
-        Err(e) => {
-            // SAFETY: the spawn failed, so no child inherited
-            // `child_sock` — both socketpair ends are still owned by
-            // this process and each is closed once.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { libc::close(child_sock) };
-            // SAFETY: `parent_sock` is this process's live socketpair
-            // end, closed once on this error path.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { libc::close(parent_sock) };
-            return Err(format!("init spawn failed: {e}"));
-        }
-    };
+            Err(e) => {
+                // SAFETY: the spawn failed, so no child inherited
+                // `child_sock` — both socketpair ends are still owned by
+                // this process and each is closed once.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                unsafe { libc::close(child_sock) };
+                // SAFETY: `parent_sock` is this process's live socketpair
+                // end, closed once on this error path.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                unsafe { libc::close(parent_sock) };
+                return Err(format!("init spawn failed: {e}"));
+            }
+        };
     // SAFETY: the spawned child holds `child_sock` through its inherited
     // (non-CLOEXEC) copy; the parent's copy is closed exactly once.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -498,6 +501,9 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
             drop(sock);
             let mut child = child;
             let _ = child.wait();
+            // The launch never left the spawn boundary — a stale
+            // registration would shield a recycled pid.
+            super::super::child::unregister_launch_root(pid as u32);
             Err(e)
         }
     }
@@ -524,9 +530,23 @@ pub fn spawn_namespaced_child_tokio(cfg: &SpawnConfig) -> Result<NamespacedChild
 
     // `tokio::process::Command` wraps the std builder, so the pre_exec
     // uncloak closure and the env contract carry over unchanged.
-    let cmd = build_init_command(cfg, &policy_path, child_sock, SpawnStdio::Piped);
+    let mut cmd = build_init_command(cfg, &policy_path, child_sock, SpawnStdio::Piped);
+    // Stamped on the std builder before the tokio conversion — the env
+    // contract carries over unchanged.
+    let launch_tag = super::super::child::apply_unix_process_group(&mut cmd);
     let mut cmd = tokio::process::Command::from(cmd);
-    let mut child = match cmd.spawn() {
+    // The registration pid, captured under the registration lock — the
+    // failure arm below names this (a completed tokio child's `id()`
+    // can already be `None`).
+    let mut registered_pid = 0u32;
+    let mut child = match super::super::child::spawn_and_register(
+        || cmd.spawn(),
+        |c| {
+            registered_pid = c.id().unwrap_or(0);
+            registered_pid
+        },
+        launch_tag,
+    ) {
         Ok(mut c) => {
             if let Some(err) = c.stderr.take() {
                 crate::termutil::relay_child_stderr(err);
@@ -563,11 +583,12 @@ pub fn spawn_namespaced_child_tokio(cfg: &SpawnConfig) -> Result<NamespacedChild
             sandbox_applied: std::cell::Cell::new(None),
         }),
         Err(e) => {
-            // `id()` is `None` once the handle can no longer name the
-            // child — `kill(-0)` (`kill(0)`) would SIGKILL *this*
-            // process's own group, so the group signal needs a real
-            // pid. `start_kill` below still reaches the child itself.
-            let pid = child.id().unwrap_or(0) as i32;
+            // The pid pinned at registration — a completed tokio
+            // child's `id()` may already be `None`, and `kill(-0)`
+            // (`kill(0)`) would SIGKILL *this* process's own group, so
+            // the group signal needs a real pid. `start_kill` below
+            // still reaches the child itself.
+            let pid = registered_pid as i32;
             if pid > 0 {
                 // SAFETY: scalar arguments; the negative pid names the
                 // child's dedicated process group, and the `pid > 0`
@@ -577,6 +598,45 @@ pub fn spawn_namespaced_child_tokio(cfg: &SpawnConfig) -> Result<NamespacedChild
             }
             drop(sock);
             let _ = child.start_kill();
+            // Sync context (spawn_blocking): reap via a raw blocking
+            // waitpid — the child is ours and was just SIGKILL'd.
+            // EINTR is retried (a caught signal mid-wait is not a reap
+            // report); ECHILD means tokio's reaper collected it first —
+            // either way the registration only drops once the reap is
+            // confirmed. The root stays registered until then, so no
+            // orphan sweep sees it unprotected mid-teardown.
+            // SAFETY: scalar pid guarded > 0; a null status pointer is
+            // allowed; only ever our own child.
+            if pid > 0 {
+                loop {
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                    let ret = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                    if ret == pid {
+                        break;
+                    }
+                    let err = std::io::Error::last_os_error().raw_os_error();
+                    if err == Some(libc::EINTR) {
+                        continue;
+                    }
+                    if err != Some(libc::ECHILD) {
+                        // Neither a reap nor "already collected" — a
+                        // persistent wait failure leaves the child
+                        // state unknown; the registration drops anyway
+                        // because a stale entry would shield a recycled
+                        // pid while a later orphan sweep can still
+                        // collect the zombie as unattributed residue.
+                        tracing::warn!(
+                            pid,
+                            ?err,
+                            "namespaced spawn teardown could not reap the init child"
+                        );
+                    }
+                    break;
+                }
+            }
+            // Same contract as the sync arm — the launch never left the
+            // spawn boundary, so its registration must not outlive it.
+            super::super::child::unregister_launch_root(registered_pid);
             Err(e)
         }
     }

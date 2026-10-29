@@ -78,10 +78,10 @@ impl Warden {
                 // it through the sanitized relay, never raw to the
                 // terminal.
                 .stderr(std::process::Stdio::piped());
-            apply_unix_process_group(&mut cmd);
+            let launch_tag = apply_unix_process_group(&mut cmd);
             let apply_record = linux_spawn::attach_linux_pre_exec(&mut cmd, sandbox_bits);
 
-            let spawned = cmd.spawn();
+            let spawned = child::spawn_and_register(|| cmd.spawn(), |c| c.id(), launch_tag);
             // The shared record holds the kernel-reported apply result
             // the pre-exec child wrote. This sync path has no launch
             // report to feed it to (`spawn_child_async_impl` does), so
@@ -159,7 +159,7 @@ impl Warden {
             // Unsandboxed does not mean trusted — the workload's
             // stderr still crosses to the terminal sanitized.
             .stderr(std::process::Stdio::piped());
-        apply_unix_process_group(&mut cmd);
+        let launch_tag = apply_unix_process_group(&mut cmd);
         // No sandbox does not mean the launcher's ambient descriptors
         // should leak — the child seals everything above stdio before
         // exec drops them.
@@ -167,7 +167,7 @@ impl Warden {
         attach_fd_hygiene(&mut cmd, &[]).map_err(|e| {
             WardenError::sandbox_setup(crate::error::SandboxStage::Prepare, e.to_string())
         })?;
-        cmd.spawn()
+        child::spawn_and_register(|| cmd.spawn(), |c| c.id(), launch_tag)
             .map(|mut c| {
                 if let Some(err) = c.stderr.take() {
                     crate::termutil::relay_child_stderr_blocking(err);
@@ -589,7 +589,7 @@ impl Warden {
             if let Some(exe) = python_executable_override(command, program) {
                 cmd.env("PYTHONEXECUTABLE", exe);
             }
-            apply_unix_process_group_tokio(&mut cmd);
+            let launch_tag = apply_unix_process_group_tokio(&mut cmd);
             // fd hygiene + fd-exec handoff: the child's pre_exec seals
             // every ambient descriptor above stdio, then uncloaks the
             // pin's dup'd descriptors so they survive sandbox-exec's
@@ -621,7 +621,8 @@ impl Warden {
                 };
                 return SpawnAttempt::err(report, source);
             }
-            let mut spawned = cmd.spawn();
+            let mut spawned =
+                child::spawn_and_register(|| cmd.spawn(), |c| c.id().unwrap_or(0), launch_tag);
             // Pin the pid before the liveness probe: the probe reaps a
             // leader that exits inside the window, after which `id()`
             // can no longer resolve — and the pgid (`process_group(0)`
@@ -878,7 +879,7 @@ impl Warden {
                 .stderr(std::process::Stdio::piped());
             apply_spawn_env(&mut cmd, opts);
             let env_applied = env_block_applies(opts);
-            apply_unix_process_group_tokio(&mut cmd);
+            let launch_tag = apply_unix_process_group_tokio(&mut cmd);
             // fd-exec handoff: the pin's CLOEXEC dups uncloak inside the
             // child's apply pipeline (before the policy seccomp filter
             // can deny `fcntl`).
@@ -887,7 +888,8 @@ impl Warden {
             // rights were requested — the report lists them.
             let requested_rights = sandbox_bits.requested_rights.clone();
             let apply_record = linux_spawn::attach_linux_pre_exec_tokio(&mut cmd, sandbox_bits);
-            let spawned = cmd.spawn();
+            let spawned =
+                child::spawn_and_register(|| cmd.spawn(), |c| c.id().unwrap_or(0), launch_tag);
             // The pre-exec child's own apply record — readable now that
             // spawn returned, unforgeable by the exec'd workload.
             let apply_snapshot = apply_record.as_ref().map(|r| r.snapshot());
@@ -963,6 +965,11 @@ impl Warden {
                                             }
                                         }
                                         let _ = child.kill().await;
+                                        // The launch never left the
+                                        // spawn boundary — a stale
+                                        // registration would shield a
+                                        // recycled pid.
+                                        child::unregister_launch_root(pid as u32);
                                         return SpawnAttempt::err(
                                             report,
                                             WardenError::ProcessSpawn(e),
@@ -1010,6 +1017,7 @@ impl Warden {
                                 }
                             }
                             let _ = child.kill().await;
+                            child::unregister_launch_root(pid as u32);
                             SpawnAttempt::err(report, e)
                         }
                     }
@@ -1214,14 +1222,18 @@ impl Warden {
         if let Some(exe) = python_executable_override(&argv[0], program) {
             cmd.env("PYTHONEXECUTABLE", exe);
         }
-        apply_unix_process_group_tokio(&mut cmd);
+        // `spawn_and_register` consumes the tag only on unix — the
+        // underscore keeps the unused binding quiet off unix.
+        let _launch_tag = apply_unix_process_group_tokio(&mut cmd);
         // fd hygiene + fd-exec handoff on the unsandboxed arm: no
         // sandbox does not mean the launcher's ambient descriptors
         // should leak — the child seals everything above stdio except
         // the fd-exec pins, which it uncloaks in the same pre_exec.
         #[cfg(unix)]
         let spawned = match attach_fd_hygiene_tokio(&mut cmd, &opts.exec_uncloak_fds) {
-            Ok(()) => cmd.spawn(),
+            Ok(()) => {
+                child::spawn_and_register(|| cmd.spawn(), |c| c.id().unwrap_or(0), _launch_tag)
+            }
             Err(e) => Err(e),
         };
         #[cfg(not(unix))]
@@ -1307,6 +1319,36 @@ impl Warden {
                                     libc::kill(pid, libc::SIGKILL);
                                 }
                             }
+                            // Sync context: reap via raw waitpid so the
+                            // registration outlives the child's reap —
+                            // EINTR is retried (a caught signal mid-wait
+                            // is not a reap report) and ECHILD means
+                            // already collected. The `pid > 0` guard
+                            // doubles as the waitpid guard (pid 0 would
+                            // wait on any child in this process's own
+                            // group).
+                            // SAFETY: pid guarded > 0; null status is
+                            // allowed; only ever our own child.
+                            #[cfg(target_os = "linux")]
+                            if pid > 0 {
+                                loop {
+                                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                                    let ret =
+                                        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                                    if ret == pid {
+                                        break;
+                                    }
+                                    let err = std::io::Error::last_os_error().raw_os_error();
+                                    if err == Some(libc::EINTR) {
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            }
+                            // The launch never left the spawn boundary
+                            // — its registration must not outlive it.
+                            #[cfg(target_os = "linux")]
+                            child::unregister_launch_root(pid as u32);
                         }
                         let _ = child.start_kill();
                         SpawnAttempt::err(report, e)

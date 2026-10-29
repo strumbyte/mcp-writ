@@ -3,9 +3,15 @@ use super::*;
 fn spawn_sh(script: &str) -> RunningChild {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg(script);
-    apply_unix_process_group_tokio(&mut cmd);
+    // `let _` off Linux — the tag only matters to the Linux orphan
+    // sweep, which attributes this session's escapees by marker value.
+    let _launch_tag = apply_unix_process_group_tokio(&mut cmd);
     let child = cmd.spawn().expect("spawn sh");
     let pgid = child.id().unwrap_or(0);
+    // Mirror the production spawn path: a supervised leader is
+    // registered with its tag until teardown removes it.
+    #[cfg(target_os = "linux")]
+    reap::register_launch_root(pgid, _launch_tag);
     RunningChild {
         stdin: None,
         stdout: None,

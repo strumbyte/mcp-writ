@@ -15,9 +15,10 @@
 //! delegated subtree or privilege); [`LifetimeCgroup::try_adopt`]
 //! returns `None` when the hierarchy is absent or unwritable, and the
 //! caller falls back to the process-group + `/proc` sweep. That
-//! fallback cannot reach a descendant that already left the group and
-//! reparented — the residual is recorded on the launch report's
-//! `process_lifetime` grant entry.
+//! fallback still names a reparented descendant while it carries the
+//! launch's lineage marker; the descendant that escapes it must leave
+//! the group, rewrite the marker, and reparent — the residual is
+//! recorded on the launch report's `process_lifetime` grant entry.
 
 use std::fs::File;
 use std::io;

@@ -65,15 +65,19 @@ where
                 Ok(bytes) => bytes,
             };
             let consumed = available.len();
-            if budget > 0 {
-                let take = consumed.min(budget);
+            let take = consumed.min(budget);
+            if take > 0 {
                 split_and_write(
                     &available[..take],
                     &mut pending,
                     &mut write_clean_stderr_line,
                 );
                 budget -= take;
-            } else if !truncating {
+            }
+            if take < consumed && !truncating {
+                // The first dropped byte marks the flood — announce it
+                // now rather than after drain: a writer closing right
+                // on the cap boundary would otherwise leave no trace.
                 truncating = true;
                 write_clean_stderr_line(STDERR_TRUNCATED_NOTICE);
             }
@@ -103,15 +107,16 @@ where
                 Ok(bytes) => bytes,
             };
             let consumed = available.len();
-            if budget > 0 {
-                let take = consumed.min(budget);
+            let take = consumed.min(budget);
+            if take > 0 {
                 split_and_write(
                     &available[..take],
                     &mut pending,
                     &mut write_clean_stderr_line,
                 );
                 budget -= take;
-            } else if !truncating {
+            }
+            if take < consumed && !truncating {
                 truncating = true;
                 write_clean_stderr_line(STDERR_TRUNCATED_NOTICE);
             }
