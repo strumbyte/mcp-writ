@@ -5,7 +5,7 @@
 //!
 //! Used wherever a launch must prove a workload's write grants cannot
 //! reach a protected path: the audit sink (`audit_log::sink_guard`) and
-//! the cgroup-eBPF control plane (`warden::ebpf::runtime`). Both are
+//! the cgroup-lifetime/control plane (`warden::cgroup`). Both are
 //! fail-closed consumers — an unresolvable spelling is treated as
 //! "cannot be proven disjoint", never as "safe".
 

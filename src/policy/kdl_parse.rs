@@ -470,12 +470,19 @@ pub(crate) fn parse_logging_fail_closed(node: &kdl::KdlNode) -> Result<bool, Pol
 
 fn parse_sandbox(doc: &KdlDocument) -> Result<crate::policy::SandboxPolicy, PolicyError> {
     let mut policy = crate::policy::SandboxPolicy::default();
-    if let Some(node) = doc.get("sandbox")
-        && let Some(val) = node.get("allow_degraded")
-    {
-        policy.allow_degraded = val.as_bool().ok_or_else(|| {
-            PolicyError::KdlParse("'sandbox.allow_degraded' must be a boolean".into())
-        })?;
+    if let Some(node) = doc.get("sandbox") {
+        if let Some(val) = node.get("allow_degraded") {
+            policy.allow_degraded = val.as_bool().ok_or_else(|| {
+                PolicyError::KdlParse("'sandbox.allow_degraded' must be a boolean".into())
+            })?;
+        }
+        if let Some(val) = node.get("require_lifetime_boundary") {
+            policy.require_lifetime_boundary = val.as_bool().ok_or_else(|| {
+                PolicyError::KdlParse(
+                    "'sandbox.require_lifetime_boundary' must be a boolean".into(),
+                )
+            })?;
+        }
     }
     Ok(policy)
 }

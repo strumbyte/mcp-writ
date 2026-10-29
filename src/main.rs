@@ -480,6 +480,7 @@ async fn real_main() {
         policy.version,
         fail_on.as_str(),
         policy.sandbox.allow_degraded,
+        policy.sandbox.require_lifetime_boundary,
         &policy_source,
     );
 

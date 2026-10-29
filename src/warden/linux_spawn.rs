@@ -34,7 +34,7 @@ use crate::enforcement::ProcessGrant;
 use crate::error::WardenError;
 use crate::policy::Policy;
 
-use super::{landlock_impl, seccomp_impl};
+use super::{cgroup, landlock_impl, seccomp_impl};
 
 // ---------------------------------------------------------------------------
 // Shared apply record (parent <-> pre-exec child)
@@ -274,6 +274,12 @@ pub(super) struct LinuxSandboxBits {
     /// the kernel-reported level, so the enforcement-level observation
     /// stays honest regardless of this flag.
     allow_degraded: bool,
+    /// `sandbox.require_lifetime_boundary` — tightens the LANDLOCK
+    /// stage: the armed cgroup is a descendant boundary only while the
+    /// member's own `cgroup.procs` writes are restrained, so anything
+    /// short of `FullyEnforced` aborts the spawn even when
+    /// `allow_degraded` would otherwise tolerate the gap.
+    require_lifetime_boundary: bool,
     /// Grant entries produced by the same rule build that produced
     /// `landlock_ruleset`/`seccomp_program` — the launch report reads
     /// these so it never recomputes a separate permission table.
@@ -291,9 +297,13 @@ pub(super) struct LinuxSandboxBits {
     /// ordinary spawn, `Some` only through [`unotify::enable_unotify`]
     /// (the `unotify-run` PoC path).
     pub(super) unotify: Option<super::unotify::UnotifyChild>,
-    /// PR-10 opt-in: a pre-opened `cgroup.procs` write fd for the
-    /// private cgroup the workload must join before exec — `Some` only
-    /// through [`ebpf::spawn_supervised`](crate::warden::ebpf::spawn_supervised).
+    /// A pre-opened `cgroup.procs` write fd for the private cgroup the
+    /// workload must join before exec — `Some` through
+    /// [`ebpf::spawn_supervised`](crate::warden::ebpf::spawn_supervised)
+    /// (mandatory: enforcement depends on it) and through the ordinary
+    /// launch paths under `sandbox.require_lifetime_boundary` (a failed
+    /// join aborts the spawn pre-exec, which is the refusal the flag
+    /// asks for).
     pub(super) cgroup_procs: Option<std::fs::File>,
     /// fd-exec handoff: the pin's `F_DUPFD_CLOEXEC` descriptor numbers.
     /// The child clears `FD_CLOEXEC` here so the `/proc/self/fd` exec
@@ -338,6 +348,44 @@ pub(super) fn prepare_linux_child_sandbox(
     policy: &Policy,
 ) -> Result<LinuxSandboxBits, WardenError> {
     seccomp_impl::require_execve_allowance(policy)?;
+    // `require_lifetime_boundary` needs the fs boundary *enforced*,
+    // not merely requested: the private cgroup holds a member only
+    // while Landlock restrains its writes to a parent or sibling
+    // `cgroup.procs`. A kernel whose ABI cannot take the full handled
+    // set (`AccessNet` is claimed at ABI V4, fs at V3) comes back
+    // `PartiallyEnforced` — leaving ambient write access and an
+    // escapable boundary — so refuse at prepare rather than spawn a
+    // child only to tear it down. `allow_degraded` cannot waive this:
+    // the flag exists precisely to refuse the gap it tolerates.
+    if policy.sandbox.require_lifetime_boundary && landlock_impl::kernel_abi() < 4 {
+        return Err(WardenError::sandbox_setup(
+            crate::error::SandboxStage::Policy,
+            "sandbox.require_lifetime_boundary: the kernel cannot fully \
+             enforce the Landlock ruleset (ABI below the handled set, or \
+             no Landlock support) — fs writes to a parent or sibling \
+             `cgroup.procs` would stay unrestricted, so the private \
+             cgroup cannot be a kernel-enforced descendant-lifetime \
+             boundary, refusing",
+        ));
+    }
+    // The private cgroup itself must also be creatable: without a
+    // mounted v2 hierarchy there is nothing to arm. Refusing here —
+    // before the mechanism is selected — lets the launcher fall back
+    // to the namespaced route, whose PID namespace satisfies the flag
+    // without a cgroup at all.
+    if policy.sandbox.require_lifetime_boundary
+        && !std::path::Path::new(cgroup::CGROUP_ROOT)
+            .join("cgroup.controllers")
+            .exists()
+    {
+        return Err(WardenError::sandbox_setup(
+            crate::error::SandboxStage::Policy,
+            "sandbox.require_lifetime_boundary: no cgroup v2 hierarchy \
+             mounted — the native route cannot arm a private subtree; \
+             the namespaced route's PID namespace can still satisfy the \
+             boundary",
+        ));
+    }
     let landlock = landlock_impl::create_landlock_ruleset(policy)?;
     let allows_execve = seccomp_impl::policy_allows_execve(policy);
     let seccomp_program = if allows_execve {
@@ -355,6 +403,7 @@ pub(super) fn prepare_linux_child_sandbox(
         landlock_ruleset: Some(landlock.ruleset),
         seccomp_program,
         allow_degraded: policy.sandbox.allow_degraded,
+        require_lifetime_boundary: policy.sandbox.require_lifetime_boundary,
         grants,
         requested_rights: landlock.requested_rights,
         record_ptr: 0,
@@ -366,8 +415,9 @@ pub(super) fn prepare_linux_child_sandbox(
 }
 
 /// Write the child's pid to `fd` (an open `cgroup.procs`) — no
-/// allocation, `write(2)` only; `pre_exec`-safe.
-fn write_self_pid(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+/// allocation, `write(2)` only; `pre_exec`-safe. Shared by the bits'
+/// CGROUP stage and [`cgroup::LifetimeCgroup::attach_join`].
+pub(super) fn write_self_pid(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
     let mut pid = std::process::id() as u64;
     let mut buf = [0u8; 20];
     let mut i = buf.len();
@@ -544,6 +594,10 @@ pub(super) fn prepare_linux_child_sandbox_ebpf(
         // enforced cgroup — a partial or absent ruleset would silently
         // remove it, so `ebpf-run` requires `FullyEnforced`.
         allow_degraded: false,
+        // `allow_degraded: false` above already refuses anything short
+        // of `FullyEnforced` — the flag's fs-boundary requirement is
+        // this route's standing contract, not an extra gate.
+        require_lifetime_boundary: false,
         grants,
         requested_rights: landlock.requested_rights,
         record_ptr: 0,
@@ -584,6 +638,10 @@ pub(super) fn prepare_linux_child_sandbox_namespaced(
         landlock_ruleset: Some(landlock.ruleset),
         seccomp_program,
         allow_degraded: policy.sandbox.allow_degraded,
+        // The PID namespace is this route's descendant-lifetime
+        // boundary — it holds independently of fs enforcement, so the
+        // flag does not tighten the LANDLOCK stage here.
+        require_lifetime_boundary: false,
         grants,
         requested_rights: landlock.requested_rights,
         record_ptr: 0,
@@ -660,6 +718,22 @@ impl LinuxSandboxBits {
                         record_fail(rec, stage::LANDLOCK, &e);
                         return Err(e);
                     }
+                    // `require_lifetime_boundary`: the private cgroup
+                    // holds a member only while the workload's own
+                    // `cgroup.procs` writes are restrained — a degraded
+                    // fs restriction leaves ambient write access to a
+                    // parent or sibling hierarchy, so the join below
+                    // would arm an escapable boundary. The flag refuses
+                    // anything short of `FullyEnforced`, independent of
+                    // `allow_degraded` (which tolerates exactly this
+                    // gap). `ebpf-run` pins this floor unconditionally.
+                    if self.require_lifetime_boundary
+                        && status.ruleset != RulesetStatus::FullyEnforced
+                    {
+                        let e = std::io::Error::from_raw_os_error(libc::EACCES);
+                        record_fail(rec, stage::LANDLOCK, &e);
+                        return Err(e);
+                    }
                     record_complete(rec, stage::LANDLOCK);
                 }
                 Err(e) => {
@@ -673,6 +747,14 @@ impl LinuxSandboxBits {
             // truthful no-op instead of silently skipping the stage.
             None => {
                 record_landlock(rec, landlock_level::NO_RULESET, 0);
+                // No fs boundary at all — under
+                // `require_lifetime_boundary` the cgroup join below
+                // would arm an escapable boundary, so refuse instead.
+                if self.require_lifetime_boundary {
+                    let e = std::io::Error::from_raw_os_error(libc::EACCES);
+                    record_fail(rec, stage::LANDLOCK, &e);
+                    return Err(e);
+                }
                 record_complete(rec, stage::LANDLOCK);
             }
         }

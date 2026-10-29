@@ -5,6 +5,43 @@ fn parse_err(src: &str) -> PolicyError {
 }
 
 #[test]
+fn sandbox_require_lifetime_boundary_parses() {
+    let policy = parse_kdl_policy(
+        r#"policy version=2
+sandbox require_lifetime_boundary=#true"#,
+    )
+    .expect("require_lifetime_boundary parses");
+    assert!(policy.sandbox.require_lifetime_boundary);
+    assert!(!policy.sandbox.allow_degraded);
+
+    // Both knobs compose on a single `sandbox` node.
+    let both = parse_kdl_policy(
+        r#"policy version=2
+sandbox allow_degraded=#true require_lifetime_boundary=#true"#,
+    )
+    .expect("combined sandbox node parses");
+    assert!(both.sandbox.allow_degraded);
+    assert!(both.sandbox.require_lifetime_boundary);
+
+    // Omitted keeps the strict default; `=#false` is the explicit waiver.
+    let omitted = parse_kdl_policy("policy version=2").expect("version-2 parses");
+    assert!(omitted.sandbox.require_lifetime_boundary);
+    let waived = parse_kdl_policy(
+        r#"policy version=2
+sandbox require_lifetime_boundary=#false"#,
+    )
+    .expect("the waiver parses");
+    assert!(!waived.sandbox.require_lifetime_boundary);
+
+    // Non-boolean fails closed.
+    let err = parse_err(
+        r#"policy version=2
+sandbox require_lifetime_boundary="yes""#,
+    );
+    assert!(matches!(err, PolicyError::KdlParse(_)), "{err:?}");
+}
+
+#[test]
 fn mcp_rule_rejects_duplicate_direction() {
     // A second `direction` on one rule is ambiguous — the load must
     // fail closed (whether the KDL document layer or the rule

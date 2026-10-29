@@ -92,10 +92,14 @@ impl Drop for StdChild {
 }
 
 impl StdChild {
-    /// Wrap a just-spawned child, adopting it into a private cgroup
-    /// when the v2 hierarchy allows — the non-escapable descendant
-    /// boundary the group kill alone cannot give.
-    pub fn spawned(child: std::process::Child) -> Self {
+    /// Wrap a just-spawned child, recording the private cgroup it
+    /// joined in `pre_exec` (verified by the caller's post-spawn
+    /// `member` check) — the non-escapable descendant boundary the
+    /// group kill alone cannot give.
+    pub(crate) fn spawned(
+        child: std::process::Child,
+        #[cfg(target_os = "linux")] lifetime_cgroup: Option<LifetimeCgroup>,
+    ) -> Self {
         // Re-registration is redundant on spawn_and_register paths —
         // `entry().or_insert` keeps the real launch tag, so the `0`
         // here only marks a leader that was never stamped.
@@ -103,11 +107,23 @@ impl StdChild {
         reap::register_launch_root(child.id(), 0);
         Self {
             #[cfg(target_os = "linux")]
-            lifetime_cgroup: LifetimeCgroup::try_adopt("run", child.id()),
+            lifetime_cgroup,
             #[cfg(unix)]
             teardown_done: false,
             child,
         }
+    }
+
+    /// Whether this child sits behind a kernel-enforced descendant-
+    /// lifetime boundary — on Linux only a `lifetime_cgroup` adoption
+    /// provides one; the process-group + `/proc` fallback sweep is
+    /// best-effort and does not satisfy
+    /// `sandbox.require_lifetime_boundary`. Off Linux a `StdChild`
+    /// carries no boundary mechanism — every route that could carry
+    /// the flag refuses before spawn, so no caller exists there.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_lifetime_boundary(&self) -> bool {
+        self.lifetime_cgroup.is_some()
     }
 }
 

@@ -204,56 +204,6 @@ fn entry_bytes(e: &RuleEntry) -> &[u8] {
     }
 }
 
-/// Fail-closed overlap check between the policy's effective fs write
-/// grants and the cgroup v2 hierarchy the private cgroup lives under.
-///
-/// cgroup-BPF attach enforces on the cgroup *subtree*: a workload that
-/// can write `cgroup.procs` of a cgroup outside the private subtree
-/// (`/sys/fs/cgroup` or an ancestor — `/sys`, `/`, or any covering glob)
-/// migrates itself or a child out from under the attached programs and
-/// sheds connect enforcement entirely. Any grant spelling covering the
-/// v2 root — or inside it, where it could still name `cgroup.procs` or
-/// `cgroup.subtree_control` of a sibling branch — refuses the launch.
-/// A root-glob spelling (`/*`, `/**`) reduces to an empty base every
-/// grant builder skips — it grants nothing and is skipped here too.
-/// Any other unresolvable spelling refuses: "cannot prove disjoint"
-/// stays on the refuse side.
-pub fn cgroup_write_grant_conflict(policy: &crate::policy::Policy) -> Option<String> {
-    let root = match crate::fsoverlap::resolve_grant_spelling(CGROUP_ROOT) {
-        Some(r) => r,
-        None => {
-            return Some(format!("cannot resolve the cgroup v2 root '{CGROUP_ROOT}'"));
-        }
-    };
-    for grant in policy.write_grant_spellings() {
-        match crate::fsoverlap::resolve_grant_spelling(&grant) {
-            Some(g) => {
-                if crate::fsoverlap::path_covers(&g, &root)
-                    || crate::fsoverlap::path_covers(&root, &g)
-                {
-                    return Some(format!(
-                        "fs write grant '{grant}' (resolves to '{}') overlaps the cgroup v2 \
-                         hierarchy at '{}' — a workload could move itself out of the \
-                         enforced cgroup and shed the connect hooks",
-                        g.display(),
-                        root.display()
-                    ));
-                }
-            }
-            None => {
-                if crate::fsoverlap::reduces_to_empty_base(&grant) {
-                    continue;
-                }
-                return Some(format!(
-                    "fs write grant '{grant}' cannot be resolved against the cgroup v2 \
-                     hierarchy — refusing rather than assuming disjoint"
-                ));
-            }
-        }
-    }
-    None
-}
-
 impl Runtime {
     /// Full pre-spawn setup — the real capability probe. Any failure
     /// returns a [`PrepareError`] naming the step, errno, and the

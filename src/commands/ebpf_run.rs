@@ -370,6 +370,7 @@ mod imp {
             policy.version,
             fail_on.as_str(),
             policy.sandbox.allow_degraded,
+            policy.sandbox.require_lifetime_boundary,
             &args
                 .policy
                 .as_ref()
@@ -434,7 +435,10 @@ mod imp {
         // overlapping the cgroup v2 hierarchy would let the workload
         // migrate out and shed the attached programs. Refuse before any
         // cgroup/BPF state exists.
-        if let Some(conflict) = ebpf::cgroup_write_grant_conflict(&policy) {
+        if let Some(conflict) = ebpf::cgroup_write_grant_conflict(
+            policy.write_grant_spellings(),
+            "shed the connect hooks",
+        ) {
             eprintln!("Error: {conflict}");
             write_report(
                 "invalid-policy",

@@ -66,10 +66,32 @@ pub struct TrajectoryRule {
 }
 
 /// OS-sandbox degradation policy. Default is fail-closed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPolicy {
     /// When true, Landlock NotEnforced/Partial states are allowed. Default false.
     pub allow_degraded: bool,
+    /// When true, every supervised launch must carry a kernel-enforced
+    /// descendant-lifetime boundary — Linux native launches require a
+    /// private cgroup v2 adoption, the namespaced route satisfies via
+    /// its PID namespace (ns-init death kills every member), and
+    /// Windows relies on the mandatory job object; on platforms with
+    /// no such mechanism (e.g. macOS) a supervised launch is refused
+    /// rather than run without the boundary. Default true — an
+    /// explicit `sandbox require_lifetime_boundary=#false` is the
+    /// documented waiver, recorded on the audit `policy.loaded`
+    /// record. Unsandboxed launches (`--dry-run`, `MCP_WRIT_SKIP_SANDBOX`)
+    /// are outside the flag's scope: they already waive every other
+    /// enforcement, so they run best-effort regardless.
+    pub require_lifetime_boundary: bool,
+}
+
+impl Default for SandboxPolicy {
+    fn default() -> Self {
+        Self {
+            allow_degraded: false,
+            require_lifetime_boundary: true,
+        }
+    }
 }
 
 /// Child-process environment policy (`defaults { environment { ... } }`).

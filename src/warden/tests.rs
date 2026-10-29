@@ -98,6 +98,50 @@ async fn test_empty_argv_rejects_without_touching_os_controls() {
     assert!(attempt.report.observations.is_empty());
 }
 
+/// `require_lifetime_boundary` defaults on — the supervised-launch
+/// contract. An explicitly unsandboxed launch is outside the flag's
+/// scope: the operator already waived every other enforcement by
+/// choosing this route, so it still runs (best-effort).
+#[test]
+fn test_unsandboxed_launch_outside_boundary_scope() {
+    let policy = default_policy();
+    assert!(policy.sandbox.require_lifetime_boundary);
+    let warden = Warden::new(policy);
+    #[cfg(windows)]
+    let (cmd, args) = (
+        "cmd",
+        vec!["/c".to_string(), "echo".to_string(), "ok".to_string()],
+    );
+    #[cfg(not(windows))]
+    let (cmd, args) = ("echo", vec!["ok".to_string()]);
+    let mut child = warden
+        .spawn_unsandboxed(cmd, &args)
+        .expect("unsandboxed launch is outside the flag's scope");
+    let _ = child.wait();
+}
+
+/// Same scope on the async arm — the flag gates supervised launches,
+/// not this route.
+#[tokio::test]
+async fn test_unsandboxed_async_launch_outside_boundary_scope() {
+    let policy = default_policy();
+    assert!(policy.sandbox.require_lifetime_boundary);
+    let warden = Warden::new(policy);
+    #[cfg(windows)]
+    let argv = vec![
+        "cmd".to_string(),
+        "/c".to_string(),
+        "echo".to_string(),
+        "ok".to_string(),
+    ];
+    #[cfg(not(windows))]
+    let argv = vec!["echo".to_string(), "ok".to_string()];
+    let child = warden
+        .spawn_unsandboxed_async_with(&argv, &SpawnOptions::default())
+        .expect("unsandboxed launch is outside the flag's scope");
+    drop(child);
+}
+
 #[test]
 fn test_spawn_child_returns_piped_io() {
     let policy = default_policy();
@@ -123,7 +167,11 @@ fn test_spawn_child_returns_piped_io() {
 async fn test_spawn_report_records_verified_launch_for_running_child() {
     use crate::enforcement::{ControlPhase, ControlState, GrantSubject};
 
-    let policy = default_policy();
+    // macOS provides no kernel-enforced descendant boundary, so the
+    // default-on `require_lifetime_boundary` would refuse — declare
+    // the waiver an operator would write.
+    let mut policy = default_policy();
+    policy.sandbox.require_lifetime_boundary = false;
     let warden = Warden::new(policy);
     let argv = vec![
         "/bin/sh".to_string(),
@@ -181,7 +229,9 @@ async fn test_spawn_report_flags_immediate_exit() {
     // the status and reads Unknown, the rule domains stay Unknown,
     // and the spawn outcome itself is unaffected (the caller sees
     // the EOF).
-    let policy = default_policy();
+    // Same default-on boundary waiver as the sibling test above.
+    let mut policy = default_policy();
+    policy.sandbox.require_lifetime_boundary = false;
     let warden = Warden::new(policy);
     let argv = vec![
         "/bin/sh".to_string(),

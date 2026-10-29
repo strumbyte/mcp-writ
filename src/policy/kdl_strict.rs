@@ -184,7 +184,14 @@ pub(crate) fn check_doc_schema(
                 0,
                 false,
             )?,
-            "sandbox" => check_props(&mut cx, node, &["allow_degraded"], "sandbox", 0, false)?,
+            "sandbox" => check_props(
+                &mut cx,
+                node,
+                &["allow_degraded", "require_lifetime_boundary"],
+                "sandbox",
+                0,
+                false,
+            )?,
             "confused_deputy_protection" => {
                 check_props(&mut cx, node, &[], "confused_deputy_protection", 1, false)?
             }
@@ -370,7 +377,14 @@ fn check_when_node(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyError
             "defaults" => check_defaults_node(cx, child)?,
             "server" => check_server_node(cx, child, None)?,
             "logging" => check_props(cx, child, &["level", "fail_closed"], "logging", 0, false)?,
-            "sandbox" => check_props(cx, child, &["allow_degraded"], "sandbox", 0, false)?,
+            "sandbox" => check_props(
+                cx,
+                child,
+                &["allow_degraded", "require_lifetime_boundary"],
+                "sandbox",
+                0,
+                false,
+            )?,
             "confused_deputy_protection" => {
                 check_props(cx, child, &[], "confused_deputy_protection", 1, false)?
             }

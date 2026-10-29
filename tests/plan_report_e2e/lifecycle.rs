@@ -368,10 +368,9 @@ async fn run_audit_allow_degraded_is_recorded() {
     let policy_path = dir.path().join("policy.kdl");
     std::fs::write(
         &policy_path,
-        format!(
-            "{}\nsandbox allow_degraded=#true\n",
-            common::sandboxed_policy("", "")
-        ),
+        // Merged into one `sandbox` node — a standalone second node
+        // would be ignored by the parser.
+        common::sandboxed_policy_with_sandbox("", "", "allow_degraded=#true"),
     )
     .expect("write policy");
     let audit_log = dir.path().join("audit.jsonl");

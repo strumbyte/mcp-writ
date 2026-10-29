@@ -186,26 +186,70 @@ pub(super) fn attach_fd_hygiene(
     Ok(())
 }
 
+/// How enforceable the private-cgroup boundary is on this launch arm —
+/// an armed cgroup is only `verified` when something restrains the
+/// workload's own `cgroup.procs` writes.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum LifetimeGrantMode {
+    /// Sandboxed launch with the Landlock fs boundary proven
+    /// `FullyEnforced` — it withholds writes to a `cgroup.procs`
+    /// outside the private subtree (a covering grant would have been
+    /// refused or skipped adoption), so a verified join is enforced.
+    /// `require_lifetime_boundary` enforces this in the child's apply;
+    /// the flag-off report downgrades to [`Self::Unconfined`] whenever
+    /// the recorded level falls short.
+    Confined,
+    /// No enforced fs boundary restrains the workload's own
+    /// `cgroup.procs` writes — an unsandboxed launch, or a sandboxed
+    /// one whose Landlock stage reported less than `FullyEnforced` —
+    /// so on a writable hierarchy a member can migrate itself out of
+    /// the subtree: the boundary is best-effort even when armed.
+    Unconfined,
+    /// The policy's write grants overlap the cgroup hierarchy —
+    /// adoption was deliberately skipped because the boundary would be
+    /// escapable by grant, not only by residual.
+    GrantConflict,
+}
+
 /// The launch report's `process_lifetime` grant entry — records whether
 /// the cgroup v2 descendant boundary was armed for this spawn so a
 /// fallback teardown never reads as a stronger guarantee than it is.
 #[cfg(target_os = "linux")]
-fn lifetime_grant(cg: &Option<cgroup::LifetimeCgroup>) -> crate::enforcement::ProcessGrant {
+fn lifetime_grant(
+    cg: &Option<cgroup::LifetimeCgroup>,
+    mode: LifetimeGrantMode,
+) -> crate::enforcement::ProcessGrant {
     use crate::enforcement::{ControlState, GrantOrigin, GrantSubject, ProcessGrant};
-    let (state, reason) = if cg.is_some() {
-        (
-            // `try_adopt` runs after `cmd.spawn()` returned — a child
-            // could already have forked, and descendants created before
-            // adoption are outside the cgroup the teardown kills.
-            ControlState::PartiallyApplied,
-            "private cgroup v2 adopted after spawn — teardown kills the \
-             adopted subtree (setsid'd daemons and reparented orphans \
-             inside it included), but descendants created before \
-             adoption are outside the boundary"
+    let (state, reason) = match (mode, cg.is_some()) {
+        (LifetimeGrantMode::Confined, true) => (
+            // The child wrote itself into the private cgroup in
+            // `pre_exec` — before `execve`, so no descendant can ever
+            // have existed outside the subtree — and the caller
+            // verified membership via `/proc/<pid>/cgroup`.
+            ControlState::Verified,
+            "private cgroup v2 joined in pre_exec — teardown kills the \
+             subtree (setsid'd daemons and reparented orphans inside it \
+             included); membership verified post-spawn"
                 .to_string(),
-        )
-    } else {
-        (
+        ),
+        (LifetimeGrantMode::Unconfined, true) => (
+            ControlState::PartiallyApplied,
+            "private cgroup v2 joined in pre_exec, but filesystem write \
+             restriction is absent or degraded — the workload can write \
+             a parent or sibling cgroup.procs and migrate itself out of \
+             the subtree; teardown kills members only — best-effort \
+             boundary"
+                .to_string(),
+        ),
+        (LifetimeGrantMode::GrantConflict, _) => (
+            ControlState::Skipped,
+            "cgroup v2 boundary deliberately unarmed — a policy write \
+             grant overlaps the hierarchy, so the workload could \
+             migrate itself out of the private subtree"
+                .to_string(),
+        ),
+        (_, _) => (
             ControlState::Skipped,
             "cgroup v2 unavailable or unwritable — teardown sweeps the \
              process group plus marker-attributed orphans reparented \
@@ -213,7 +257,7 @@ fn lifetime_grant(cg: &Option<cgroup::LifetimeCgroup>) -> crate::enforcement::Pr
              rewrote its launch lineage marker, and reparented cannot \
              be told apart from a host child and can outlive the session"
                 .to_string(),
-        )
+        ),
     };
     ProcessGrant {
         subject: GrantSubject::Rule {

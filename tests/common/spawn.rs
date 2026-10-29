@@ -155,12 +155,61 @@ pub const FIXTURE_SYSCALLS_KDL: &str = concat!(
     "    }\n"
 );
 
+/// `sandbox` properties a supervised launch on *this host* must declare
+/// — the waivers an operator would write. `require_lifetime_boundary`
+/// defaults on: macOS provides no kernel descendant-boundary mechanism
+/// at all, and a pre-ABI-4 Linux kernel cannot fully enforce the
+/// Landlock ruleset that pins a member cgroup, so both need the
+/// explicit `=#false`. The old kernel also needs `allow_degraded` for
+/// its partially enforced ruleset. Capable hosts get an empty string —
+/// no waiver is emitted where the boundary is enforceable.
+pub fn sandbox_waiver_props() -> String {
+    #[cfg(target_os = "linux")]
+    if super::binaries::linux_below_landlock_v4() {
+        return " allow_degraded=#true require_lifetime_boundary=#false".to_string();
+    }
+    if cfg!(target_os = "macos") {
+        " require_lifetime_boundary=#false".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// One `sandbox` node merging caller props with the host waivers — the
+/// parser keeps only the first `sandbox` node, so callers never append
+/// a second one. Emits an empty string when the merged set is empty.
+pub fn sandbox_waiver_node(extra_props: &str) -> String {
+    let mut props = sandbox_waiver_props();
+    let extra = extra_props.trim();
+    if !extra.is_empty() {
+        props.push(' ');
+        props.push_str(extra);
+    }
+    if props.is_empty() {
+        String::new()
+    } else {
+        format!("sandbox{props}\n")
+    }
+}
+
 /// Compose a minimal sandboxed policy: `defaults` with the given fs allow
-/// lines plus the fixture syscall baseline (Unix), `logging`, and the
-/// caller's `server` block verbatim.
+/// lines plus the fixture syscall baseline (Unix), one merged `sandbox`
+/// waiver node, `logging`, and the caller's `server` block verbatim.
 pub fn sandboxed_policy(fs_allows: &str, server_kdl: &str) -> String {
+    sandboxed_policy_with_sandbox(fs_allows, server_kdl, "")
+}
+
+/// [`sandboxed_policy`] with caller `sandbox` props merged into the same
+/// node — never append a standalone `sandbox ...` line, the parser
+/// keeps only the first node and would silently drop one of them.
+pub fn sandboxed_policy_with_sandbox(
+    fs_allows: &str,
+    server_kdl: &str,
+    sandbox_props: &str,
+) -> String {
     let syscalls = if cfg!(unix) { FIXTURE_SYSCALLS_KDL } else { "" };
+    let sandbox = sandbox_waiver_node(sandbox_props);
     format!(
-        "policy version=1\ndefaults {{\n    filesystem {{\n        secret-overlay #true\n{fs_allows}    }}\n{syscalls}}}\nlogging level=\"info\" fail_closed=#false\n{server_kdl}"
+        "policy version=1\ndefaults {{\n    filesystem {{\n        secret-overlay #true\n{fs_allows}    }}\n{syscalls}}}\n{sandbox}logging level=\"info\" fail_closed=#false\n{server_kdl}"
     )
 }

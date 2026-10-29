@@ -192,6 +192,7 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
         policy.version,
         fail_on.as_str(),
         policy.sandbox.allow_degraded,
+        policy.sandbox.require_lifetime_boundary,
         &args
             .policy
             .as_ref()

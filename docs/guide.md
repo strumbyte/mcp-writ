@@ -2152,6 +2152,52 @@ Landlock ABI ships, the follow-up policy is the same: adopt it as an
 what the catalog's `landlock` requirement names, and never claim an
 enforcement level the kernel did not report.
 
+**Descendant-lifetime boundary (`sandbox require_lifetime_boundary`, default `#true`).**
+Every supervised launch tears the workload's process tree down at
+session end. The *enforced* boundary is kernel-side: on Linux a private
+cgroup v2 subtree (`cgroup.kill`; the child joins it in `pre_exec`, so
+no descendant is ever born outside it), on the namespaced
+route the PID namespace itself (ns-init's death kills every member), and
+on Windows the mandatory Job Object. The flag defaults on, so a
+supervised launch without a kernel-enforced boundary is refused at the
+`policy` stage instead of running unbounded — every macOS supervised
+launch (the platform has no equivalent mechanism) and every Linux
+native launch that cannot arm the private subtree. Explicitly
+unsandboxed launches (`--dry-run`, `MCP_WRIT_SKIP_SANDBOX`) are outside
+the flag's scope: that route already waived every other enforcement, so
+it runs best-effort and the report records it honestly (`partially-applied`
+when a cgroup armed, `skipped` when not).
+
+`require_lifetime_boundary=#false` is the explicit waiver that restores
+the accepted-residual posture: the Linux fallback becomes the
+process-group + `/proc` sweep augmented by the per-launch lineage
+marker — best-effort, since a workload that escapes its process group,
+rewrites the marker in its own environment, and outlives the leader
+cannot be told apart from a host child once reparented, and no
+unprivileged userspace mechanism can close that gap. The waiver is
+written into the policy and lands on the audit `policy.loaded` record
+as `require_lifetime_boundary=false`, so an unbounded launch never
+reads as bounded.
+
+The boundary is also refused when the policy itself would hand the
+workload the means to leave it: an fs write grant overlapping the
+cgroup v2 hierarchy reaches a parent or sibling `cgroup.procs`, so the
+member could migrate itself out of its private subtree — under the flag
+such a policy refuses the launch, and under the waiver the cgroup is
+deliberately left unarmed (the grant reports `skipped` with the
+conflict named rather than claiming a hollow boundary). The cgroup
+subtree is a boundary only while the member's own `cgroup.procs`
+writes are restrained, so the flag also requires the Landlock
+filesystem ruleset to report `FullyEnforced` — a degraded or absent
+enforcement leaves ambient write access to the hierarchy and is
+refused at prepare/apply (a kernel ABI below the handled set, or no
+mounted cgroup v2 hierarchy, is refused before spawn so the launcher
+can still pick the namespaced route, whose PID namespace satisfies the
+flag without a cgroup), and `sandbox allow_degraded=#true` cannot waive
+it: the flag exists to refuse exactly that gap. Under the waiver, a
+degraded Landlock reports the armed cgroup as `partially-applied`,
+never `verified`.
+
 | Area | Linux | macOS | Windows |
 |---|---|---|---|
 | Filesystem | **OS-enforced** (Landlock default-deny). Global `defaults.filesystem` **plus** the `filesystem` of every *allowed* tool merge into one process-wide ruleset — grants are not scoped per tool call. `mode="read"` maps to Landlock read rights including `Execute`; `mode="write"` adds write rights including `Truncate` (enforced on kernel ≥ 6.2). Trailing globs reduce to a real directory; mid-path globs such as `/home/*/.ssh` and missing paths → **warning**, the rule is skipped (default-deny still applies). A `deny` beneath an allowed parent → **rejected** at load on every OS (Landlock re-checks it at spawn). An `allow` rooted on a filesystem Landlock cannot mediate — pseudo-filesystems without persistent kernel inode identity, observed on 9p/v9fs mounts such as WSL2's `drvfs` — → **refused** at launch (the ruleset would report enforced yet never match the granted object); place the workload on a local filesystem. | **OS-enforced** (SBPL `subpath` rules) for the **global** lists only. Per-tool `filesystem` → **Auditor-checked**. `mode="exec"` adds `file-map-executable`, the grant dyld needs to map a non-system dylib. Independently of policy, every launch derives the workload's own code roots — an installed runtime's prefix (Homebrew/MacPorts/Nix/CLT tree or toolchain dir), the transitive Mach-O dylib closure (`@rpath`/`@loader_path`/`@executable_path` resolved), and an interpreted payload's project dir — and grants them read+map-executable, so a Homebrew/CLT interpreter or vendored native addon starts without any `mode="exec"` entry. A writable+executable overlap → **rejected** at load. | **OS-enforced** — under `appcontainer`, DACL grants to the AppContainer SID for global paths that exist at spawn; missing paths are skipped silently. Under `psec`, the same lists are encoded into the security-environment spec instead of DACL writes — entries must be literal absolute paths (globs and relative forms refuse at the policy-check stage) and missing paths are skipped. Per-tool `filesystem` → **Auditor-checked** under either mechanism. Matching is case-insensitive. |
