@@ -610,6 +610,8 @@ pub fn spawn_namespaced_child_tokio(cfg: &SpawnConfig) -> Result<NamespacedChild
             if pid > 0 {
                 loop {
                     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                    // SAFETY: scalar pid guarded > 0; a null status
+                    // pointer is allowed; only ever our own child.
                     let ret = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
                     if ret == pid {
                         break;

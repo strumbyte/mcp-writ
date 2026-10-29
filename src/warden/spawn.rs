@@ -281,7 +281,7 @@ impl Warden {
                 c
             })
             .map_err(WardenError::ProcessSpawn)
-            .and_then(|c| {
+            .map(|c| {
                 #[cfg(target_os = "linux")]
                 let verified = lifetime_cgroup.filter(|cg| cg.member(c.id()));
                 let std_child = child::StdChild::spawned(
@@ -289,7 +289,7 @@ impl Warden {
                     #[cfg(target_os = "linux")]
                     verified,
                 );
-                Ok(ChildProcess::Standard(std_child))
+                ChildProcess::Standard(std_child)
             })
     }
 

@@ -153,7 +153,7 @@ pub(crate) fn spawn_and_register<T>(
         let mut live = LIVE_LAUNCH_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
         let spawned = spawn()?;
         live.insert(pid(&spawned), launch_tag);
-        return Ok(spawned);
+        Ok(spawned)
     }
     #[cfg(not(target_os = "linux"))]
     {
