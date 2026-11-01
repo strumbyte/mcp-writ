@@ -146,8 +146,8 @@ pub fn guard_stopped(
 
 /// `policy.loaded`: the effective policy was loaded and bound. The
 /// `policy_*` fields carry its identity; `details` repeats
-/// version/hash and adds the resolved `fail_on` dial, the source
-/// path (or `default`), and the logger `session_id`, so the record
+/// version/hash and adds the resolved `fail_on` dial, the logger
+/// `session_id`, and the source path (or `default`), so the record
 /// still shows version and dial when the context hash could not be
 /// computed. `source` is an operator-supplied path string, so it is
 /// percent-encoded via [`encode_audit_field_value`] — a spelling like
@@ -195,10 +195,10 @@ pub fn policy_loaded(
         " secret_overlay=false"
     };
     event.details = Some(format!(
-        "version={} hash={hash} fail_on={fail_on}{degraded}{boundary}{overlay} source={} session_id={}",
+        "version={} hash={hash} fail_on={fail_on}{degraded}{boundary}{overlay} session_id={} source={}",
         policy.version,
-        encode_audit_field_value(source),
-        logger.session_id()
+        logger.session_id(),
+        encode_audit_field_value(source)
     ));
     logger.log(event);
 }

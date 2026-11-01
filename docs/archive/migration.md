@@ -149,4 +149,25 @@ mismatch record (`tools_list.changed`, `hash.mismatch`) covered the
 failure. Unblocked `tools_list.verified` records are unchanged
 (`action: "allowed"` / `outcome: "success"`).
 
+## Audit `details` value respelling: `policy.loaded` `source=` is percent-encoded (schema `"2.0"`)
+
+`policy.loaded` records the operator-supplied policy path in `details`
+as `source=<value>`. Schema `"1.0"` lines carried the literal spelling —
+`source=/etc/mcp-secure/policy.kdl` — where a path containing whitespace
+or `k=v` text could read as extra `details` tokens. Schema `"2.0"` lines
+percent-encode the value — `source=%2Fetc%2Fmcp-secure%2Fpolicy.kdl` —
+so a path spelling can never forge `k=v` members. Already-unreserved
+spellings such as `default` pass through unchanged, and the token now
+trails `session_id`: the encoded path is the expandable tail of
+`details`, so the field's byte bound cannot cut the session identifier
+off an expanded value.
+
+Consumers that only anchor on the `source=` token's presence are
+unaffected. Consumers that compare or display the path itself —
+dashboards and SIEM rules matching a literal directory or filename —
+must percent-decode the value first: decode a `source=` value that
+contains `%`; values without `%` are unchanged by the encoding. The
+top-level `policy_id` / `policy_version` / `policy_hash` members are
+untouched — only the `source=` token inside `details` respelled.
+
 The original MIT license and copyright notice are retained.

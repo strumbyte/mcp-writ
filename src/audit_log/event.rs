@@ -209,7 +209,7 @@ pub struct PolicyAuditContext {
 /// members — so this bumps only on a breaking shape change (a renamed
 /// or removed member, or a respelled value), recorded in the migration
 /// guide.
-pub const AUDIT_SCHEMA_VERSION: &str = "1.0";
+pub const AUDIT_SCHEMA_VERSION: &str = "2.0";
 
 /// Byte ceiling for a single string member copied into an audit record
 /// from wire data — tool names, request ids, violation detail. Client

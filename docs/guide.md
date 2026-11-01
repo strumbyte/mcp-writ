@@ -2616,7 +2616,7 @@ Each line carries:
 
 | Field | Type | Content |
 |---|---|---|
-| `schema_version` | string | Audit schema version (`"1.0"`) |
+| `schema_version` | string | Audit schema version (`"2.0"`) |
 | `timestamp` | string | UTC ISO-8601 with milliseconds |
 | `event_id` | string (UUIDv7) | Unique per event |
 | `correlation_id` | string (UUIDv7) | Groups related events |
@@ -2749,8 +2749,8 @@ lifecycle records:
 - `policy.loaded` (`configuration`) — the effective policy loaded and
   bound. `details` repeats `version`, the effective-KDL `hash`, the
   resolved `fail_on` dial (`none` is recorded even when no finding
-  fires), `source` (path or `default` — percent-encoded, so a path
-  spelling can never forge `k=v` tokens), and `session_id`;
+  fires), `session_id`, and `source` (path or `default` —
+  percent-encoded, so a path spelling can never forge `k=v` tokens);
   `policy_id` /
   `policy_version` / `policy_hash` carry the same identity. A policy
   carrying `sandbox allow_degraded=#true` adds `allow_degraded=true` —
