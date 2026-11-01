@@ -155,7 +155,10 @@ pub fn guard_stopped(
 /// dial — the requirement defaults on (a supervised launch refuses
 /// without a kernel-enforced descendant boundary), so only an explicit
 /// `sandbox require_lifetime_boundary=#false` is noteworthy enough to
-/// leave on the record.
+/// leave on the record. `secret_overlay` records the disabled
+/// secret-path overlay — the overlay defaults on, so the token appears
+/// only when the policy disabled it (`secret-overlay #false`); its
+/// absence means the overlay is in force.
 pub fn policy_loaded(
     logger: &AuditLogger,
     ctx: &SessionAuditContext,
@@ -163,6 +166,7 @@ pub fn policy_loaded(
     fail_on: &str,
     allow_degraded: bool,
     require_lifetime_boundary: bool,
+    secret_overlay: bool,
     source: &str,
 ) {
     let mut event = lifecycle_event(ctx, EventType::PolicyLoaded, Outcome::Success);
@@ -181,8 +185,13 @@ pub fn policy_loaded(
     } else {
         " require_lifetime_boundary=false"
     };
+    let overlay = if secret_overlay {
+        ""
+    } else {
+        " secret_overlay=false"
+    };
     event.details = Some(format!(
-        "version={version} hash={hash} fail_on={fail_on}{degraded}{boundary} source={source} session_id={}",
+        "version={version} hash={hash} fail_on={fail_on}{degraded}{boundary}{overlay} source={source} session_id={}",
         logger.session_id()
     ));
     logger.log(event);
@@ -507,6 +516,7 @@ mod tests {
             "none",
             false,
             true,
+            true,
             "/etc/mcp-secure/policy.kdl",
         );
         logger.shutdown().await.unwrap();
@@ -540,7 +550,7 @@ mod tests {
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
 
-        policy_loaded(&logger, &ctx, 1, "high", false, false, "default");
+        policy_loaded(&logger, &ctx, 1, "high", false, false, true, "default");
         logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -565,11 +575,44 @@ mod tests {
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
 
-        policy_loaded(&logger, &ctx, 1, "high", true, false, "default");
+        policy_loaded(&logger, &ctx, 1, "high", true, false, true, "default");
         logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("allow_degraded=true"), "got: {content}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A policy that disabled the secret-path overlay records the dial —
+    /// a launch under `secret-overlay #false` is never shown as running
+    /// with the overlay in force; the default stays silent.
+    #[tokio::test]
+    async fn policy_loaded_records_secret_overlay_dial() {
+        let Some(dir) = test_dir() else {
+            crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+            return;
+        };
+        let path = dir.join("audit.jsonl");
+        let logger = AuditLogger::to_file(&path).unwrap();
+        let ctx = ctx_with_policy("srv");
+
+        policy_loaded(&logger, &ctx, 1, "high", false, true, false, "default");
+        logger.shutdown().await.unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("secret_overlay=false"), "got: {content}");
+
+        let path_on = dir.join("audit-on.jsonl");
+        let logger_on = AuditLogger::to_file(&path_on).unwrap();
+
+        policy_loaded(&logger_on, &ctx, 1, "high", false, true, true, "default");
+        logger_on.shutdown().await.unwrap();
+
+        let content_on = std::fs::read_to_string(&path_on).unwrap();
+        assert!(
+            !content_on.contains("secret_overlay=false"),
+            "got: {content_on}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

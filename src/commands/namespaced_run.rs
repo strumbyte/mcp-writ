@@ -355,6 +355,7 @@ mod imp {
             fail_on.as_str(),
             policy.sandbox.allow_degraded,
             policy.sandbox.require_lifetime_boundary,
+            policy.fs.secret_overlay,
             &args
                 .policy
                 .as_ref()
