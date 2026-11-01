@@ -49,7 +49,9 @@ impl nojson::DisplayJson for UuidStr {
 
 /// Serialize an AuditEvent to a single-line JSON string (JSONL format).
 /// Uses nojson builder — no serde dependency.
-/// The session id is the producing logger's stream provenance, supplied by the writer at serialization time, and is therefore present on every line by construction.
+/// The session id is the producing logger's stream provenance, supplied
+/// by the writer at serialization time, and is therefore present on
+/// every line by construction.
 pub fn write_event_jsonl(session_id: &str, event: &AuditEvent) -> String {
     nojson::object(|f| {
         f.member("schema_version", event.schema_version)?;
@@ -141,13 +143,20 @@ pub fn now_iso8601() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
+/// Per-process sequence folded into every generated id: pid + millis
+/// alone collides when two loggers are created inside the same
+/// millisecond, and the id is stamped on every emitted line as the
+/// stream's provenance.
+static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn generate_session_id() -> String {
     let pid = std::process::id();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    format!("{pid}-{ts}")
+    let seq = SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{pid}-{ts}-{seq}")
 }
 
 /// Convert days since Unix epoch to (year, month, day).

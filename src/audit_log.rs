@@ -239,7 +239,7 @@ impl AuditLogger {
         let writer_failed = FailureFlag::new();
         // stderr delivery cannot prove a durable write — a fail-closed
         // logger's completion waiters must not be acknowledged here.
-        let writer_handle = tokio::spawn(tracing_writer_task(rx, !fail_closed, session_id.clone(),));
+        let writer_handle = tokio::spawn(tracing_writer_task(rx, !fail_closed, session_id.clone()));
         Self {
             inner: std::sync::Arc::new(AuditLoggerInner {
                 tx: std::sync::Mutex::new(Some(tx)),

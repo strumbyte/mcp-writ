@@ -104,6 +104,7 @@ fn reopen_sink(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 pub(super) async fn file_writer_task(
     mut rx: mpsc::Receiver<AuditItem>,
     mut writer: std::io::BufWriter<std::fs::File>,
@@ -392,7 +393,11 @@ pub(super) async fn file_writer_task(
     }
 }
 
-pub(super) async fn tracing_writer_task(mut rx: mpsc::Receiver<AuditItem>, sink_durable: bool, session_id: String) {
+pub(super) async fn tracing_writer_task(
+    mut rx: mpsc::Receiver<AuditItem>,
+    sink_durable: bool,
+    session_id: String,
+) {
     while let Some((evt, ack, _permit)) = rx.recv().await {
         let json = write_event_jsonl(&session_id, &evt);
         match evt.severity {

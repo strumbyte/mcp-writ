@@ -111,6 +111,38 @@ async fn test_logger_to_file_writes_jsonl() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The writer attaches the logger's own session id at serialization —
+/// every line a `log`ged event produces must carry the id
+/// `AuditLogger::session_id()` reports, proving the structured member
+/// is wired to the same id the `details` strings quote.
+#[tokio::test]
+async fn test_logger_written_records_carry_logger_session_id() {
+    let Some(dir) = make_test_dir("audit_session_id") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
+    let path = dir.join("session_id.jsonl");
+
+    let logger = AuditLogger::to_file(&path).expect("should create logger");
+    let session_id = logger.session_id().to_owned();
+    for _ in 0..3 {
+        logger.log(make_test_event());
+    }
+    let _ = logger.shutdown().await;
+
+    let stamped = format!("\"session_id\":\"{session_id}\"");
+    let content = std::fs::read_to_string(&path).expect("should read file");
+    assert!(!content.is_empty(), "file should not be empty");
+    for line in content.lines() {
+        assert!(
+            line.contains(&stamped),
+            "written record must carry the logger's session_id: {line}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn test_logger_multiple_events() {
     let Some(dir) = make_test_dir("audit_multi_new") else {
@@ -522,7 +554,14 @@ async fn test_logger_byte_budget_fail_closed() {
     let rx = Some(rx);
     let writer_handle = tokio::spawn(async move {});
     // One record (~300 wire bytes) fits the 600 budget; a second cannot.
-    let logger = assemble_logger(tx, writer_handle, true, 600, writer_failed, generate_session_id());
+    let logger = assemble_logger(
+        tx,
+        writer_handle,
+        true,
+        600,
+        writer_failed,
+        generate_session_id(),
+    );
 
     let mut big = make_test_event();
     big.details = Some("y".repeat(500));

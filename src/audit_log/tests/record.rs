@@ -500,6 +500,16 @@ fn test_generate_session_id_not_empty() {
     assert!(!id.is_empty());
     assert!(id.contains('-'));
 }
+
+#[test]
+fn test_generate_session_id_unique_within_process() {
+    // The seq suffix must distinguish ids minted inside the same
+    // millisecond — the value is stamped on every emitted line.
+    let first = generate_session_id();
+    let second = generate_session_id();
+    assert_ne!(first, second);
+}
+
 /// The bound_audit_field helper keeps short values verbatim and cuts
 /// at a UTF-8 boundary for multi-byte content.
 #[test]
