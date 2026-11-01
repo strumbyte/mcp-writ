@@ -415,6 +415,27 @@ fn test_write_event_jsonl_guard_version() {
     assert_eq!(gv, env!("CARGO_PKG_VERSION"));
 }
 
+#[test]
+fn test_write_event_jsonl_session_id_member() {
+    let mut event = make_test_event();
+    event.session_id = Some("4777-1792821100856".to_string());
+    let json = write_event_jsonl(&event);
+    assert!(
+        json.contains("\"session_id\":\"4777-1792821100856\""),
+        "session_id member must carry the stamped value: {json}"
+    );
+}
+
+#[test]
+fn test_write_event_jsonl_session_id_null() {
+    let event = make_test_event();
+    let json = write_event_jsonl(&event);
+    assert!(
+        json.contains("\"session_id\":null"),
+        "unstamped event must serialize session_id as null: {json}"
+    );
+}
+
 // ─── Time Utilities ─────────────────────────────────────────────────────
 
 #[test]

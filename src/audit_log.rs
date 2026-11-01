@@ -261,8 +261,14 @@ impl AuditLogger {
     /// Bound the wire-derived string members of `event` to
     /// [`MAX_AUDIT_FIELD_BYTES`] and return the record's byte-budget
     /// share — capped at the whole budget so a single oversized record
-    /// can always proceed once the queue drains.
-    fn prepare(event: &mut AuditEvent) -> u32 {
+    /// can always proceed once the queue drains. The logger stamps its
+    /// own session id onto the record here (unless a producer already
+    /// set one), so every queued record carries the structured session
+    /// identifier.
+    fn prepare(event: &mut AuditEvent, session_id: &str) -> u32 {
+        if event.session_id.is_none() {
+            event.session_id = Some(session_id.to_owned());
+        }
         event.bound_wire_fields();
         event.wire_size().min(QUEUE_BYTE_BUDGET) as u32
     }
@@ -273,7 +279,7 @@ impl AuditLogger {
     /// exhausted byte budget — marks the logger unavailable instead of
     /// silently discarding the event.
     pub fn log(&self, mut event: AuditEvent) {
-        let need = Self::prepare(&mut event);
+        let need = Self::prepare(&mut event, &self.inner.session_id);
         let permit = match self.inner.bytes_budget.clone().try_acquire_many_owned(need) {
             Ok(p) => Some(p),
             Err(_) => {
@@ -348,7 +354,7 @@ impl AuditLogger {
             self.log(event);
             return Ok(());
         }
-        let need = Self::prepare(&mut event);
+        let need = Self::prepare(&mut event, &self.inner.session_id);
         // Bounded backpressure: wait for byte budget before queueing —
         // saturation slows the producer instead of dropping the record.
         let permit = match self
@@ -409,7 +415,7 @@ impl AuditLogger {
             self.log(event);
             return self.ensure_available();
         }
-        let need = Self::prepare(&mut event);
+        let need = Self::prepare(&mut event, &self.inner.session_id);
         let permit = match self
             .inner
             .bytes_budget

@@ -59,6 +59,10 @@ pub fn write_event_jsonl(event: &AuditEvent) -> String {
             Some(id) => f.member("parent_event_id", UuidStr(id))?,
             None => f.member("parent_event_id", &JsonNull)?,
         };
+        match &event.session_id {
+            Some(s) => f.member("session_id", s.as_str())?,
+            None => f.member("session_id", &JsonNull)?,
+        };
         f.member("event_type", event.event_type.as_str())?;
         f.member("event_category", event.event_type.category())?;
         f.member("severity", event.severity.as_str())?;
