@@ -846,6 +846,57 @@ fn macho_symbols_imports_and_strings() {
 }
 
 #[test]
+fn duplicate_string_sections_scan_once_and_stay_complete() {
+    // Many `__cstring` declarations over the *same* file range are a
+    // classic amplification: each would otherwise rescan identical
+    // bytes. Dedup keeps coverage complete — the shared range still
+    // yields its findings and nothing is reported as a subset.
+    let cstr: &[u8] = b"https://dup-range.example\0";
+    let sections: Vec<Sect> = (0..64u64)
+        .map(|i| Sect {
+            name: "__cstring",
+            flags: 0,
+            vaddr: 0x4000 + i * 0x1000,
+            bytes: cstr.to_vec(),
+        })
+        .collect();
+    let mut m = thin_macho64(CPU_TYPE_ARM64, 0, &sections, &[], &[], None);
+    let shared = sect_file_offset(&m, 0);
+    for idx in 1..sections.len() {
+        set_sect_file_offset(&mut m, idx, shared);
+    }
+    let profile = profile::analyze(&m).unwrap();
+    assert!(
+        profile
+            .strings
+            .urls
+            .iter()
+            .any(|u| u.contains("dup-range.example")),
+        "urls: {:?}",
+        profile.strings.urls
+    );
+    assert_eq!(profile.analysis.strings.status, AnalysisStatus::Analyzed);
+}
+
+#[test]
+fn string_section_declarations_are_bounded() {
+    // Distinct string-section ranges past the candidate bound stop the
+    // scan: cumulative bytes and range count are both capped, and the
+    // cut surfaces as Partial rather than an unbounded walk.
+    let sections: Vec<Sect> = (0..17_000u64)
+        .map(|i| Sect {
+            name: "__cstring",
+            flags: 0,
+            vaddr: 0x4000 + i * 0x1000,
+            bytes: b"x\0".to_vec(),
+        })
+        .collect();
+    let m = thin_macho64(CPU_TYPE_ARM64, 0, &sections, &[], &[], None);
+    let profile = profile::analyze(&m).unwrap();
+    assert_eq!(profile.analysis.strings.status, AnalysisStatus::Partial);
+}
+
+#[test]
 fn macho_code_region_metadata_is_precise() {
     let text = words(&[movz_x16(59), SVC_80, RET]);
     let m = thin_macho64(
@@ -867,6 +918,165 @@ fn macho_code_region_metadata_is_precise() {
     assert_eq!(r.slice_offset, Some(r.file_offset));
     // The svc site address is the section vaddr + instruction offset.
     assert_eq!(profile.syscalls[0].site.address, 0x1004);
+}
+
+/// Section `idx`'s declared file offset (`section_64.offset`, at +48)
+/// inside a built thin Mach-O — needed to patch ranges the sequential
+/// builder layout never produces.
+fn sect_file_offset(buf: &[u8], idx: usize) -> u32 {
+    let field = 32 + 72 + idx * 80 + 48;
+    u32::from_le_bytes(buf[field..field + 4].try_into().unwrap())
+}
+
+fn set_sect_file_offset(buf: &mut [u8], idx: usize, off: u32) {
+    let field = 32 + 72 + idx * 80 + 48;
+    put32(buf, field, off);
+}
+
+#[test]
+fn overlapping_executable_sections_are_coalesced() {
+    // Executable sections declared over the same file bytes must decode
+    // once: a hostile table can stack thousands of them, and each would
+    // otherwise repeat the same disassembly on a bounded input.
+    let code = words(&[movz_x16(59), SVC_80, RET]);
+    let mut m = thin_macho64(
+        CPU_TYPE_ARM64,
+        0,
+        &[
+            text_sect(0x1000, code.clone()),
+            text_sect(0x2000, code.clone()),
+            text_sect(0x3000, code),
+        ],
+        &[],
+        &[],
+        None,
+    );
+    let shared = sect_file_offset(&m, 0);
+    set_sect_file_offset(&mut m, 1, shared);
+    set_sect_file_offset(&mut m, 2, shared);
+
+    let profile = profile::analyze(&m).unwrap();
+    let regions = &profile.analysis.target.code_regions;
+    assert_eq!(regions.len(), 1, "{regions:?}");
+    // One decode pass — the single svc site resolves exactly once.
+    assert_eq!(profile.syscalls.len(), 1);
+    assert_eq!(profile.syscalls[0].site.address, 0x1004);
+    assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Partial);
+    let detail = profile
+        .analysis
+        .syscalls
+        .detail
+        .as_deref()
+        .unwrap_or_default();
+    assert!(detail.contains("overlap"), "{detail}");
+}
+
+#[test]
+fn partially_overlapping_section_is_dropped_whole() {
+    // A section starting inside an earlier range is dropped rather than
+    // clipped mid-instruction — the tail's coverage loss is honest
+    // Partial, never a possibly-misdecoded region.
+    let mut m = thin_macho64(
+        CPU_TYPE_ARM64,
+        0,
+        &[
+            text_sect(0x1000, words(&[movz_x16(59), SVC_80, RET])),
+            text_sect(0x2000, words(&[movz_x16(20), SVC_80, RET])),
+        ],
+        &[],
+        &[],
+        None,
+    );
+    let first = sect_file_offset(&m, 0);
+    // Sect 1 starts 8 bytes inside sect 0's 12-byte range.
+    set_sect_file_offset(&mut m, 1, first + 8);
+
+    let profile = profile::analyze(&m).unwrap();
+    assert_eq!(profile.analysis.target.code_regions.len(), 1);
+    assert_eq!(profile.syscalls.len(), 1);
+    assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Partial);
+}
+
+#[test]
+fn disjoint_executable_sections_still_analyze_fully() {
+    // Non-overlapping executable sections keep complete coverage — the
+    // coalescing bound must not shrink legitimate declarations.
+    let m = thin_macho64(
+        CPU_TYPE_ARM64,
+        0,
+        &[
+            text_sect(0x1000, words(&[movz_x16(59), SVC_80, RET])),
+            text_sect(0x2000, words(&[movz_x16(20), SVC_80, RET])),
+        ],
+        &[],
+        &[],
+        None,
+    );
+    let profile = profile::analyze(&m).unwrap();
+    assert_eq!(profile.analysis.target.code_regions.len(), 2);
+    assert_eq!(profile.syscalls.len(), 2);
+    assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Analyzed);
+}
+
+#[test]
+fn executable_region_count_is_bounded() {
+    // More executable sections than the region cap: the retained set
+    // stops at the bound and the report says so rather than silently
+    // listing a subset.
+    let sections: Vec<Sect> = (0..5000u64)
+        .map(|i| Sect {
+            name: "__text",
+            flags: S_ATTR_INSTRUCTIONS,
+            vaddr: 0x1000 + i * 0x1000,
+            bytes: RET.to_vec(),
+        })
+        .collect();
+    let m = thin_macho64(CPU_TYPE_ARM64, 0, &sections, &[], &[], None);
+    let profile = profile::analyze(&m).unwrap();
+    assert_eq!(
+        profile.analysis.target.code_regions.len(),
+        4096,
+        "regions are capped at MAX_CODE_REGIONS"
+    );
+    assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Partial);
+    let detail = profile
+        .analysis
+        .syscalls
+        .detail
+        .as_deref()
+        .unwrap_or_default();
+    assert!(detail.contains("region bound"), "{detail}");
+}
+
+#[test]
+fn executable_section_declarations_are_bounded_at_collection() {
+    // More section declarations than the candidate pool (4 ×
+    // MAX_CODE_REGIONS): collection itself stops at the bound —
+    // name allocation and sorting never scale with the declared
+    // count — and the report flags the cut as Partial.
+    let sections: Vec<Sect> = (0..17_000u64)
+        .map(|i| Sect {
+            name: "__text",
+            flags: S_ATTR_INSTRUCTIONS,
+            vaddr: 0x1000 + i * 0x1000,
+            bytes: RET.to_vec(),
+        })
+        .collect();
+    let m = thin_macho64(CPU_TYPE_ARM64, 0, &sections, &[], &[], None);
+    let profile = profile::analyze(&m).unwrap();
+    assert_eq!(
+        profile.analysis.target.code_regions.len(),
+        4096,
+        "kept regions stay at MAX_CODE_REGIONS"
+    );
+    assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Partial);
+    let detail = profile
+        .analysis
+        .syscalls
+        .detail
+        .as_deref()
+        .unwrap_or_default();
+    assert!(detail.contains("declarations truncated"), "{detail}");
 }
 
 #[test]

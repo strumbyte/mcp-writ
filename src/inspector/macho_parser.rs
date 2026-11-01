@@ -58,7 +58,32 @@ pub(crate) fn parse_slice(slice_bytes: &[u8]) -> Result<MachO<'_>, InspectorErro
     MachO::parse(slice_bytes, 0).map_err(|e| InspectorError::ParseError(format!("{e}")))
 }
 
-/// Executable sections of a parsed Mach-O, in load-command order.
+/// Derived-state bounds for executable-region enumeration, mirroring
+/// the ELF path's `MAX_CODE_REGIONS`. The input cap covers file bytes,
+/// not the decode work a hostile section table multiplies: every
+/// declared executable region is independently disassembled downstream,
+/// so the retained set is capped in count and in aggregate bytes.
+pub(crate) const MAX_CODE_REGIONS: usize = 4096;
+/// Aggregate decode budget for one slice — the same bound the top-level
+/// read applies to the input. Coalescing below already keeps retained
+/// ranges disjoint, so their sum can never exceed the slice; the
+/// constant makes that invariant an explicit budget rather than an
+/// emergent property.
+pub(crate) const MAX_CODE_REGION_BYTES: u64 = crate::inspector::MAX_ANALYZED_FILE_BYTES;
+/// Executable-section *declarations* retained for coalescing — larger
+/// than `MAX_CODE_REGIONS` so overlapping declarations cannot crowd
+/// later disjoint sections out of the kept set, but still bounded:
+/// every candidate costs a name `String` and a sort slot *before* the
+/// kept caps below apply, and a hostile table (~80 B per `section_64`
+/// load command inside a 512 MiB input) could otherwise stack millions
+/// of allocations on top of the input bound.
+const MAX_SECTION_CANDIDATES: usize = MAX_CODE_REGIONS * 4;
+/// Cumulative bytes `string_findings` rescans in one slice — the input
+/// bound again: disjoint declared ranges already sum to less than the
+/// slice, so the bound only bites when declarations overlap.
+const MAX_STRING_SCAN_BYTES: u64 = crate::inspector::MAX_ANALYZED_FILE_BYTES;
+
+/// Executable sections of a parsed Mach-O, sorted by file offset.
 ///
 /// A section counts as code when it carries an instruction attribute
 /// (`S_ATTR_PURE_INSTRUCTIONS`/`S_ATTR_SOME_INSTRUCTIONS` — set by the
@@ -66,17 +91,32 @@ pub(crate) fn parse_slice(slice_bytes: &[u8]) -> Result<MachO<'_>, InspectorErro
 /// `__text` inside an execute-protected segment. Every returned region is
 /// decoded by the caller; coverage gaps surface as `Partial`, never as a
 /// silent clean scan.
+///
+/// Overlapping declarations are coalesced before return: a crafted
+/// table can point thousands of executable sections at the same file
+/// bytes, and decoding each independently would multiply work far past
+/// the input bound. A section whose range starts inside an
+/// earlier-kept one is dropped whole rather than clipped — clipping
+/// could start the decode mid-instruction and fabricate sites. Dropped
+/// or budget-cut sections return as a `Some` detail note so the caller
+/// can mark the analysis `Partial`; the region list never silently
+/// narrows.
 pub(crate) fn executable_sections<'a>(
     macho: &'a MachO<'a>,
     slice_len: u64,
-) -> Result<Vec<MachOCodeRegion<'a>>, InspectorError> {
+) -> Result<(Vec<MachOCodeRegion<'a>>, Option<String>), InspectorError> {
     let mut regions = Vec::new();
-    for segment in &macho.segments {
+    let mut candidates_truncated = false;
+    'outer: for segment in &macho.segments {
         let seg_exec = segment.initprot & constants::VM_PROT_EXECUTE != 0;
-        let sections = segment
-            .sections()
-            .map_err(|e| InspectorError::ParseError(format!("sections: {e}")))?;
-        for (sect, data) in sections {
+        // Iterating `&Segment` reads each `section_64` on demand;
+        // `segment.sections()` would collect every declaration into a
+        // Vec *before* `MAX_SECTION_CANDIDATES` below could apply — a
+        // single segment with a huge `nsects` would re-open the
+        // allocation path this bound exists to close.
+        for section in segment.into_iter() {
+            let (sect, data) =
+                section.map_err(|e| InspectorError::ParseError(format!("sections: {e}")))?;
             let sectname = sect.name().unwrap_or("");
             let has_instr_attrs = sect.flags
                 & (constants::S_ATTR_PURE_INSTRUCTIONS | constants::S_ATTR_SOME_INSTRUCTIONS)
@@ -98,6 +138,13 @@ pub(crate) fn executable_sections<'a>(
                     slice_len,
                 )));
             }
+            // Bound the candidate pool *before* the name alloc and the
+            // sort — declarations past this point are coverage the
+            // analysis reports as cut, not work it still performs.
+            if regions.len() >= MAX_SECTION_CANDIDATES {
+                candidates_truncated = true;
+                break 'outer;
+            }
             regions.push(MachOCodeRegion {
                 name: format!("{},{}", sect.segname().unwrap_or(""), sectname),
                 slice_offset: sect.offset as u64,
@@ -106,7 +153,55 @@ pub(crate) fn executable_sections<'a>(
             });
         }
     }
-    Ok(regions)
+    // Decode must follow the file, not load-command order — coverage is
+    // tracked against sorted file ranges below.
+    regions.sort_by_key(|r| r.slice_offset);
+    let mut kept: Vec<MachOCodeRegion> = Vec::new();
+    let mut covered_end = 0u64;
+    let mut kept_bytes = 0u64;
+    let mut coalesced = 0usize;
+    let mut truncated = false;
+    for r in regions {
+        if r.slice_offset < covered_end {
+            coalesced += 1;
+            continue;
+        }
+        if kept.len() >= MAX_CODE_REGIONS
+            || kept_bytes + r.bytes.len() as u64 > MAX_CODE_REGION_BYTES
+        {
+            truncated = true;
+            break;
+        }
+        covered_end = r.slice_offset + r.bytes.len() as u64;
+        kept_bytes += r.bytes.len() as u64;
+        kept.push(r);
+    }
+    let partial = if coalesced == 0 && !truncated && !candidates_truncated {
+        None
+    } else {
+        let mut note = String::new();
+        if coalesced > 0 {
+            note.push_str(&format!(
+                "{coalesced} executable section(s) overlapping an earlier range \
+                 were coalesced out"
+            ));
+        }
+        if truncated {
+            if !note.is_empty() {
+                note.push_str("; ");
+            }
+            note.push_str("executable region bound reached");
+        }
+        if candidates_truncated {
+            if !note.is_empty() {
+                note.push_str("; ");
+            }
+            note.push_str("executable section declarations truncated");
+        }
+        note.push_str("; syscall findings are a lower bound");
+        Some(note)
+    };
+    Ok((kept, partial))
 }
 
 /// Mach-O symbols/imports for the capability profile.
@@ -237,20 +332,44 @@ pub(crate) fn symbol_profile(macho: &MachO) -> (SymbolProfile, Option<String>) {
 pub(crate) fn string_findings(macho: &MachO) -> Result<StringFindings, InspectorError> {
     let mut raw = Vec::new();
     let mut truncated = false;
+    // Bounds on the *scan*, not just the findings: every matching
+    // section is rescanned in full, so a table of overlapping
+    // `__cstring` declarations pointing at one large string-free region
+    // would multiply work past the input bound without ever reaching
+    // `MAX_RAW_STRINGS`. Exact-duplicate declarations share one
+    // `(offset, size)` range and are scanned once — a rescan cannot add
+    // findings, so dedup is not itself a truncation. The distinct-range
+    // count and cumulative scanned bytes are both capped; either bound
+    // marks the findings truncated rather than silently narrowing.
+    let mut seen_ranges = std::collections::HashSet::new();
+    let mut scanned_bytes = 0u64;
     'outer: for segment in &macho.segments {
-        let sections = segment
-            .sections()
-            .map_err(|e| InspectorError::ParseError(format!("sections: {e}")))?;
-        for (sect, data) in sections {
-            if STRING_SECTIONS.contains(&sect.name().unwrap_or("")) {
-                let (extracted, buf_truncated) = strings::extract_strings_from_bytes(data);
-                truncated |= buf_truncated;
-                raw.extend(extracted);
-                if raw.len() >= strings::MAX_RAW_STRINGS {
-                    raw.truncate(strings::MAX_RAW_STRINGS);
-                    truncated = true;
-                    break 'outer;
-                }
+        // Lazy section iteration — see `executable_sections` above; a
+        // collecting `sections()` call would allocate every declared
+        // section of a huge segment before the string cap could bite.
+        for section in segment.into_iter() {
+            let (sect, data) =
+                section.map_err(|e| InspectorError::ParseError(format!("sections: {e}")))?;
+            if !STRING_SECTIONS.contains(&sect.name().unwrap_or("")) || data.is_empty() {
+                continue;
+            }
+            if !seen_ranges.insert((sect.offset as u64, sect.size)) {
+                continue;
+            }
+            if seen_ranges.len() > MAX_SECTION_CANDIDATES
+                || scanned_bytes + data.len() as u64 > MAX_STRING_SCAN_BYTES
+            {
+                truncated = true;
+                break 'outer;
+            }
+            scanned_bytes += data.len() as u64;
+            let (extracted, buf_truncated) = strings::extract_strings_from_bytes(data);
+            truncated |= buf_truncated;
+            raw.extend(extracted);
+            if raw.len() >= strings::MAX_RAW_STRINGS {
+                raw.truncate(strings::MAX_RAW_STRINGS);
+                truncated = true;
+                break 'outer;
             }
         }
     }

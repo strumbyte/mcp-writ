@@ -2103,6 +2103,70 @@ fn pyvenv_home_outside_a_base_install_seeds_nothing() {
     }
 }
 
+/// `pyvenv.cfg` sits beside an attacker-selected interpreter, so it is
+/// consumed under a hard byte bound: an oversized config is refused
+/// whole (never parsed as a prefix), and a sparse file cannot drive an
+/// allocation proportional to its declared length.
+#[test]
+fn oversized_pyvenv_cfg_seeds_no_home_grant() {
+    use crate::legislator::source_bind::InterpreterKind;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let venv = root.join("proj/.venv");
+    let base_bin = root.join("base/bin");
+    std::fs::create_dir_all(venv.join("bin")).unwrap();
+    std::fs::create_dir_all(&base_bin).unwrap();
+    std::fs::write(base_bin.join("python3"), "x").unwrap();
+    let spelled = venv.join("bin/python");
+    std::fs::write(&spelled, "x").unwrap();
+
+    let kdl_for = || {
+        let workload = WorkloadHashes {
+            interpreter: Some(InterpreterKind::Python),
+            interpreter_path: Some(spelled.clone()),
+            spelled_path: Some(spelled.clone()),
+            payload_path: None,
+            ..Default::default()
+        };
+        generate_policy(
+            &empty_result(),
+            &CapabilityProfile::empty(),
+            None,
+            &[],
+            &workload,
+        )
+    };
+
+    // A valid `home=` line comes first, yet the file is over the bound
+    // — it is refused whole, never read as a prefix.
+    let mut cfg = format!("home = {}\n", base_bin.display());
+    cfg.push_str(&" ".repeat(MAX_PYVENV_CFG_BYTES as usize));
+    std::fs::write(venv.join("pyvenv.cfg"), cfg).unwrap();
+    let kdl = kdl_for();
+    assert!(
+        !kdl.contains("seeded from pyvenv.cfg home"),
+        "over-limit config must not seed a home grant:\n{kdl}"
+    );
+    // The venv layout grants are unaffected — the bound only changes
+    // how much of the config is trusted.
+    assert_eq!(
+        allow_lines(&kdl, &escape_kdl_string(&venv.to_string_lossy())).len(),
+        1,
+        "venv root grant missing:\n{kdl}"
+    );
+
+    // A sparse file declares most of its length as holes: the bounded
+    // read still cuts at the limit rather than allocating to size.
+    let cfg = std::fs::File::create(venv.join("pyvenv.cfg")).unwrap();
+    cfg.set_len(256 * 1024 * 1024).unwrap();
+    drop(cfg);
+    let kdl = kdl_for();
+    assert!(
+        !kdl.contains("seeded from pyvenv.cfg home"),
+        "sparse config must not seed a home grant:\n{kdl}"
+    );
+}
+
 /// The `environment` draft is candidates commented out — nothing live,
 /// so the restricted child environment (fail-closed) is unchanged.
 #[test]

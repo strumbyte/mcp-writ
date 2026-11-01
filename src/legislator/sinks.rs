@@ -24,10 +24,16 @@ const MAX_SCAN_WORK_BYTES: u64 = 256 * 1024 * 1024;
 
 type ScanResult = (Vec<Permission>, Vec<String>);
 
-struct ScanCache<'a> {
-    /// Whole-binding results keyed by body content — K bindings over
-    /// one shared handler body scan it once.
-    bodies: std::collections::HashMap<&'a str, ScanResult>,
+struct ScanCache {
+    /// Whole-binding results keyed by handler *identity*: the body's
+    /// `(data pointer, len)`. `ToolBinding.body` is `Rc<str>` — K
+    /// bindings over one shared handler share a single allocation — so
+    /// the memoization the map exists for needs no content compare.
+    /// Keying on `&str` text instead would run a full-body hash on
+    /// every probe, before `spend()` is ever charged — thousands of
+    /// registrations on one large handler would multiply CPU entirely
+    /// outside the work budget.
+    bodies: std::collections::HashMap<(usize, usize), ScanResult>,
     /// Helper-body results keyed by position in `functions`.
     helpers: std::collections::HashMap<usize, ScanResult>,
     /// Bytes of scanning left before the analysis declares itself partial.
@@ -35,7 +41,7 @@ struct ScanCache<'a> {
     truncated: bool,
 }
 
-impl<'a> ScanCache<'a> {
+impl ScanCache {
     fn new() -> Self {
         Self {
             bodies: std::collections::HashMap::new(),
@@ -114,16 +120,21 @@ fn scan_with_one_hop<'a>(
     functions: &'a [SourceFunction],
     language: InterpreterKind,
     cp_bindings: Option<&ChildProcessBindings>,
-    cache: &mut ScanCache<'a>,
+    cache: &mut ScanCache,
 ) -> ScanResult {
-    let (mut perms, mut risks) = if let Some(hit) = cache.bodies.get(body) {
+    // Handler identity, not content: every `body` here is a deref of a
+    // live `Rc<str>` field, so equal pointers with equal lengths are
+    // provably the same allocation — and distinct live allocations can
+    // never share one.
+    let key = (body.as_ptr() as usize, body.len());
+    let (mut perms, mut risks) = if let Some(hit) = cache.bodies.get(&key) {
         hit.clone()
     } else if cache.spend(body.len()) {
         let r = match language {
             InterpreterKind::Python => scan_python_sinks(body),
             InterpreterKind::Node | InterpreterKind::Npx => scan_js_sinks(body, cp_bindings),
         };
-        cache.bodies.insert(body, r.clone());
+        cache.bodies.insert(key, r.clone());
         r
     } else {
         return (Vec::new(), Vec::new());
@@ -1196,6 +1207,59 @@ def write_file(path):
         assert!(
             t.permissions.contains(&Permission::ProcessExec),
             "os.system in f-string interpolation must be ProcessExec, got {t:?}"
+        );
+    }
+
+    /// The body cache memoizes on the `Rc` allocation, not on hashing
+    /// the text: one shared handler costs its scan once, cache hits
+    /// spend nothing, and identical text under a different allocation
+    /// is a different identity — never conflated.
+    #[test]
+    fn body_cache_keys_by_allocation_identity() {
+        let mut cache = ScanCache::new();
+        let fns: Vec<SourceFunction> = Vec::new();
+        let body: std::rc::Rc<str> = std::rc::Rc::from("return open(path, 'w')");
+        let (p1, _) = scan_with_one_hop(&body, &fns, InterpreterKind::Python, None, &mut cache);
+        let spent = MAX_SCAN_WORK_BYTES - cache.work_left;
+        assert!(spent > 0);
+        let (p2, _) = scan_with_one_hop(&body, &fns, InterpreterKind::Python, None, &mut cache);
+        assert_eq!(p1, p2);
+        assert_eq!(cache.bodies.len(), 1, "one shared allocation scans once");
+        assert_eq!(
+            MAX_SCAN_WORK_BYTES - cache.work_left,
+            spent,
+            "a cache hit must not charge the work budget"
+        );
+        let other: std::rc::Rc<str> = std::rc::Rc::from("return open(path, 'w')");
+        scan_with_one_hop(&other, &fns, InterpreterKind::Python, None, &mut cache);
+        assert_eq!(
+            cache.bodies.len(),
+            2,
+            "identical text in a second allocation is a distinct identity"
+        );
+    }
+
+    /// K registrations over one handler all carry its full capability
+    /// result — the shared-body memoization must neither rescan per
+    /// binding nor truncate under the work budget.
+    #[test]
+    fn stacked_decorators_on_one_handler_share_the_scan() {
+        let mut src = String::new();
+        for i in 0..64 {
+            src.push_str(&format!("@mcp.tool(name=\"t{i}\")\n"));
+        }
+        src.push_str("def handler(path):\n    return open(path, 'w').write('x')\n");
+        let bindings = bind_python(&src);
+        let fns = extract_functions(&src);
+        let caps = capabilities_from_bindings(&bindings, &fns, InterpreterKind::Python, &src);
+        let bound = caps
+            .iter()
+            .filter(|c| c.permissions.contains(&Permission::FileWrite))
+            .count();
+        assert_eq!(bound, 64, "{caps:?}");
+        assert!(
+            caps.iter().all(|c| c.warning.is_none()),
+            "shared-body scans must not carry truncation warnings: {caps:?}"
         );
     }
 }

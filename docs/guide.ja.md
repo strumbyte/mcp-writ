@@ -1569,6 +1569,7 @@ logging level="info"
 | `event_id` | string (UUIDv7) | イベントごとに一意 |
 | `correlation_id` | string (UUIDv7) | 関連イベントをグループ化 |
 | `parent_event_id` | string (UUIDv7) または `null` | イベントが別イベントに起因する場合に設定 |
+| `session_id` | string | emit したロガーのプロセスごとの ID（`{pid}-{ミリ秒}-{連番}`）— writer が直列化時に付与するため、`audit.reopened` マーカーを含む全行に存在 |
 | `event_type` | string | ドット区切りのイベント名（下記一覧） |
 | `event_category` | string | `event_type` のカテゴリ（下記一覧） |
 | `severity` | string | `info` / `low` / `medium` / `high` / `critical` |
@@ -1610,7 +1611,7 @@ logging level="info"
 
 `tools_list.verified`（`supply_chain`）は、サーバの広告リストに対するマニフェストスキャン＋ハッシュ検証の判定を記録する — 通過時は `action: "allowed"` / `outcome: "success"`、検証が一覧を拒否した場合は `details` に `blocked=true` を持つ `action: "observed"` / `outcome: "failure"`。検証済み digest の公開とレスポンス転送の**前に**（拒否の場合は拒否応答の送出の前に）永続ストレージへコミットされる — `logging.fail_closed` 下でコミットできないレコードは状態遷移を拒否し、監査なしのリストを送出しない。
 
-`run` / `run-image` は起動をライフサイクルレコードで囲む。これらはすべて同じ `correlation_id`（`--report` 成果物が `launch_id` として持つ起動 ID と同値）と `details.session_id`（emit したロガーのプロセスごとの ID）を共有する。`run` ではホストのガードが書く。`run-image` ではゲスト内の `mcp-secure-runner` が書き（`--log-dir` がマウントされていればその中へ、無ければゲストの stderr へ）、ホスト採番の `MCP_WRIT_LAUNCH_ID` で相関する — ゲスト開始前のホスト側処理（イメージ解決・隔離チェック・コンテナ spawn）はライフサイクルレコードを出さない:
+`run` / `run-image` は起動をライフサイクルレコードで囲む。これらはすべて同じ `correlation_id`（`--report` 成果物が `launch_id` として持つ起動 ID と同値）と `details.session_id`（emit したロガーのプロセスごとの ID — 全行のトップレベル `session_id` メンバでも同じ値が運ばれる）を共有する。`run` ではホストのガードが書く。`run-image` ではゲスト内の `mcp-secure-runner` が書き（`--log-dir` がマウントされていればその中へ、無ければゲストの stderr へ）、ホスト採番の `MCP_WRIT_LAUNCH_ID` で相関する — ゲスト開始前のホスト側処理（イメージ解決・隔離チェック・コンテナ spawn）はライフサイクルレコードを出さない:
 
 - `guard.started`（`system`）— ガードプロセスが監査シンクを開いた。`details` には `component`（ホストは `mcp-writ`、ゲストは `mcp-secure-runner`）、`pid`、`session_id`、および起動に設定されたセッション全体の弱化が入る: `sandbox=skipped via MCP_WRIT_SKIP_SANDBOX` や `dry_run=true`。これらの無い `guard.started` は完全な設定制御下での実行を意味する。
 - `policy.loaded`（`configuration`）— 実効ポリシーがロード・バインドされた。`details` は `version`、実効 KDL の `hash`、解決済み `fail_on` ダイヤル（finding が 1 件も無くても `none` は記録される）、`source`（パスまたは `default`）、`session_id` を繰り返す。`policy_id` / `policy_version` / `policy_hash` も同じ識別情報を持つ。`sandbox allow_degraded=#true` を持つポリシーでは `allow_degraded=true` が追加される — その起動は部分適用のサンドボックスを有効と受け入れたことを意味する。

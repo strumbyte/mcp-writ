@@ -2621,6 +2621,7 @@ Each line carries:
 | `event_id` | string (UUIDv7) | Unique per event |
 | `correlation_id` | string (UUIDv7) | Groups related events |
 | `parent_event_id` | string (UUIDv7) or `null` | Set when an event is caused by another |
+| `session_id` | string | Emitting logger's per-process id (`{pid}-{millis}-{seq}`) — stamped by the writer at serialization, so it is present on every line including the in-band `audit.reopened` marker |
 | `event_type` | string | Dotted event name (list below) |
 | `event_category` | string | Category of `event_type` (list below) |
 | `severity` | string | `info` / `low` / `medium` / `high` / `critical` |
@@ -2731,7 +2732,8 @@ transition instead of shipping an unaudited list.
 `run` / `run-image` bracket a launch with lifecycle records that all
 share `correlation_id` — the same launch id the `--report` artifact
 carries as `launch_id` — and `details.session_id`, the emitting logger's
-per-process id. `run` writes them from the host guard; for `run-image`
+per-process id (also the top-level `session_id` member on every line).
+`run` writes them from the host guard; for `run-image`
 the in-guest `mcp-secure-runner` writes them (to the mounted `--log-dir`,
 or the guest's stderr when none is mounted), correlated by the
 host-minted `MCP_WRIT_LAUNCH_ID` — host-side steps before the guest

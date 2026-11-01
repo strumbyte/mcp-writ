@@ -10,8 +10,23 @@ use crate::legislator::source_bind::{
 pub fn bind_python(source: &str) -> Vec<ToolBinding> {
     let functions = extract_functions(source);
     let mut bindings = Vec::new();
-    collect_decorator_bindings(source, &functions, &mut bindings);
-    collect_add_tool_bindings(source, &functions, &mut bindings);
+    let mut notes = Vec::new();
+    collect_decorator_bindings(source, &functions, &mut bindings, &mut notes);
+    collect_add_tool_bindings(source, &functions, &mut bindings, &mut notes);
+    if !notes.is_empty() {
+        // Analysis-level truncation record: appended after every
+        // retained binding so it can never displace one — downstream it
+        // is an Unbound ToolCapability, surfacing as a finding in
+        // `cross_validate_source` rather than a note folded onto a
+        // bound binding.
+        bindings.push(ToolBinding {
+            tool_name: "<unbound>".into(),
+            function_name: None,
+            body: Rc::default(),
+            bound: false,
+            warning: Some(notes.join("; ")),
+        });
+    }
     bindings
 }
 
@@ -104,17 +119,36 @@ fn function_body(lines: &[&str], def_idx: usize, def_indent: usize) -> (String, 
     (body, i)
 }
 
+/// Collects decorator bindings into `out`, pushing truncation
+/// diagnostics into `notes`: the pending-overflow note when a decorator
+/// run overran `pending`, and the shared output-cap note when `out`
+/// itself fills and later decorators/registrations go unanalyzed. The
+/// caller emits the joined notes as a separate analysis-level record
+/// after every retained binding, so they reach `cross_validate_source`
+/// as an Unbound finding without ever holding an `out` slot a retained
+/// binding still needs.
 fn collect_decorator_bindings(
     source: &str,
     functions: &[SourceFunction],
     out: &mut Vec<ToolBinding>,
+    notes: &mut Vec<String>,
 ) {
     let lines: Vec<&str> = source.lines().collect();
     let mut pending: Vec<String> = Vec::new();
+    // `pending` shares the output cap it feeds: every entry is an owned
+    // `String`, so a `def`-less decorator run would otherwise stack one
+    // allocation per attacker line long before the binding check can
+    // fire. The flag is analysis-level: once any run overflows, the
+    // single returned note covers the analysis — it is never cleared.
+    let mut pending_capped = false;
     let mut i = 0;
     while i < lines.len() {
         let trimmed = lines[i].trim_start();
         if let Some(deco) = take_tool_decorator(&lines, &mut i) {
+            if pending.len() >= MAX_TOOL_BINDINGS {
+                pending_capped = true;
+                continue;
+            }
             pending.push(deco);
             continue;
         }
@@ -127,6 +161,8 @@ fn collect_decorator_bindings(
             continue;
         }
         if out.len() >= MAX_TOOL_BINDINGS {
+            emit_pending_cap_note(notes, pending_capped);
+            note_once(notes, output_cap_note());
             return;
         }
         if let Some(fn_name) = def_name(trimmed) {
@@ -137,6 +173,8 @@ fn collect_decorator_bindings(
             let (body, dup) = unique_function_body(functions, &fn_name);
             for deco in pending.drain(..) {
                 if out.len() >= MAX_TOOL_BINDINGS {
+                    emit_pending_cap_note(notes, pending_capped);
+                    note_once(notes, output_cap_note());
                     return;
                 }
                 let mut binding = binding_from_decorator(&deco, &fn_name, &body);
@@ -151,6 +189,34 @@ fn collect_decorator_bindings(
         }
         pending.clear();
         i += 1;
+    }
+    emit_pending_cap_note(notes, pending_capped);
+}
+
+/// The pending-overflow diagnostic — pushed once when any decorator run
+/// overran `pending` during the analysis.
+fn emit_pending_cap_note(notes: &mut Vec<String>, capped: bool) {
+    if capped {
+        notes.push(format!(
+            "Unbound: tool-decorator run exceeds the {MAX_TOOL_BINDINGS}-binding \
+             limit; the rest of the run was not analyzed"
+        ));
+    }
+}
+
+/// The output-cap diagnostic — whichever collector fills `out` first
+/// emits it, so it must be identical for `note_once` to dedupe.
+fn output_cap_note() -> String {
+    format!(
+        "the {MAX_TOOL_BINDINGS}-binding limit was reached; later \
+         decorators/registrations were not analyzed"
+    )
+}
+
+/// Push `note` only when `notes` does not already carry it verbatim.
+fn note_once(notes: &mut Vec<String>, note: String) {
+    if !notes.iter().any(|n| n.as_str() == note) {
+        notes.push(note);
     }
 }
 
@@ -323,6 +389,7 @@ fn collect_add_tool_bindings(
     source: &str,
     functions: &[SourceFunction],
     out: &mut Vec<ToolBinding>,
+    notes: &mut Vec<String>,
 ) {
     let scan = strip_py_strings_and_comments(source);
     let bytes = scan.as_bytes();
@@ -330,6 +397,7 @@ fn collect_add_tool_bindings(
     let mut i = 0;
     while i + needle.len() < bytes.len() {
         if out.len() >= MAX_TOOL_BINDINGS {
+            note_once(notes, output_cap_note());
             return;
         }
         if &bytes[i..i + needle.len()] == needle {
@@ -925,5 +993,161 @@ def scan(path):
     return path
 "#;
         assert_eq!(bound_names(src), vec!["scan"]);
+    }
+
+    /// A `def`-less run of tool decorators must not stack one owned
+    /// `String` per attacker line: `pending` is bounded by the same cap
+    /// as the bindings it feeds, and the truncation surfaces as a
+    /// separate analysis-level record rather than silent loss.
+    #[test]
+    fn decorator_run_past_the_cap_is_bounded_and_marked() {
+        let mut src = String::new();
+        for i in 0..MAX_TOOL_BINDINGS + 64 {
+            src.push_str(&format!("@mcp.tool(name=\"t{i}\")\n"));
+        }
+        src.push_str("def handler():\n    return 1\n");
+        let bindings = bind_python(&src);
+        assert!(
+            bindings.len() <= MAX_TOOL_BINDINGS + 1,
+            "retained bindings stay in the cap plus one analysis record: {}",
+            bindings.len()
+        );
+        assert!(
+            bindings.iter().any(|b| !b.bound
+                && b.warning
+                    .as_deref()
+                    .is_some_and(|w| w.contains("binding limit"))),
+            "the truncated run is diagnosed: {bindings:?}"
+        );
+        // The bindings the cap could still emit keep their real names —
+        // truncation drops only what the run held beyond the limit.
+        assert!(
+            bindings.iter().any(|b| b.bound),
+            "retained decorators still bind: {bindings:?}"
+        );
+    }
+
+    /// With one `out` slot left, a capped run's retained binding still
+    /// fills it — the truncation note is appended as a separate Unbound
+    /// record that `cross_validate_source` reports, never folded onto
+    /// that binding.
+    #[test]
+    fn cap_warning_never_displaces_a_retained_binding() {
+        use crate::legislator::cross_validator::cross_validate_source;
+        use crate::legislator::source_bind::{InterpreterKind, analyze_source};
+
+        let mut src = String::new();
+        for i in 0..MAX_TOOL_BINDINGS - 1 {
+            src.push_str(&format!(
+                "@mcp.tool(name=\"r{i}\")\ndef r{i}():\n    return 1\n"
+            ));
+        }
+        for i in 0..MAX_TOOL_BINDINGS + 8 {
+            src.push_str(&format!("@mcp.tool(name=\"t{i}\")\n"));
+        }
+        src.push_str("def last():\n    return 2\n");
+        let bindings = bind_python(&src);
+        let retained: Vec<_> = bindings.iter().filter(|b| b.bound).collect();
+        assert_eq!(retained.len(), MAX_TOOL_BINDINGS, "{bindings:?}");
+        let last = retained.last().expect("the run's retained binding");
+        assert!(
+            last.warning.is_none(),
+            "the retained binding is preserved clean: {last:?}"
+        );
+        let notes: Vec<_> = bindings.iter().filter(|b| !b.bound).collect();
+        assert_eq!(notes.len(), 1, "one analysis-level note: {bindings:?}");
+        assert!(
+            notes[0]
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("binding limit")),
+            "{notes:?}"
+        );
+        // The note travels as an Unbound record: it lands in the
+        // analysis warnings and in the cross-validation verdicts.
+        let analysis = analyze_source(Path::new("cap_test.py"), InterpreterKind::Python, &src);
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|w| w.contains("binding limit")),
+            "analysis warnings carry the note: {:?}",
+            analysis.warnings
+        );
+        let result = cross_validate_source(&analysis.tools, &[]);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|v| v.reason.contains("binding limit")),
+            "the note reaches cross_validate_source: {:?}",
+            result.warnings
+        );
+    }
+
+    /// Filling `out` with legitimate bindings is a different truncation
+    /// than a pending-run overflow: it is tracked separately and still
+    /// produces the analysis-level diagnostic when later decorators go
+    /// unanalyzed.
+    #[test]
+    fn output_cap_truncation_is_diagnosed_without_pending_overflow() {
+        let mut src = String::new();
+        for i in 0..MAX_TOOL_BINDINGS + 8 {
+            src.push_str(&format!(
+                "@mcp.tool(name=\"r{i}\")\ndef r{i}():\n    return 1\n"
+            ));
+        }
+        let bindings = bind_python(&src);
+        assert_eq!(
+            bindings.iter().filter(|b| b.bound).count(),
+            MAX_TOOL_BINDINGS,
+            "{bindings:?}"
+        );
+        let notes: Vec<_> = bindings.iter().filter(|b| !b.bound).collect();
+        assert_eq!(notes.len(), 1, "one analysis-level note: {bindings:?}");
+        let w = notes[0].warning.as_deref().unwrap_or_default();
+        assert!(w.contains("binding limit was reached"), "{w}");
+        assert!(!w.contains("decorator run"), "{w}");
+    }
+
+    /// The drain-loop's own output-cap return produces the same
+    /// diagnostic: stacked decorators overflowing `out` mid-drain are
+    /// reported, not silently dropped.
+    #[test]
+    fn drain_loop_output_cap_produces_the_diagnostic() {
+        let mut src = String::new();
+        for i in 0..MAX_TOOL_BINDINGS - 1 {
+            src.push_str(&format!(
+                "@mcp.tool(name=\"r{i}\")\ndef r{i}():\n    return 1\n"
+            ));
+        }
+        src.push_str("@mcp.tool(name=\"x\")\n@mcp.tool(name=\"y\")\ndef last():\n    return 2\n");
+        let bindings = bind_python(&src);
+        assert!(bindings.iter().any(|b| b.bound && b.tool_name == "x"));
+        let notes: Vec<_> = bindings.iter().filter(|b| !b.bound).collect();
+        assert_eq!(notes.len(), 1, "{bindings:?}");
+        let w = notes[0].warning.as_deref().unwrap_or_default();
+        assert!(w.contains("binding limit was reached"), "{w}");
+        assert!(!w.contains("decorator run"), "{w}");
+    }
+
+    /// `add_tool` registrations share the same output-cap diagnostic —
+    /// a full `out` there is not silent either.
+    #[test]
+    fn add_tool_output_cap_produces_the_diagnostic() {
+        let mut src = String::new();
+        for i in 0..MAX_TOOL_BINDINGS + 8 {
+            src.push_str(&format!("mcp.add_tool(\"t{i}\", f{i})\n"));
+        }
+        let bindings = bind_python(&src);
+        assert_eq!(
+            bindings.iter().filter(|b| b.bound).count(),
+            MAX_TOOL_BINDINGS,
+            "{bindings:?}"
+        );
+        let notes: Vec<_> = bindings.iter().filter(|b| !b.bound).collect();
+        assert_eq!(notes.len(), 1, "one analysis-level note: {bindings:?}");
+        let w = notes[0].warning.as_deref().unwrap_or_default();
+        assert!(w.contains("binding limit was reached"), "{w}");
     }
 }

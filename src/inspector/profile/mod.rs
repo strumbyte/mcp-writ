@@ -4,8 +4,8 @@ use crate::inspector::macho_parser;
 use crate::inspector::slicer::{self, ResolvedSyscall};
 use crate::inspector::strings::{self, StringFindings};
 use crate::inspector::target::{
-    AnalysisReport, AnalysisState, AnalysisTarget, BinaryFormat, CodeRegion, ElfClass, Endianness,
-    Isa, MachOPlatform, ReasonCode, SyscallAbi,
+    AnalysisReport, AnalysisState, AnalysisStatus, AnalysisTarget, BinaryFormat, CodeRegion,
+    ElfClass, Endianness, Isa, MachOPlatform, ReasonCode, SyscallAbi,
 };
 use crate::inspector::text_section;
 
@@ -531,7 +531,7 @@ fn analyze_macho(bytes: &[u8], mut target: AnalysisTarget) -> CapabilityProfile 
     // Executable code regions; file_offset is file-absolute inside the
     // container, slice_offset stays slice-relative — never conflated.
     let (syscalls_state, syscalls) = match macho_parser::executable_sections(&macho, slice.size) {
-        Ok(regions) => {
+        Ok((regions, regions_note)) => {
             for r in &regions {
                 target.code_regions.push(CodeRegion {
                     name: r.name.clone(),
@@ -542,7 +542,23 @@ fn analyze_macho(bytes: &[u8], mut target: AnalysisTarget) -> CapabilityProfile 
                     analyzed: false,
                 });
             }
-            analyze_macho_syscalls(&macho, &mut target, &regions)
+            let (mut state, syscalls) = analyze_macho_syscalls(&macho, &mut target, &regions);
+            // Coalesced or budget-cut section declarations mean the
+            // decoded set is a subset of what the file claims — Partial
+            // when decoding ran, but never downgrade an Unsupported or
+            // Failed gate that already explains why nothing decoded.
+            if let Some(note) = regions_note
+                && matches!(
+                    state.status,
+                    AnalysisStatus::Analyzed | AnalysisStatus::Partial
+                )
+            {
+                state = AnalysisState::partial(match state.detail.take() {
+                    Some(existing) => format!("{existing}; {note}"),
+                    None => note,
+                });
+            }
+            (state, syscalls)
         }
         Err(e) => (
             AnalysisState::failed(
