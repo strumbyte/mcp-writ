@@ -676,12 +676,21 @@ fn grant_covered(dir: &Path, granted: &[(PathBuf, &'static str)], need: &'static
     })
 }
 
+/// `pyvenv.cfg` is a handful of `key = value` lines the venv tool
+/// writes — anything past this bound is not a legitimate config. The
+/// file sits beside an attacker-selected interpreter, so it goes
+/// through the bounded reader rather than `read_to_string`: an
+/// oversized or sparse config, non-UTF-8 text, or a link/non-regular
+/// entry seeds nothing instead of driving a whole-file allocation.
+const MAX_PYVENV_CFG_BYTES: u64 = 64 * 1024;
+
 /// The `home =` line of a `pyvenv.cfg` names the base interpreter
 /// prefix — needed where the venv interpreter is a copy (Windows
 /// `Scripts\python.exe`) rather than a symlink the resolved pin can
 /// follow.
 fn pyvenv_home(venv_dir: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(venv_dir.join("pyvenv.cfg")).ok()?;
+    let text = crate::fspriv::read_text_bounded(&venv_dir.join("pyvenv.cfg"), MAX_PYVENV_CFG_BYTES)
+        .ok()?;
     for line in text.lines() {
         if let Some(rest) = line.trim().strip_prefix("home")
             && let Some(value) = rest.trim_start().strip_prefix('=')
