@@ -210,6 +210,7 @@ impl AuditLogger {
             sync_mode,
             path.to_path_buf(),
             reopen_rx,
+            session_id.clone(),
         ));
         Ok(Self {
             inner: std::sync::Arc::new(AuditLoggerInner {
@@ -238,7 +239,7 @@ impl AuditLogger {
         let writer_failed = FailureFlag::new();
         // stderr delivery cannot prove a durable write — a fail-closed
         // logger's completion waiters must not be acknowledged here.
-        let writer_handle = tokio::spawn(tracing_writer_task(rx, !fail_closed));
+        let writer_handle = tokio::spawn(tracing_writer_task(rx, !fail_closed, session_id.clone(),));
         Self {
             inner: std::sync::Arc::new(AuditLoggerInner {
                 tx: std::sync::Mutex::new(Some(tx)),
@@ -261,16 +262,13 @@ impl AuditLogger {
     /// Bound the wire-derived string members of `event` to
     /// [`MAX_AUDIT_FIELD_BYTES`] and return the record's byte-budget
     /// share — capped at the whole budget so a single oversized record
-    /// can always proceed once the queue drains. The logger stamps its
-    /// own session id onto the record here (unless a producer already
-    /// set one), so every queued record carries the structured session
-    /// identifier.
+    /// can always proceed once the queue drains. The session id is no
+    /// longer stored on the event; the writer attaches its own
+    /// logger's id at serialization time, so this function only
+    /// accounts for the id's length in the byte-budget share.
     fn prepare(event: &mut AuditEvent, session_id: &str) -> u32 {
-        if event.session_id.is_none() {
-            event.session_id = Some(session_id.to_owned());
-        }
         event.bound_wire_fields();
-        event.wire_size().min(QUEUE_BYTE_BUDGET) as u32
+        (event.wire_size() + session_id.len()).min(QUEUE_BYTE_BUDGET) as u32
     }
 
     /// Log an audit event. Non-blocking.

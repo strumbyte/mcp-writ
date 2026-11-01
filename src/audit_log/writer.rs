@@ -112,6 +112,7 @@ pub(super) async fn file_writer_task(
     sync_mode: AuditSyncMode,
     audit_path: PathBuf,
     mut reopen_rx: mpsc::Receiver<ReopenRequest>,
+    session_id: String,
 ) {
     // The parent handle is retained for every open so the entry can be
     // re-verified at commit-ack time; its fsync runs once before the
@@ -146,7 +147,7 @@ pub(super) async fn file_writer_task(
                         let must_sync = ack.is_some()
                             || matches!(sync_mode, AuditSyncMode::EveryEvent)
                             || evt.severity >= IMMEDIATE_SYNC_SEVERITY;
-                        let json = write_event_jsonl(&evt);
+                        let json = write_event_jsonl(&session_id, &evt);
                         // A failed write gates the durable path below:
                         // the record may never have reached the buffer,
                         // so a later successful flush must not be
@@ -295,7 +296,10 @@ pub(super) async fn file_writer_task(
                         let mut evt =
                             marker(result.as_ref().err().map(|e| e.to_string()));
                         evt.bound_wire_fields();
-                        let mut line = write_event_jsonl(&evt);
+                        // Serialized with the writer's own session id here,
+                        // like every other record — this guarantees the
+                        // rotation marker carries the structured id.
+                        let mut line = write_event_jsonl(&session_id, &evt);
                         line.push('\n');
                         let mut marker_result = Ok(());
                         if let Err(e) = writer.write_all(line.as_bytes()) {
@@ -388,9 +392,9 @@ pub(super) async fn file_writer_task(
     }
 }
 
-pub(super) async fn tracing_writer_task(mut rx: mpsc::Receiver<AuditItem>, sink_durable: bool) {
+pub(super) async fn tracing_writer_task(mut rx: mpsc::Receiver<AuditItem>, sink_durable: bool, session_id: String) {
     while let Some((evt, ack, _permit)) = rx.recv().await {
-        let json = write_event_jsonl(&evt);
+        let json = write_event_jsonl(&session_id, &evt);
         match evt.severity {
             Severity::Critical | Severity::High => {
                 tracing::error!(target: "audit", "{}", json);

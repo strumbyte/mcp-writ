@@ -289,12 +289,6 @@ pub struct AuditEvent {
     pub event_id: Uuid,
     pub correlation_id: Uuid,
     pub parent_event_id: Option<Uuid>,
-    /// Structured session identifier of the launch (supervised
-    /// session) that produced this record — the same value the
-    /// lifecycle records carry in their `details` text. Stamped by
-    /// `AuditLogger` at enqueue; `None` only for records synthesized
-    /// outside a logger, and serializes as `null` then.
-    pub session_id: Option<String>,
     pub event_type: EventType,
     pub severity: Severity,
     pub outcome: Outcome,
@@ -337,7 +331,6 @@ impl AuditEvent {
             event_id: Uuid::now_v7(),
             correlation_id,
             parent_event_id: None,
-            session_id: None,
             event_type,
             severity,
             outcome,
@@ -394,7 +387,6 @@ impl AuditEvent {
     pub(crate) fn wire_size(&self) -> usize {
         let mut n = 256usize; // fixed members, names, punctuation
         for field in [
-            self.session_id.as_deref(),
             self.target_server.as_deref(),
             self.target_tool.as_deref(),
             self.request_id.as_deref(),

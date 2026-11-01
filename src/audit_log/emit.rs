@@ -49,7 +49,8 @@ impl nojson::DisplayJson for UuidStr {
 
 /// Serialize an AuditEvent to a single-line JSON string (JSONL format).
 /// Uses nojson builder — no serde dependency.
-pub fn write_event_jsonl(event: &AuditEvent) -> String {
+/// The session id is the producing logger's stream provenance, supplied by the writer at serialization time, and is therefore present on every line by construction.
+pub fn write_event_jsonl(session_id: &str, event: &AuditEvent) -> String {
     nojson::object(|f| {
         f.member("schema_version", event.schema_version)?;
         f.member("timestamp", event.timestamp.as_str())?;
@@ -59,10 +60,7 @@ pub fn write_event_jsonl(event: &AuditEvent) -> String {
             Some(id) => f.member("parent_event_id", UuidStr(id))?,
             None => f.member("parent_event_id", &JsonNull)?,
         };
-        match &event.session_id {
-            Some(s) => f.member("session_id", s.as_str())?,
-            None => f.member("session_id", &JsonNull)?,
-        };
+        f.member("session_id", session_id)?;
         f.member("event_type", event.event_type.as_str())?;
         f.member("event_category", event.event_type.category())?;
         f.member("severity", event.severity.as_str())?;

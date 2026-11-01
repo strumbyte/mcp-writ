@@ -122,7 +122,7 @@ fn test_action_as_str() {
 #[test]
 fn test_write_event_jsonl_valid_json() {
     let event = make_test_event();
-    let json = write_event_jsonl(&event);
+    let json = write_event_jsonl("4777-1792821100856", &event);
     let parsed = nojson::RawJson::parse(&json).expect("must be valid JSON");
 
     let sv = parsed
@@ -218,7 +218,7 @@ fn test_write_event_jsonl_denied_event() {
     event.target_tool = Some("exec_shell".to_string());
     event.details = Some("Path matches denied pattern: /etc/shadow".to_string());
 
-    let json = write_event_jsonl(&event);
+    let json = write_event_jsonl("4777-1792821100856", &event);
     let parsed = nojson::RawJson::parse(&json).expect("must be valid JSON");
 
     let et = parsed
@@ -252,7 +252,7 @@ fn test_write_event_jsonl_null_fields() {
         Outcome::Success,
         Action::Observed,
     );
-    let json = write_event_jsonl(&event);
+    let json = write_event_jsonl("4777-1792821100856", &event);
     assert!(json.contains("\"target_server\":null"), "got: {json}");
     assert!(json.contains("\"target_tool\":null"), "got: {json}");
     assert!(json.contains("\"policy_id\":null"), "got: {json}");
@@ -268,14 +268,14 @@ fn test_write_event_jsonl_null_fields() {
 fn test_write_event_jsonl_enforcement_member() {
     let mut event = make_test_event();
     assert!(
-        write_event_jsonl(&event).contains("\"enforcement\":null"),
+        write_event_jsonl("4777-1792821100856", &event).contains("\"enforcement\":null"),
         "absent member must serialize null"
     );
 
     event.enforcement = Some(EmbeddedJson::new(
         "{\"backend\":\"none\",\"dry_run\":true}".to_string(),
     ));
-    let json = write_event_jsonl(&event);
+    let json = write_event_jsonl("4777-1792821100856", &event);
     assert!(
         json.contains("\"enforcement\":{\"backend\":\"none\",\"dry_run\":true}"),
         "object must be verbatim, got: {json}"
@@ -315,7 +315,7 @@ fn test_write_event_jsonl_with_policy_context() {
         hash: "sha256:a1b2c3".to_string(),
     });
 
-    let json = write_event_jsonl(&event);
+    let json = write_event_jsonl("4777-1792821100856", &event);
     let parsed = nojson::RawJson::parse(&json).expect("must be valid JSON");
 
     let pid = parsed
@@ -352,7 +352,7 @@ fn test_write_event_jsonl_with_policy_context() {
 #[test]
 fn test_write_event_jsonl_uuid_format() {
     let event = make_test_event();
-    let json = write_event_jsonl(&event);
+    let json = write_event_jsonl("4777-1792821100856", &event);
     let parsed = nojson::RawJson::parse(&json).expect("must be valid JSON");
 
     let eid = parsed
@@ -384,7 +384,7 @@ fn test_write_event_jsonl_with_parent_event_id() {
     );
     event.parent_event_id = Some(parent);
 
-    let json = write_event_jsonl(&event);
+    let json = write_event_jsonl("4777-1792821100856", &event);
     let parsed = nojson::RawJson::parse(&json).expect("must be valid JSON");
 
     let peid = parsed
@@ -401,7 +401,7 @@ fn test_write_event_jsonl_with_parent_event_id() {
 #[test]
 fn test_write_event_jsonl_guard_version() {
     let event = make_test_event();
-    let json = write_event_jsonl(&event);
+    let json = write_event_jsonl("4777-1792821100856", &event);
     let parsed = nojson::RawJson::parse(&json).expect("must be valid JSON");
 
     let gv = parsed
@@ -417,9 +417,8 @@ fn test_write_event_jsonl_guard_version() {
 
 #[test]
 fn test_write_event_jsonl_session_id_member() {
-    let mut event = make_test_event();
-    event.session_id = Some("4777-1792821100856".to_string());
-    let json = write_event_jsonl(&event);
+    let event = make_test_event();
+    let json = write_event_jsonl("4777-1792821100856", &event);
     assert!(
         json.contains("\"session_id\":\"4777-1792821100856\""),
         "session_id member must carry the stamped value: {json}"
@@ -427,12 +426,25 @@ fn test_write_event_jsonl_session_id_member() {
 }
 
 #[test]
-fn test_write_event_jsonl_session_id_null() {
+fn test_write_event_jsonl_session_id_from_argument() {
     let event = make_test_event();
-    let json = write_event_jsonl(&event);
+    let first = write_event_jsonl("4777-1792821100856", &event);
+    let second = write_event_jsonl("9999-1792821100999", &event);
     assert!(
-        json.contains("\"session_id\":null"),
-        "unstamped event must serialize session_id as null: {json}"
+        first.contains("\"session_id\":\"4777-1792821100856\""),
+        "session_id member must carry the given id: {first}"
+    );
+    assert!(
+        second.contains("\"session_id\":\"9999-1792821100999\""),
+        "session_id member must carry the given id: {second}"
+    );
+    assert!(
+        !first.contains("\"session_id\":null"),
+        "session_id member must never serialize as null: {first}"
+    );
+    assert!(
+        !second.contains("\"session_id\":null"),
+        "session_id member must never serialize as null: {second}"
     );
 }
 
