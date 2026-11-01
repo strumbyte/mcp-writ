@@ -2348,7 +2348,7 @@ Auditor enforcement: a tool with `side_effect="read_only"` is rejected when argu
 
 #### `secret-overlay`
 
-Default **on** (`#true` when omitted). Opt out with `secret-overlay #false` under `defaults.filesystem`.
+Default **on** (`#true` when omitted). Opt out with `secret-overlay #false` under `defaults.filesystem`. The opt-out lands on the audit `policy.loaded` record as `secret_overlay=false` — the token spells the audit field `secret_overlay`, not the KDL key `secret-overlay` — so a launch without the overlay never reads as overlaid.
 
 An allow glob cannot override reserved secret paths (`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`, `**/.ssh/**`, `**/.gnupg/**`, `**/.aws/credentials`, `**/.env`, `**/.env.*` except `.env.example`). Ordinary new files under an allow glob (for example `/workspace/notes.txt`) are not rejected. Auditor normalizes `tools/call` arguments (NFKC, bounded percent-decode, `file:` URIs, symlink follow when resolvable). The checked spelling and the forwarded spelling must be the same string: where a per-tool fs allow decision (or a deputy use check) applies, an argument whose normalization changed it — a `file:` URI, percent-encoded bytes, NFKC-equivalent characters — is refused and the caller must resend the canonical spelling, because on a byte-preserving filesystem the normalized name and the raw name can be different directory entries. TOCTOU — a swap between that check and the child's `open` — is **Warden's** job. Passing the Auditor check does not claim TOCTOU is closed: per-tool `filesystem` rules are a *name-level* boundary, not an object-level one. A cooperating actor that can swap a symlink or rename an ancestor between the check and the server's `open` can redirect the call to a different object **inside the same process-wide grant union** (on Linux the union is `defaults.filesystem` plus every allowed tool's `filesystem`). Do not rely on a per-tool rule to protect a higher-value path that shares that union; keep such paths out of every grant, or rely on Warden's default-deny rather than the per-tool allow-list.
 
@@ -2616,7 +2616,7 @@ Each line carries:
 
 | Field | Type | Content |
 |---|---|---|
-| `schema_version` | string | Audit schema version (`"1.0"`) |
+| `schema_version` | string | Audit schema version (`"2.0"`) |
 | `timestamp` | string | UTC ISO-8601 with milliseconds |
 | `event_id` | string (UUIDv7) | Unique per event |
 | `correlation_id` | string (UUIDv7) | Groups related events |
@@ -2749,10 +2749,20 @@ lifecycle records:
 - `policy.loaded` (`configuration`) — the effective policy loaded and
   bound. `details` repeats `version`, the effective-KDL `hash`, the
   resolved `fail_on` dial (`none` is recorded even when no finding
-  fires), `source` (path or `default`), and `session_id`; `policy_id` /
+  fires), `session_id`, and `source` (path or `default` —
+  percent-encoded, so a path spelling can never forge `k=v` tokens);
+  `policy_id` /
   `policy_version` / `policy_hash` carry the same identity. A policy
   carrying `sandbox allow_degraded=#true` adds `allow_degraded=true` —
-  the launch accepted a partially-enforced sandbox as valid.
+  the launch accepted a partially-enforced sandbox as valid. A `sandbox
+  require_lifetime_boundary=#false` waiver adds
+  `require_lifetime_boundary=false` — the launch runs without a
+  kernel-enforced descendant boundary. A `defaults.filesystem`
+  `secret-overlay #false` opt-out adds `secret_overlay=false` — the
+  launch runs without the reserved-secret-path overlay (the token keeps
+  the field's snake_case spelling). Each token appears only when its
+  dial sits off the fail-secure default; absent tokens mean strict
+  posture.
 - `session.started` (`session`) — the child spawned and the Auditor
   relay is running; pairs with `session.ended`. A launch that fails
   earlier emits `server.error` instead — never a started session that

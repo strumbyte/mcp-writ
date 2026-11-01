@@ -642,11 +642,13 @@ fn emulated_connect_uses_pinned_sockaddr() {
 }
 
 /// One full fork/notif/emulate cycle; `true` on success, `false` when
-/// the notified task died mid-window (unreadable sockaddr, emulation
-/// setup failure, `ENOENT` on `NOTIF_SEND`, or the child never
-/// answering) — safe to retry after the child is reaped. Real
-/// assertion failures still panic; a deterministic bug fails all
-/// retries identically.
+/// the scenario's machinery broke before the verdict — a child dead
+/// before its notification existed (failed handoff, `ENOENT` on
+/// `NOTIF_RECV`), dying under it (unreadable sockaddr, emulation setup
+/// failure, `ENOENT` on `NOTIF_SEND`), never answering, or a dead
+/// rewriter — safe to retry after the child is reaped. Real assertion
+/// failures still panic; a deterministic bug fails all retries
+/// identically.
 fn emulated_connect_attempt() -> bool {
     // Loopback listener: the pinned sockaddr's destination.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -734,12 +736,16 @@ fn emulated_connect_attempt() -> bool {
         // window a CONTINUE answer would expose.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rw = unsafe { libc::fork() };
-        assert!(rw >= 0);
+        if rw < 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::_exit(1) };
+        }
         if rw == 0 {
             let mut b = [0u8; 1];
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { libc::recv(trig[0], b.as_mut_ptr().cast(), 1, 0) };
-            write_sa(1);
+            if unsafe { libc::recv(trig[0], b.as_mut_ptr().cast(), 1, 0) } == 1 {
+                write_sa(1);
+            }
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::_exit(0) };
         }
@@ -747,7 +753,10 @@ fn emulated_connect_attempt() -> bool {
         unsafe { libc::close(trig[0]) };
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        assert!(s >= 0);
+        if s < 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::_exit(1) };
+        }
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rc = unsafe { libc::connect(s, page.cast::<libc::sockaddr>(), 16) };
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -769,19 +778,6 @@ fn emulated_connect_attempt() -> bool {
     unsafe { libc::close(trig[0]) };
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let sock = unsafe { File::from_raw_fd(res[1]) };
-    let listener = (UnotifyParent {
-        sock: sock.try_clone().unwrap(),
-    })
-    .recv_listener()
-    .expect("listener fd");
-    let notif = loop {
-        match notify_recv(listener.as_raw_fd()) {
-            Ok(n) => break n,
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(e) => panic!("NOTIF_RECV failed: {e}"),
-        }
-    };
-    assert_eq!(notif.data.nr, CONNECT_NR as i32);
     // Tear down an attempt whose child is presumed dead (or parked on
     // a notification the kernel already discarded): wake the rewriter
     // grandchild off its `recv(trig[0])` first — an early-failed
@@ -799,6 +795,53 @@ fn emulated_connect_attempt() -> bool {
         libc::close(trig[1]);
         libc::munmap(page.cast(), 4096);
     };
+    // A handoff that never lands is the same dead-task race — the
+    // child died before it could pass the listener.
+    let cloned = match sock.try_clone() {
+        Ok(c) => c,
+        Err(_) => {
+            reap(pid);
+            return false;
+        }
+    };
+    let listener = match (UnotifyParent { sock: cloned }).recv_listener() {
+        Ok(l) => l,
+        Err(_) => {
+            reap(pid);
+            return false;
+        }
+    };
+    // Bound the notification wait like the handoff's, then read: a
+    // child that died before its `connect` makes RECV answer ENOENT —
+    // the same machinery race as a mid-window death.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let notif = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut pfd = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // An interrupted or expired wait fails the attempt — EINTR'd
+        // waits re-enter through this deadline rather than re-blocking
+        // an unbounded RECV.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if unsafe { libc::poll(&mut pfd, 1, left.as_millis().min(i32::MAX as u128) as i32) } <= 0 {
+            reap(pid);
+            return false;
+        }
+        match notify_recv(listener.as_raw_fd()) {
+            Ok(n) => break n,
+            // The notification stays queued — re-poll under the
+            // remaining deadline instead of re-blocking RECV.
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(_) => {
+                reap(pid);
+                return false;
+            }
+        }
+    };
+    assert_eq!(notif.data.nr, CONNECT_NR as i32);
     let raw = match inspect_sockaddr(notif.pid, notif.data.args[1], notif.data.args[2]) {
         SockTarget::Inet { dest, port, raw } => {
             assert_eq!(dest, "127.0.0.1".parse::<IpAddr>().unwrap());
@@ -814,11 +857,13 @@ fn emulated_connect_attempt() -> bool {
         other => panic!("sockaddr decode failed: {other:?}"),
     };
     // Let the rewriter clobber the child's buffer *after* inspection.
-    assert_eq!(
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { libc::send(trig[1], &b'X' as *const u8 as *const libc::c_void, 1, 0) },
-        1
-    );
+    // A refused send means the rewriter's read end died — the same
+    // machinery race as a dead notified task.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::send(trig[1], &b'X' as *const u8 as *const libc::c_void, 1, 0) } != 1 {
+        reap(pid);
+        return false;
+    }
     std::thread::sleep(std::time::Duration::from_millis(100));
     // Emulate: dup the child's socket, connect on the pinned bytes. A
     // dead child fails the pidfd dup — the same death race.
@@ -843,8 +888,16 @@ fn emulated_connect_attempt() -> bool {
         Err(e) => panic!("result send: {e}"),
     }
     let mut byte = [0u8; 1];
+    let mut pfd2 = libc::pollfd {
+        fd: sock.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    if unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) } != 1 {
+    if unsafe { libc::poll(&mut pfd2, 1, 10_000) } <= 0
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        || unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) } != 1
+    {
         reap(pid);
         return false;
     }

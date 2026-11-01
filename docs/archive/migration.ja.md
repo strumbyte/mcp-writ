@@ -81,4 +81,10 @@ server "docs" {
 
 また、検証が一覧を拒否した場合にも `tools_list.verified` レコードがコミットされるようになりました — `details` に `blocked=true` を持つ `outcome: "failure"` / `action: "observed"` で、拒否応答の送出の前に記録されます。従来は不一致の記録（`tools_list.changed`、`hash.mismatch`）のみが失敗を表していました。通過した `tools_list.verified` レコードは変更ありません（`action: "allowed"` / `outcome: "success"`）。
 
+## 監査 `details` 値の表記変更: `policy.loaded` の `source=` がパーセントエンコードに（スキーマ `"2.0"`）
+
+`policy.loaded` はオペレータ指定のポリシーパスを `details` 内の `source=<値>` として記録します。スキーマ `"1.0"` の行はリテラル表記 — `source=/etc/mcp-secure/policy.kdl` — であり、空白や `k=v` 文字列を含むパスが `details` の追加トークンとして読めてしまいました。スキーマ `"2.0"` の行は値をパーセントエンコードします — `source=%2Fetc%2Fmcp-secure%2Fpolicy.kdl` — ので、パスの綴りが `k=v` メンバを偽造することはありません。`default` のような unreserved 文字だけの綴りはそのまま通過します。またこのトークンは `session_id` の後ろに移りました — エンコード済みパスは `details` の膨張する末尾であり、フィールドのバイト上限で切り詰められてもセッション識別子が欠けないようにするためです。
+
+`source=` トークンの存在だけを見る利用側は影響を受けません。パスそのものを比較・表示する利用側 — リテラルのディレクトリやファイル名に一致させるダッシュボードや SIEM ルール — は、先に値をパーセントデコードする必要があります。`%` を含む `source=` 値はデコードし、`%` を含まない値はエンコード前と同じです。トップレベルの `policy_id` / `policy_version` / `policy_hash` メンバは変更ありません — 表記が変わったのは `details` 内の `source=` トークンだけです。
+
 元の MIT ライセンスと著作権表示を保持しています。

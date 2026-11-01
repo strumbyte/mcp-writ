@@ -189,10 +189,8 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
     lifecycle::policy_loaded(
         &audit_logger,
         &session_audit,
-        policy.version,
         fail_on.as_str(),
-        policy.sandbox.allow_degraded,
-        policy.sandbox.require_lifetime_boundary,
+        &policy,
         &args
             .policy
             .as_ref()

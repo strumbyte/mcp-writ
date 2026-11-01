@@ -133,7 +133,7 @@ fn test_write_event_jsonl_valid_json() {
         .unwrap()
         .as_string_str()
         .unwrap();
-    assert_eq!(sv, "1.0");
+    assert_eq!(sv, "2.0");
 
     let et = parsed
         .value()
