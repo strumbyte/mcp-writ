@@ -224,6 +224,7 @@ async fn run_audit_lifecycle_brackets_session() {
     // No weakening dial was configured, so none is recorded — an absent
     // token is what "full configured control" looks like.
     assert!(!loaded.contains("allow_degraded"), "got: {loaded}");
+    assert!(!loaded.contains("secret_overlay"), "got: {loaded}");
 
     // A server-less policy never reports "default" as the target server.
     for line in lifecycle_lines(&audit_log) {
@@ -414,6 +415,64 @@ async fn run_audit_allow_degraded_is_recorded() {
         .find(|l| l.contains("\"event_type\":\"policy.loaded\""))
         .expect("policy.loaded must exist");
     assert!(loaded.contains("allow_degraded=true"), "got: {loaded}");
+}
+
+/// `defaults.filesystem` `secret-overlay #false` is a configured
+/// weakening — the dial lands on `policy.loaded` so a launch without
+/// the reserved-path overlay never reads as overlaid.
+#[tokio::test]
+async fn run_audit_secret_overlay_disabled_is_recorded() {
+    let dir = common::real_tempdir();
+    let policy_path = dir.path().join("policy.kdl");
+    std::fs::write(
+        &policy_path,
+        // The shared fixture always emits `secret-overlay #true` —
+        // flip that one key so the rest (syscall baseline, the host's
+        // sandbox waiver node) stays identical to a runnable policy.
+        common::sandboxed_policy("", "").replace("secret-overlay #true", "secret-overlay #false"),
+    )
+    .expect("write policy");
+    let audit_log = dir.path().join("audit.jsonl");
+
+    let argv = common::echo_stdio_argv();
+    let mut args: Vec<String> = vec![
+        "--dry-run".into(),
+        "--policy".into(),
+        policy_path.to_string_lossy().into_owned(),
+        "--audit-log".into(),
+        audit_log.to_string_lossy().into_owned(),
+        "--".into(),
+    ];
+    args.extend(argv);
+
+    let out = timeout(
+        Duration::from_secs(TIMEOUT_SECS),
+        Command::new(bin())
+            .arg("run")
+            .args(&args)
+            .env_remove("MCP_WRIT_SKIP_SANDBOX")
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .expect("run timed out")
+    .expect("run mcp-writ");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let content = std::fs::read_to_string(&audit_log).unwrap();
+    let loaded = content
+        .lines()
+        .find(|l| l.contains("\"event_type\":\"policy.loaded\""))
+        .expect("policy.loaded must exist");
+    assert!(loaded.contains("secret_overlay=false"), "got: {loaded}");
 }
 
 /// `fail-on none` lands on `policy.loaded` even when the session

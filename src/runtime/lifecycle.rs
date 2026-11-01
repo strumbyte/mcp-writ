@@ -18,8 +18,10 @@ use uuid::Uuid;
 
 use crate::audit_log::{
     Action, AuditEvent, AuditLogger, EventType, Outcome, PolicyAuditContext, Severity,
+    encode_audit_field_value,
 };
 use crate::enforcement::LaunchOutcome;
+use crate::policy::Policy;
 
 /// Identity shared by every audit record of one launch.
 ///
@@ -147,26 +149,28 @@ pub fn guard_stopped(
 /// version/hash and adds the resolved `fail_on` dial, the source
 /// path (or `default`), and the logger `session_id`, so the record
 /// still shows version and dial when the context hash could not be
-/// computed. `allow_degraded` adds the policy's other weakening dial
-/// (`sandbox.allow_degraded=#true` tolerates partial OS enforcement);
-/// its absence means the policy accepted no degraded state — a
-/// partially-enforced spawn refuses rather than degrades.
-/// `require_lifetime_boundary` records the waiver of the launch-shaping
-/// dial — the requirement defaults on (a supervised launch refuses
-/// without a kernel-enforced descendant boundary), so only an explicit
-/// `sandbox require_lifetime_boundary=#false` is noteworthy enough to
-/// leave on the record. `secret_overlay` records the disabled
-/// secret-path overlay — the overlay defaults on, so the token appears
-/// only when the policy disabled it (`secret-overlay #false`); its
-/// absence means the overlay is in force.
+/// computed. `source` is an operator-supplied path string, so it is
+/// percent-encoded via [`encode_audit_field_value`] — a spelling like
+/// `…/secret_overlay=false/…` can never read as the disabled dial.
+/// The bound `policy` also contributes its weakening dials —
+/// each records a token only when set off the fail-secure default, so
+/// an absent token always reads as the strict posture:
+/// `sandbox.allow_degraded=#true` records `allow_degraded=true` (the
+/// launch accepted a partially-enforced sandbox — without it a
+/// partially-enforced spawn refuses rather than degrades);
+/// `sandbox require_lifetime_boundary=#false` records
+/// `require_lifetime_boundary=false` (the launch-shaping dial defaults
+/// on — a supervised launch refuses without a kernel-enforced
+/// descendant boundary — so only an explicit waiver is noteworthy);
+/// `defaults.filesystem` `secret-overlay #false` records
+/// `secret_overlay=false` (the secret-path overlay defaults on, so the
+/// token appears only when the policy disabled it; its absence means
+/// the overlay is in force).
 pub fn policy_loaded(
     logger: &AuditLogger,
     ctx: &SessionAuditContext,
-    version: u32,
     fail_on: &str,
-    allow_degraded: bool,
-    require_lifetime_boundary: bool,
-    secret_overlay: bool,
+    policy: &Policy,
     source: &str,
 ) {
     let mut event = lifecycle_event(ctx, EventType::PolicyLoaded, Outcome::Success);
@@ -175,23 +179,25 @@ pub fn policy_loaded(
         .as_ref()
         .map(|p| p.hash.as_str())
         .unwrap_or("unavailable");
-    let degraded = if allow_degraded {
+    let degraded = if policy.sandbox.allow_degraded {
         " allow_degraded=true"
     } else {
         ""
     };
-    let boundary = if require_lifetime_boundary {
+    let boundary = if policy.sandbox.require_lifetime_boundary {
         ""
     } else {
         " require_lifetime_boundary=false"
     };
-    let overlay = if secret_overlay {
+    let overlay = if policy.fs.secret_overlay {
         ""
     } else {
         " secret_overlay=false"
     };
     event.details = Some(format!(
-        "version={version} hash={hash} fail_on={fail_on}{degraded}{boundary}{overlay} source={source} session_id={}",
+        "version={} hash={hash} fail_on={fail_on}{degraded}{boundary}{overlay} source={} session_id={}",
+        policy.version,
+        encode_audit_field_value(source),
         logger.session_id()
     ));
     logger.log(event);
@@ -509,23 +515,18 @@ mod tests {
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
 
-        policy_loaded(
-            &logger,
-            &ctx,
-            2,
-            "none",
-            false,
-            true,
-            true,
-            "/etc/mcp-secure/policy.kdl",
-        );
+        let policy = Policy {
+            version: 2,
+            ..Default::default()
+        };
+        policy_loaded(&logger, &ctx, "none", &policy, "/etc/mcp-secure/policy.kdl");
         logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"event_type\":\"policy.loaded\""));
         assert!(content.contains("\"policy_version\":\"2\""));
         assert!(content.contains("fail_on=none"), "got: {content}");
-        assert!(content.contains("source=/etc/mcp-secure/policy.kdl"));
+        assert!(content.contains("source=%2Fetc%2Fmcp-secure%2Fpolicy.kdl"));
         assert!(content.contains(&format!("session_id={}", logger.session_id())));
         // The strict defaults stay silent: only an opted-in weakening
         // or boundary waiver leaves a token on the record.
@@ -534,6 +535,7 @@ mod tests {
             !content.contains("require_lifetime_boundary"),
             "got: {content}"
         );
+        assert!(!content.contains("secret_overlay"), "got: {content}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -550,7 +552,9 @@ mod tests {
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
 
-        policy_loaded(&logger, &ctx, 1, "high", false, false, true, "default");
+        let mut policy = Policy::default();
+        policy.sandbox.require_lifetime_boundary = false;
+        policy_loaded(&logger, &ctx, "high", &policy, "default");
         logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -575,7 +579,10 @@ mod tests {
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
 
-        policy_loaded(&logger, &ctx, 1, "high", true, false, true, "default");
+        let mut policy = Policy::default();
+        policy.sandbox.allow_degraded = true;
+        policy.sandbox.require_lifetime_boundary = false;
+        policy_loaded(&logger, &ctx, "high", &policy, "default");
         logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -596,7 +603,9 @@ mod tests {
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
 
-        policy_loaded(&logger, &ctx, 1, "high", false, true, false, "default");
+        let mut policy = Policy::default();
+        policy.fs.secret_overlay = false;
+        policy_loaded(&logger, &ctx, "high", &policy, "default");
         logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -605,12 +614,26 @@ mod tests {
         let path_on = dir.join("audit-on.jsonl");
         let logger_on = AuditLogger::to_file(&path_on).unwrap();
 
-        policy_loaded(&logger_on, &ctx, 1, "high", false, true, true, "default");
+        // An enabled overlay under a source path that literally spells
+        // the disabled token — with a whitespace delimiter on top —
+        // still records the encoded path as a single token, never the
+        // bare `secret_overlay=false`.
+        policy_loaded(
+            &logger_on,
+            &ctx,
+            "high",
+            &Policy::default(),
+            "/pol dir/secret_overlay=false/policy.kdl",
+        );
         logger_on.shutdown().await.unwrap();
 
         let content_on = std::fs::read_to_string(&path_on).unwrap();
         assert!(
             !content_on.contains("secret_overlay=false"),
+            "got: {content_on}"
+        );
+        assert!(
+            content_on.contains("source=%2Fpol%20dir%2Fsecret_overlay%3Dfalse%2Fpolicy.kdl"),
             "got: {content_on}"
         );
         let _ = std::fs::remove_dir_all(&dir);

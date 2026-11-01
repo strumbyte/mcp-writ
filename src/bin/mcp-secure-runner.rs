@@ -586,11 +586,8 @@ async fn main() {
     lifecycle::policy_loaded(
         &audit_logger,
         &session_audit,
-        policy.version,
         fail_on.as_str(),
-        policy.sandbox.allow_degraded,
-        policy.sandbox.require_lifetime_boundary,
-        policy.fs.secret_overlay,
+        &policy,
         &policy_source,
     );
 
