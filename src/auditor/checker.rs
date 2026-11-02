@@ -87,8 +87,8 @@ impl PolicyViolation {
     /// Their reasons name the refused target first — `host '…'`,
     /// `destination '…'`, and for paths `path '…'` *with* the
     /// rejection phrase the fs sub-policy or the overlay produces
-    /// (the overlay clause matched as the producer's terminal text,
-    /// so the phrase inside a path spelling cannot spoof it) —
+    /// (each clause matched as the producer's terminal text, so the
+    /// phrase inside a path spelling cannot spoof it) —
     /// which is exactly what `correction_candidates.denied_targets`
     /// reports as widening candidates. Everything else stays out:
     /// tool-level authorization refusals, `args_schema` and
@@ -106,8 +106,8 @@ impl PolicyViolation {
             return true;
         }
         self.reason.starts_with("path '")
-            && (self.reason.contains("denied by tool fs sub-policy")
-                || self.reason.contains("not in tool fs allowed paths")
+            && (self.reason.ends_with("') denied by tool fs sub-policy")
+                || self.reason.ends_with("') not in tool fs allowed paths")
                 || self
                     .reason
                     .ends_with("' matches the secret-path overlay (beats explicit allow)"))

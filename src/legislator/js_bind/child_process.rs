@@ -230,6 +230,16 @@ fn classify_cp_rhs(
     if aliases.contains(&ident) {
         return classify_after_cp_module(source, after_ident);
     }
+    // A re-alias carries the source's provenance: a dynamically-bound
+    // name stays unresolvable (`const g = f` where `f = cp[name]` —
+    // including as a destructure's source), an imported method name
+    // stays a bare callable (`const g = execFile`).
+    if dynamic.contains(&ident) {
+        return Some(CpRhs::Unresolved);
+    }
+    if imported.contains(&ident) {
+        return Some(CpRhs::Method);
+    }
     None
 }
 
@@ -470,6 +480,9 @@ fn require_spec_matching(source: &str, i: usize, ok: impl Fn(&str) -> bool) -> O
 struct ImportedName {
     local: String,
     original: String,
+    /// `...rest` — binds the remaining exports as one namespace-like
+    /// object (a module alias), never a single imported function.
+    rest: bool,
 }
 
 fn parse_import_list(inner: &str) -> Vec<ImportedName> {
@@ -479,10 +492,21 @@ fn parse_import_list(inner: &str) -> Vec<ImportedName> {
         if part.is_empty() {
             continue;
         }
+        if let Some(rest) = part.strip_prefix("...")
+            && let Some(local) = simple_ident(rest)
+        {
+            out.push(ImportedName {
+                local: local.clone(),
+                original: local,
+                rest: true,
+            });
+            continue;
+        }
         if let Some((orig, local)) = split_cjs_rename(part) {
             out.push(ImportedName {
                 local,
                 original: orig,
+                rest: false,
             });
             continue;
         }
@@ -496,7 +520,11 @@ fn parse_import_list(inner: &str) -> Vec<ImportedName> {
             }
         };
         if !local.is_empty() {
-            out.push(ImportedName { local, original });
+            out.push(ImportedName {
+                local,
+                original,
+                rest: false,
+            });
         }
     }
     out
@@ -520,7 +548,8 @@ fn simple_ident(s: &str) -> Option<String> {
     }
 }
 
-/// `promises` / `default` are namespaces (`cp.execFile`), not bare callables.
+/// `promises` / `default` / `...rest` are namespaces (`cp.execFile`),
+/// not bare callables.
 /// `{ default as execFile }` still allows a bare call when the local name is a CP method.
 fn absorb_cp_imports(
     names: &[ImportedName],
@@ -528,7 +557,7 @@ fn absorb_cp_imports(
     imported: &mut HashSet<String>,
 ) {
     for n in names {
-        if n.original == "promises" {
+        if n.rest || n.original == "promises" {
             aliases.insert(n.local.clone());
         } else if n.original == "default" {
             bind_default_import(Some(n.local.clone()), aliases, imported);

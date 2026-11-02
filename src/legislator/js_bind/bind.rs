@@ -608,16 +608,42 @@ fn declarator_rhs_is_fn_head(between: &str) -> bool {
     if rhs.starts_with("=>") {
         return true;
     }
-    if rhs.starts_with("function") || rhs.starts_with("async") {
+    // `function`/`async` must be whole identifiers — `functional` or
+    // `async_foo` is an ordinary value, not a function head.
+    if starts_with_ident(rhs, "function") || starts_with_ident(rhs, "async") {
         return true;
     }
-    if !rhs.contains("=>") {
+    // An arrow head is the *complete* RHS: a parameter head ending in
+    // `=>`. Anything past the `=>` is expression body — a later
+    // statement's `=>` text (`x = a => a` newline `g = function()`)
+    // must not back-attribute the `{` that follows to this name.
+    let Some(head) = rhs.trim_end().strip_suffix("=>") else {
         return false;
-    }
-    // An arrow head opens with a parameter: `(`, `[`, `{`, or an ident.
-    rhs.chars()
-        .next()
-        .is_some_and(|c| matches!(c, '(' | '[' | '{') || is_ident_start(c))
+    };
+    arrow_param_head(head.trim_end())
+}
+
+/// `s` begins with `kw` as a whole identifier — the next byte is not
+/// an identifier byte (or is absent).
+fn starts_with_ident(s: &str, kw: &str) -> bool {
+    s.strip_prefix(kw)
+        .is_some_and(|rest| rest.as_bytes().first().is_none_or(|b| !is_ident_byte(*b)))
+}
+
+/// The text before an arrow's `=>`: a balanced `(`/`[`/`{` parameter
+/// list whose closer is the last byte, or one bare-identifier
+/// parameter.
+fn arrow_param_head(head: &str) -> bool {
+    let close = match head.chars().next() {
+        Some('(') => find_matching(head, 0, '(', ')'),
+        Some('[') => find_matching(head, 0, '[', ']'),
+        Some('{') => find_matching(head, 0, '{', '}'),
+        Some(c) if is_ident_start(c) => {
+            return take_ident(head, 0).is_some_and(|(_, end)| end == head.len());
+        }
+        _ => return false,
+    };
+    close == Some(head.len() - 1)
 }
 
 /// `{` of the function body: skip destructuring `{` in the parameter list, then

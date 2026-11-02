@@ -534,7 +534,7 @@ fn discovery_policy(command: &[String], tmpdir: &Path) -> crate::policy::Policy 
 fn push_literal_dirs(policy: &mut crate::policy::Policy, command: &[String]) {
     fn push(list: &mut Vec<String>, dir: &Path) {
         let dir = dir.to_string_lossy().into_owned();
-        if !list.iter().any(|e| *e == dir) {
+        if !list.contains(&dir) {
             list.push(dir);
         }
     }
@@ -578,9 +578,22 @@ fn create_discovery_tmpdir() -> Result<PathBuf, ToolsListError> {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-    std::fs::create_dir_all(&tmp).map_err(ToolsListError::ProcessSpawn)?;
+    // Exclusive create at the requested mode: the private TMPDIR
+    // never exists first with default (or pre-existing) permissions.
+    #[cfg(unix)]
+    let created = {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&tmp)
+    };
+    #[cfg(not(unix))]
+    let created = std::fs::DirBuilder::new().create(&tmp);
+    created.map_err(ToolsListError::ProcessSpawn)?;
     #[cfg(unix)]
     {
+        // The creation mode is masked by the process umask — chmod
+        // the exact 0700 so owner access cannot be masked away. On
+        // failure the fresh dir is removed: neither discovery path
+        // may run against a directory with unusable permissions.
         if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)) {
             let _ = std::fs::remove_dir_all(&tmp);
             return Err(ToolsListError::ProcessSpawn(e));

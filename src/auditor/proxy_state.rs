@@ -54,6 +54,17 @@ pub(crate) const MAX_TALLY_TOOLS: usize = 256;
 /// The most distinct `(tool, reason)` denial pairs the tally retains.
 pub(crate) const MAX_TALLY_DENIALS: usize = 256;
 
+/// Retained-bytes budget for `called_tools`. Names are
+/// client-controlled — a request can spell one up to the frame cap —
+/// so the entry cap alone cannot bound what the tally holds.
+pub(crate) const MAX_TALLY_TOOL_BYTES: usize = 64 * 1024;
+
+/// Retained-bytes budget for `denied`. Reasons embed the client's
+/// path spelling (raw and resolved), so a pair is far larger than a
+/// bare name; a flood of giant denials starves only this budget,
+/// never the called-tool set.
+pub(crate) const MAX_TALLY_DENIAL_BYTES: usize = 512 * 1024;
+
 /// Process-local session tally for the launch report's correction
 /// candidates: which tools the client actually called, and the
 /// substantive policy violations the tools/call gates produced
@@ -64,9 +75,11 @@ pub(crate) const MAX_TALLY_DENIALS: usize = 256;
 /// tool), `args_schema` and path-traversal validation failures, and
 /// session-state refusals (trajectory / confused-deputy gates):
 /// those are not targets a wider grant could answer. Retention is
-/// bounded by [`MAX_TALLY_TOOLS`] / [`MAX_TALLY_DENIALS`]; past a cap
-/// new entries are dropped and the matching `*_truncated` flag is
-/// set, so the report can state the candidates are incomplete.
+/// bounded by [`MAX_TALLY_TOOLS`] / [`MAX_TALLY_DENIALS`] on entry
+/// count and [`MAX_TALLY_TOOL_BYTES`] / [`MAX_TALLY_DENIAL_BYTES`] on
+/// retained bytes; past a cap new entries are dropped and the
+/// matching `*_truncated` flag is set, so the report can state the
+/// candidates are incomplete.
 #[derive(Debug, Default)]
 pub struct CallTally {
     pub called_tools: std::collections::BTreeSet<String>,
@@ -84,7 +97,10 @@ impl CallTally {
         if self.called_tools.contains(tool) {
             return;
         }
-        if self.called_tools.len() >= MAX_TALLY_TOOLS {
+        let retained: usize = self.called_tools.iter().map(String::len).sum();
+        if self.called_tools.len() >= MAX_TALLY_TOOLS
+            || retained + tool.len() > MAX_TALLY_TOOL_BYTES
+        {
             self.called_tools_truncated = true;
             return;
         }
@@ -96,7 +112,14 @@ impl CallTally {
         if self.denied.contains(&entry) {
             return;
         }
-        if self.denied.len() >= MAX_TALLY_DENIALS {
+        let retained: usize = self
+            .denied
+            .iter()
+            .map(|(tool, reason)| tool.len() + reason.len())
+            .sum();
+        if self.denied.len() >= MAX_TALLY_DENIALS
+            || retained + entry.0.len() + entry.1.len() > MAX_TALLY_DENIAL_BYTES
+        {
             self.denied_truncated = true;
             return;
         }
@@ -320,6 +343,30 @@ mod tests {
         assert!(!pending.try_insert(RpcId::Null));
         assert!(!pending.remove(&RpcId::Null));
         assert!(pending.try_insert(RpcId::Number("1".into())));
+    }
+
+    #[test]
+    fn test_call_tally_bounds_retained_bytes() {
+        // A name at the byte budget fits; the next new name — however
+        // small — cannot, and the tally reports itself truncated.
+        let mut tally = CallTally::default();
+        let huge = "t".repeat(MAX_TALLY_TOOL_BYTES);
+        tally.record_call(&huge);
+        assert_eq!(tally.called_tools.len(), 1);
+        tally.record_call("small");
+        assert!(tally.called_tools_truncated);
+        assert!(!tally.called_tools.contains("small"));
+        // A repeat of a retained name still deduplicates, not truncates.
+        tally.record_call(&huge);
+        assert_eq!(tally.called_tools.len(), 1);
+
+        let mut tally = CallTally::default();
+        let reason = "r".repeat(MAX_TALLY_DENIAL_BYTES - 1);
+        tally.record_denial("t", &reason);
+        assert_eq!(tally.denied.len(), 1);
+        tally.record_denial("t2", "r2");
+        assert!(tally.denied_truncated);
+        assert!(!tally.denied.iter().any(|(tool, _)| tool == "t2"));
     }
 
     #[test]

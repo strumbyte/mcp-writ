@@ -78,6 +78,7 @@ fn write_source_tools(
                 }),
             )?;
             o.member("bound", BoolLiteral(t.bound))?;
+            o.member("complete", BoolLiteral(t.complete))?;
             o.member(
                 "audit_risks",
                 nojson::array(|ra| {
@@ -228,6 +229,24 @@ mod tests {
         assert!(raw.value().to_member("source_tools").is_ok());
         assert!(json_str.contains("read_file"));
         assert!(json_str.contains("network:outbound"));
+        let first = raw
+            .value()
+            .to_member("source_tools")
+            .unwrap()
+            .required()
+            .unwrap()
+            .to_array()
+            .unwrap()
+            .next()
+            .expect("one source tool");
+        let complete = first
+            .to_member("complete")
+            .unwrap()
+            .required()
+            .unwrap()
+            .as_boolean_str()
+            .unwrap();
+        assert_eq!(complete, "true", "source_tools[0].complete: {json_str}");
         let native = crate::inspector::profile::format_json(&profile);
         assert!(
             !native.contains("source_tools"),

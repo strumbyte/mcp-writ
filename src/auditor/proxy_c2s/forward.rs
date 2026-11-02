@@ -210,6 +210,7 @@ where
                     line,
                     "no verified tools/list has been published yet",
                     None,
+                    false,
                 )
                 .await?;
                 return Ok(());
@@ -225,6 +226,7 @@ where
                 line,
                 "tools/list revalidation in progress",
                 None,
+                false,
             )
             .await?;
             return Ok(());
@@ -291,6 +293,7 @@ where
                                 "tool '{}' is not advertised by the verified tools/list",
                                 tool.as_deref().unwrap_or("<unknown>")
                             )),
+                            true,
                         )
                         .await?;
                         return Ok(());
@@ -900,19 +903,23 @@ where
 /// verified listing published yet. `reason` is the client-facing text;
 /// `audit_reason` carries the detail for the audit record when the wire
 /// text must stay membership-blind (an allowed-but-unadvertised name
-/// must read exactly like a denied or unknown one).
+/// must read exactly like a denied or unknown one). `tool_denied`
+/// selects the authorization-refusal lead for that unadvertised-name
+/// refusal — it is an authorization denial, not a call-level one, so
+/// the wire wording stays identical to a policy allow/deny refusal.
 pub(super) async fn deny_busy_tools_call<W>(
     shared: &ProxyShared<W>,
     raw_id: &str,
     line: &str,
     reason: &str,
     audit_reason: Option<&str>,
+    tool_denied: bool,
 ) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let tool = extract_tool_name_from_line(line).unwrap_or_else(|| "<unknown>".into());
-    let error_response = build_error_response(raw_id, &tool, reason, false);
+    let error_response = build_error_response(raw_id, &tool, reason, tool_denied);
     write_client_frame(&shared.client_out, &error_response).await?;
     let correlation_id = Uuid::now_v7();
     let mut event = AuditEvent::new(

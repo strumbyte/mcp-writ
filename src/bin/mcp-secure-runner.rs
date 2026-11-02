@@ -710,8 +710,8 @@ async fn main() {
         report,
         path: guest_report_path(&dir),
         cross_uid_channel: true,
-        call_tally: None,
-        declared_tools: Vec::new(),
+        call_tally: Some(launched.call_tally.clone()),
+        declared_tools: launched.declared_tools.clone(),
     });
 
     // SIGUSR1 re-opens the file audit sink — the guest-side logrotate

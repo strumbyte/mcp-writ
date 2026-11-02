@@ -921,6 +921,22 @@ mod tests {
         );
     }
 
+    /// A semicolon-free arrow declarator ends at its body expression —
+    /// the `=>` mid-RHS belongs to `x` alone, so the `{` opening the
+    /// next declaration's body must not be attached to `x`.
+    #[test]
+    fn semicolon_free_arrow_does_not_steal_next_function_body() {
+        let src = "const x = a => a\nconst g = function() { return 1; }";
+        let fns = extract_functions(src);
+        let g = fns.iter().find(|f| f.name == "g").expect("g extracted");
+        assert!(g.body.contains("return 1"), "body={:?}", g.body);
+        assert!(
+            fns.iter()
+                .all(|f| f.name != "x" || !f.body.contains("return 1")),
+            "x must not carry g's body: {fns:?}"
+        );
+    }
+
     #[test]
     fn async_generator_function_is_extracted() {
         let src = r#"
@@ -1097,6 +1113,10 @@ mod tests {
             r#"const cp = require("child_process"); const f = cp.promises[name]; f("id");"#,
             r#"const f = require("child_process")[name]; f("id");"#,
             r#"const cp = require("child_process"); const { [k]: f } = cp; f("id");"#,
+            // A re-alias of the dynamically-bound name stays unprovable —
+            // and so does a destructure whose source is that name.
+            r#"const cp = require("child_process"); const f = cp[name]; const g = f; g("id");"#,
+            r#"const cp = require("child_process"); const f = cp[name]; const { exec } = f; exec("id");"#,
             // A dynamically-bound name passed to a cp wrapper is opaque
             // too — the wrapped callable could be exec.
             r#"const {promisify} = require("util"); const cp = require("child_process"); const f = cp[name]; promisify(f)("id");"#,
