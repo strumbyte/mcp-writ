@@ -512,9 +512,17 @@ fn test_secret_overlay_follows_symlink() {
 #[test]
 fn test_denied_policy_alias_matches_resolved_request() {
     use super::super::sub_policy::authorize_one_path;
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let real = dir.path().join("real");
     std::fs::create_dir_all(real.join("blocked")).unwrap();
+    // The fixture pins its own modes: directory modes otherwise come
+    // from the process umask, and under a group-writable umask (0007)
+    // the ancestors would read as replaceable and authorization would
+    // fail closed before the sub-policy decision this test exercises.
+    for p in [dir.path(), real.as_path(), real.join("blocked").as_path()] {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let alias = dir.path().join("alias");
     std::os::unix::fs::symlink(&real, &alias).unwrap();
     let tool = ToolPolicy::named("read_file", true);

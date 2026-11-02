@@ -528,6 +528,7 @@ pub async fn run(options: &SandboxRunOptions) -> Result<i32, Box<dyn std::error:
         target: target(),
         policy: None,
         dry_run: false,
+        allow_replaceable_paths: false,
         plan: plan(),
         observations: vec![],
         result: None,

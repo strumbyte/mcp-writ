@@ -220,6 +220,7 @@ impl HostRunRec {
             target: self.target,
             policy: self.policy,
             dry_run: false,
+            allow_replaceable_paths: false,
             plan: EnforcementPlan {
                 controls: self.controls,
                 grants: Vec::new(),

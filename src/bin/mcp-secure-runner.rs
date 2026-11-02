@@ -138,6 +138,7 @@ fn write_early_failure_report(report_dir: Option<&Path>, launch_id: uuid::Uuid, 
         target: ExecutionTarget::native(),
         policy: None,
         dry_run: false,
+        allow_replaceable_paths: false,
         plan: EnforcementPlan {
             controls: Vec::new(),
             grants: Vec::new(),

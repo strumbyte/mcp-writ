@@ -25,6 +25,7 @@ fn sample_report() -> LaunchReport {
             hash: "sha256:abc".to_string(),
         }),
         dry_run: false,
+        allow_replaceable_paths: false,
         plan: EnforcementPlan {
             controls: vec![
                 PlannedControl {
@@ -1021,4 +1022,15 @@ fn summary_to_json_shape() {
         "psec must serialize null"
     );
     assert_eq!(member(root, "dry_run").as_raw_str(), "false");
+}
+
+#[test]
+fn allow_replaceable_paths_serializes_false_and_true() {
+    let json = sample_report().to_json();
+    assert!(json.contains(r#""allow_replaceable_paths":false"#));
+
+    let mut report = sample_report();
+    report.allow_replaceable_paths = true;
+    let json = report.to_json();
+    assert!(json.contains(r#""allow_replaceable_paths":true"#));
 }

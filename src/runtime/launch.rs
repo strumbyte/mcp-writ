@@ -846,6 +846,7 @@ pub async fn launch(
         target,
         policy: policy_context.clone(),
         dry_run,
+        allow_replaceable_paths: crate::fspriv::replaceable_paths_permitted(),
         plan,
         observations,
         // The session is now running; the caller rewrites this with the
@@ -1096,6 +1097,7 @@ fn failure_report(
         target,
         policy: policy_context.clone(),
         dry_run,
+        allow_replaceable_paths: crate::fspriv::replaceable_paths_permitted(),
         plan,
         observations,
         result: Some(LaunchOutcome {

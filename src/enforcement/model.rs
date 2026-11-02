@@ -649,6 +649,14 @@ pub struct LaunchReport {
     /// and the hash of the effective `to_kdl` form.
     pub policy: Option<PolicyAuditContext>,
     pub dry_run: bool,
+    /// Whether the operator opt-out that tolerates replaceable
+    /// (shared-writable) ancestors for policy/audit paths
+    /// (`MCP_WRIT_ALLOW_REPLACEABLE_PATHS`) was in force for this
+    /// launch. The same fact rides the audit spawn record as a
+    /// token; the report carries it so the weakening is visible
+    /// without opening the audit log. Only the native launch path
+    /// can set this — other constructors report `false`.
+    pub allow_replaceable_paths: bool,
     pub plan: EnforcementPlan,
     pub observations: Vec<EnforcementObservation>,
     /// Final result of the launch; `None` only while the outcome has not

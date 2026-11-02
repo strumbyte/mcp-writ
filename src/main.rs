@@ -195,6 +195,7 @@ async fn real_main() {
                 target: report_target.clone(),
                 policy,
                 dry_run: report_dry_run,
+                allow_replaceable_paths: false,
                 plan: mcp_writ::enforcement::EnforcementPlan {
                     controls: Vec::new(),
                     grants: Vec::new(),

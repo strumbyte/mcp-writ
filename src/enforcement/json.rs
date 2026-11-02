@@ -549,6 +549,7 @@ impl LaunchReport {
                 None => f.member("policy", JsonNull)?,
             }
             f.member("dry_run", report.dry_run)?;
+            f.member("allow_replaceable_paths", report.allow_replaceable_paths)?;
             f.member("plan", nojson::object(|f| report.plan.write_json(f)))?;
             f.member(
                 "observations",
