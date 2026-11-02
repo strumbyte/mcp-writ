@@ -652,13 +652,19 @@ fn f67_missing_suffix_under_replaceable_ancestor_is_refused() {
 #[cfg(unix)]
 #[test]
 fn f67_private_ancestors_still_resolve() {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     // Control case: a symlink whose parent is owner-only, plus
     // ordinary private dirs, keep authorizing normally.
     let dir = tempfile::tempdir().unwrap();
     let inside = dir.path().join("real");
     std::fs::create_dir(&inside).unwrap();
+    // The fixture pins its own modes: directory modes otherwise come
+    // from the process umask, and under a group-writable umask (0007)
+    // the ancestors would read as replaceable and the control case
+    // would fail for an environmental reason.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(inside.join("f"), b"x").unwrap();
     symlink(&inside, dir.path().join("alias")).unwrap();
 

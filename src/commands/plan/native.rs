@@ -34,6 +34,9 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
         return finalize(report);
     };
 
+    report.checks.push(policy_posture_check(&policy));
+    report.checks.push(policy_placement_check(&policy));
+
     // command.resolve — a missing executable blocks the launch, so it
     // blocks the plan's `ready`. With hash entries configured, `run`
     // expands a `#!` script to the interpreter launch the kernel would
@@ -423,6 +426,95 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
 
     report.plan = Some(plan);
     finalize(report)
+}
+
+/// The `policy.posture` record — the bound policy's weakening dials,
+/// stated whether or not any is weakened. `run` records a weakened
+/// dial on `policy.loaded`; `plan` surfaces the same states before
+/// the launch so a draft's posture is reviewable from the plan alone.
+fn policy_posture_check(policy: &crate::policy::Policy) -> PlanCheck {
+    let secret_overlay = policy.fs.secret_overlay;
+    let allow_degraded = policy.sandbox.allow_degraded;
+    let require_lifetime_boundary = policy.sandbox.require_lifetime_boundary;
+    let detail = format!(
+        "secret_overlay={} allow_degraded={} require_lifetime_boundary={}",
+        if secret_overlay { "on" } else { "off" },
+        allow_degraded,
+        require_lifetime_boundary,
+    );
+    if !secret_overlay || allow_degraded || !require_lifetime_boundary {
+        PlanCheck {
+            id: "policy.posture",
+            status: PlanCheckStatus::Warn,
+            detail: Some(format!(
+                "{detail} — a weakening dial is set: the launch would run with reduced enforcement"
+            )),
+            remediation: Some(
+                "if the weakening is unintended, restore the dial in the policy \
+                 (secret-overlay #true, sandbox allow_degraded=#false, \
+                 require_lifetime_boundary=#true) — `run` records weakened dials \
+                 on policy.loaded"
+                    .to_string(),
+            ),
+        }
+    } else {
+        check("policy.posture", PlanCheckStatus::Pass, Some(detail))
+    }
+}
+
+/// The `policy.placement` record — whether the policy's own source
+/// files sit where a launch can trust them: outside the ancestry the
+/// trust gate refuses, and outside the write grants the policy itself
+/// hands out. Both gates refuse at `run`; `plan` reports them as
+/// warnings so the placement is fixable before the first launch.
+fn policy_placement_check(policy: &crate::policy::Policy) -> PlanCheck {
+    if policy.source_files().is_empty() {
+        return check(
+            "policy.placement",
+            PlanCheckStatus::Pass,
+            Some("policy has no file sources (embedded default)".to_string()),
+        );
+    }
+    if let Err(e) = crate::policy::loader::require_trusted_policy_sources(policy) {
+        return PlanCheck {
+            id: "policy.placement",
+            status: PlanCheckStatus::Warn,
+            detail: Some(format!("{e}")),
+            remediation: Some(
+                "move the policy and its extends/include files to a location that \
+                 is not group/world-writable, or set \
+                 MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1 to accept the substitution \
+                 risk explicitly — `run` refuses an untrusted policy source"
+                    .to_string(),
+            ),
+        };
+    }
+    let grants = policy.write_grant_spellings();
+    for source in policy.source_files() {
+        if let Some(conflict) =
+            crate::audit_log::policy_source_write_conflict(grants.iter().cloned(), &source)
+        {
+            return PlanCheck {
+                id: "policy.placement",
+                status: PlanCheckStatus::Warn,
+                detail: Some(format!(
+                    "write grant reaches policy source '{}': {conflict}",
+                    source.display()
+                )),
+                remediation: Some(
+                    "narrow the write grant so it does not cover the policy source, \
+                     or move the policy outside the granted tree — `run` refuses \
+                     this launch"
+                        .to_string(),
+                ),
+            };
+        }
+    }
+    check(
+        "policy.placement",
+        PlanCheckStatus::Pass,
+        Some("policy sources are trusted and outside the policy's write grants".to_string()),
+    )
 }
 
 /// True when `MCP_WRIT_SKIP_SANDBOX` is set truthy — the same rule

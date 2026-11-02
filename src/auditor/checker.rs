@@ -67,6 +67,18 @@ impl PolicyViolation {
             other => other,
         }
     }
+
+    /// Whether this refusal is a tool-level authorization refusal — the
+    /// tool is unallowed or absent from the policy — rather than any
+    /// other refusal of the call. The wire message uses this to
+    /// distinguish the two, so it never claims an allowed tool is
+    /// prohibited when only the call was denied.
+    pub fn is_authorization_denial(&self) -> bool {
+        matches!(
+            self.reason.as_str(),
+            REASON_TOOL_NOT_ALLOWED | REASON_TOOL_NOT_FOUND
+        )
+    }
 }
 
 /// Result of a successful policy check, carrying sub-policy metadata.

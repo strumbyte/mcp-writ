@@ -919,6 +919,12 @@ pub async fn launch(
             ));
         }
     }
+    // The replaceable-paths opt-out waives a fail-closed ancestry
+    // check, so an activation rides the spawn record like the other
+    // launch waivers — its absence means the check stood.
+    if crate::fspriv::replaceable_paths_permitted() {
+        details.push_str(" allow_replaceable_paths=true");
+    }
     // The exec method a hash pin produced is part of the launch's
     // security surface: the exe image is snapshot-exec'd (`fd` on
     // Linux, `staged` on other Unix) or path-launched under the

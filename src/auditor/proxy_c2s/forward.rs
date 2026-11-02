@@ -421,6 +421,7 @@ where
                         &id_str,
                         &violation.tool_name,
                         violation.client_reason(),
+                        violation.is_authorization_denial(),
                     );
                     write_client_frame(&shared.client_out, &error_response).await?;
                 }
@@ -887,7 +888,7 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let tool = extract_tool_name_from_line(line).unwrap_or_else(|| "<unknown>".into());
-    let error_response = build_error_response(raw_id, &tool, reason);
+    let error_response = build_error_response(raw_id, &tool, reason, false);
     write_client_frame(&shared.client_out, &error_response).await?;
     let correlation_id = Uuid::now_v7();
     let mut event = AuditEvent::new(

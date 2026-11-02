@@ -2348,13 +2348,19 @@ Auditor enforcement: a tool with `side_effect="read_only"` is rejected when argu
 
 #### `secret-overlay`
 
-Default **on** (`#true` when omitted). Opt out with `secret-overlay #false` under `defaults.filesystem`. The opt-out lands on the audit `policy.loaded` record as `secret_overlay=false` — the token spells the audit field `secret_overlay`, not the KDL key `secret-overlay` — so a launch without the overlay never reads as overlaid.
+Default **on** (`#true` when omitted). Opt out with `secret-overlay #false` under `defaults.filesystem`.
 
 An allow glob cannot override reserved secret paths (`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`, `**/.ssh/**`, `**/.gnupg/**`, `**/.aws/credentials`, `**/.env`, `**/.env.*` except `.env.example`). Ordinary new files under an allow glob (for example `/workspace/notes.txt`) are not rejected. Auditor normalizes `tools/call` arguments (NFKC, bounded percent-decode, `file:` URIs, symlink follow when resolvable). The checked spelling and the forwarded spelling must be the same string: where a per-tool fs allow decision (or a deputy use check) applies, an argument whose normalization changed it — a `file:` URI, percent-encoded bytes, NFKC-equivalent characters — is refused and the caller must resend the canonical spelling, because on a byte-preserving filesystem the normalized name and the raw name can be different directory entries. TOCTOU — a swap between that check and the child's `open` — is **Warden's** job. Passing the Auditor check does not claim TOCTOU is closed: per-tool `filesystem` rules are a *name-level* boundary, not an object-level one. A cooperating actor that can swap a symlink or rename an ancestor between the check and the server's `open` can redirect the call to a different object **inside the same process-wide grant union** (on Linux the union is `defaults.filesystem` plus every allowed tool's `filesystem`). Do not rely on a per-tool rule to protect a higher-value path that shares that union; keep such paths out of every grant, or rely on Warden's default-deny rather than the per-tool allow-list.
 
 **Path authorization refuses replaceable ancestors.** The Auditor binds a resolved *spelling* with no handle behind it, so a component a different principal could rename between the check and the server's `open` would void the binding: a path resolving through a group- or world-writable directory without the sticky bit (Unix), or through an ancestor whose DACL grants replace rights to a broad principal — a null DACL counts as unrestricted (Windows) — is refused rather than authorized. A sticky shared directory such as `/tmp` constrains renames to each entry's owner and is accepted. Deployments that intentionally keep workspaces under group-shared trees (`0775`-style directories) hit this refusal on every authorized path; `MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1` opts back into the pre-check behavior and accepts the rename-swap race on every authorized path — prefer granting an owner-restricted tree. Symlink components under a shared-writable parent stay refused either way; the opt-out does not cover them.
 
 **Argument extraction is fail-closed on unrecognized fields.** Every string in `params.arguments` and `params.inputResponses` is classified, not just the well-known keys: path fields (`path`, `file`, `dir`, `output`, `dest`, `destination`, `source`, `target`, `root`, `cwd`, `*Path`, `*_path`), network fields (`url`, `host`, `uri`, `endpoint`, `origin` and the aliases `addr`, `address`, `peer`, `proxy`, `upstream`, `server`, `relay`, `socket`, `broker`, `ip`, `domain`, `remote`, `dial`, `connect`, `redirect`, `bind`, `listen` and their plurals / `*Ip`-style spellings), resource-shaped values under any key (paths, `scheme://` URLs, IP literals, `host:port`, `[v6]:port`), and reserved secret spellings (`.env`, `.ssh`, `.gnupg`, `.aws/credentials`) under any key. A bare token on a network field is checked as a host — `server="api.example.com"` and `peer="api.example.com:8443"` reach the same allow list as `host=` — and `side_effect="read_only"` sees all of them. A string under no vocabulary above is refused whenever the tool carries a restricted contract — an fs `allow`/`deny`/`require` rule, a tool `network` block (including `allow none`), `read_only`, or a global outbound rule — when the value could still name a resource (separators, `~`/`$`/`%`/`@` sigils, or a dot). Bare words and declared payload fields (`content`, `text`, `data`, `note`, `prompt`, `value`, …) stay forwardable, so an allowed `path="/ok"` decoy can no longer authorize an unchecked `./secret` under another key. Identity- and credential-shaped keys are *not* payload — `id`, `user`, `username`, `token`, `secret`, `password`, `auth` carry either a server-resolvable selector or a credential the contract never declared, so their values survive classification like any unrecognized field. Tools that legitimately take resource-shaped strings under custom keys bind them with per-tool `deputy` `extract` pointers or rename the field.
+
+#### Argument semantics are out of scope
+
+The per-tool checks above classify argument *values* — path-like, network-target-like, and host/socket-like strings — and judge those targets against the tool's rules. They do not parse the semantics of a free-form language carried inside an argument. A tool whose argument is a statement in such a language (a SQL query, a shell command line, a script) is therefore judged as a tool — whether it may be called at all, and whether any path- or host-shaped fragments inside the string name allowed targets — but what the statement itself does is not evaluated. Granting a query tool does not restrain the queries: a single allowed statement can still read, modify, or exfiltrate whatever the interpreter permits, and some statements escape into the interpreter's own host — a PostgreSQL `COPY ... TO PROGRAM`, for example, runs a shell command with the database server's privileges.
+
+The execution subject can also sit outside the sandbox entirely: the MCP server process is what the Warden confines, while a query is executed by the database server process, possibly on another host. Restraint for language-carrying tools belongs to the interpreter side's privileges — connect with a least-privilege role (no superuser, no command-execution rights such as `COPY TO/FROM PROGRAM`), and treat the MCP-layer policy as reach control (which server may be launched, which hosts it may contact), not as statement control.
 
 #### `trajectory`
 
@@ -2616,12 +2622,11 @@ Each line carries:
 
 | Field | Type | Content |
 |---|---|---|
-| `schema_version` | string | Audit schema version (`"2.0"`) |
+| `schema_version` | string | Audit schema version (`"1.0"`) |
 | `timestamp` | string | UTC ISO-8601 with milliseconds |
 | `event_id` | string (UUIDv7) | Unique per event |
 | `correlation_id` | string (UUIDv7) | Groups related events |
 | `parent_event_id` | string (UUIDv7) or `null` | Set when an event is caused by another |
-| `session_id` | string | Emitting logger's per-process id (`{pid}-{millis}-{seq}`) — stamped by the writer at serialization, so it is present on every line including the in-band `audit.reopened` marker |
 | `event_type` | string | Dotted event name (list below) |
 | `event_category` | string | Category of `event_type` (list below) |
 | `severity` | string | `info` / `low` / `medium` / `high` / `critical` |
@@ -2732,8 +2737,7 @@ transition instead of shipping an unaudited list.
 `run` / `run-image` bracket a launch with lifecycle records that all
 share `correlation_id` — the same launch id the `--report` artifact
 carries as `launch_id` — and `details.session_id`, the emitting logger's
-per-process id (also the top-level `session_id` member on every line).
-`run` writes them from the host guard; for `run-image`
+per-process id. `run` writes them from the host guard; for `run-image`
 the in-guest `mcp-secure-runner` writes them (to the mounted `--log-dir`,
 or the guest's stderr when none is mounted), correlated by the
 host-minted `MCP_WRIT_LAUNCH_ID` — host-side steps before the guest
@@ -2749,20 +2753,10 @@ lifecycle records:
 - `policy.loaded` (`configuration`) — the effective policy loaded and
   bound. `details` repeats `version`, the effective-KDL `hash`, the
   resolved `fail_on` dial (`none` is recorded even when no finding
-  fires), `session_id`, and `source` (path or `default` —
-  percent-encoded, so a path spelling can never forge `k=v` tokens);
-  `policy_id` /
+  fires), `source` (path or `default`), and `session_id`; `policy_id` /
   `policy_version` / `policy_hash` carry the same identity. A policy
   carrying `sandbox allow_degraded=#true` adds `allow_degraded=true` —
-  the launch accepted a partially-enforced sandbox as valid. A `sandbox
-  require_lifetime_boundary=#false` waiver adds
-  `require_lifetime_boundary=false` — the launch runs without a
-  kernel-enforced descendant boundary. A `defaults.filesystem`
-  `secret-overlay #false` opt-out adds `secret_overlay=false` — the
-  launch runs without the reserved-secret-path overlay (the token keeps
-  the field's snake_case spelling). Each token appears only when its
-  dial sits off the fail-secure default; absent tokens mean strict
-  posture.
+  the launch accepted a partially-enforced sandbox as valid.
 - `session.started` (`session`) — the child spawned and the Auditor
   relay is running; pairs with `session.ended`. A launch that fails
   earlier emits `server.error` instead — never a started session that
