@@ -314,7 +314,10 @@ fn parent_write_restriction() {
 
 /// Set `dir`'s DACL from an SDDL string as a protected DACL, so the
 /// fixture's trust state is exactly the spelled one regardless of
-/// the ACEs the temp parent would otherwise hand down.
+/// the ACEs the temp parent would otherwise hand down. Applying it
+/// propagates to existing children (their inherited ACEs are
+/// stripped), so fixtures that need a readable child apply the DACL
+/// before creating the child and give the ACEs OI/CI inheritance.
 #[cfg(windows)]
 fn set_dacl_from_sddl(dir: &std::path::Path, sddl: &str) {
     use windows::Win32::Security::Authorization::{
@@ -393,14 +396,20 @@ fn windows_trusted_source_rejects_broad_dacl_ancestor() {
     let root = create_private_tempdir("trusted-source-win").unwrap();
     let shared = root.join("shared");
     fs::create_dir(&shared).unwrap();
+    // The DACL goes on before the leaf exists, and the fixture ACEs
+    // carry OI/CI inheritance: applying a protected DACL to a
+    // container propagates to existing children by stripping their
+    // inherited ACEs, so a leaf created first would be left with an
+    // empty DACL and fail every read (os error 5) before the
+    // ancestor walk this test exercises is ever reached.
+    set_dacl_from_sddl(&shared, "D:P(A;OICI;FA;;;WD)");
     let leaf = shared.join("real.py");
     fs::write(&leaf, b"entry\n").unwrap();
-    set_dacl_from_sddl(&shared, "D:P(A;;FA;;;WD)");
     assert!(
         require_trusted_source_file(&leaf).is_err(),
         "a source under a broadly replaceable ancestor must refuse"
     );
-    set_dacl_from_sddl(&shared, "D:P(A;;FA;;;OW)(A;;FA;;;SY)");
+    set_dacl_from_sddl(&shared, "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)");
     assert!(
         require_trusted_source_file(&leaf).is_ok(),
         "the same source under an owner/SYSTEM-only parent must pass"

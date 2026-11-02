@@ -675,7 +675,10 @@ fn f67_private_ancestors_still_resolve() {
 
 /// Set `dir`'s DACL from an SDDL string as a protected DACL, so the
 /// fixture's trust state is exactly the spelled one regardless of
-/// the ACEs the temp parent would otherwise hand down.
+/// the ACEs the temp parent would otherwise hand down. Applying it
+/// propagates to existing children (their inherited ACEs are
+/// stripped), so fixtures that need a readable child apply the DACL
+/// before creating the child and give the ACEs OI/CI inheritance.
 #[cfg(windows)]
 fn set_dacl_from_sddl(dir: &std::path::Path, sddl: &str) {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
@@ -732,15 +735,21 @@ fn windows_replaceable_ancestor_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     let shared = dir.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
+    // The DACL goes on before the leaf exists, and the fixture ACEs
+    // carry OI/CI inheritance: applying a protected DACL to a
+    // container propagates to existing children by stripping their
+    // inherited ACEs, so a leaf created first would be left with an
+    // empty DACL and fail every read (os error 5) before the
+    // ancestor walk this test exercises is ever reached.
+    set_dacl_from_sddl(&shared, "D:P(A;OICI;FA;;;WD)");
     let leaf = shared.join("f.txt");
     std::fs::write(&leaf, b"x").unwrap();
     let leaf_str = leaf.to_string_lossy().into_owned();
-    set_dacl_from_sddl(&shared, "D:P(A;;FA;;;WD)");
     assert!(
         resolve_for_authorization(&leaf_str).is_err(),
         "an ancestor granting Everyone replace rights must fail closed"
     );
-    set_dacl_from_sddl(&shared, "D:P(A;;FA;;;OW)(A;;FA;;;SY)");
+    set_dacl_from_sddl(&shared, "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)");
     let resolved =
         resolve_for_authorization(&leaf_str).expect("owner/SYSTEM-only ancestors must resolve");
     assert!(resolved.ends_with("f.txt"), "{resolved}");
