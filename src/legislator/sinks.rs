@@ -11,6 +11,13 @@ pub struct ToolCapability {
     pub tool_name: String,
     pub permissions: Vec<Permission>,
     pub bound: bool,
+    /// `true` only when the scan covered the handler *and* every
+    /// reachable helper without a construct the analyzer cannot
+    /// resolve (computed `child_process` member calls, dynamic cp
+    /// bindings) or a work-budget exit. `false` means `permissions` /
+    /// `audit_risks` are partial — callers must treat the tool as
+    /// unproven (denied pending review), never as allowed.
+    pub complete: bool,
     pub audit_risks: Vec<String>,
     pub warning: Option<String>,
 }
@@ -22,7 +29,27 @@ pub struct ToolCapability {
 /// helper sinks.
 const MAX_SCAN_WORK_BYTES: u64 = 256 * 1024 * 1024;
 
-type ScanResult = (Vec<Permission>, Vec<String>);
+/// One handler body fully scanned: sink results plus the set of
+/// callee names indexed once, so helper membership probes are set
+/// lookups rather than per-helper body rescans.
+#[derive(Clone)]
+struct BodyScan {
+    perms: Vec<Permission>,
+    risks: Vec<String>,
+    /// A `child_process` receiver carried a member access the analyzer
+    /// could not resolve — the body's capability is unproven.
+    dynamic_cp: bool,
+    calls: std::rc::Rc<std::collections::HashSet<String>>,
+    /// The callee-name index could not be built within the work
+    /// budget — `calls` is empty and helper membership is unproven.
+    /// Recorded here because a cache hit otherwise loses the failure
+    /// that produced the empty set and reads the scan as complete.
+    calls_incomplete: bool,
+}
+
+/// One helper body fully scanned (helpers never inline their own
+/// callees, so no call index is kept).
+type HelperScan = (Vec<Permission>, Vec<String>, bool);
 
 struct ScanCache {
     /// Whole-binding results keyed by handler *identity*: the body's
@@ -33,12 +60,11 @@ struct ScanCache {
     /// every probe, before `spend()` is ever charged — thousands of
     /// registrations on one large handler would multiply CPU entirely
     /// outside the work budget.
-    bodies: std::collections::HashMap<(usize, usize), ScanResult>,
+    bodies: std::collections::HashMap<(usize, usize), BodyScan>,
     /// Helper-body results keyed by position in `functions`.
-    helpers: std::collections::HashMap<usize, ScanResult>,
+    helpers: std::collections::HashMap<usize, HelperScan>,
     /// Bytes of scanning left before the analysis declares itself partial.
     work_left: u64,
-    truncated: bool,
 }
 
 impl ScanCache {
@@ -47,20 +73,29 @@ impl ScanCache {
             bodies: std::collections::HashMap::new(),
             helpers: std::collections::HashMap::new(),
             work_left: MAX_SCAN_WORK_BYTES,
-            truncated: false,
         }
     }
 
-    /// Spend `n` bytes of scan work; returns false (and records
-    /// truncation) once the budget is gone.
+    /// Spend `n` bytes of scan work; returns false once the budget is
+    /// gone — the caller marks *its own* tool incomplete rather than
+    /// treating the partial result as proven.
     fn spend(&mut self, n: usize) -> bool {
         if self.work_left < n as u64 {
             self.work_left = 0;
-            self.truncated = true;
             return false;
         }
         self.work_left -= n as u64;
         true
+    }
+}
+
+#[cfg(test)]
+impl ScanCache {
+    fn with_budget(bytes: u64) -> Self {
+        Self {
+            work_left: bytes,
+            ..Self::new()
+        }
     }
 }
 
@@ -88,26 +123,39 @@ pub fn capabilities_from_bindings(
                     tool_name: b.tool_name.clone(),
                     permissions: Vec::new(),
                     bound: false,
+                    complete: false,
                     audit_risks: Vec::new(),
                     warning: b.warning.clone(),
                 };
             }
-            let (permissions, audit_risks) = scan_with_one_hop(
+            let (permissions, audit_risks, dynamic_cp, hit_limit) = scan_with_one_hop(
                 &b.body,
                 functions,
                 language,
                 cp_bindings.as_ref(),
                 &mut cache,
             );
-            let warning = match (b.warning.clone(), cache.truncated) {
-                (Some(w), true) => Some(format!("{w}; capability scan truncated")),
-                (None, true) => Some("capability scan truncated".to_string()),
-                (w, false) => w,
+            // Completeness is mandatory per-tool state: a scan that met
+            // an unresolvable construct or ran out of budget must never
+            // emit its partial permissions as a proven capability.
+            let mut notes = Vec::new();
+            if dynamic_cp {
+                notes.push("unresolved dynamic child_process invocation");
+            }
+            if hit_limit {
+                notes.push("capability scan truncated");
+            }
+            let complete = notes.is_empty();
+            let warning = match (b.warning.clone(), complete) {
+                (Some(w), false) => Some(format!("{w}; {}", notes.join("; "))),
+                (None, false) => Some(notes.join("; ")),
+                (w, true) => w,
             };
             ToolCapability {
                 tool_name: b.tool_name.clone(),
                 permissions,
                 bound: true,
+                complete,
                 audit_risks,
                 warning,
             }
@@ -115,43 +163,82 @@ pub fn capabilities_from_bindings(
         .collect()
 }
 
+/// `(permissions, audit_risks, dynamic_cp, hit_limit)` — the last two
+/// are the scan's self-reported incompleteness: a `child_process`
+/// receiver it could not resolve, or a work-budget exit that left
+/// helpers unscanned.
 fn scan_with_one_hop<'a>(
     body: &'a str,
     functions: &'a [SourceFunction],
     language: InterpreterKind,
     cp_bindings: Option<&ChildProcessBindings>,
     cache: &mut ScanCache,
-) -> ScanResult {
+) -> (Vec<Permission>, Vec<String>, bool, bool) {
     // Handler identity, not content: every `body` here is a deref of a
     // live `Rc<str>` field, so equal pointers with equal lengths are
     // provably the same allocation — and distinct live allocations can
     // never share one.
     let key = (body.as_ptr() as usize, body.len());
-    let (mut perms, mut risks) = if let Some(hit) = cache.bodies.get(&key) {
-        hit.clone()
+    let mut hit_limit = false;
+    let (mut perms, mut risks, mut dynamic_cp, calls) = if let Some(hit) = cache.bodies.get(&key) {
+        // A cached scan may carry an unindexed `calls` set — the
+        // failure that produced it must mark this tool too.
+        hit_limit |= hit.calls_incomplete;
+        (
+            hit.perms.clone(),
+            hit.risks.clone(),
+            hit.dynamic_cp,
+            hit.calls.clone(),
+        )
     } else if cache.spend(body.len()) {
-        let r = match language {
-            InterpreterKind::Python => scan_python_sinks(body),
+        let (p, r, d) = match language {
+            InterpreterKind::Python => {
+                let (p, r) = scan_python_sinks(body);
+                (p, r, false)
+            }
             InterpreterKind::Node | InterpreterKind::Npx => scan_js_sinks(body, cp_bindings),
         };
-        cache.bodies.insert(key, r.clone());
-        r
+        // The callee-name index is one extra pass over the same
+        // body — still charged to the budget, and its loss marks
+        // the tool incomplete (membership could not be proven).
+        // The flag is stored on the cached scan so a cache hit
+        // replays the same incompleteness instead of silently
+        // presenting the empty index as a proven one.
+        let mut calls_incomplete = false;
+        let calls = if cache.spend(body.len()) {
+            std::rc::Rc::new(collect_called_names(body))
+        } else {
+            calls_incomplete = true;
+            std::rc::Rc::new(std::collections::HashSet::new())
+        };
+        hit_limit = calls_incomplete;
+        let body_scan = BodyScan {
+            perms: p.clone(),
+            risks: r.clone(),
+            dynamic_cp: d,
+            calls: calls.clone(),
+            calls_incomplete,
+        };
+        cache.bodies.insert(key, body_scan);
+        (p, r, d, calls)
     } else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), false, true);
     };
     for (idx, helper) in functions.iter().enumerate() {
-        // The membership probe is itself a body-length scan — charge it.
-        if !cache.spend(body.len()) {
-            break;
-        }
-        if !contains_call(body, &helper.name) {
+        // Membership is a set lookup — indexed once per handler instead
+        // of rescanned per helper, so helper count no longer multiplies
+        // body-length work against the budget.
+        if !calls.contains(&helper.name) {
             continue;
         }
-        let (hp, hr) = if let Some(hit) = cache.helpers.get(&idx) {
+        let (hp, hr, hd) = if let Some(hit) = cache.helpers.get(&idx) {
             hit.clone()
         } else if cache.spend(helper.body.len()) {
             let r = match language {
-                InterpreterKind::Python => scan_python_sinks(&helper.body),
+                InterpreterKind::Python => {
+                    let (p, r) = scan_python_sinks(&helper.body);
+                    (p, r, false)
+                }
                 InterpreterKind::Node | InterpreterKind::Npx => {
                     scan_js_sinks(&helper.body, cp_bindings)
                 }
@@ -159,8 +246,10 @@ fn scan_with_one_hop<'a>(
             cache.helpers.insert(idx, r.clone());
             r
         } else {
+            hit_limit = true;
             break;
         };
+        dynamic_cp |= hd;
         merge_perms(&mut perms, hp);
         for r in hr {
             if !risks.contains(&r) {
@@ -168,7 +257,7 @@ fn scan_with_one_hop<'a>(
             }
         }
     }
-    (perms, risks)
+    (perms, risks, dynamic_cp, hit_limit)
 }
 
 fn merge_perms(dst: &mut Vec<Permission>, extra: Vec<Permission>) {
@@ -177,6 +266,31 @@ fn merge_perms(dst: &mut Vec<Permission>, extra: Vec<Permission>) {
             dst.push(p);
         }
     }
+}
+
+/// Identifier tokens directly followed by `(` — the helper-membership
+/// index scanned once per handler body. Byte-level like the old
+/// `contains_call` probe (no string/comment elision), so it can only
+/// over-approximate call sites — a superset that scans extra helpers,
+/// never fewer.
+fn collect_called_names(body: &str) -> std::collections::HashSet<String> {
+    let bytes = body.as_bytes();
+    let mut names = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_ident_byte(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            if body[i..].trim_start().starts_with('(') {
+                names.insert(body[start..i].to_string());
+            }
+            continue;
+        }
+        i += 1;
+    }
+    names
 }
 
 fn contains_call(body: &str, name: &str) -> bool {
@@ -251,18 +365,24 @@ fn scan_python_sinks(body: &str) -> (Vec<Permission>, Vec<String>) {
     (perms, risks)
 }
 
+/// `(permissions, audit_risks, unresolved_cp)` — the last flag means
+/// a `child_process` receiver carried a member access the analyzer
+/// could not resolve, so the body's capability is unproven.
 fn scan_js_sinks(
     body: &str,
     cp_bindings: Option<&ChildProcessBindings>,
-) -> (Vec<Permission>, Vec<String>) {
+) -> (Vec<Permission>, Vec<String>, bool) {
     let scan = strip_js_strings_and_comments(body);
     let mut perms = Vec::new();
     let mut risks = Vec::new();
+    let mut unresolved_cp = false;
 
-    if let Some(bindings) = cp_bindings
-        && crate::legislator::js_bind::js_has_cp_exec(body, bindings)
-    {
-        push_perm(&mut perms, Permission::ProcessExec);
+    if let Some(bindings) = cp_bindings {
+        let usage = crate::legislator::js_bind::js_scan_cp_usage(body, bindings);
+        if usage.exec {
+            push_perm(&mut perms, Permission::ProcessExec);
+        }
+        unresolved_cp = usage.unresolved;
     }
     if contains_substr(&scan, "writeFile")
         || contains_substr(&scan, "appendFile")
@@ -285,7 +405,7 @@ fn scan_js_sinks(
     if contains_call(&scan, "eval") {
         push_risk(&mut risks, "eval");
     }
-    (perms, risks)
+    (perms, risks, unresolved_cp)
 }
 
 fn push_perm(perms: &mut Vec<Permission>, p: Permission) {
@@ -1219,10 +1339,10 @@ def write_file(path):
         let mut cache = ScanCache::new();
         let fns: Vec<SourceFunction> = Vec::new();
         let body: std::rc::Rc<str> = std::rc::Rc::from("return open(path, 'w')");
-        let (p1, _) = scan_with_one_hop(&body, &fns, InterpreterKind::Python, None, &mut cache);
+        let (p1, ..) = scan_with_one_hop(&body, &fns, InterpreterKind::Python, None, &mut cache);
         let spent = MAX_SCAN_WORK_BYTES - cache.work_left;
         assert!(spent > 0);
-        let (p2, _) = scan_with_one_hop(&body, &fns, InterpreterKind::Python, None, &mut cache);
+        let (p2, ..) = scan_with_one_hop(&body, &fns, InterpreterKind::Python, None, &mut cache);
         assert_eq!(p1, p2);
         assert_eq!(cache.bodies.len(), 1, "one shared allocation scans once");
         assert_eq!(
@@ -1260,6 +1380,148 @@ def write_file(path):
         assert!(
             caps.iter().all(|c| c.warning.is_none()),
             "shared-body scans must not carry truncation warnings: {caps:?}"
+        );
+    }
+
+    /// A `child_process` member access the analyzer cannot resolve is
+    /// not "no exec" — it marks the tool incomplete, so the emitted
+    /// capability can never carry partial permissions as proven.
+    #[test]
+    fn js_computed_child_process_member_marks_tool_incomplete() {
+        let cases = [
+            r#"
+const cp = require("child_process");
+server.tool("read_file", (args) => cp[args.method](args.command));
+"#,
+            r#"
+const cp = require("child_process");
+server.tool("read_file", (args) => cp?.[args.method](args.command));
+"#,
+            r#"
+const cp = require("child_process");
+function launch(command) { return cp[command.fn](command.line); }
+server.tool("read_file", (args) => launch(args));
+"#,
+            r#"
+const cp = require("child_process");
+const f = cp["exec" + "Sync"];
+server.tool("read_file", (args) => f(args.command));
+"#,
+        ];
+        for src in cases {
+            let path = Path::new("computed.js");
+            let analysis = analyze_source(path, InterpreterKind::Node, src);
+            let t = analysis
+                .tools
+                .iter()
+                .find(|c| c.tool_name == "read_file")
+                .unwrap();
+            assert!(t.bound, "{src}\n{t:?}");
+            assert!(!t.complete, "{src}\nmust be incomplete: {t:?}");
+            assert!(
+                t.warning
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("unresolved dynamic child_process invocation"),
+                "{src}\nwarning must name the cause: {t:?}"
+            );
+            assert!(
+                !t.permissions.contains(&Permission::ProcessExec),
+                "a dynamic member must not *prove* ProcessExec: {t:?}"
+            );
+        }
+    }
+
+    /// The denied surface, end to end: an incomplete tool never emits
+    /// an allowed verdict — only the Case-C warning a policy author
+    /// reviews.
+    #[test]
+    fn js_computed_child_process_member_is_denied_not_allowed() {
+        let src = r#"
+const cp = require("child_process");
+server.tool("read_file", (args) => cp[args.method](args.command));
+"#;
+        let path = Path::new("computed.js");
+        let analysis = analyze_source(path, InterpreterKind::Node, src);
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|w| w.contains("unresolved dynamic child_process")),
+            "SourceAnalysis must surface the scan caveat: {:?}",
+            analysis.warnings
+        );
+        let result =
+            crate::legislator::cross_validator::cross_validate_source(&analysis.tools, &[]);
+        assert!(
+            result
+                .allowed
+                .iter()
+                .all(|v| v.tool_name.as_deref() != Some("read_file")),
+            "no allowed verdict for an unproven tool: {result:?}"
+        );
+        assert!(result.warnings.iter().any(|v| {
+            v.case == crate::legislator::cross_validator::VerdictCase::C
+                && v.tool_name.as_deref() == Some("read_file")
+        }));
+    }
+
+    /// Work-budget exhaustion must not pass partial permissions off as
+    /// a complete scan — the tool reports hit_limit and stays denied.
+    #[test]
+    fn work_budget_exhaustion_marks_scan_hit_limit() {
+        let mut cache = ScanCache::with_budget(4); // smaller than the body
+        let (perms, _risks, _dynamic, hit_limit) = scan_with_one_hop(
+            "def handler():\n    return open(path, 'w')\n",
+            &[],
+            InterpreterKind::Python,
+            None,
+            &mut cache,
+        );
+        assert!(hit_limit, "a spent budget must report hit_limit");
+        assert!(perms.is_empty());
+    }
+
+    /// The callee-name index makes helper membership a set lookup —
+    /// helper count no longer multiplies handler-length work against
+    /// the budget, so many helpers over one handler do not truncate.
+    #[test]
+    fn many_helpers_do_not_multiply_handler_work() {
+        let src = String::from("def handler(path):\n    h0()\n");
+        let helpers: Vec<SourceFunction> = (0..256)
+            .map(|i| SourceFunction {
+                name: format!("h{i}"),
+                body: format!("def h{i}():\n    pass\n").into(),
+                top_level: true,
+            })
+            .collect();
+        let mut cache = ScanCache::new();
+        let (_p, _r, _d, hit_limit) =
+            scan_with_one_hop(&src, &helpers, InterpreterKind::Python, None, &mut cache);
+        assert!(!hit_limit, "helper membership must not rescale the body");
+        assert!(cache.work_left > MAX_SCAN_WORK_BYTES / 2);
+    }
+
+    /// A callee-name index lost to the budget must stay lost on a
+    /// cache hit: the first scan's `hit_limit` marks its own tool, and
+    /// the cached `calls` set is empty either way — without the
+    /// recorded flag a second binding over the same body would read
+    /// the partial scan as complete.
+    #[test]
+    fn index_budget_failure_survives_the_body_cache() {
+        let body: std::rc::Rc<str> = std::rc::Rc::from("def handler():\n    h0()\n");
+        // Room for exactly the body scan — the index spend must fail.
+        let mut cache = ScanCache::with_budget(body.len() as u64);
+        let fns: Vec<SourceFunction> = Vec::new();
+        let (_p, _r, _d, first) =
+            scan_with_one_hop(&body, &fns, InterpreterKind::Python, None, &mut cache);
+        assert!(first, "index spend failure marks the first scan");
+        let (_p, _r, _d, second) =
+            scan_with_one_hop(&body, &fns, InterpreterKind::Python, None, &mut cache);
+        assert_eq!(cache.bodies.len(), 1, "second scan is a cache hit");
+        assert!(
+            second,
+            "a cache hit on an unindexed body must stay incomplete"
         );
     }
 }

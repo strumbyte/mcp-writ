@@ -391,6 +391,17 @@ pub fn analyze_source(path: &Path, interpreter: InterpreterKind, source: &str) -
         }
     }
     let tools = sinks::capabilities_from_bindings(&bindings, &functions, interpreter, source);
+    // A bound-but-incomplete tool's scan caveat is a file-level finding
+    // — `cross_validate_source` already denies it, but the analysis
+    // surface must carry the reason without an operator diffing tools.
+    for t in &tools {
+        if t.bound
+            && !t.complete
+            && let Some(w) = &t.warning
+        {
+            warnings.push(w.clone());
+        }
+    }
     SourceAnalysis {
         path: path.to_path_buf(),
         interpreter,
@@ -431,7 +442,13 @@ pub fn format_source_human(analysis: &SourceAnalysis) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let bind = if tool.bound { "bound" } else { "unbound" };
+        let bind = if !tool.bound {
+            "unbound"
+        } else if !tool.complete {
+            "incomplete"
+        } else {
+            "bound"
+        };
         out.push_str(&format!(
             "  - {} [{bind}]: {}\n",
             crate::termutil::sanitize_for_terminal(&tool.tool_name),

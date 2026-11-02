@@ -32,9 +32,10 @@ pub async fn run_generate_policy(args: GenPolicyArgs) {
     } else {
         eprintln!(
             "WARNING: generate-policy executes the MCP server to discover tools. \
-             Discovery inherits a restricted environment (PATH + private TMPDIR). \
-             Use --static-only to skip execution, or --unsafe-unsandboxed-discovery \
-             to inherit the ambient environment."
+             The server runs inside the Warden sandbox (restricted environment, \
+             deny-all egress, private TMPDIR). Use --static-only to skip execution, \
+             or --unsafe-unsandboxed-discovery to run it without the sandbox and \
+             inherit the ambient environment."
         );
         let opts = crate::legislator::tools_list::DiscoveryOptions {
             restrict_environment: !args.unsafe_unsandboxed_discovery,

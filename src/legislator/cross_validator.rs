@@ -329,15 +329,27 @@ pub fn cross_validate_source(
         seen.insert(cap.tool_name.clone());
         let intent = intents.iter().find(|i| i.tool_name == cap.tool_name);
 
-        if !cap.bound {
+        // Unbound tools and bound-but-incomplete tools share the
+        // fail-closed branch: a partial capability (unresolvable
+        // `child_process` member, truncated helper scan) must never
+        // produce an allowed verdict. Case C emits the tool denied
+        // pending review rather than granting its partial permissions.
+        if !cap.bound || !cap.complete {
             warnings.push(PermissionVerdict {
                 permission: Permission::Unknown,
                 tool_name: Some(cap.tool_name.clone()),
                 reason: cap.warning.clone().unwrap_or_else(|| {
-                    format!(
-                        "Tool '{}' is Unbound; Capability is not proven",
-                        cap.tool_name
-                    )
+                    if !cap.bound {
+                        format!(
+                            "Tool '{}' is Unbound; Capability is not proven",
+                            cap.tool_name
+                        )
+                    } else {
+                        format!(
+                            "Tool '{}' capability analysis is incomplete; Capability is not proven",
+                            cap.tool_name
+                        )
+                    }
                 }),
                 case: VerdictCase::C,
             });
@@ -816,6 +828,7 @@ mod tests {
             tool_name: name.into(),
             permissions: perms,
             bound,
+            complete: bound,
             audit_risks: vec![],
             warning: if bound {
                 None
@@ -847,12 +860,48 @@ mod tests {
         assert!(result.warnings.iter().any(|v| v.case == VerdictCase::C));
     }
 
+    /// A bound-but-incomplete tool (dynamic cp member, truncated
+    /// scan) shares the fail-closed branch: no allowed verdict, no
+    /// blocked verdict — only the Case-C review warning.
+    #[test]
+    fn source_incomplete_is_case_c_not_allowed() {
+        let tools = vec![ToolCapability {
+            tool_name: "read_file".into(),
+            permissions: vec![Permission::FileRead],
+            bound: true,
+            complete: false,
+            audit_risks: vec![],
+            warning: Some("capability scan truncated".into()),
+        }];
+        let result = cross_validate_source(&tools, &[]);
+        assert!(
+            result
+                .allowed
+                .iter()
+                .all(|v| v.tool_name.as_deref() != Some("read_file")),
+            "partial permissions must not emit allowed verdicts: {result:?}"
+        );
+        assert!(
+            result
+                .blocked
+                .iter()
+                .all(|v| v.tool_name.as_deref() != Some("read_file")),
+            "{result:?}"
+        );
+        assert!(
+            result.warnings.iter().any(|v| {
+                v.case == VerdictCase::C && v.tool_name.as_deref() == Some("read_file")
+            })
+        );
+    }
+
     #[test]
     fn source_eval_risk_is_not_process_exec_block() {
         let tools = vec![ToolCapability {
             tool_name: "read_file".into(),
             permissions: vec![Permission::FileRead],
             bound: true,
+            complete: true,
             audit_risks: vec!["eval".into()],
             warning: None,
         }];

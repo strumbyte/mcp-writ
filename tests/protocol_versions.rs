@@ -2,25 +2,26 @@
 //!
 //! Fixtures live in `tests/fixtures/mcp_servers/`. No network, no rmcp.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use mcp_writ::legislator::tools_list::{ToolsListError, fetch_tools_list_detailed};
+mod common;
+
+use mcp_writ::legislator::tools_list::{ToolsListError, ToolsListFetch};
 use mcp_writ::protocol::SupportedProtocolVersion;
 
 fn fixture_server(name: &str) -> Vec<String> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/mcp_servers")
-        .join(name);
-    if cfg!(windows) {
-        vec![
-            "py".to_string(),
-            "-3".to_string(),
-            path.to_string_lossy().into_owned(),
-        ]
-    } else {
-        vec!["python3".to_string(), path.to_string_lossy().into_owned()]
-    }
+    common::python3_script_argv(&format!("tests/fixtures/mcp_servers/{name}"))
+}
+
+/// Sandboxed discovery mutates the fixture dirs' DACLs; parallel
+/// fetches race grant/restore read-modify-write and can drop a sibling
+/// session's ACE mid-run, so these fetches serialize.
+async fn fetch_tools_list_detailed(
+    command: &[String],
+    timeout: Option<Duration>,
+) -> Result<ToolsListFetch, ToolsListError> {
+    let _g = common::sandbox_spawn_lock().lock().await;
+    mcp_writ::legislator::tools_list::fetch_tools_list_detailed(command, timeout).await
 }
 
 fn fetch_timeout() -> Option<Duration> {

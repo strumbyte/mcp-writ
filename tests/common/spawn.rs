@@ -5,6 +5,28 @@ use std::path::Path;
 
 use super::paths::policy_path_str;
 
+/// Serializes sandboxed test sessions within a test binary.
+///
+/// A Warden spawn mutates the filesystem DACL of every granted path
+/// (add the container ACE, strip it again at teardown). That is a
+/// read-modify-write on a shared object: two parallel sessions on the
+/// same directories can lose each other's ACE mid-run, so the child
+/// dies on an access it should hold. Holding this lock across a
+/// sandboxed session keeps grant/restore pairs non-overlapping inside
+/// one test binary (cargo already runs test binaries one at a time).
+/// On Unix Landlock carries no such shared-mutation hazard, but the
+/// lock is cheap there — tests lock unconditionally so the contract
+/// stays platform-independent.
+///
+/// A `tokio` mutex because `#[tokio::test]` runs the whole binary on
+/// one thread — a blocking `std::sync::Mutex::lock` would deadlock the
+/// executor while a sibling task holds the guard. Sync callers take
+/// `.blocking_lock()`, async callers `.lock().await`.
+pub fn sandbox_spawn_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
+}
+
 // ─── sandboxed spawn helpers ─────────────────────────────────────────────
 // Shared by `path_resolution_e2e` and `real_servers_e2e`. These never set
 // `MCP_WRIT_SKIP_SANDBOX`, so the Warden actually applies.

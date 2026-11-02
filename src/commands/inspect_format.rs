@@ -217,6 +217,7 @@ mod tests {
             tool_name: "read_file".into(),
             permissions: vec![crate::legislator::heuristics::Permission::NetworkOutbound],
             bound: true,
+            complete: true,
             audit_risks: vec![],
             warning: None,
         }];

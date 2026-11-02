@@ -546,16 +546,78 @@ fn match_fn_decl(source: &str, i: usize) -> Option<(String, usize)> {
             if name.is_empty() {
                 continue;
             }
-            if let Some(rel) = source[name_end..].find('{') {
-                let between = source[name_end..name_end + rel].trim();
-                if between.contains('=') && (between.contains("=>") || between.contains("function"))
-                {
-                    return Some((name, name_end + rel));
+            // The `{` must open *this* declarator's function body — an
+            // unbounded forward search bleeds into a later statement
+            // (`const cp = require("child_process")\nfunction f() {…}`)
+            // and would attach that statement's body to this name.
+            let mut from = name_end;
+            while let Some(brace) = declarator_body_brace(source, from) {
+                if declarator_rhs_is_fn_head(&source[name_end..brace]) {
+                    return Some((name, brace));
                 }
+                from = brace + 1;
             }
         }
     }
     None
+}
+
+/// First `{` inside the same declarator statement, or `None` when a
+/// boundary (`;`, a top-level `,` or `}`) ends it first. Braces nested
+/// inside `(`/`[` (call args, array literals, destructured params) do
+/// not count.
+fn declarator_body_brace(source: &str, name_end: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut i = name_end;
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                i = skip_quoted(source, i);
+                continue;
+            }
+            b'`' => {
+                i = skip_template_literal(source, i);
+                continue;
+            }
+            b'/' if is_line_or_block_comment(source, i) => {
+                i = skip_inert_js(source, i);
+                continue;
+            }
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b'{' if depth == 0 => return Some(i),
+            b';' | b',' | b'}' if depth == 0 => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `between` (the `name`…`{` span) is this declarator's function head
+/// iff it holds `=` whose RHS opens a function or arrow head —
+/// `function`, `async`, or a parameter list ending in `=>`. Anything
+/// else (`require(…)`, a literal, another statement's tokens) means
+/// the `{` belongs to a different statement.
+fn declarator_rhs_is_fn_head(between: &str) -> bool {
+    let Some(eq) = between.find('=') else {
+        return false;
+    };
+    let rhs = between[eq + 1..].trim_start();
+    if rhs.starts_with("=>") {
+        return true;
+    }
+    if rhs.starts_with("function") || rhs.starts_with("async") {
+        return true;
+    }
+    if !rhs.contains("=>") {
+        return false;
+    }
+    // An arrow head opens with a parameter: `(`, `[`, `{`, or an ident.
+    rhs.chars()
+        .next()
+        .is_some_and(|c| matches!(c, '(' | '[' | '{') || is_ident_start(c))
 }
 
 /// `{` of the function body: skip destructuring `{` in the parameter list, then

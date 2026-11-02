@@ -1,13 +1,13 @@
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::protocol::tools_list::{
     MAX_PAGES, MAX_TOTAL_TOOLS, ToolsListParseError, parse_tools_list_response_page,
@@ -220,7 +220,16 @@ pub async fn fetch_tools_list(
 /// Options for live tools/list discovery.
 #[derive(Debug, Clone)]
 pub struct DiscoveryOptions {
-    /// When true, clear the child environment except PATH and a private TMPDIR.
+    /// `true` (default) — the discovery server runs inside the Warden:
+    /// environment stripped to the same contract a supervised launch
+    /// gets, deny-all egress, an fs surface limited to the command's
+    /// own tree plus a private writable TMPDIR, and the descendant
+    /// process tree owned by `RunningChild`. When that isolation
+    /// cannot be established the spawn fails closed.
+    ///
+    /// `false` — the explicit `--unsafe-unsandboxed-discovery`
+    /// downgrade: ambient environment, no OS sandbox. It is a
+    /// documented trust decision, not a silent fallback.
     pub restrict_environment: bool,
 }
 
@@ -289,32 +298,21 @@ pub async fn fetch_tools_list_detailed_with(
 }
 
 struct StdioSession {
-    stdin: tokio::process::ChildStdin,
-    reader: BufReader<tokio::process::ChildStdout>,
+    stdin: Box<dyn AsyncWrite + Unpin + Send>,
+    reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     next_id: i64,
 }
 
 impl StdioSession {
-    fn from_child(
-        child: &mut tokio::process::Child,
-        protocol_version: SupportedProtocolVersion,
-        step: ProtocolStep,
-    ) -> Result<Self, ToolsListError> {
-        let stdin = child.stdin.take().ok_or_else(|| ToolsListError::Io {
-            protocol_version,
-            step,
-            source: io::Error::other("failed to capture child stdin"),
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| ToolsListError::Io {
-            protocol_version,
-            step,
-            source: io::Error::other("failed to capture child stdout"),
-        })?;
-        Ok(Self {
+    fn from_io(
+        stdin: Box<dyn AsyncWrite + Unpin + Send>,
+        stdout: Box<dyn AsyncRead + Unpin + Send>,
+    ) -> Self {
+        Self {
             stdin,
             reader: BufReader::new(stdout),
             next_id: 1,
-        })
+        }
     }
 
     fn alloc_id(&mut self) -> i64 {
@@ -427,10 +425,285 @@ impl StdioSession {
     }
 }
 
-fn spawn_server(
+/// The discovery server child. `Sandboxed` is the default — the
+/// Warden owns environment, egress, the fs surface, and the whole
+/// descendant process tree. `Plain` is the explicit
+/// `--unsafe-unsandboxed-discovery` downgrade.
+enum DiscoveryChild {
+    Sandboxed(crate::warden::RunningChild),
+    Plain(tokio::process::Child),
+}
+
+impl DiscoveryChild {
+    fn take_stdio(
+        &mut self,
+        protocol_version: SupportedProtocolVersion,
+        step: ProtocolStep,
+    ) -> Result<StdioSession, ToolsListError> {
+        let io_err = |detail: &'static str| ToolsListError::Io {
+            protocol_version,
+            step,
+            source: io::Error::other(detail),
+        };
+        let (stdin, stdout) = match self {
+            Self::Sandboxed(c) => c
+                .take_io()
+                .ok_or_else(|| io_err("failed to capture sandboxed child stdio"))?,
+            Self::Plain(c) => (
+                Box::new(
+                    c.stdin
+                        .take()
+                        .ok_or_else(|| io_err("failed to capture child stdin"))?,
+                ) as Box<dyn AsyncWrite + Unpin + Send>,
+                Box::new(
+                    c.stdout
+                        .take()
+                        .ok_or_else(|| io_err("failed to capture child stdout"))?,
+                ) as Box<dyn AsyncRead + Unpin + Send>,
+            ),
+        };
+        Ok(StdioSession::from_io(stdin, stdout))
+    }
+}
+
+/// Spawn the discovery server. `opts.restrict_environment` selects the
+/// isolation contract — it is not an env-only flag: `true` means the
+/// Warden path (fail closed when the sandbox cannot be established),
+/// `false` means the documented ambient-inheritance downgrade.
+/// `MCP_WRIT_SKIP_SANDBOX` takes the same documented downgrade `run`
+/// does — the environment contract stays, the OS sandbox steps aside.
+async fn spawn_server(
     command: &[String],
     inherit_stderr: bool,
     opts: &DiscoveryOptions,
+) -> Result<(DiscoveryChild, Option<PathBuf>), ToolsListError> {
+    if opts.restrict_environment {
+        if env_skip_sandbox() {
+            return spawn_server_plain_restricted(command, inherit_stderr)
+                .map(|(c, t)| (DiscoveryChild::Plain(c), t));
+        }
+        return spawn_server_sandboxed(command)
+            .await
+            .map(|(c, t)| (DiscoveryChild::Sandboxed(c), Some(t)));
+    }
+    spawn_server_plain_ambient(command, inherit_stderr).map(|(c, t)| (DiscoveryChild::Plain(c), t))
+}
+
+/// True when `MCP_WRIT_SKIP_SANDBOX` is set truthy — the same rule
+/// `run` and `plan` apply, so discovery takes the same documented
+/// downgrade rather than inventing a second escape hatch.
+fn env_skip_sandbox() -> bool {
+    std::env::var("MCP_WRIT_SKIP_SANDBOX")
+        .map(|v| {
+            let v = v.trim().to_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false)
+}
+
+/// The deny-by-default policy a discovery server runs under: egress
+/// stays fully denied (tools/list is stdio-only), the fs surface
+/// covers the command's own tree plus the interpreter runtime, the
+/// private TMPDIR is the only writable surface, and the secrets
+/// overlay stays on — the server must not read credentials while
+/// answering the protocol handshake.
+fn discovery_policy(command: &[String], tmpdir: &Path) -> crate::policy::Policy {
+    let mut policy = crate::legislator::self_test_warden::prepare_warden_probe_policy(
+        &crate::policy::Policy::default(),
+        tmpdir,
+        command,
+    );
+    push_literal_dirs(&mut policy, command);
+    // `prepare_warden_probe_policy` waives the secrets overlay for the
+    // self-test control file — a discovery server gets no such pass.
+    policy.fs.secret_overlay = true;
+    // macOS carries no kernel descendant-lifetime boundary, and the
+    // launch host may have no writable cgroup — discovery accepts the
+    // RunningChild's best-effort process-tree sweep rather than
+    // refusing outright.
+    policy.sandbox.require_lifetime_boundary = false;
+    policy
+}
+
+/// Literal spellings of the directories `prepare_warden_probe_policy`
+/// grants as `dir/**`. Landlock strips the glob to the same root, so a
+/// literal entry is equivalent there — and it is the only spelling
+/// Windows DACL grants and macOS literal subpaths can express. The
+/// literal set mirrors the probe walk: the executable's parent plus
+/// the parent of every path-valued argument (the workload's own tree).
+fn push_literal_dirs(policy: &mut crate::policy::Policy, command: &[String]) {
+    fn push(list: &mut Vec<String>, dir: &Path) {
+        let dir = dir.to_string_lossy().into_owned();
+        if !list.iter().any(|e| *e == dir) {
+            list.push(dir);
+        }
+    }
+    if let Some(argv0) = command.first()
+        && let Ok(resolved) = crate::workload::resolve_command_path(argv0)
+        && let Some(parent) = resolved.parent()
+    {
+        push(&mut policy.fs.read_only, parent);
+    }
+    for arg in command.iter().skip(1) {
+        let path = Path::new(arg);
+        if !path.exists() {
+            continue;
+        }
+        let parent = if path.is_dir() {
+            Some(path.to_path_buf())
+        } else {
+            path.canonicalize()
+                .ok()
+                .and_then(|c| c.parent().map(Path::to_path_buf))
+                .or_else(|| path.parent().map(Path::to_path_buf))
+        };
+        if let Some(parent) = parent {
+            // Keep parity with the probe walk: a grant covering
+            // WARDEN_PROBE_PATH would erase OS-deny evidence.
+            let canonical = parent.canonicalize().unwrap_or_else(|_| parent.clone());
+            if !Path::new(crate::legislator::self_test::WARDEN_PROBE_PATH).starts_with(&canonical) {
+                push(&mut policy.fs.read_only, &parent);
+            }
+        }
+    }
+}
+
+fn create_discovery_tmpdir() -> Result<PathBuf, ToolsListError> {
+    let tmp = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp-writ-discover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&tmp).map_err(ToolsListError::ProcessSpawn)?;
+    #[cfg(unix)]
+    {
+        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(ToolsListError::ProcessSpawn(e));
+        }
+    }
+    Ok(tmp)
+}
+
+/// The Warden-isolated spawn. Fail closed: when the sandbox cannot be
+/// established (unsupported mechanism, unbuildable ruleset), discovery
+/// errors rather than run the server outside it.
+async fn spawn_server_sandboxed(
+    command: &[String],
+) -> Result<(crate::warden::RunningChild, PathBuf), ToolsListError> {
+    let tmp = create_discovery_tmpdir()?;
+    let policy = discovery_policy(command, &tmp);
+    let resolved = crate::workload::resolve_command_path(&command[0]).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&tmp);
+        ToolsListError::ProcessSpawn(io::Error::other(format!(
+            "cannot resolve '{}': {e}",
+            command[0]
+        )))
+    })?;
+    let mut argv = command.to_vec();
+    argv[0] = resolved.to_string_lossy().into_owned();
+    let opts = crate::warden::SpawnOptions {
+        restrict_environment: true,
+        allowed_names: Vec::new(),
+        tmpdir: Some(tmp.clone()),
+        ..Default::default()
+    };
+    // A discovery workload is a real spawn: dyld needs the same
+    // derived code-map grants a `run` launch computes (argv[0] is
+    // resolved).
+    #[cfg(target_os = "macos")]
+    let opts = {
+        let mut o = opts;
+        o.exec_map_dirs =
+            crate::warden::macos_sandbox::code_map_dirs(std::path::Path::new(&argv[0]), &argv);
+        o
+    };
+    match crate::warden::Warden::new(policy)
+        .spawn_child_async_with(&argv, &opts)
+        .await
+    {
+        Ok(child) => Ok((child, tmp)),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Err(ToolsListError::ProcessSpawn(io::Error::other(format!(
+                "sandboxed discovery spawn failed: {e}"
+            ))))
+        }
+    }
+}
+
+/// The `MCP_WRIT_SKIP_SANDBOX` downgrade: no OS sandbox, but the same
+/// restricted environment contract a supervised launch keeps — PATH,
+/// the Windows system vars, and a private TMPDIR. Discovery runs
+/// attacker-controlled code, so the ambient environment still does
+/// not cross.
+fn spawn_server_plain_restricted(
+    command: &[String],
+    inherit_stderr: bool,
+) -> Result<(tokio::process::Child, Option<PathBuf>), ToolsListError> {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "WARNING: MCP_WRIT_SKIP_SANDBOX is set — tools/list discovery runs \
+             without the OS sandbox (restricted environment only)."
+        );
+    }
+    let tmp = create_discovery_tmpdir()?;
+    let mut cmd = tokio::process::Command::new(&command[0]);
+    cmd.args(&command[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true);
+    if inherit_stderr {
+        cmd.stderr(Stdio::piped());
+    } else {
+        cmd.stderr(Stdio::null());
+    }
+    cmd.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    #[cfg(windows)]
+    {
+        for key in [
+            "SYSTEMROOT",
+            "WINDIR",
+            "PATHEXT",
+            "COMSPEC",
+            "SYSTEMDRIVE",
+            "LOCALAPPDATA",
+        ] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+    }
+    cmd.env("TMPDIR", &tmp);
+    cmd.env("TMP", &tmp);
+    cmd.env("TEMP", &tmp);
+    match cmd.spawn() {
+        Ok(mut child) => {
+            if inherit_stderr {
+                relay_discovery_stderr(child.stderr.take());
+            }
+            Ok((child, Some(tmp)))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Err(ToolsListError::ProcessSpawn(e))
+        }
+    }
+}
+
+/// The `--unsafe-unsandboxed-discovery` path: ambient environment, no
+/// OS sandbox — only invoked on the explicit flag.
+fn spawn_server_plain_ambient(
+    command: &[String],
+    inherit_stderr: bool,
 ) -> Result<(tokio::process::Child, Option<PathBuf>), ToolsListError> {
     let mut cmd = tokio::process::Command::new(&command[0]);
     cmd.args(&command[1..])
@@ -446,62 +719,14 @@ fn spawn_server(
     } else {
         cmd.stderr(Stdio::null());
     }
-    let mut tmpdir = None;
-    if opts.restrict_environment {
-        cmd.env_clear();
-        if let Ok(path) = std::env::var("PATH") {
-            cmd.env("PATH", path);
-        }
-        #[cfg(windows)]
-        {
-            if let Ok(sr) = std::env::var("SYSTEMROOT") {
-                cmd.env("SYSTEMROOT", sr);
-            }
-            if let Ok(windir) = std::env::var("WINDIR") {
-                cmd.env("WINDIR", windir);
-            }
-            if let Ok(pathext) = std::env::var("PATHEXT") {
-                cmd.env("PATHEXT", pathext);
-            }
-        }
-        let tmp = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
-            .join(format!(
-                "mcp-writ-discover-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ));
-        if std::fs::create_dir_all(&tmp).is_ok() {
-            #[cfg(unix)]
-            {
-                if let Err(e) =
-                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))
-                {
-                    let _ = std::fs::remove_dir_all(&tmp);
-                    return Err(ToolsListError::ProcessSpawn(e));
-                }
-            }
-            cmd.env("TMPDIR", &tmp);
-            cmd.env("TMP", &tmp);
-            cmd.env("TEMP", &tmp);
-            tmpdir = Some(tmp);
-        }
-    }
     match cmd.spawn() {
         Ok(mut child) => {
             if inherit_stderr {
                 relay_discovery_stderr(child.stderr.take());
             }
-            Ok((child, tmpdir))
+            Ok((child, None))
         }
-        Err(e) => {
-            if let Some(dir) = tmpdir {
-                let _ = std::fs::remove_dir_all(dir);
-            }
-            Err(ToolsListError::ProcessSpawn(e))
-        }
+        Err(e) => Err(ToolsListError::ProcessSpawn(e)),
     }
 }
 
@@ -509,19 +734,33 @@ fn spawn_server(
 /// terminal control characters escaped and a hard byte cap — the server
 /// being probed is attacker-controlled, so its diagnostics cross as
 /// text, never raw bytes. Shared implementation:
-/// [`crate::termutil::relay_child_stderr`].
+/// [`crate::termutil::relay_child_stderr`]. (The Warden path relays
+/// the child's stderr through the same sanitizer internally.)
 fn relay_discovery_stderr(stderr: Option<tokio::process::ChildStderr>) {
     let Some(stderr) = stderr else { return };
     crate::termutil::relay_child_stderr(stderr);
 }
 
-async fn shutdown_child(child: &mut tokio::process::Child) {
-    drop(child.stdin.take());
-    match tokio::time::timeout(Duration::from_millis(200), child.wait()).await {
-        Ok(_) => {}
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+async fn shutdown_child(child: &mut DiscoveryChild) {
+    match child {
+        DiscoveryChild::Sandboxed(c) => {
+            // stdin was moved into the session and closed with it —
+            // give the server a brief window to exit on EOF, then take
+            // the process group / descendant tree down with it.
+            let _ =
+                tokio::time::timeout(Duration::from_millis(200), c.wait_for_natural_exit()).await;
+            let _ = c.kill().await;
+            let _ = c.wait().await;
+        }
+        DiscoveryChild::Plain(c) => {
+            drop(c.stdin.take());
+            match tokio::time::timeout(Duration::from_millis(200), c.wait()).await {
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = c.kill().await;
+                    let _ = c.wait().await;
+                }
+            }
         }
     }
 }
@@ -539,7 +778,7 @@ async fn probe_protocol_version(
     timeout: Duration,
     opts: &DiscoveryOptions,
 ) -> Result<VersionProbeOutcome, ToolsListError> {
-    let (mut child, tmpdir) = spawn_server(command, false, opts)?;
+    let (mut child, tmpdir) = spawn_server(command, false, opts).await?;
     let outcome = probe_protocol_version_on_sibling(&mut child, timeout).await;
     shutdown_child(&mut child).await;
     remove_discovery_tmpdir(tmpdir);
@@ -547,11 +786,11 @@ async fn probe_protocol_version(
 }
 
 async fn probe_protocol_version_on_sibling(
-    child: &mut tokio::process::Child,
+    child: &mut DiscoveryChild,
     timeout: Duration,
 ) -> VersionProbeOutcome {
     let version = SupportedProtocolVersion::Mcp2026July28;
-    let mut session = match StdioSession::from_child(child, version, ProtocolStep::Probe) {
+    let mut session = match child.take_stdio(version, ProtocolStep::Probe) {
         Ok(session) => session,
         Err(_) => return VersionProbeOutcome::TryMcp2025November25,
     };
@@ -579,7 +818,7 @@ async fn fetch_mcp_2026_07_28(
     timeout: Duration,
     opts: &DiscoveryOptions,
 ) -> Result<ToolsListFetch, ToolsListError> {
-    let (mut child, tmpdir) = spawn_server(command, true, opts)?;
+    let (mut child, tmpdir) = spawn_server(command, true, opts).await?;
     let result = fetch_mcp_2026_07_28_on_child(&mut child, timeout).await;
     shutdown_child(&mut child).await;
     remove_discovery_tmpdir(tmpdir);
@@ -587,11 +826,11 @@ async fn fetch_mcp_2026_07_28(
 }
 
 async fn fetch_mcp_2026_07_28_on_child(
-    child: &mut tokio::process::Child,
+    child: &mut DiscoveryChild,
     timeout: Duration,
 ) -> Result<ToolsListFetch, ToolsListError> {
     let version = SupportedProtocolVersion::Mcp2026July28;
-    let mut session = StdioSession::from_child(child, version, ProtocolStep::ToolsList)?;
+    let mut session = child.take_stdio(version, ProtocolStep::ToolsList)?;
     let mut pages = PageAccumulator::new();
     let mut current_cursor: Option<String> = None;
     let mut seen_cursors = std::collections::HashSet::new();
@@ -658,7 +897,7 @@ async fn fetch_mcp_2025_11_25(
     timeout: Duration,
     opts: &DiscoveryOptions,
 ) -> Result<ToolsListFetch, ToolsListError> {
-    let (mut child, tmpdir) = spawn_server(command, true, opts)?;
+    let (mut child, tmpdir) = spawn_server(command, true, opts).await?;
     let result = fetch_mcp_2025_11_25_on_child(&mut child, timeout).await;
     shutdown_child(&mut child).await;
     remove_discovery_tmpdir(tmpdir);
@@ -666,11 +905,11 @@ async fn fetch_mcp_2025_11_25(
 }
 
 async fn fetch_mcp_2025_11_25_on_child(
-    child: &mut tokio::process::Child,
+    child: &mut DiscoveryChild,
     timeout: Duration,
 ) -> Result<ToolsListFetch, ToolsListError> {
     let version = SupportedProtocolVersion::Mcp2025November25;
-    let mut session = StdioSession::from_child(child, version, ProtocolStep::Initialize)?;
+    let mut session = child.take_stdio(version, ProtocolStep::Initialize)?;
 
     let init_id = session.alloc_id();
     session

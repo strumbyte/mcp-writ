@@ -376,12 +376,20 @@ pub async fn launch(
     // dead the same way. Refuse both pre-spawn — the same predicates
     // the selection reports — rather than run a workload whose
     // declared grant never applies.
+    //
+    // The same check runs for the mandatory Landlock controls the
+    // kernel ABI cannot apply at all — a declared fs grant or TCP
+    // allow on an ABI 0 kernel, or a TCP allow under ABI v1-v3,
+    // launches with that control silently absent. `allow_degraded`
+    // tolerates a weaker ruleset here exactly as in the selection —
+    // never a mandatory control that drops entirely.
     #[cfg(target_os = "linux")]
     if linux_mechanism.is_none() && sandbox_skip_reason.is_none() {
         let mut dead = crate::warden::select::dead_udp_allows_without_selection(&policy);
         dead.extend(crate::warden::select::dead_fs_grants_without_selection(
             &policy,
         ));
+        dead.extend(crate::warden::select::dropped_landlock_controls_without_selection(&policy));
         if !dead.is_empty() {
             let reason = dead.join("; ");
             let detail = format!("linux egress policy refused: {reason}");
