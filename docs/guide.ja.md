@@ -1328,7 +1328,7 @@ Auditor の強制: `side_effect="read_only"` のツールは、引数にホス�
 
 #### `secret-overlay`
 
-デフォルトは **オン**（省略時 `#true`）。オプトアウトは `defaults.filesystem` の `secret-overlay #false`。
+デフォルトは **オン**（省略時 `#true`）。オプトアウトは `defaults.filesystem` の `secret-overlay #false`。オプトアウトは監査レコード `policy.loaded` に `secret_overlay=false` として記録される — トークンは KDL キー `secret-overlay` ではなく監査フィールド `secret_overlay` の綴りを使う — ので、overlay を外した起動が overlay ありとは読めない。
 
 allow glob は予約済み秘密パス（`/etc/passwd`、`/etc/shadow`、`/etc/sudoers`、`**/.ssh/**`、`**/.gnupg/**`、`**/.aws/credentials`、`**/.env`、`**/.env.*`。ただし `.env.example` は除く）を上書きできない。allow glob 内の通常の新規ファイル（例: `/workspace/notes.txt`）は拒否しない。Auditor は `tools/call` 引数を正規化する（NFKC、有界パーセントデコード、`file:` URI、辿れる範囲のシンボリックリンク）。TOCTOU — その検査と子の `open` の間の置換 — は **Warden** の責務である。Auditor を通過したことをもって TOCTOU が解消したとは言わない。
 
@@ -1570,11 +1570,12 @@ logging level="info"
 
 | フィールド | 型 | 内容 |
 |---|---|---|
-| `schema_version` | string | 監査スキーマバージョン（`"1.0"`） |
+| `schema_version` | string | 監査スキーマバージョン（`"2.0"`） |
 | `timestamp` | string | ミリ秒精度の UTC ISO-8601 |
 | `event_id` | string (UUIDv7) | イベントごとに一意 |
 | `correlation_id` | string (UUIDv7) | 関連イベントをグループ化 |
 | `parent_event_id` | string (UUIDv7) または `null` | イベントが別イベントに起因する場合に設定 |
+| `session_id` | string | emit したロガーのプロセスごとの ID（`{pid}-{ミリ秒}-{連番}`）— writer が直列化時に付与するため、`audit.reopened` マーカーを含む全行に存在 |
 | `event_type` | string | ドット区切りのイベント名（下記一覧） |
 | `event_category` | string | `event_type` のカテゴリ（下記一覧） |
 | `severity` | string | `info` / `low` / `medium` / `high` / `critical` |
@@ -1616,10 +1617,10 @@ logging level="info"
 
 `tools_list.verified`（`supply_chain`）は、サーバの広告リストに対するマニフェストスキャン＋ハッシュ検証の判定を記録する — 通過時は `action: "allowed"` / `outcome: "success"`、検証が一覧を拒否した場合は `details` に `blocked=true` を持つ `action: "observed"` / `outcome: "failure"`。検証済み digest の公開とレスポンス転送の**前に**（拒否の場合は拒否応答の送出の前に）永続ストレージへコミットされる — `logging.fail_closed` 下でコミットできないレコードは状態遷移を拒否し、監査なしのリストを送出しない。
 
-`run` / `run-image` は起動をライフサイクルレコードで囲む。これらはすべて同じ `correlation_id`（`--report` 成果物が `launch_id` として持つ起動 ID と同値）と `details.session_id`（emit したロガーのプロセスごとの ID）を共有する。`run` ではホストのガードが書く。`run-image` ではゲスト内の `mcp-secure-runner` が書き（`--log-dir` がマウントされていればその中へ、無ければゲストの stderr へ）、ホスト採番の `MCP_WRIT_LAUNCH_ID` で相関する — ゲスト開始前のホスト側処理（イメージ解決・隔離チェック・コンテナ spawn）はライフサイクルレコードを出さない:
+`run` / `run-image` は起動をライフサイクルレコードで囲む。これらはすべて同じ `correlation_id`（`--report` 成果物が `launch_id` として持つ起動 ID と同値）と `details.session_id`（emit したロガーのプロセスごとの ID — 全行のトップレベル `session_id` メンバでも同じ値が運ばれる）を共有する。`run` ではホストのガードが書く。`run-image` ではゲスト内の `mcp-secure-runner` が書き（`--log-dir` がマウントされていればその中へ、無ければゲストの stderr へ）、ホスト採番の `MCP_WRIT_LAUNCH_ID` で相関する — ゲスト開始前のホスト側処理（イメージ解決・隔離チェック・コンテナ spawn）はライフサイクルレコードを出さない:
 
 - `guard.started`（`system`）— ガードプロセスが監査シンクを開いた。`details` には `component`（ホストは `mcp-writ`、ゲストは `mcp-secure-runner`）、`pid`、`session_id`、および起動に設定されたセッション全体の弱化が入る: `sandbox=skipped via MCP_WRIT_SKIP_SANDBOX` や `dry_run=true`。これらの無い `guard.started` は完全な設定制御下での実行を意味する。
-- `policy.loaded`（`configuration`）— 実効ポリシーがロード・バインドされた。`details` は `version`、実効 KDL の `hash`、解決済み `fail_on` ダイヤル（finding が 1 件も無くても `none` は記録される）、`source`（パスまたは `default`）、`session_id` を繰り返す。`policy_id` / `policy_version` / `policy_hash` も同じ識別情報を持つ。`sandbox allow_degraded=#true` を持つポリシーでは `allow_degraded=true` が追加される — その起動は部分適用のサンドボックスを有効と受け入れたことを意味する。
+- `policy.loaded`（`configuration`）— 実効ポリシーがロード・バインドされた。`details` は `version`、実効 KDL の `hash`、解決済み `fail_on` ダイヤル（finding が 1 件も無くても `none` は記録される）、`session_id`、`source`（パスまたは `default`。パスの綴りが `k=v` トークンを偽造しないようパーセントエンコードされる）を繰り返す。`policy_id` / `policy_version` / `policy_hash` も同じ識別情報を持つ。`sandbox allow_degraded=#true` を持つポリシーでは `allow_degraded=true` が追加される — その起動は部分適用のサンドボックスを有効と受け入れたことを意味する。`sandbox require_lifetime_boundary=#false` の waiver は `require_lifetime_boundary=false` を追加する — その起動は kernel による子孫ライフタイム境界を放棄している。`defaults.filesystem` の `secret-overlay #false` によるオプトアウトは `secret_overlay=false` を追加する — その起動は予約済み秘密パスの overlay なしで走る（トークンはフィールドの snake_case 綴りを使う）。各トークンは対応するダイヤルが fail-secure 既定から外れたときだけ記録され、不在なら厳格な姿勢を意味する。
 - `session.started`（`session`）— 子プロセスが spawn され Auditor リレーが動作中。`session.ended` と対になる。より早い段階で失敗した起動は代わりに `server.error` を出す — 走らなかったセッションを started と記録することはない。
 - `server.connected`（`server`）— `details` は `spawned <exe> backend=<name>` に、`--dry-run` では `(dry-run)`、OS サンドボックスを迂回した起動では `sandbox=skipped`（`--dry-run` または `MCP_WRIT_SKIP_SANDBOX`）、完全適用を下回る状態で許容された各 `os.*` 観測の `<control>=<state>` トークン（`partially_applied` / `not_applied` / `failed` — 許容された `allow_degraded` の結果や失敗した grant）、`allow` リスト環境制限下では `env_missing=<名>` / `env_path_missing=<名>`（親環境に存在しなかった、あるいは単一絶対パス値が実在しない許可変数名のカンマ区切り — パーセントエンコード済みで値は記録しない）、そして `session_id` を持つ。`backend` はその起動が走った OS サンドボックス機構を名指す（`landlock+seccomp`、`appcontainer`、`psec`、`sandbox-exec`、または OS サンドボックスがスキップされたとき、プラットフォームに backend が無いとき、選択された機構がこのホストに存在しないときは `none`）。トークンは `--report` が持つのと同じ `observations` から生成される。`unknown` は列挙されない（観測限界の記録であり、受け入れた弱化ではないため）。トークンが無いことは「観測された許容弱化が無い」を意味するに留まる — `unknown`・`skipped`・`not_applicable` の制御もトークンを出さないため、制御が実際に enforced だったかはレポートの `observations` が答えるのであり、トークンの不在から推測しない。OS サンドボックス自体の省略だけは `sandbox=skipped` が名指す。
 

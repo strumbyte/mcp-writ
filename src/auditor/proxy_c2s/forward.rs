@@ -55,10 +55,10 @@ pub(super) async fn deny_request<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    if method == "tools/call" {
-        if let Some(tool) = extract_tool_name_from_line(line) {
-            shared.tally.lock().unwrap().record_call(&tool);
-        }
+    if method == "tools/call"
+        && let Some(tool) = extract_tool_name_from_line(line)
+    {
+        shared.tally.lock().unwrap().record_call(&tool);
     }
     if shared.dry_run && dry_run_observable(method, &verdict) {
         // The deny decision is send-ordered ahead of the observed
@@ -184,8 +184,9 @@ where
 {
     // ── tools/call legacy gates: list-busy, tool policy, session ──
     if method == "tools/call" {
-        if let Some(tool) = extract_tool_name_from_line(line) {
-            shared.tally.lock().unwrap().record_call(&tool);
+        let tool = extract_tool_name_from_line(line);
+        if let Some(tool) = tool.as_deref() {
+            shared.tally.lock().unwrap().record_call(tool);
         }
         // Verified-generation capture (F10): when manifest scanning or a
         // `tools-list-hash` pin enforces the manifest, a call may only
@@ -258,7 +259,6 @@ where
         let check_result = apply_session_gates(shared, check_result, line, id).await;
         return match check_result {
             Ok(check_pass) => {
-                let tool = extract_tool_name_from_line(line);
                 // F6: among calls the policy allows, only names the
                 // verified listing actually advertised to this client
                 // may forward — a statically allowed tool the server
@@ -400,11 +400,18 @@ where
                 // exactly the evidence the report's widening
                 // candidates are computed from, and an enforced
                 // denial is the same evidence after the fact.
-                shared
-                    .tally
-                    .lock()
-                    .unwrap()
-                    .record_denial(&violation.tool_name, &violation.reason);
+                // Only target-policy denials land — the tally's
+                // documented contract. Tool-level authorization
+                // refusals, args_schema validation failures, and
+                // session-state refusals are not targets a wider
+                // grant could answer.
+                if violation.is_denied_target() {
+                    shared
+                        .tally
+                        .lock()
+                        .unwrap()
+                        .record_denial(&violation.tool_name, &violation.reason);
+                }
                 // Tool name and reason are client-controlled — escape
                 // terminal controls before they reach a TTY log.
                 if observe {

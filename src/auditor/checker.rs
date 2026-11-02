@@ -79,6 +79,39 @@ impl PolicyViolation {
             REASON_TOOL_NOT_ALLOWED | REASON_TOOL_NOT_FOUND
         )
     }
+
+    /// Whether this refusal is a target-policy denial — a target the
+    /// call's arguments name was refused by a policy rule: the tool
+    /// fs allow/deny sub-policy, the secret-path overlay's reserved
+    /// match, and the global or per-tool network host/egress rules.
+    /// Their reasons name the refused target first — `host '…'`,
+    /// `destination '…'`, and for paths `path '…'` *with* the
+    /// rejection phrase the fs sub-policy or the overlay produces
+    /// (the overlay clause matched as the producer's terminal text,
+    /// so the phrase inside a path spelling cannot spoof it) —
+    /// which is exactly what `correction_candidates.denied_targets`
+    /// reports as widening candidates. Everything else stays out:
+    /// tool-level authorization refusals, `args_schema` and
+    /// path-traversal validation failures, session-state refusals
+    /// (`trajectory:` / `confused deputy:`), contract-shape refusals
+    /// (`inputResponses denied …`, a missing path/URL target, a
+    /// non-canonical spelling, an extraction-budget or `requestState`
+    /// cap failure), and `path '…'` reasons that refuse the
+    /// *spelling* rather than the target — an unnormalizable or
+    /// unresolvable path, invisible Unicode, a dirty URI scheme, an
+    /// opaque `file:` URI — none names a denied target a wider grant
+    /// could answer.
+    pub fn is_denied_target(&self) -> bool {
+        if self.reason.starts_with("host '") || self.reason.starts_with("destination '") {
+            return true;
+        }
+        self.reason.starts_with("path '")
+            && (self.reason.contains("denied by tool fs sub-policy")
+                || self.reason.contains("not in tool fs allowed paths")
+                || self
+                    .reason
+                    .ends_with("' matches the secret-path overlay (beats explicit allow)"))
+    }
 }
 
 /// Result of a successful policy check, carrying sub-policy metadata.

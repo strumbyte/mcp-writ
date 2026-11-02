@@ -23,6 +23,7 @@ use crate::verifier::fail_on::FailOn;
 ///   list_changed revalidation requests are consumed, never echoed).
 ///
 /// All tools/call requests are recorded in the audit log.
+#[expect(clippy::too_many_arguments)]
 pub async fn run_proxy<W, R>(
     policy: &Policy,
     dry_run: bool,

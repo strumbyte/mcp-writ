@@ -195,7 +195,7 @@ async fn real_main() {
                 target: report_target.clone(),
                 policy,
                 dry_run: report_dry_run,
-                allow_replaceable_paths: false,
+                allow_replaceable_paths: mcp_writ::fspriv::replaceable_paths_permitted(),
                 plan: mcp_writ::enforcement::EnforcementPlan {
                     controls: Vec::new(),
                     grants: Vec::new(),

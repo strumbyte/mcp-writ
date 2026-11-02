@@ -673,66 +673,21 @@ fn f67_private_ancestors_still_resolve() {
     assert!(resolved.ends_with("real/f"), "resolved={resolved}");
 }
 
-/// Set `dir`'s DACL from an SDDL string as a protected DACL, so the
-/// fixture's trust state is exactly the spelled one regardless of
-/// the ACEs the temp parent would otherwise hand down. Applying it
-/// propagates to existing children (their inherited ACEs are
-/// stripped), so fixtures that need a readable child apply the DACL
-/// before creating the child and give the ACEs OI/CI inheritance.
-#[cfg(windows)]
-fn set_dacl_from_sddl(dir: &std::path::Path, sddl: &str) {
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
-    use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
-    };
-    use windows::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    };
-    use windows::core::HSTRING;
-
-    let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(&HSTRING::from(sddl), 1, &mut sd, None)
-    }
-    .unwrap_or_else(|e| panic!("SDDL '{sddl}' must parse: {e}"));
-    let mut present = windows::core::BOOL(0);
-    let mut defaulted = windows::core::BOOL(0);
-    let mut dacl: *mut ACL = std::ptr::null_mut();
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) }
-        .unwrap_or_else(|e| panic!("GetSecurityDescriptorDacl: {e}"));
-    assert!(present.as_bool(), "fixture SDDL must carry a DACL");
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let result = unsafe {
-        SetNamedSecurityInfoW(
-            &HSTRING::from(dir.to_string_lossy().as_ref()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(dacl),
-            None,
-        )
-    };
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
-    }
-    result
-        .ok()
-        .unwrap_or_else(|e| panic!("SetNamedSecurityInfoW for '{}': {e}", dir.display()));
-}
-
 /// The authorization layer's counterpart of the f67 control and
 /// refusal cases, with DACLs in place of mode bits: an ancestor
 /// granting Everyone replace rights fails closed; the same tree
-/// with an owner/SYSTEM-only ancestor resolves.
+/// with an owner/SYSTEM-only ancestor resolves. The ancestry walk
+/// inspects every level up to the volume root, so the fixture needs
+/// a root whose whole chain is write-restricted — a host whose temp
+/// ancestry already grants lower-trust workers `Modify` fails the
+/// resolve-case on the environment, not the fixture.
 #[cfg(windows)]
 #[test]
 fn windows_replaceable_ancestor_fails_closed() {
-    let dir = tempfile::tempdir().unwrap();
+    let Some(dir) = crate::testutil::restricted_tempdir() else {
+        crate::testutil::skip_unless_required("no write-restricted root for DACL fixture");
+        return;
+    };
     let shared = dir.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
     // The DACL goes on before the leaf exists, and the fixture ACEs
@@ -741,7 +696,7 @@ fn windows_replaceable_ancestor_fails_closed() {
     // inherited ACEs, so a leaf created first would be left with an
     // empty DACL and fail every read (os error 5) before the
     // ancestor walk this test exercises is ever reached.
-    set_dacl_from_sddl(&shared, "D:P(A;OICI;FA;;;WD)");
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;OICI;FA;;;WD)");
     let leaf = shared.join("f.txt");
     std::fs::write(&leaf, b"x").unwrap();
     let leaf_str = leaf.to_string_lossy().into_owned();
@@ -749,7 +704,7 @@ fn windows_replaceable_ancestor_fails_closed() {
         resolve_for_authorization(&leaf_str).is_err(),
         "an ancestor granting Everyone replace rights must fail closed"
     );
-    set_dacl_from_sddl(&shared, "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)");
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)");
     let resolved =
         resolve_for_authorization(&leaf_str).expect("owner/SYSTEM-only ancestors must resolve");
     assert!(resolved.ends_with("f.txt"), "{resolved}");
@@ -758,20 +713,24 @@ fn windows_replaceable_ancestor_fails_closed() {
 /// The f67 missing-suffix case on Windows: authorization runs
 /// before the target exists (a write destination), and a broadly
 /// replaceable ancestor refuses the not-yet-created path the same
-/// way it refuses an existing one.
+/// way it refuses an existing one. Same write-restricted-root
+/// requirement as the resolve test above.
 #[cfg(windows)]
 #[test]
 fn windows_missing_suffix_under_replaceable_ancestor_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
+    let Some(dir) = crate::testutil::restricted_tempdir() else {
+        crate::testutil::skip_unless_required("no write-restricted root for DACL fixture");
+        return;
+    };
     let shared = dir.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
     let missing_str = shared.join("not-there.txt").to_string_lossy().into_owned();
-    set_dacl_from_sddl(&shared, "D:P(A;;FA;;;WD)");
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;;FA;;;WD)");
     assert!(
         resolve_for_authorization(&missing_str).is_err(),
         "a missing suffix under a replaceable ancestor must refuse"
     );
-    set_dacl_from_sddl(&shared, "D:P(A;;FA;;;OW)(A;;FA;;;SY)");
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;;FA;;;OW)(A;;FA;;;SY)");
     assert!(
         resolve_for_authorization(&missing_str).is_ok(),
         "the same missing suffix under a restricted ancestor must resolve"

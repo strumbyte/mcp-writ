@@ -47,6 +47,13 @@ pub(crate) struct VerifiedToolSet {
     pub(crate) names: std::collections::HashSet<String>,
 }
 
+/// The most distinct called-tool names the tally retains — a session
+/// must not grow the set without bound.
+pub(crate) const MAX_TALLY_TOOLS: usize = 256;
+
+/// The most distinct `(tool, reason)` denial pairs the tally retains.
+pub(crate) const MAX_TALLY_DENIALS: usize = 256;
+
 /// Process-local session tally for the launch report's correction
 /// candidates: which tools the client actually called, and the
 /// substantive policy violations the tools/call gates produced
@@ -54,23 +61,46 @@ pub(crate) struct VerifiedToolSet {
 /// resolved target). Recording only — nothing in the proxy decides
 /// differently because this exists. The denied entries deliberately
 /// exclude tool-level authorization refusals (unknown/unallowed
-/// tool): those are not targets a wider grant could answer.
+/// tool), `args_schema` and path-traversal validation failures, and
+/// session-state refusals (trajectory / confused-deputy gates):
+/// those are not targets a wider grant could answer. Retention is
+/// bounded by [`MAX_TALLY_TOOLS`] / [`MAX_TALLY_DENIALS`]; past a cap
+/// new entries are dropped and the matching `*_truncated` flag is
+/// set, so the report can state the candidates are incomplete.
 #[derive(Debug, Default)]
 pub struct CallTally {
     pub called_tools: std::collections::BTreeSet<String>,
-    pub denied: Vec<(String, String)>,
+    pub denied: std::collections::BTreeSet<(String, String)>,
+    /// Set once `called_tools` is full — later names are dropped, so
+    /// a dropped tool can appear in `unused_tools` despite being
+    /// called.
+    pub called_tools_truncated: bool,
+    /// Set once `denied` is full — later pairs are dropped.
+    pub denied_truncated: bool,
 }
 
 impl CallTally {
     pub fn record_call(&mut self, tool: &str) {
+        if self.called_tools.contains(tool) {
+            return;
+        }
+        if self.called_tools.len() >= MAX_TALLY_TOOLS {
+            self.called_tools_truncated = true;
+            return;
+        }
         self.called_tools.insert(tool.to_string());
     }
 
     pub fn record_denial(&mut self, tool: &str, reason: &str) {
         let entry = (tool.to_string(), reason.to_string());
-        if !self.denied.contains(&entry) {
-            self.denied.push(entry);
+        if self.denied.contains(&entry) {
+            return;
         }
+        if self.denied.len() >= MAX_TALLY_DENIALS {
+            self.denied_truncated = true;
+            return;
+        }
+        self.denied.insert(entry);
     }
 }
 

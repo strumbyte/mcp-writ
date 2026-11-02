@@ -120,13 +120,19 @@ fn finalize_report(
         && let Some(tally) = t.call_tally.clone()
     {
         let snapshot = tally.lock().unwrap();
-        let unused_tools: Vec<String> = t
-            .declared_tools
-            .iter()
-            .filter(|name| !snapshot.called_tools.contains(*name))
-            .cloned()
-            .collect();
-        let basis = format!(
+        // A truncated called-tool tally cannot distinguish "never
+        // called" from "dropped by the cap" — unused_tools is omitted
+        // rather than presenting a dropped tool as definitely unused.
+        let unused_tools: Vec<String> = if snapshot.called_tools_truncated {
+            Vec::new()
+        } else {
+            t.declared_tools
+                .iter()
+                .filter(|name| !snapshot.called_tools.contains(*name))
+                .cloned()
+                .collect()
+        };
+        let mut basis = format!(
             "computed from this session's tools/call traffic ({} mode); unused_tools were declared for the bound server but never called during the session",
             if t.report.dry_run {
                 "dry-run"
@@ -134,6 +140,18 @@ fn finalize_report(
                 "enforced"
             }
         );
+        if snapshot.called_tools_truncated {
+            basis.push_str(
+                "; the called-tool tally hit its retention cap, so unused_tools is \
+                 omitted — a called name dropped by the cap cannot be told apart \
+                 from one never called",
+            );
+        }
+        if snapshot.denied_truncated {
+            basis.push_str(
+                "; denied_targets hit the session tally's retention cap and is truncated",
+            );
+        }
         t.report.correction_candidates = Some(crate::enforcement::CorrectionCandidates {
             unused_tools,
             denied_targets: snapshot

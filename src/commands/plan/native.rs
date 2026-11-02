@@ -437,10 +437,8 @@ fn policy_posture_check(policy: &crate::policy::Policy) -> PlanCheck {
     let allow_degraded = policy.sandbox.allow_degraded;
     let require_lifetime_boundary = policy.sandbox.require_lifetime_boundary;
     let detail = format!(
-        "secret_overlay={} allow_degraded={} require_lifetime_boundary={}",
-        if secret_overlay { "on" } else { "off" },
-        allow_degraded,
-        require_lifetime_boundary,
+        "secret_overlay={secret_overlay} allow_degraded={allow_degraded} \
+         require_lifetime_boundary={require_lifetime_boundary}",
     );
     if !secret_overlay || allow_degraded || !require_lifetime_boundary {
         PlanCheck {
@@ -468,6 +466,13 @@ fn policy_posture_check(policy: &crate::policy::Policy) -> PlanCheck {
 /// hands out. Both gates refuse at `run`; `plan` reports them as
 /// warnings so the placement is fixable before the first launch.
 fn policy_placement_check(policy: &crate::policy::Policy) -> PlanCheck {
+    policy_placement_check_inner(policy, crate::fspriv::replaceable_paths_permitted())
+}
+
+fn policy_placement_check_inner(
+    policy: &crate::policy::Policy,
+    replaceable_permitted: bool,
+) -> PlanCheck {
     if policy.source_files().is_empty() {
         return check(
             "policy.placement",
@@ -475,7 +480,12 @@ fn policy_placement_check(policy: &crate::policy::Policy) -> PlanCheck {
             Some("policy has no file sources (embedded default)".to_string()),
         );
     }
-    if let Err(e) = crate::policy::loader::require_trusted_policy_sources(policy) {
+    // `MCP_WRIT_ALLOW_REPLACEABLE_PATHS` makes the trusted-source gate
+    // vacuous — `require_trusted_policy_sources` would pass anything,
+    // so the source's trust is unverified rather than established.
+    if !replaceable_permitted
+        && let Err(e) = crate::policy::loader::require_trusted_policy_sources(policy)
+    {
         return PlanCheck {
             id: "policy.placement",
             status: PlanCheckStatus::Warn,
@@ -509,6 +519,24 @@ fn policy_placement_check(policy: &crate::policy::Policy) -> PlanCheck {
                 ),
             };
         }
+    }
+    if replaceable_permitted {
+        return PlanCheck {
+            id: "policy.placement",
+            status: PlanCheckStatus::Warn,
+            detail: Some(
+                "policy sources are unverified — MCP_WRIT_ALLOW_REPLACEABLE_PATHS \
+                 bypassed trusted-source verification (outside-write-grant \
+                 overlap was checked and found none)"
+                    .to_string(),
+            ),
+            remediation: Some(
+                "unset MCP_WRIT_ALLOW_REPLACEABLE_PATHS to restore source \
+                 verification, or keep it to accept the substitution risk — `run` \
+                 records allow_replaceable_paths=true on the launch report"
+                    .to_string(),
+            ),
+        };
     }
     check(
         "policy.placement",
@@ -563,5 +591,33 @@ fn sandbox_mechanism_detail(mechanism: Option<crate::execution::WindowsNativeMec
         }
     } else {
         "no OS sandbox on this platform".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With `MCP_WRIT_ALLOW_REPLACEABLE_PATHS` in force the trusted-source
+    /// gate is bypassed wholesale — the result must read unverified,
+    /// never "trusted". The flag is taken as a parameter so the test
+    /// never mutates process-wide env state other tests observe.
+    #[test]
+    fn placement_reports_unverified_under_replaceable_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.kdl");
+        std::fs::write(&path, "policy version=2\n").unwrap();
+        let policy = crate::policy::loader::load_policy(&path).unwrap();
+        let c = policy_placement_check_inner(&policy, true);
+        assert_eq!(c.id, "policy.placement");
+        assert_eq!(c.status, PlanCheckStatus::Warn);
+        assert!(
+            c.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unverified"),
+            "got: {:?}",
+            c.detail
+        );
     }
 }
