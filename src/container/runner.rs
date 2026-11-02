@@ -250,6 +250,7 @@ impl HostRunRec {
                 report_json: self.guest_report_json,
             }),
             isolation: Some(self.isolation),
+            correction_candidates: None,
         }
     }
 }

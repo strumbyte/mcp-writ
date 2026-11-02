@@ -118,6 +118,12 @@ pub struct Launched {
     /// its inherited descriptor names the snapshot, not a path.
     #[cfg(all(unix, not(target_os = "linux")))]
     pub _exec_staging: Option<crate::verifier::hash::FdExecPlan>,
+    /// The Auditor's session call tally — read back at session end
+    /// to compute the report's correction candidates.
+    pub call_tally: crate::auditor::proxy_state::SharedCallTally,
+    /// Tool names the bound policy declares (`allowed`), in policy
+    /// order — the population the candidates' unused set is drawn from.
+    pub declared_tools: Vec<String>,
 }
 
 /// Failure at one step of [`launch`]. Callers render the message with their
@@ -794,10 +800,19 @@ pub async fn launch(
         }
     };
 
+    // The bound policy's declared tools, for the report's
+    // correction candidates: what this session could have called.
+    let declared_tools: Vec<String> = policy
+        .tools
+        .iter()
+        .filter(|t| t.allowed)
+        .map(|t| t.name.clone())
+        .collect();
     let auditor = Auditor::new(policy, audit_logger.clone())
         .with_dry_run(dry_run)
         .with_fail_on(fail_on)
         .with_max_frame_bytes(max_frame_bytes);
+    let call_tally = auditor.call_tally();
     let auditor_handle = tokio::spawn(async move { auditor.run(child_stdin, child_stdout).await });
 
     // Observations only the launch path can take: the pre-spawn identity
@@ -847,6 +862,7 @@ pub async fn launch(
         guest: None,
         // A native launch involves no isolation backend.
         isolation: None,
+        correction_candidates: None,
     };
     tracing::debug!("launch report: {}", report.to_json());
 
@@ -968,6 +984,8 @@ pub async fn launch(
         _spawn_pin: spawn_pin,
         #[cfg(all(unix, not(target_os = "linux")))]
         _exec_staging: fd_exec_plan,
+        call_tally,
+        declared_tools,
     })
 }
 
@@ -1089,6 +1107,7 @@ fn failure_report(
         guest_runner: None,
         guest: None,
         isolation: None,
+        correction_candidates: None,
     })
 }
 

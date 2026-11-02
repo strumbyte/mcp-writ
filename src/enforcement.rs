@@ -43,11 +43,12 @@ pub use check::{
     MigrationStatus, PinResult, PinStatus, PolicyWarningRecord, ReviewMarkerRecord,
 };
 pub use model::{
-    CodeIdentity, ControlLayer, ControlPhase, ControlState, EgressLayerStatus, EgressLayersPlan,
-    EgressRuleReport, EnforcementObservation, EnforcementPlan, FsAccess, GrantOrigin, GrantSubject,
-    GuestReportLink, GuestReportState, GuestRunnerIdentity, IdentityKind, IdentityPin,
-    IsolationRecord, LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport, ObservationBasis,
-    PinCheck, PinRole, PlannedControl, ProcessGrant, ToolDisposition,
+    CodeIdentity, ControlLayer, ControlPhase, ControlState, CorrectionCandidates, DeniedTarget,
+    EgressLayerStatus, EgressLayersPlan, EgressRuleReport, EnforcementObservation, EnforcementPlan,
+    FsAccess, GrantOrigin, GrantSubject, GuestReportLink, GuestReportState, GuestRunnerIdentity,
+    IdentityKind, IdentityPin, IsolationRecord, LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome,
+    LaunchReport, ObservationBasis, PinCheck, PinRole, PlannedControl, ProcessGrant,
+    ToolDisposition,
 };
 pub use plan::{PLAN_REPORT_SCHEMA_VERSION, PlanCheck, PlanCheckStatus, PlanReport, PlanStatus};
 pub use summary::{

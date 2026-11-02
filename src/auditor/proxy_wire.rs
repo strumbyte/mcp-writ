@@ -931,8 +931,7 @@ mod tests {
 
     #[test]
     fn test_build_error_response_with_null_id() {
-        let response =
-            build_error_response("null", "dangerous_tool", "tool is not allowed", true);
+        let response = build_error_response("null", "dangerous_tool", "tool is not allowed", true);
         let json = nojson::RawJson::parse(&response).expect("should be valid JSON");
         let id_raw = json
             .value()

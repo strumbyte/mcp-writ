@@ -55,6 +55,11 @@ pub(super) async fn deny_request<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    if method == "tools/call" {
+        if let Some(tool) = extract_tool_name_from_line(line) {
+            shared.tally.lock().unwrap().record_call(&tool);
+        }
+    }
     if shared.dry_run && dry_run_observable(method, &verdict) {
         // The deny decision is send-ordered ahead of the observed
         // forward — even a denied-tracked frame must not cross ahead of
@@ -179,6 +184,9 @@ where
 {
     // ── tools/call legacy gates: list-busy, tool policy, session ──
     if method == "tools/call" {
+        if let Some(tool) = extract_tool_name_from_line(line) {
+            shared.tally.lock().unwrap().record_call(&tool);
+        }
         // Verified-generation capture (F10): when manifest scanning or a
         // `tools-list-hash` pin enforces the manifest, a call may only
         // run against a published verified set. `0` means none
@@ -388,6 +396,15 @@ where
                 // refusal). A refused commit propagates: the violating
                 // request never crosses unaudited.
                 shared.audit.log_committed(event).await?;
+                // Recorded for both fates: a dry-run observation is
+                // exactly the evidence the report's widening
+                // candidates are computed from, and an enforced
+                // denial is the same evidence after the fact.
+                shared
+                    .tally
+                    .lock()
+                    .unwrap()
+                    .record_denial(&violation.tool_name, &violation.reason);
                 // Tool name and reason are client-controlled — escape
                 // terminal controls before they reach a TTY log.
                 if observe {
@@ -1058,6 +1075,9 @@ mod tests {
                 fail_on: crate::verifier::fail_on::FailOn::None,
                 max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
                 audit: Arc::new(crate::audit_log::AuditLogger::to_tracing()),
+                tally: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::auditor::proxy_state::CallTally::default(),
+                )),
                 session: None,
                 wire: Arc::new(Mutex::new(proxy_rpc::WireState::new())),
                 pending_tools_list: Arc::new(Mutex::new(PendingToolsList::new())),

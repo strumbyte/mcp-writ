@@ -162,6 +162,7 @@ fn write_early_failure_report(report_dir: Option<&Path>, launch_id: uuid::Uuid, 
         // The host records the isolation it applied; the guest-side
         // report does not re-assert it.
         isolation: None,
+        correction_candidates: None,
     };
     write_guest_report(report_dir, &report);
 }
@@ -708,6 +709,8 @@ async fn main() {
         report,
         path: guest_report_path(&dir),
         cross_uid_channel: true,
+        call_tally: None,
+        declared_tools: Vec::new(),
     });
 
     // SIGUSR1 re-opens the file audit sink — the guest-side logrotate

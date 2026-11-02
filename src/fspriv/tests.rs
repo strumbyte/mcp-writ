@@ -312,6 +312,102 @@ fn parent_write_restriction() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Set `dir`'s DACL from an SDDL string as a protected DACL, so the
+/// fixture's trust state is exactly the spelled one regardless of
+/// the ACEs the temp parent would otherwise hand down.
+#[cfg(windows)]
+fn set_dacl_from_sddl(dir: &std::path::Path, sddl: &str) {
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    };
+    use windows::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    use windows::core::HSTRING;
+
+    let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(&HSTRING::from(sddl), 1, &mut sd, None)
+    }
+    .unwrap_or_else(|e| panic!("SDDL '{sddl}' must parse: {e}"));
+    let _sd = SdGuard(sd.0);
+    let mut present = windows::core::BOOL(0);
+    let mut defaulted = windows::core::BOOL(0);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) }
+        .unwrap_or_else(|e| panic!("GetSecurityDescriptorDacl: {e}"));
+    assert!(present.as_bool(), "fixture SDDL must carry a DACL");
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            &HSTRING::from(dir.to_string_lossy().as_ref()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    result
+        .ok()
+        .unwrap_or_else(|e| panic!("SetNamedSecurityInfoW for '{}': {e}", dir.display()));
+}
+
+/// The Windows counterpart of `parent_write_restriction`: the
+/// ancestor walk reads DACLs instead of mode bits. A parent whose
+/// DACL hands Everyone replace rights lets any principal rename the
+/// child away; an owner/SYSTEM-only parent passes. The walk also
+/// covers the temp ancestors above the fixture root — the same
+/// trusted-class assumption the other Windows tests make.
+#[cfg(windows)]
+#[test]
+fn windows_parent_write_restriction_follows_dacl() {
+    let root = create_private_tempdir("parent-restrict-win").unwrap();
+    let shared = root.join("shared");
+    fs::create_dir(&shared).unwrap();
+    let child = shared.join("logs");
+    fs::create_dir(&child).unwrap();
+    set_dacl_from_sddl(&shared, "D:P(A;;FA;;;WD)");
+    assert!(
+        require_parent_write_restricted(&child).is_err(),
+        "a parent granting Everyone replace rights must refuse"
+    );
+    set_dacl_from_sddl(&shared, "D:P(A;;FA;;;OW)(A;;FA;;;SY)");
+    assert!(
+        require_parent_write_restricted(&child).is_ok(),
+        "an owner/SYSTEM-only parent must pass"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The trusted-source gate under a DACL-broad ancestor: the file
+/// itself is untouched, but its parent can be renamed by anyone, so
+/// the source is refused until the parent is restricted.
+#[cfg(windows)]
+#[test]
+fn windows_trusted_source_rejects_broad_dacl_ancestor() {
+    let root = create_private_tempdir("trusted-source-win").unwrap();
+    let shared = root.join("shared");
+    fs::create_dir(&shared).unwrap();
+    let leaf = shared.join("real.py");
+    fs::write(&leaf, b"entry\n").unwrap();
+    set_dacl_from_sddl(&shared, "D:P(A;;FA;;;WD)");
+    assert!(
+        require_trusted_source_file(&leaf).is_err(),
+        "a source under a broadly replaceable ancestor must refuse"
+    );
+    set_dacl_from_sddl(&shared, "D:P(A;;FA;;;OW)(A;;FA;;;SY)");
+    assert!(
+        require_trusted_source_file(&leaf).is_ok(),
+        "the same source under an owner/SYSTEM-only parent must pass"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// The default drive-root DACL carries an *inherit-only*
 /// `Authenticated Users` Modify ACE — it grants rights to children
 /// created below, never to the root itself. An earlier revision
@@ -435,6 +531,24 @@ fn current_user_sddl() -> String {
         )));
     }
     s
+}
+
+/// A null DACL is unrestricted access — everyone, full control.
+/// The classification must answer "untrusted grant possible" for
+/// both rights masks rather than treating the object as safe.
+#[cfg(windows)]
+#[test]
+fn null_dacl_counts_as_untrusted_grant() {
+    assert!(
+        dacl_has_untrusted_grant(std::ptr::null_mut(), file_write_rights(), false)
+            .expect("null DACL classification"),
+        "a null DACL must count as an untrusted grant (file rights)"
+    );
+    assert!(
+        dacl_has_untrusted_grant(std::ptr::null_mut(), dir_replace_rights(), true)
+            .expect("null DACL classification"),
+        "a null DACL must count as an untrusted grant (replace rights)"
+    );
 }
 
 /// The finding-2 matrix, evaluated on real DACLs built from SDDL:

@@ -35,6 +35,12 @@ pub struct ReportTarget {
     /// unreadable to the host consumer it exists for. When set, the
     /// finished file is relaxed to 0644.
     pub cross_uid_channel: bool,
+    /// The Auditor's session call tally, when the launch had one —
+    /// `finalize_report` computes the report's correction candidates
+    /// from it together with `declared_tools`.
+    pub call_tally: Option<crate::auditor::proxy_state::SharedCallTally>,
+    /// Tool names the bound policy declares (`allowed`), in policy order.
+    pub declared_tools: Vec<String>,
 }
 
 impl ReportTarget {
@@ -95,7 +101,6 @@ impl ReportTarget {
 /// `Arc`-shared, so a `kill`ed or dropped child still reports the
 /// proxy's final values.
 fn finalize_report(
-    #[allow(unused_mut)] // only the Linux namespaced stamp mutates it
     mut target: Option<ReportTarget>,
     outcome: LaunchOutcome,
     code: i32,
@@ -111,6 +116,37 @@ fn finalize_report(
         sess.stats = Some(src.stats.snapshot());
     }
     let _ = child;
+    if let Some(t) = target.as_mut()
+        && let Some(tally) = t.call_tally.clone()
+    {
+        let snapshot = tally.lock().unwrap();
+        let unused_tools: Vec<String> = t
+            .declared_tools
+            .iter()
+            .filter(|name| !snapshot.called_tools.contains(*name))
+            .cloned()
+            .collect();
+        let basis = format!(
+            "computed from this session's tools/call traffic ({} mode); unused_tools were declared for the bound server but never called during the session",
+            if t.report.dry_run {
+                "dry-run"
+            } else {
+                "enforced"
+            }
+        );
+        t.report.correction_candidates = Some(crate::enforcement::CorrectionCandidates {
+            unused_tools,
+            denied_targets: snapshot
+                .denied
+                .iter()
+                .map(|(tool, reason)| crate::enforcement::DeniedTarget {
+                    tool: tool.clone(),
+                    reason: reason.clone(),
+                })
+                .collect(),
+            basis,
+        });
+    }
     match target {
         Some(t) => t.finish(outcome, code),
         None => code,

@@ -47,6 +47,37 @@ pub(crate) struct VerifiedToolSet {
     pub(crate) names: std::collections::HashSet<String>,
 }
 
+/// Process-local session tally for the launch report's correction
+/// candidates: which tools the client actually called, and the
+/// substantive policy violations the tools/call gates produced
+/// (tool name + the detailed audit-side reason, which names the
+/// resolved target). Recording only — nothing in the proxy decides
+/// differently because this exists. The denied entries deliberately
+/// exclude tool-level authorization refusals (unknown/unallowed
+/// tool): those are not targets a wider grant could answer.
+#[derive(Debug, Default)]
+pub struct CallTally {
+    pub called_tools: std::collections::BTreeSet<String>,
+    pub denied: Vec<(String, String)>,
+}
+
+impl CallTally {
+    pub fn record_call(&mut self, tool: &str) {
+        self.called_tools.insert(tool.to_string());
+    }
+
+    pub fn record_denial(&mut self, tool: &str, reason: &str) {
+        let entry = (tool.to_string(), reason.to_string());
+        if !self.denied.contains(&entry) {
+            self.denied.push(entry);
+        }
+    }
+}
+
+/// The shared handle the relay records into and the launch path
+/// reads back at session end.
+pub type SharedCallTally = std::sync::Arc<std::sync::Mutex<CallTally>>;
+
 pub(crate) struct PendingToolsList {
     ids: std::collections::VecDeque<RpcId>,
 }
@@ -107,6 +138,7 @@ pub(crate) struct ProxyShared<W> {
     /// both relay directions' readers.
     pub(crate) max_frame_bytes: usize,
     pub(crate) audit: Arc<AuditLogger>,
+    pub(crate) tally: SharedCallTally,
     /// Process-local session: Confused Deputy and/or trajectory (never requestState).
     pub(crate) session: Option<Arc<Mutex<SessionState>>>,
     /// Bidirectional MCP correlation: established revision, 2025
@@ -213,6 +245,7 @@ impl<W> Clone for ProxyShared<W> {
             fail_on: self.fail_on,
             max_frame_bytes: self.max_frame_bytes,
             audit: self.audit.clone(),
+            tally: self.tally.clone(),
             session: self.session.clone(),
             wire: self.wire.clone(),
             pending_tools_list: self.pending_tools_list.clone(),

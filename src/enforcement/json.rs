@@ -89,6 +89,34 @@ fn write_isolation(
     }
 }
 
+fn write_correction_candidates(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    c: &CorrectionCandidates,
+) -> std::fmt::Result {
+    f.member(
+        "unused_tools",
+        nojson::array(|f| {
+            for t in &c.unused_tools {
+                f.element(t.as_str())?;
+            }
+            Ok(())
+        }),
+    )?;
+    f.member(
+        "denied_targets",
+        nojson::array(|f| {
+            for d in &c.denied_targets {
+                f.element(nojson::object(|o| {
+                    o.member("tool", d.tool.as_str())?;
+                    o.member("reason", d.reason.as_str())
+                }))?;
+            }
+            Ok(())
+        }),
+    )?;
+    f.member("basis", c.basis.as_str())
+}
+
 fn write_control(
     f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
     c: &PlannedControl,
@@ -569,6 +597,13 @@ impl LaunchReport {
             match &report.isolation {
                 Some(i) => f.member("isolation", nojson::object(|f| write_isolation(f, i))),
                 None => f.member("isolation", JsonNull),
+            }?;
+            match &report.correction_candidates {
+                Some(c) => f.member(
+                    "correction_candidates",
+                    nojson::object(|f| write_correction_candidates(f, c)),
+                ),
+                None => f.member("correction_candidates", JsonNull),
             }
         })
         .to_string()
