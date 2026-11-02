@@ -555,7 +555,10 @@ fn match_fn_decl(source: &str, i: usize) -> Option<(String, usize)> {
                 if declarator_rhs_is_fn_head(&source[name_end..brace]) {
                     return Some((name, brace));
                 }
-                from = brace + 1;
+                // `(a): {T} =>` — a `{` opening a return-type object
+                // literal is not the body; skip to its `}` so the
+                // real body brace still gets probed.
+                from = type_brace_close(source, brace).map_or(brace + 1, |c| c + 1);
             }
         }
     }
@@ -623,6 +626,29 @@ fn declarator_rhs_is_fn_head(between: &str) -> bool {
     arrow_param_head(head.trim_end())
 }
 
+/// `brace` opens a return-type object literal when the text before it
+/// spells `) :` — return the type's matching `}` then. A `{` after
+/// anything else (a label, ternary colon, object key) is not a type
+/// head, so the caller keeps the ordinary `brace + 1` retry.
+fn type_brace_close(source: &str, brace: usize) -> Option<usize> {
+    fn prev_non_ws(source: &str, mut i: usize) -> Option<usize> {
+        loop {
+            i = i.checked_sub(1)?;
+            if !source.as_bytes()[i].is_ascii_whitespace() {
+                return Some(i);
+            }
+        }
+    }
+    let colon = prev_non_ws(source, brace)?;
+    if source.as_bytes()[colon] != b':' {
+        return None;
+    }
+    if prev_non_ws(source, colon).is_none_or(|p| source.as_bytes()[p] != b')') {
+        return None;
+    }
+    find_matching(source, brace, '{', '}')
+}
+
 /// `s` begins with `kw` as a whole identifier — the next byte is not
 /// an identifier byte (or is absent).
 fn starts_with_ident(s: &str, kw: &str) -> bool {
@@ -631,10 +657,10 @@ fn starts_with_ident(s: &str, kw: &str) -> bool {
 }
 
 /// The text before an arrow's `=>`: a balanced `(`/`[`/`{` parameter
-/// list whose closer is the last byte, or one bare-identifier
-/// parameter.
+/// list, optionally followed by a TypeScript return-type annotation
+/// (`(a): T`), or one bare-identifier parameter.
 fn arrow_param_head(head: &str) -> bool {
-    let close = match head.chars().next() {
+    let Some(close) = (match head.chars().next() {
         Some('(') => find_matching(head, 0, '(', ')'),
         Some('[') => find_matching(head, 0, '[', ']'),
         Some('{') => find_matching(head, 0, '{', '}'),
@@ -642,8 +668,24 @@ fn arrow_param_head(head: &str) -> bool {
             return take_ident(head, 0).is_some_and(|(_, end)| end == head.len());
         }
         _ => return false,
+    }) else {
+        return false;
     };
-    close == Some(head.len() - 1)
+    if close == head.len() - 1 {
+        return true;
+    }
+    // `: T` between the parameter list and `=>`: a TS return-type
+    // annotation is the only allowed text there. skip_ts_type bounds
+    // the type exactly, so trailing non-type tokens still reject.
+    let colon = skip_ws_and_comments(head, close + 1);
+    if head.as_bytes().get(colon) != Some(&b':') {
+        return false;
+    }
+    let type_start = skip_ws_and_comments(head, colon + 1);
+    if type_start >= head.len() {
+        return false;
+    }
+    skip_ws_and_comments(head, skip_ts_type(head, type_start)) == head.len()
 }
 
 /// `{` of the function body: skip destructuring `{` in the parameter list, then

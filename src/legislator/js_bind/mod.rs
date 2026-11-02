@@ -921,6 +921,25 @@ mod tests {
         );
     }
 
+    /// `const handler = (req: Req): Res => {…}` — a TypeScript
+    /// return-type annotation between `)` and `=>` is still an arrow
+    /// head; the `{` body binds to `handler`.
+    #[test]
+    fn ts_annotated_arrow_declarator_is_extracted() {
+        for src in [
+            "const handler = (req: Req): Res => { return res; }",
+            "const handler = (req: Req): { ok: boolean } => { return res; }",
+            "const handler = (req: Req): Promise<Res> => { return res; }",
+        ] {
+            let fns = extract_functions(src);
+            let h = fns
+                .iter()
+                .find(|f| f.name == "handler")
+                .unwrap_or_else(|| panic!("handler not extracted: {src}"));
+            assert!(h.body.contains("return res"), "body={:?} src={src}", h.body);
+        }
+    }
+
     /// A semicolon-free arrow declarator ends at its body expression —
     /// the `=>` mid-RHS belongs to `x` alone, so the `{` opening the
     /// next declaration's body must not be attached to `x`.
