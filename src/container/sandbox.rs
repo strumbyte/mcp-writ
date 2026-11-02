@@ -528,6 +528,7 @@ pub async fn run(options: &SandboxRunOptions) -> Result<i32, Box<dyn std::error:
         target: target(),
         policy: None,
         dry_run: false,
+        allow_replaceable_paths: false,
         plan: plan(),
         observations: vec![],
         result: None,
@@ -541,6 +542,7 @@ pub async fn run(options: &SandboxRunOptions) -> Result<i32, Box<dyn std::error:
             unit_id: None,
             detail: None,
         }),
+        correction_candidates: None,
     };
     if let Some(path) = &options.report {
         // Check report storage before any VM or workload is started.

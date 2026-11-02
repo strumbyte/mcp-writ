@@ -24,6 +24,9 @@ fn shared_for_test_with(
         fail_on: crate::verifier::fail_on::FailOn::DEFAULT,
         max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
         audit: Arc::new(audit),
+        tally: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::auditor::proxy_state::CallTally::default(),
+        )),
         session: None,
         wire: Arc::new(Mutex::new(proxy_rpc::WireState::new())),
         pending_tools_list: Arc::new(Mutex::new(PendingToolsList::new())),

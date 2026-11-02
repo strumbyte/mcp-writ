@@ -546,16 +546,146 @@ fn match_fn_decl(source: &str, i: usize) -> Option<(String, usize)> {
             if name.is_empty() {
                 continue;
             }
-            if let Some(rel) = source[name_end..].find('{') {
-                let between = source[name_end..name_end + rel].trim();
-                if between.contains('=') && (between.contains("=>") || between.contains("function"))
-                {
-                    return Some((name, name_end + rel));
+            // The `{` must open *this* declarator's function body — an
+            // unbounded forward search bleeds into a later statement
+            // (`const cp = require("child_process")\nfunction f() {…}`)
+            // and would attach that statement's body to this name.
+            let mut from = name_end;
+            while let Some(brace) = declarator_body_brace(source, from) {
+                if declarator_rhs_is_fn_head(&source[name_end..brace]) {
+                    return Some((name, brace));
                 }
+                // `(a): {T} =>` — a `{` opening a return-type object
+                // literal is not the body; skip to its `}` so the
+                // real body brace still gets probed.
+                from = type_brace_close(source, brace).map_or(brace + 1, |c| c + 1);
             }
         }
     }
     None
+}
+
+/// First `{` inside the same declarator statement, or `None` when a
+/// boundary (`;`, a top-level `,` or `}`) ends it first. Braces nested
+/// inside `(`/`[` (call args, array literals, destructured params) do
+/// not count.
+fn declarator_body_brace(source: &str, name_end: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut i = name_end;
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                i = skip_quoted(source, i);
+                continue;
+            }
+            b'`' => {
+                i = skip_template_literal(source, i);
+                continue;
+            }
+            b'/' if is_line_or_block_comment(source, i) => {
+                i = skip_inert_js(source, i);
+                continue;
+            }
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b'{' if depth == 0 => return Some(i),
+            b';' | b',' | b'}' if depth == 0 => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `between` (the `name`…`{` span) is this declarator's function head
+/// iff it holds `=` whose RHS opens a function or arrow head —
+/// `function`, `async`, or a parameter list ending in `=>`. Anything
+/// else (`require(…)`, a literal, another statement's tokens) means
+/// the `{` belongs to a different statement.
+fn declarator_rhs_is_fn_head(between: &str) -> bool {
+    let Some(eq) = between.find('=') else {
+        return false;
+    };
+    let rhs = between[eq + 1..].trim_start();
+    if rhs.starts_with("=>") {
+        return true;
+    }
+    // `function`/`async` must be whole identifiers — `functional` or
+    // `async_foo` is an ordinary value, not a function head.
+    if starts_with_ident(rhs, "function") || starts_with_ident(rhs, "async") {
+        return true;
+    }
+    // An arrow head is the *complete* RHS: a parameter head ending in
+    // `=>`. Anything past the `=>` is expression body — a later
+    // statement's `=>` text (`x = a => a` newline `g = function()`)
+    // must not back-attribute the `{` that follows to this name.
+    let Some(head) = rhs.trim_end().strip_suffix("=>") else {
+        return false;
+    };
+    arrow_param_head(head.trim_end())
+}
+
+/// `brace` opens a return-type object literal when the text before it
+/// spells `) :` — return the type's matching `}` then. A `{` after
+/// anything else (a label, ternary colon, object key) is not a type
+/// head, so the caller keeps the ordinary `brace + 1` retry.
+fn type_brace_close(source: &str, brace: usize) -> Option<usize> {
+    fn prev_non_ws(source: &str, mut i: usize) -> Option<usize> {
+        loop {
+            i = i.checked_sub(1)?;
+            if !source.as_bytes()[i].is_ascii_whitespace() {
+                return Some(i);
+            }
+        }
+    }
+    let colon = prev_non_ws(source, brace)?;
+    if source.as_bytes()[colon] != b':' {
+        return None;
+    }
+    if prev_non_ws(source, colon).is_none_or(|p| source.as_bytes()[p] != b')') {
+        return None;
+    }
+    find_matching(source, brace, '{', '}')
+}
+
+/// `s` begins with `kw` as a whole identifier — the next byte is not
+/// an identifier byte (or is absent).
+fn starts_with_ident(s: &str, kw: &str) -> bool {
+    s.strip_prefix(kw)
+        .is_some_and(|rest| rest.as_bytes().first().is_none_or(|b| !is_ident_byte(*b)))
+}
+
+/// The text before an arrow's `=>`: a balanced `(`/`[`/`{` parameter
+/// list, optionally followed by a TypeScript return-type annotation
+/// (`(a): T`), or one bare-identifier parameter.
+fn arrow_param_head(head: &str) -> bool {
+    let Some(close) = (match head.chars().next() {
+        Some('(') => find_matching(head, 0, '(', ')'),
+        Some('[') => find_matching(head, 0, '[', ']'),
+        Some('{') => find_matching(head, 0, '{', '}'),
+        Some(c) if is_ident_start(c) => {
+            return take_ident(head, 0).is_some_and(|(_, end)| end == head.len());
+        }
+        _ => return false,
+    }) else {
+        return false;
+    };
+    if close == head.len() - 1 {
+        return true;
+    }
+    // `: T` between the parameter list and `=>`: a TS return-type
+    // annotation is the only allowed text there. skip_ts_type bounds
+    // the type exactly, so trailing non-type tokens still reject.
+    let colon = skip_ws_and_comments(head, close + 1);
+    if head.as_bytes().get(colon) != Some(&b':') {
+        return false;
+    }
+    let type_start = skip_ws_and_comments(head, colon + 1);
+    if type_start >= head.len() {
+        return false;
+    }
+    skip_ws_and_comments(head, skip_ts_type(head, type_start)) == head.len()
 }
 
 /// `{` of the function body: skip destructuring `{` in the parameter list, then

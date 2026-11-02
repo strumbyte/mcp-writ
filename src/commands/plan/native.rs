@@ -34,6 +34,9 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
         return finalize(report);
     };
 
+    report.checks.push(policy_posture_check(&policy));
+    report.checks.push(policy_placement_check(&policy));
+
     // command.resolve — a missing executable blocks the launch, so it
     // blocks the plan's `ready`. With hash entries configured, `run`
     // expands a `#!` script to the interpreter launch the kernel would
@@ -425,6 +428,123 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
     finalize(report)
 }
 
+/// The `policy.posture` record — the bound policy's weakening dials,
+/// stated whether or not any is weakened. `run` records a weakened
+/// dial on `policy.loaded`; `plan` surfaces the same states before
+/// the launch so a draft's posture is reviewable from the plan alone.
+fn policy_posture_check(policy: &crate::policy::Policy) -> PlanCheck {
+    let secret_overlay = policy.fs.secret_overlay;
+    let allow_degraded = policy.sandbox.allow_degraded;
+    let require_lifetime_boundary = policy.sandbox.require_lifetime_boundary;
+    let detail = format!(
+        "secret_overlay={secret_overlay} allow_degraded={allow_degraded} \
+         require_lifetime_boundary={require_lifetime_boundary}",
+    );
+    if !secret_overlay || allow_degraded || !require_lifetime_boundary {
+        PlanCheck {
+            id: "policy.posture",
+            status: PlanCheckStatus::Warn,
+            detail: Some(format!(
+                "{detail} — a weakening dial is set: the launch would run with reduced enforcement"
+            )),
+            remediation: Some(
+                "if the weakening is unintended, restore the dial in the policy \
+                 (secret-overlay #true, sandbox allow_degraded=#false, \
+                 require_lifetime_boundary=#true) — `run` records weakened dials \
+                 on policy.loaded"
+                    .to_string(),
+            ),
+        }
+    } else {
+        check("policy.posture", PlanCheckStatus::Pass, Some(detail))
+    }
+}
+
+/// The `policy.placement` record — whether the policy's own source
+/// files sit where a launch can trust them: outside the ancestry the
+/// trust gate refuses, and outside the write grants the policy itself
+/// hands out. Both gates refuse at `run`; `plan` reports them as
+/// warnings so the placement is fixable before the first launch.
+fn policy_placement_check(policy: &crate::policy::Policy) -> PlanCheck {
+    policy_placement_check_inner(policy, crate::fspriv::replaceable_paths_permitted())
+}
+
+fn policy_placement_check_inner(
+    policy: &crate::policy::Policy,
+    replaceable_permitted: bool,
+) -> PlanCheck {
+    if policy.source_files().is_empty() {
+        return check(
+            "policy.placement",
+            PlanCheckStatus::Pass,
+            Some("policy has no file sources (embedded default)".to_string()),
+        );
+    }
+    // `MCP_WRIT_ALLOW_REPLACEABLE_PATHS` makes the trusted-source gate
+    // vacuous — `require_trusted_policy_sources` would pass anything,
+    // so the source's trust is unverified rather than established.
+    if !replaceable_permitted
+        && let Err(e) = crate::policy::loader::require_trusted_policy_sources(policy)
+    {
+        return PlanCheck {
+            id: "policy.placement",
+            status: PlanCheckStatus::Warn,
+            detail: Some(format!("{e}")),
+            remediation: Some(
+                "move the policy and its extends/include files to a location that \
+                 is not group/world-writable, or set \
+                 MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1 to accept the substitution \
+                 risk explicitly — `run` refuses an untrusted policy source"
+                    .to_string(),
+            ),
+        };
+    }
+    let grants = policy.write_grant_spellings();
+    for source in policy.source_files() {
+        if let Some(conflict) =
+            crate::audit_log::policy_source_write_conflict(grants.iter().cloned(), &source)
+        {
+            return PlanCheck {
+                id: "policy.placement",
+                status: PlanCheckStatus::Warn,
+                detail: Some(format!(
+                    "write grant reaches policy source '{}': {conflict}",
+                    source.display()
+                )),
+                remediation: Some(
+                    "narrow the write grant so it does not cover the policy source, \
+                     or move the policy outside the granted tree — `run` refuses \
+                     this launch"
+                        .to_string(),
+                ),
+            };
+        }
+    }
+    if replaceable_permitted {
+        return PlanCheck {
+            id: "policy.placement",
+            status: PlanCheckStatus::Warn,
+            detail: Some(
+                "policy sources are unverified — MCP_WRIT_ALLOW_REPLACEABLE_PATHS \
+                 bypassed trusted-source verification (outside-write-grant \
+                 overlap was checked and found none)"
+                    .to_string(),
+            ),
+            remediation: Some(
+                "unset MCP_WRIT_ALLOW_REPLACEABLE_PATHS to restore source \
+                 verification, or keep it to accept the substitution risk — `run` \
+                 records allow_replaceable_paths=true on the launch report"
+                    .to_string(),
+            ),
+        };
+    }
+    check(
+        "policy.placement",
+        PlanCheckStatus::Pass,
+        Some("policy sources are trusted and outside the policy's write grants".to_string()),
+    )
+}
+
 /// True when `MCP_WRIT_SKIP_SANDBOX` is set truthy — the same rule
 /// `run` applies, so `plan` warns about the same launch the user gets.
 fn env_skip_sandbox() -> bool {
@@ -471,5 +591,33 @@ fn sandbox_mechanism_detail(mechanism: Option<crate::execution::WindowsNativeMec
         }
     } else {
         "no OS sandbox on this platform".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With `MCP_WRIT_ALLOW_REPLACEABLE_PATHS` in force the trusted-source
+    /// gate is bypassed wholesale — the result must read unverified,
+    /// never "trusted". The flag is taken as a parameter so the test
+    /// never mutates process-wide env state other tests observe.
+    #[test]
+    fn placement_reports_unverified_under_replaceable_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.kdl");
+        std::fs::write(&path, "policy version=2\n").unwrap();
+        let policy = crate::policy::loader::load_policy(&path).unwrap();
+        let c = policy_placement_check_inner(&policy, true);
+        assert_eq!(c.id, "policy.placement");
+        assert_eq!(c.status, PlanCheckStatus::Warn);
+        assert!(
+            c.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unverified"),
+            "got: {:?}",
+            c.detail
+        );
     }
 }

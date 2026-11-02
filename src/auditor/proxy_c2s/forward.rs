@@ -55,6 +55,11 @@ pub(super) async fn deny_request<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    if method == "tools/call"
+        && let Some(tool) = extract_tool_name_from_line(line)
+    {
+        shared.tally.lock().unwrap().record_call(&tool);
+    }
     if shared.dry_run && dry_run_observable(method, &verdict) {
         // The deny decision is send-ordered ahead of the observed
         // forward — even a denied-tracked frame must not cross ahead of
@@ -179,6 +184,10 @@ where
 {
     // ── tools/call legacy gates: list-busy, tool policy, session ──
     if method == "tools/call" {
+        let tool = extract_tool_name_from_line(line);
+        if let Some(tool) = tool.as_deref() {
+            shared.tally.lock().unwrap().record_call(tool);
+        }
         // Verified-generation capture (F10): when manifest scanning or a
         // `tools-list-hash` pin enforces the manifest, a call may only
         // run against a published verified set. `0` means none
@@ -201,6 +210,7 @@ where
                     line,
                     "no verified tools/list has been published yet",
                     None,
+                    false,
                 )
                 .await?;
                 return Ok(());
@@ -216,6 +226,7 @@ where
                 line,
                 "tools/list revalidation in progress",
                 None,
+                false,
             )
             .await?;
             return Ok(());
@@ -250,7 +261,6 @@ where
         let check_result = apply_session_gates(shared, check_result, line, id).await;
         return match check_result {
             Ok(check_pass) => {
-                let tool = extract_tool_name_from_line(line);
                 // F6: among calls the policy allows, only names the
                 // verified listing actually advertised to this client
                 // may forward — a statically allowed tool the server
@@ -283,6 +293,7 @@ where
                                 "tool '{}' is not advertised by the verified tools/list",
                                 tool.as_deref().unwrap_or("<unknown>")
                             )),
+                            true,
                         )
                         .await?;
                         return Ok(());
@@ -388,6 +399,22 @@ where
                 // refusal). A refused commit propagates: the violating
                 // request never crosses unaudited.
                 shared.audit.log_committed(event).await?;
+                // Recorded for both fates: a dry-run observation is
+                // exactly the evidence the report's widening
+                // candidates are computed from, and an enforced
+                // denial is the same evidence after the fact.
+                // Only target-policy denials land — the tally's
+                // documented contract. Tool-level authorization
+                // refusals, args_schema validation failures, and
+                // session-state refusals are not targets a wider
+                // grant could answer.
+                if violation.is_denied_target() {
+                    shared
+                        .tally
+                        .lock()
+                        .unwrap()
+                        .record_denial(&violation.tool_name, &violation.reason);
+                }
                 // Tool name and reason are client-controlled — escape
                 // terminal controls before they reach a TTY log.
                 if observe {
@@ -421,6 +448,7 @@ where
                         &id_str,
                         &violation.tool_name,
                         violation.client_reason(),
+                        violation.is_authorization_denial(),
                     );
                     write_client_frame(&shared.client_out, &error_response).await?;
                 }
@@ -875,19 +903,23 @@ where
 /// verified listing published yet. `reason` is the client-facing text;
 /// `audit_reason` carries the detail for the audit record when the wire
 /// text must stay membership-blind (an allowed-but-unadvertised name
-/// must read exactly like a denied or unknown one).
+/// must read exactly like a denied or unknown one). `tool_denied`
+/// selects the authorization-refusal lead for that unadvertised-name
+/// refusal — it is an authorization denial, not a call-level one, so
+/// the wire wording stays identical to a policy allow/deny refusal.
 pub(super) async fn deny_busy_tools_call<W>(
     shared: &ProxyShared<W>,
     raw_id: &str,
     line: &str,
     reason: &str,
     audit_reason: Option<&str>,
+    tool_denied: bool,
 ) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let tool = extract_tool_name_from_line(line).unwrap_or_else(|| "<unknown>".into());
-    let error_response = build_error_response(raw_id, &tool, reason);
+    let error_response = build_error_response(raw_id, &tool, reason, tool_denied);
     write_client_frame(&shared.client_out, &error_response).await?;
     let correlation_id = Uuid::now_v7();
     let mut event = AuditEvent::new(
@@ -1057,6 +1089,9 @@ mod tests {
                 fail_on: crate::verifier::fail_on::FailOn::None,
                 max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
                 audit: Arc::new(crate::audit_log::AuditLogger::to_tracing()),
+                tally: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::auditor::proxy_state::CallTally::default(),
+                )),
                 session: None,
                 wire: Arc::new(Mutex::new(proxy_rpc::WireState::new())),
                 pending_tools_list: Arc::new(Mutex::new(PendingToolsList::new())),

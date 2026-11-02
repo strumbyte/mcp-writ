@@ -312,6 +312,77 @@ fn parent_write_restriction() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// The Windows counterpart of `parent_write_restriction`: the
+/// ancestor walk reads DACLs instead of mode bits. A parent whose
+/// DACL hands Everyone replace rights lets any principal rename the
+/// child away; an owner/SYSTEM-only parent passes. The walk covers
+/// every ancestor up to the volume root, so the fixture needs a root
+/// whose whole chain is write-restricted — a host whose temp
+/// ancestry already grants lower-trust workers `Modify` (sandbox
+/// tooling, domain group ACEs) fails the pass-case on the
+/// environment, not the fixture.
+#[cfg(windows)]
+#[test]
+fn windows_parent_write_restriction_follows_dacl() {
+    let Some(root) = crate::testutil::restricted_tempdir() else {
+        crate::testutil::skip_unless_required("no write-restricted root for DACL fixture");
+        return;
+    };
+    let shared = root.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    let child = shared.join("logs");
+    fs::create_dir(&child).unwrap();
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;;FA;;;WD)");
+    assert!(
+        require_parent_write_restricted(&child).is_err(),
+        "a parent granting Everyone replace rights must refuse"
+    );
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;;FA;;;OW)(A;;FA;;;SY)");
+    assert!(
+        require_parent_write_restricted(&child).is_ok(),
+        "an owner/SYSTEM-only parent must pass"
+    );
+}
+
+/// The trusted-source gate under a DACL-broad ancestor: the file
+/// itself is untouched, but its parent can be renamed by anyone, so
+/// the source is refused until the parent is restricted. The same
+/// write-restricted-root requirement as the DACL tests above — the
+/// ancestry walk reads every level above the fixture.
+#[cfg(windows)]
+#[test]
+fn windows_trusted_source_rejects_broad_dacl_ancestor() {
+    let Some(root) = crate::testutil::restricted_tempdir() else {
+        crate::testutil::skip_unless_required("no write-restricted root for DACL fixture");
+        return;
+    };
+    let shared = root.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    // The ancestor alone carries the broad grant: `shared` gets an
+    // Everyone full-access DACL, and the leaf gets its own protected
+    // owner/SYSTEM-only DACL, so the refusal below can only come from
+    // the ancestor walk — never from an untrusted grant inherited by
+    // the leaf itself.
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;;FA;;;WD)");
+    let leaf = shared.join("real.py");
+    fs::write(&leaf, b"entry\n").unwrap();
+    crate::testutil::set_dacl_from_sddl(&leaf, "D:P(A;;FA;;;OW)(A;;FA;;;SY)");
+    let err = require_trusted_source_file(&leaf)
+        .expect_err("a source under a broadly replaceable ancestor must refuse");
+    assert!(
+        err.to_string().contains(&format!(
+            "ancestor '{}'",
+            shared.canonicalize().unwrap().display()
+        )),
+        "the refusal must identify the replaceable ancestor: {err}"
+    );
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)");
+    assert!(
+        require_trusted_source_file(&leaf).is_ok(),
+        "the same source under an owner/SYSTEM-only parent must pass"
+    );
+}
+
 /// The default drive-root DACL carries an *inherit-only*
 /// `Authenticated Users` Modify ACE — it grants rights to children
 /// created below, never to the root itself. An earlier revision
@@ -435,6 +506,24 @@ fn current_user_sddl() -> String {
         )));
     }
     s
+}
+
+/// A null DACL is unrestricted access — everyone, full control.
+/// The classification must answer "untrusted grant possible" for
+/// both rights masks rather than treating the object as safe.
+#[cfg(windows)]
+#[test]
+fn null_dacl_counts_as_untrusted_grant() {
+    assert!(
+        dacl_has_untrusted_grant(std::ptr::null_mut(), file_write_rights(), false)
+            .expect("null DACL classification"),
+        "a null DACL must count as an untrusted grant (file rights)"
+    );
+    assert!(
+        dacl_has_untrusted_grant(std::ptr::null_mut(), dir_replace_rights(), true)
+            .expect("null DACL classification"),
+        "a null DACL must count as an untrusted grant (replace rights)"
+    );
 }
 
 /// The finding-2 matrix, evaluated on real DACLs built from SDDL:

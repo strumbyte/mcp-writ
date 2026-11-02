@@ -188,8 +188,21 @@ pub(crate) fn join_audit_details(sub_policy: Option<&str>, notes: &[String]) -> 
 
 /// Build a JSON-RPC error response for a policy violation.
 /// Uses nojson builder to construct the JSON (no manual string concatenation).
-pub(crate) fn build_error_response(id_raw: &str, tool_name: &str, reason: &str) -> String {
-    let message = format!("Policy violation: tool '{tool_name}' is not allowed ({reason})");
+/// `tool_denied` is true only for a tool-level authorization refusal;
+/// every other refusal (argument target out of scope, session state,
+/// validation) uses the call-denied lead so the message never claims
+/// an allowed tool is prohibited.
+pub(crate) fn build_error_response(
+    id_raw: &str,
+    tool_name: &str,
+    reason: &str,
+    tool_denied: bool,
+) -> String {
+    let message = if tool_denied {
+        format!("Policy violation: tool '{tool_name}' is not allowed ({reason})")
+    } else {
+        format!("Policy violation: call to tool '{tool_name}' was denied ({reason})")
+    };
     let id_literal = RawLiteral(id_raw.to_string());
     let result = nojson::object(|f| {
         f.member("jsonrpc", "2.0")?;
@@ -850,7 +863,7 @@ mod tests {
 
     #[test]
     fn test_build_error_response_structure() {
-        let response = build_error_response("1", "exec_shell", "tool is not allowed");
+        let response = build_error_response("1", "exec_shell", "tool is not allowed", true);
         let json = nojson::RawJson::parse(&response).expect("should be valid JSON");
 
         let jsonrpc = json
@@ -902,7 +915,8 @@ mod tests {
 
     #[test]
     fn test_build_error_response_with_string_id() {
-        let response = build_error_response(r#""req-abc""#, "write_file", "tool is not allowed");
+        let response =
+            build_error_response(r#""req-abc""#, "write_file", "tool is not allowed", true);
         let json = nojson::RawJson::parse(&response).expect("should be valid JSON");
         let id = json
             .value()
@@ -917,7 +931,7 @@ mod tests {
 
     #[test]
     fn test_build_error_response_with_null_id() {
-        let response = build_error_response("null", "dangerous_tool", "tool is not allowed");
+        let response = build_error_response("null", "dangerous_tool", "tool is not allowed", true);
         let json = nojson::RawJson::parse(&response).expect("should be valid JSON");
         let id_raw = json
             .value()
@@ -940,6 +954,31 @@ mod tests {
             .as_string_str()
             .unwrap();
         assert!(msg.contains("dangerous_tool"));
+    }
+
+    #[test]
+    fn test_build_error_response_call_denied() {
+        let response = build_error_response(
+            "1",
+            "read_file",
+            "path '/x' (resolved '/x') not in tool fs allowed paths",
+            false,
+        );
+        let json = nojson::RawJson::parse(&response).expect("should be valid JSON");
+        let msg = json
+            .value()
+            .to_member("error")
+            .unwrap()
+            .required()
+            .unwrap()
+            .to_member("message")
+            .unwrap()
+            .required()
+            .unwrap()
+            .as_string_str()
+            .unwrap();
+        assert!(msg.contains("call to tool 'read_file' was denied"));
+        assert!(!msg.contains("is not allowed"));
     }
 
     fn oversize(head: &[u8], tail: &[u8]) -> OversizeFrame {

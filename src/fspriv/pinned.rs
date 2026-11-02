@@ -284,8 +284,9 @@ pub fn require_parent_write_restricted(dir: &Path) -> io::Result<()> {
 /// behavior for deployments that deliberately run under group-shared
 /// trees (a group-writable workspace, a drvfs mount reporting 0777) —
 /// every path bound by name then carries the swap race the callers
-/// refuse by default.
-pub(crate) fn replaceable_paths_permitted() -> bool {
+/// refuse by default. Also what the launch report's
+/// `allow_replaceable_paths` field records.
+pub fn replaceable_paths_permitted() -> bool {
     std::env::var_os("MCP_WRIT_ALLOW_REPLACEABLE_PATHS").is_some_and(|v| !v.is_empty() && v != "0")
 }
 

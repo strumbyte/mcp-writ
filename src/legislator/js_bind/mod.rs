@@ -3,7 +3,9 @@ mod child_process;
 mod lex;
 
 pub use bind::{bind_js, extract_functions};
-pub(crate) use child_process::js_has_cp_exec;
+#[cfg(test)]
+use child_process::CpScan;
+pub(crate) use child_process::js_scan_cp_usage;
 pub use child_process::{
     ChildProcessBindings, body_has_child_process_exec, child_process_bindings,
 };
@@ -919,6 +921,41 @@ mod tests {
         );
     }
 
+    /// `const handler = (req: Req): Res => {…}` — a TypeScript
+    /// return-type annotation between `)` and `=>` is still an arrow
+    /// head; the `{` body binds to `handler`.
+    #[test]
+    fn ts_annotated_arrow_declarator_is_extracted() {
+        for src in [
+            "const handler = (req: Req): Res => { return res; }",
+            "const handler = (req: Req): { ok: boolean } => { return res; }",
+            "const handler = (req: Req): Promise<Res> => { return res; }",
+        ] {
+            let fns = extract_functions(src);
+            let h = fns
+                .iter()
+                .find(|f| f.name == "handler")
+                .unwrap_or_else(|| panic!("handler not extracted: {src}"));
+            assert!(h.body.contains("return res"), "body={:?} src={src}", h.body);
+        }
+    }
+
+    /// A semicolon-free arrow declarator ends at its body expression —
+    /// the `=>` mid-RHS belongs to `x` alone, so the `{` opening the
+    /// next declaration's body must not be attached to `x`.
+    #[test]
+    fn semicolon_free_arrow_does_not_steal_next_function_body() {
+        let src = "const x = a => a\nconst g = function() { return 1; }";
+        let fns = extract_functions(src);
+        let g = fns.iter().find(|f| f.name == "g").expect("g extracted");
+        assert!(g.body.contains("return 1"), "body={:?}", g.body);
+        assert!(
+            fns.iter()
+                .all(|f| f.name != "x" || !f.body.contains("return 1")),
+            "x must not carry g's body: {fns:?}"
+        );
+    }
+
     #[test]
     fn async_generator_function_is_extracted() {
         let src = r#"
@@ -1041,5 +1078,101 @@ mod tests {
 
         // Unterminated input still returns None rather than panicking.
         assert_eq!(super::lex::take_string("\"\\é", 0), None);
+    }
+
+    /// `child_process` usage verdict for a whole snippet: the bindings
+    /// table is parsed from the same source, like the capability
+    /// pipeline does.
+    fn cp_usage(src: &str) -> CpScan {
+        let bindings = child_process_bindings(src);
+        js_scan_cp_usage(src, &bindings)
+    }
+
+    #[test]
+    fn computed_child_process_member_is_unresolved() {
+        for src in [
+            r#"child_process[name]("id");"#,
+            r#"child_process?.[name]("id");"#,
+            r#"const cp = require("child_process"); cp[name]("id");"#,
+            r#"const cp = require("child_process"); cp?.[name]("id");"#,
+            r#"const cp = require("child_process"); cp.promises[name]("id");"#,
+            r#"const cp = require("child_process"); cp.default.promises[name]("id");"#,
+            r#"require("child_process")[name]("id");"#,
+            r#"const cp = require("child_process"); cp["exec"+"Sync"]("id");"#,
+            r#"const cp = require("child_process"); cp[`execSync`]("id");"#,
+            // No call at all — an opaque extraction is just as unprovable.
+            r#"const cp = require("child_process"); const f = cp[name];"#,
+        ] {
+            let u = cp_usage(src);
+            assert!(!u.exec, "{src} must not prove exec");
+            assert!(u.unresolved, "{src} must be unresolved");
+        }
+    }
+
+    #[test]
+    fn computed_member_through_adapters_is_unresolved() {
+        for src in [
+            r#"const {promisify} = require("util"); const cp = require("child_process"); promisify(cp[name])("id");"#,
+            r#"const cp = require("child_process"); Reflect.apply(cp[name], null, ["id"]);"#,
+            r#"const cp = require("child_process"); Function.prototype.call.call(cp[name], null, "id");"#,
+            r#"const cp = require("child_process"); cp.exec[name]("id");"#,
+            r#"import("child_process").then(m => m[name]("id"));"#,
+        ] {
+            let u = cp_usage(src);
+            assert!(u.unresolved, "{src} must be unresolved");
+        }
+    }
+
+    #[test]
+    fn dynamic_binding_then_call_is_unresolved() {
+        for src in [
+            // `f` is bound to a member the analyzer cannot name — a bare
+            // `f(...)` could be exec, so the call site is unresolved.
+            r#"const cp = require("child_process"); const f = cp[name]; f("id");"#,
+            r#"const cp = require("child_process"); const f = cp.promises[name]; f("id");"#,
+            r#"const f = require("child_process")[name]; f("id");"#,
+            r#"const cp = require("child_process"); const { [k]: f } = cp; f("id");"#,
+            // A re-alias of the dynamically-bound name stays unprovable —
+            // and so does a destructure whose source is that name.
+            r#"const cp = require("child_process"); const f = cp[name]; const g = f; g("id");"#,
+            r#"const cp = require("child_process"); const f = cp[name]; const { exec } = f; exec("id");"#,
+            // A dynamically-bound name passed to a cp wrapper is opaque
+            // too — the wrapped callable could be exec.
+            r#"const {promisify} = require("util"); const cp = require("child_process"); const f = cp[name]; promisify(f)("id");"#,
+        ] {
+            let u = cp_usage(src);
+            assert!(u.unresolved, "{src} must be unresolved");
+        }
+    }
+
+    #[test]
+    fn literal_member_forms_still_prove_exec_not_unresolved() {
+        for src in [
+            r#"child_process.exec("id");"#,
+            r#"const cp = require("child_process"); cp.execFile("id");"#,
+            r#"const cp = require("child_process"); cp["execSync"]("id");"#,
+            r#"const cp = require("child_process"); cp.promises.execFile("id");"#,
+            r#"const cp = require("child_process"); cp.exec["call"](null, "id");"#,
+            r#"import("child_process").then(m => m.execFile("id"));"#,
+        ] {
+            let u = cp_usage(src);
+            assert!(u.exec, "{src} must prove exec");
+            assert!(!u.unresolved, "{src} must not be unresolved");
+        }
+    }
+
+    #[test]
+    fn unknown_literal_member_neither_exec_nor_unresolved() {
+        for src in [
+            // A literal member that is not a cp method is provably not
+            // an exec surface.
+            r#"const cp = require("child_process"); cp.constants.usingJSDOM;"#,
+            r#"const cp = require("child_process"); cp.exec("id").pid;"#,
+            // An uninvoked member reference is not an invocation.
+            r#"const cp = require("child_process"); const n = cp.execFile.name;"#,
+        ] {
+            let u = cp_usage(src);
+            assert!(!u.unresolved, "{src} must not be unresolved");
+        }
     }
 }

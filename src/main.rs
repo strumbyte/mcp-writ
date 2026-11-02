@@ -195,6 +195,7 @@ async fn real_main() {
                 target: report_target.clone(),
                 policy,
                 dry_run: report_dry_run,
+                allow_replaceable_paths: mcp_writ::fspriv::replaceable_paths_permitted(),
                 plan: mcp_writ::enforcement::EnforcementPlan {
                     controls: Vec::new(),
                     grants: Vec::new(),
@@ -216,6 +217,7 @@ async fn real_main() {
                 guest_runner: None,
                 guest: None,
                 isolation: None,
+                correction_candidates: None,
             };
             if let Err(e) = report.write_to(path) {
                 eprintln!(
@@ -634,6 +636,8 @@ async fn real_main() {
             report: launched.report,
             path,
             cross_uid_channel: false,
+            call_tally: Some(launched.call_tally.clone()),
+            declared_tools: launched.declared_tools.clone(),
         });
 
     // SIGUSR1 re-opens the file audit sink — the logrotate coexistence

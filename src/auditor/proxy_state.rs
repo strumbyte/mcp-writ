@@ -47,6 +47,90 @@ pub(crate) struct VerifiedToolSet {
     pub(crate) names: std::collections::HashSet<String>,
 }
 
+/// The most distinct called-tool names the tally retains — a session
+/// must not grow the set without bound.
+pub(crate) const MAX_TALLY_TOOLS: usize = 256;
+
+/// The most distinct `(tool, reason)` denial pairs the tally retains.
+pub(crate) const MAX_TALLY_DENIALS: usize = 256;
+
+/// Retained-bytes budget for `called_tools`. Names are
+/// client-controlled — a request can spell one up to the frame cap —
+/// so the entry cap alone cannot bound what the tally holds.
+pub(crate) const MAX_TALLY_TOOL_BYTES: usize = 64 * 1024;
+
+/// Retained-bytes budget for `denied`. Reasons embed the client's
+/// path spelling (raw and resolved), so a pair is far larger than a
+/// bare name; a flood of giant denials starves only this budget,
+/// never the called-tool set.
+pub(crate) const MAX_TALLY_DENIAL_BYTES: usize = 512 * 1024;
+
+/// Process-local session tally for the launch report's correction
+/// candidates: which tools the client actually called, and the
+/// substantive policy violations the tools/call gates produced
+/// (tool name + the detailed audit-side reason, which names the
+/// resolved target). Recording only — nothing in the proxy decides
+/// differently because this exists. The denied entries deliberately
+/// exclude tool-level authorization refusals (unknown/unallowed
+/// tool), `args_schema` and path-traversal validation failures, and
+/// session-state refusals (trajectory / confused-deputy gates):
+/// those are not targets a wider grant could answer. Retention is
+/// bounded by [`MAX_TALLY_TOOLS`] / [`MAX_TALLY_DENIALS`] on entry
+/// count and [`MAX_TALLY_TOOL_BYTES`] / [`MAX_TALLY_DENIAL_BYTES`] on
+/// retained bytes; past a cap new entries are dropped and the
+/// matching `*_truncated` flag is set, so the report can state the
+/// candidates are incomplete.
+#[derive(Debug, Default)]
+pub struct CallTally {
+    pub called_tools: std::collections::BTreeSet<String>,
+    pub denied: std::collections::BTreeSet<(String, String)>,
+    /// Set once `called_tools` is full — later names are dropped, so
+    /// a dropped tool can appear in `unused_tools` despite being
+    /// called.
+    pub called_tools_truncated: bool,
+    /// Set once `denied` is full — later pairs are dropped.
+    pub denied_truncated: bool,
+}
+
+impl CallTally {
+    pub fn record_call(&mut self, tool: &str) {
+        if self.called_tools.contains(tool) {
+            return;
+        }
+        let retained: usize = self.called_tools.iter().map(String::len).sum();
+        if self.called_tools.len() >= MAX_TALLY_TOOLS
+            || retained + tool.len() > MAX_TALLY_TOOL_BYTES
+        {
+            self.called_tools_truncated = true;
+            return;
+        }
+        self.called_tools.insert(tool.to_string());
+    }
+
+    pub fn record_denial(&mut self, tool: &str, reason: &str) {
+        let entry = (tool.to_string(), reason.to_string());
+        if self.denied.contains(&entry) {
+            return;
+        }
+        let retained: usize = self
+            .denied
+            .iter()
+            .map(|(tool, reason)| tool.len() + reason.len())
+            .sum();
+        if self.denied.len() >= MAX_TALLY_DENIALS
+            || retained + entry.0.len() + entry.1.len() > MAX_TALLY_DENIAL_BYTES
+        {
+            self.denied_truncated = true;
+            return;
+        }
+        self.denied.insert(entry);
+    }
+}
+
+/// The shared handle the relay records into and the launch path
+/// reads back at session end.
+pub type SharedCallTally = std::sync::Arc<std::sync::Mutex<CallTally>>;
+
 pub(crate) struct PendingToolsList {
     ids: std::collections::VecDeque<RpcId>,
 }
@@ -107,6 +191,7 @@ pub(crate) struct ProxyShared<W> {
     /// both relay directions' readers.
     pub(crate) max_frame_bytes: usize,
     pub(crate) audit: Arc<AuditLogger>,
+    pub(crate) tally: SharedCallTally,
     /// Process-local session: Confused Deputy and/or trajectory (never requestState).
     pub(crate) session: Option<Arc<Mutex<SessionState>>>,
     /// Bidirectional MCP correlation: established revision, 2025
@@ -213,6 +298,7 @@ impl<W> Clone for ProxyShared<W> {
             fail_on: self.fail_on,
             max_frame_bytes: self.max_frame_bytes,
             audit: self.audit.clone(),
+            tally: self.tally.clone(),
             session: self.session.clone(),
             wire: self.wire.clone(),
             pending_tools_list: self.pending_tools_list.clone(),
@@ -257,6 +343,30 @@ mod tests {
         assert!(!pending.try_insert(RpcId::Null));
         assert!(!pending.remove(&RpcId::Null));
         assert!(pending.try_insert(RpcId::Number("1".into())));
+    }
+
+    #[test]
+    fn test_call_tally_bounds_retained_bytes() {
+        // A name at the byte budget fits; the next new name — however
+        // small — cannot, and the tally reports itself truncated.
+        let mut tally = CallTally::default();
+        let huge = "t".repeat(MAX_TALLY_TOOL_BYTES);
+        tally.record_call(&huge);
+        assert_eq!(tally.called_tools.len(), 1);
+        tally.record_call("small");
+        assert!(tally.called_tools_truncated);
+        assert!(!tally.called_tools.contains("small"));
+        // A repeat of a retained name still deduplicates, not truncates.
+        tally.record_call(&huge);
+        assert_eq!(tally.called_tools.len(), 1);
+
+        let mut tally = CallTally::default();
+        let reason = "r".repeat(MAX_TALLY_DENIAL_BYTES - 1);
+        tally.record_denial("t", &reason);
+        assert_eq!(tally.denied.len(), 1);
+        tally.record_denial("t2", "r2");
+        assert!(tally.denied_truncated);
+        assert!(!tally.denied.iter().any(|(tool, _)| tool == "t2"));
     }
 
     #[test]

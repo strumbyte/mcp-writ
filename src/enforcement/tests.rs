@@ -25,6 +25,7 @@ fn sample_report() -> LaunchReport {
             hash: "sha256:abc".to_string(),
         }),
         dry_run: false,
+        allow_replaceable_paths: false,
         plan: EnforcementPlan {
             controls: vec![
                 PlannedControl {
@@ -145,6 +146,7 @@ fn sample_report() -> LaunchReport {
             unit_id: Some("9f1c3ab2".to_string()),
             detail: None,
         }),
+        correction_candidates: None,
     }
 }
 
@@ -502,6 +504,57 @@ fn code_identity_absent_serializes_null() {
     assert!(
         member(root, "code_identity").kind().is_null(),
         "unassessed identity must serialize null"
+    );
+}
+
+#[test]
+fn correction_candidates_serialize_null_and_populated() {
+    // `sample_report` carries no candidates — the member is JSON null.
+    let json = sample_report().to_json();
+    assert!(json.contains(r#""correction_candidates":null"#));
+    let parsed = nojson::RawJson::parse(&json).expect("valid json");
+    assert!(
+        member(parsed.value(), "correction_candidates")
+            .kind()
+            .is_null()
+    );
+
+    // A populated value serializes the unused list, each denied
+    // target's tool and reason, and the basis.
+    let mut report = sample_report();
+    report.correction_candidates = Some(CorrectionCandidates {
+        unused_tools: vec!["delete_all".to_string(), "write_files".to_string()],
+        denied_targets: vec![DeniedTarget {
+            tool: "read_files".to_string(),
+            reason: "path '/etc/shadow' is outside the allowed roots".to_string(),
+        }],
+        basis: "computed from this session's tools/call traffic (dry-run mode)".to_string(),
+    });
+    let json = report.to_json();
+    let parsed = nojson::RawJson::parse(&json).expect("valid json");
+    let candidates = member(parsed.value(), "correction_candidates");
+    let unused: Vec<_> = member(candidates, "unused_tools")
+        .to_array()
+        .unwrap()
+        .map(|t| t.as_string_str().unwrap().to_string())
+        .collect();
+    assert_eq!(unused, ["delete_all", "write_files"]);
+    let denied: Vec<_> = member(candidates, "denied_targets")
+        .to_array()
+        .unwrap()
+        .collect();
+    assert_eq!(denied.len(), 1);
+    assert_eq!(
+        member(denied[0], "tool").as_string_str().unwrap(),
+        "read_files"
+    );
+    assert_eq!(
+        member(denied[0], "reason").as_string_str().unwrap(),
+        "path '/etc/shadow' is outside the allowed roots"
+    );
+    assert_eq!(
+        member(candidates, "basis").as_string_str().unwrap(),
+        "computed from this session's tools/call traffic (dry-run mode)"
     );
 }
 
@@ -969,4 +1022,15 @@ fn summary_to_json_shape() {
         "psec must serialize null"
     );
     assert_eq!(member(root, "dry_run").as_raw_str(), "false");
+}
+
+#[test]
+fn allow_replaceable_paths_serializes_false_and_true() {
+    let json = sample_report().to_json();
+    assert!(json.contains(r#""allow_replaceable_paths":false"#));
+
+    let mut report = sample_report();
+    report.allow_replaceable_paths = true;
+    let json = report.to_json();
+    assert!(json.contains(r#""allow_replaceable_paths":true"#));
 }

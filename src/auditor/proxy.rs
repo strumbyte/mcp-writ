@@ -23,12 +23,14 @@ use crate::verifier::fail_on::FailOn;
 ///   list_changed revalidation requests are consumed, never echoed).
 ///
 /// All tools/call requests are recorded in the audit log.
+#[expect(clippy::too_many_arguments)]
 pub async fn run_proxy<W, R>(
     policy: &Policy,
     dry_run: bool,
     fail_on: FailOn,
     max_frame_bytes: usize,
     audit_logger: Arc<AuditLogger>,
+    tally: super::proxy_state::SharedCallTally,
     child_stdin: W,
     child_stdout: R,
 ) -> Result<(), AuditorError>
@@ -45,6 +47,7 @@ where
         fail_on,
         max_frame_bytes,
         audit: audit_logger,
+        tally,
         // Process-local session: Confused Deputy and/or trajectory (never requestState).
         session: if policy.confused_deputy_protection || policy.trajectory {
             Some(Arc::new(tokio::sync::Mutex::new(SessionState::new())))

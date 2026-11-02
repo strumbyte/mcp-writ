@@ -649,6 +649,14 @@ pub struct LaunchReport {
     /// and the hash of the effective `to_kdl` form.
     pub policy: Option<PolicyAuditContext>,
     pub dry_run: bool,
+    /// Whether the operator opt-out that tolerates replaceable
+    /// (shared-writable) ancestors for policy/audit paths
+    /// (`MCP_WRIT_ALLOW_REPLACEABLE_PATHS`) was in force for this
+    /// launch. The same fact rides the audit spawn record as a
+    /// token; the report carries it so the weakening is visible
+    /// without opening the audit log. Only the native launch path
+    /// can set this — other constructors report `false`.
+    pub allow_replaceable_paths: bool,
     pub plan: EnforcementPlan,
     pub observations: Vec<EnforcementObservation>,
     /// Final result of the launch; `None` only while the outcome has not
@@ -671,4 +679,33 @@ pub struct LaunchReport {
     /// isolation backend: the configured vs. confirmed boundary and the
     /// unit identifier. `None` on native and guest-side reports.
     pub isolation: Option<IsolationRecord>,
+    /// Session-end correction candidates (native launch path only;
+    /// `None` where no Auditor tally exists).
+    pub correction_candidates: Option<CorrectionCandidates>,
+}
+
+/// One widening candidate: a tools/call the session's gates denied
+/// for a target reason (the detailed reason names the resolved
+/// target). Tool-level authorization refusals never appear here —
+/// they are not targets a wider grant could answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeniedTarget {
+    pub tool: String,
+    pub reason: String,
+}
+
+/// Correction candidates computed at session end from the Auditor's
+/// call tally, for a human reviewing the policy after a dry run (or
+/// an enforced session). `unused_tools` are declared for the bound
+/// server but were never called during the session — declared is
+/// not the same as needed, but unused is not proof of unneeded
+/// either; they are candidates with grounds, never deletions.
+/// `denied_targets` are what the session actually asked for and was
+/// refused — candidates for widening, never automatic grants.
+/// `basis` states, in words, what the candidates were computed from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectionCandidates {
+    pub unused_tools: Vec<String>,
+    pub denied_targets: Vec<DeniedTarget>,
+    pub basis: String,
 }

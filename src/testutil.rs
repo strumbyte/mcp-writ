@@ -125,3 +125,55 @@ pub(crate) fn restricted_tempdir() -> Option<tempfile::TempDir> {
     }
     None
 }
+
+/// Set `dir`'s DACL from an SDDL string as a protected DACL, so the
+/// fixture's trust state is exactly the spelled one regardless of the
+/// ACEs the parent would otherwise hand down. Applying it propagates
+/// to existing children (their inherited ACEs are stripped), so
+/// fixtures that need a readable child apply the DACL before creating
+/// the child and give the ACEs OI/CI inheritance.
+#[cfg(windows)]
+pub(crate) fn set_dacl_from_sddl(dir: &std::path::Path, sddl: &str) {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    };
+    use windows::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    use windows::core::HSTRING;
+
+    let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(&HSTRING::from(sddl), 1, &mut sd, None)
+    }
+    .unwrap_or_else(|e| panic!("SDDL '{sddl}' must parse: {e}"));
+    let mut present = windows::core::BOOL(0);
+    let mut defaulted = windows::core::BOOL(0);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) }
+        .unwrap_or_else(|e| panic!("GetSecurityDescriptorDacl: {e}"));
+    assert!(present.as_bool(), "fixture SDDL must carry a DACL");
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            &HSTRING::from(dir.to_string_lossy().as_ref()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+    result
+        .ok()
+        .unwrap_or_else(|e| panic!("SetNamedSecurityInfoW for '{}': {e}", dir.display()));
+}

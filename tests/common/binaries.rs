@@ -24,32 +24,50 @@ pub fn mcp_writ_bin() -> PathBuf {
 /// Argv for a Python interpreter plus a fixture script under `tests/`.
 pub fn python3_script_argv(relative_script: &str) -> Vec<String> {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative_script);
-    if cfg!(windows) {
-        vec![
-            "py".to_string(),
-            "-3".to_string(),
-            script.to_string_lossy().into_owned(),
-        ]
-    } else {
-        vec!["python3".to_string(), script.to_string_lossy().into_owned()]
-    }
+    // Compile-time selection: `windows_python_argv0` exists only on
+    // Windows, so a runtime `cfg!` branch would not compile elsewhere.
+    #[cfg(windows)]
+    let mut argv = windows_python_argv0();
+    #[cfg(not(windows))]
+    let mut argv = vec!["python3".to_string()];
+    argv.push(script.to_string_lossy().into_owned());
+    argv
+}
+
+/// Windows fixture interpreter prefix. `py -3` resolves the user's
+/// install through the per-user registry hive, which an AppContainer
+/// token cannot see — so fixtures that may spawn inside the OS
+/// sandbox carry the resolved `python.exe` path instead. Falls back
+/// to `py -3` when the launcher cannot report an executable (hosts
+/// without the sandbox see no difference).
+#[cfg(windows)]
+fn windows_python_argv0() -> Vec<String> {
+    static RESOLVED: OnceLock<Vec<String>> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let exe = Command::new("py")
+                .args(["-3", "-c", "import sys;print(sys.executable)"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && PathBuf::from(s).is_file());
+            match exe {
+                Some(exe) => vec![exe],
+                None => vec!["py".to_string(), "-3".to_string()],
+            }
+        })
+        .clone()
 }
 
 /// Argv for a stdin→stdout echo process (mock MCP server).
 ///
 /// Linux CI has `cat`. Windows developer machines often do not put Git's
-/// `cat.exe` on PATH, so tests use the Python launcher instead.
+/// `cat.exe` on PATH, so tests use the Python fixture interpreter.
 pub fn echo_stdio_argv() -> Vec<String> {
     if cfg!(windows) {
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join("echo_stdio.py");
-        vec![
-            "py".to_string(),
-            "-3".to_string(),
-            script.to_string_lossy().into_owned(),
-        ]
+        python3_script_argv("tests/fixtures/echo_stdio.py")
     } else {
         vec!["cat".to_string()]
     }

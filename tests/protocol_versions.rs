@@ -2,25 +2,29 @@
 //!
 //! Fixtures live in `tests/fixtures/mcp_servers/`. No network, no rmcp.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use mcp_writ::legislator::tools_list::{ToolsListError, fetch_tools_list_detailed};
+#[cfg(unix)]
+use std::path::PathBuf;
+
+mod common;
+
+use mcp_writ::legislator::tools_list::{ToolsListError, ToolsListFetch};
 use mcp_writ::protocol::SupportedProtocolVersion;
 
 fn fixture_server(name: &str) -> Vec<String> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/mcp_servers")
-        .join(name);
-    if cfg!(windows) {
-        vec![
-            "py".to_string(),
-            "-3".to_string(),
-            path.to_string_lossy().into_owned(),
-        ]
-    } else {
-        vec!["python3".to_string(), path.to_string_lossy().into_owned()]
-    }
+    common::python3_script_argv(&format!("tests/fixtures/mcp_servers/{name}"))
+}
+
+/// Sandboxed discovery mutates the fixture dirs' DACLs; parallel
+/// fetches race grant/restore read-modify-write and can drop a sibling
+/// session's ACE mid-run, so these fetches serialize.
+async fn fetch_tools_list_detailed(
+    command: &[String],
+    timeout: Option<Duration>,
+) -> Result<ToolsListFetch, ToolsListError> {
+    let _g = common::sandbox_spawn_lock().lock().await;
+    mcp_writ::legislator::tools_list::fetch_tools_list_detailed(command, timeout).await
 }
 
 fn fetch_timeout() -> Option<Duration> {
@@ -129,9 +133,33 @@ async fn sibling_probe_must_not_kill_real_child() {
         script.to_string_lossy().into_owned(),
     ];
 
-    let fetched = fetch_tools_list_detailed(&command, fetch_timeout())
-        .await
-        .expect("real child must survive after sibling probe dies");
+    // The marker lives in the shared temp dir — outside the child's
+    // writable surface under discovery sandboxing (its own tree plus
+    // the private TMPDIR), so a sandboxed fixture could never append
+    // to it. This lifecycle check therefore runs the documented
+    // `MCP_WRIT_SKIP_SANDBOX` downgrade rather than widening the
+    // discovery policy. The env toggle is process-global, so it is
+    // held across the fetch inside the same lock sibling fetches
+    // take: no concurrent fetch in this binary can observe it.
+    let fetched = {
+        let _g = common::sandbox_spawn_lock().lock().await;
+        let prior = std::env::var_os("MCP_WRIT_SKIP_SANDBOX");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { std::env::set_var("MCP_WRIT_SKIP_SANDBOX", "1") };
+        let result =
+            mcp_writ::legislator::tools_list::fetch_tools_list_detailed(&command, fetch_timeout())
+                .await;
+        // Restore the exact prior value — set back when it was
+        // present, removed only when it was originally absent.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("MCP_WRIT_SKIP_SANDBOX", v),
+                None => std::env::remove_var("MCP_WRIT_SKIP_SANDBOX"),
+            }
+        };
+        result.expect("real child must survive after sibling probe dies")
+    };
 
     assert_eq!(
         fetched.protocol_version,

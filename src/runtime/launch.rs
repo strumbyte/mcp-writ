@@ -118,6 +118,12 @@ pub struct Launched {
     /// its inherited descriptor names the snapshot, not a path.
     #[cfg(all(unix, not(target_os = "linux")))]
     pub _exec_staging: Option<crate::verifier::hash::FdExecPlan>,
+    /// The Auditor's session call tally — read back at session end
+    /// to compute the report's correction candidates.
+    pub call_tally: crate::auditor::proxy_state::SharedCallTally,
+    /// Tool names the bound policy declares (`allowed`), in policy
+    /// order — the population the candidates' unused set is drawn from.
+    pub declared_tools: Vec<String>,
 }
 
 /// Failure at one step of [`launch`]. Callers render the message with their
@@ -370,12 +376,20 @@ pub async fn launch(
     // dead the same way. Refuse both pre-spawn — the same predicates
     // the selection reports — rather than run a workload whose
     // declared grant never applies.
+    //
+    // The same check runs for the mandatory Landlock controls the
+    // kernel ABI cannot apply at all — a declared fs grant or TCP
+    // allow on an ABI 0 kernel, or a TCP allow under ABI v1-v3,
+    // launches with that control silently absent. `allow_degraded`
+    // tolerates a weaker ruleset here exactly as in the selection —
+    // never a mandatory control that drops entirely.
     #[cfg(target_os = "linux")]
     if linux_mechanism.is_none() && sandbox_skip_reason.is_none() {
         let mut dead = crate::warden::select::dead_udp_allows_without_selection(&policy);
         dead.extend(crate::warden::select::dead_fs_grants_without_selection(
             &policy,
         ));
+        dead.extend(crate::warden::select::dropped_landlock_controls_without_selection(&policy));
         if !dead.is_empty() {
             let reason = dead.join("; ");
             let detail = format!("linux egress policy refused: {reason}");
@@ -794,10 +808,19 @@ pub async fn launch(
         }
     };
 
+    // The bound policy's declared tools, for the report's
+    // correction candidates: what this session could have called.
+    let declared_tools: Vec<String> = policy
+        .tools
+        .iter()
+        .filter(|t| t.allowed)
+        .map(|t| t.name.clone())
+        .collect();
     let auditor = Auditor::new(policy, audit_logger.clone())
         .with_dry_run(dry_run)
         .with_fail_on(fail_on)
         .with_max_frame_bytes(max_frame_bytes);
+    let call_tally = auditor.call_tally();
     let auditor_handle = tokio::spawn(async move { auditor.run(child_stdin, child_stdout).await });
 
     // Observations only the launch path can take: the pre-spawn identity
@@ -831,6 +854,7 @@ pub async fn launch(
         target,
         policy: policy_context.clone(),
         dry_run,
+        allow_replaceable_paths: crate::fspriv::replaceable_paths_permitted(),
         plan,
         observations,
         // The session is now running; the caller rewrites this with the
@@ -847,6 +871,7 @@ pub async fn launch(
         guest: None,
         // A native launch involves no isolation backend.
         isolation: None,
+        correction_candidates: None,
     };
     tracing::debug!("launch report: {}", report.to_json());
 
@@ -919,6 +944,12 @@ pub async fn launch(
             ));
         }
     }
+    // The replaceable-paths opt-out waives a fail-closed ancestry
+    // check, so an activation rides the spawn record like the other
+    // launch waivers — its absence means the check stood.
+    if crate::fspriv::replaceable_paths_permitted() {
+        details.push_str(" allow_replaceable_paths=true");
+    }
     // The exec method a hash pin produced is part of the launch's
     // security surface: the exe image is snapshot-exec'd (`fd` on
     // Linux, `staged` on other Unix) or path-launched under the
@@ -962,6 +993,8 @@ pub async fn launch(
         _spawn_pin: spawn_pin,
         #[cfg(all(unix, not(target_os = "linux")))]
         _exec_staging: fd_exec_plan,
+        call_tally,
+        declared_tools,
     })
 }
 
@@ -1072,6 +1105,7 @@ fn failure_report(
         target,
         policy: policy_context.clone(),
         dry_run,
+        allow_replaceable_paths: crate::fspriv::replaceable_paths_permitted(),
         plan,
         observations,
         result: Some(LaunchOutcome {
@@ -1083,6 +1117,7 @@ fn failure_report(
         guest_runner: None,
         guest: None,
         isolation: None,
+        correction_candidates: None,
     })
 }
 

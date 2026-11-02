@@ -987,3 +987,82 @@ fn unmediatable_fs_violations_flags_pseudo_fs_grants() {
     p.tools = vec![tool];
     assert!(unmediatable_fs_violations(&p, 6).is_empty());
 }
+
+// --- shared Landlock ABI mandatory-control gate -----------------------
+//
+// `landlock_abi_violations` is the pure half of both the native
+// selection's ABI check and the legacy `linux_mechanism: None`
+// preflight: `allow_degraded` tolerates a weaker ruleset, never a
+// declared fs grant or TCP allow the kernel cannot apply at all.
+
+fn fs_grant_policy() -> Policy {
+    let mut p = Policy::default();
+    p.fs.read_only.push("/usr/**".to_string());
+    p
+}
+
+#[test]
+fn abi_zero_drops_declared_fs_even_when_degraded() {
+    let mut p = fs_grant_policy();
+    p.sandbox.allow_degraded = true;
+    let v = landlock_abi_violations(&p, 0);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains("mandatory controls"), "got: {}", v[0]);
+}
+
+#[test]
+fn abi_zero_drops_declared_tcp_even_when_degraded() {
+    let mut p = bare_port_policy();
+    p.sandbox.allow_degraded = true;
+    let v = landlock_abi_violations(&p, 0);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains("mandatory controls"), "got: {}", v[0]);
+}
+
+#[test]
+fn abi_zero_without_degraded_refuses_regardless() {
+    // Even a pure deny-all policy refuses without the flag — the
+    // ruleset is simply absent.
+    let v = landlock_abi_violations(&deny_all_policy(), 0);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains("no Landlock support"), "got: {}", v[0]);
+}
+
+#[test]
+fn abi_zero_tolerates_empty_surface_under_degraded() {
+    // Nothing declared → nothing dropped; degradation is tolerated.
+    let mut p = deny_all_policy();
+    p.sandbox.allow_degraded = true;
+    assert!(landlock_abi_violations(&p, 0).is_empty());
+}
+
+#[test]
+fn abi_v1_to_v3_drops_tcp_under_degraded() {
+    for abi in 1..=3 {
+        let mut p = bare_port_policy();
+        p.sandbox.allow_degraded = true;
+        let v = landlock_abi_violations(&p, abi);
+        assert_eq!(v.len(), 1, "abi {abi}: {v:?}");
+        assert!(v[0].contains("predates network rules"), "got: {}", v[0]);
+    }
+}
+
+#[test]
+fn abi_v1_to_v3_keeps_fs_under_degraded() {
+    // fs rights exist since ABI v1 — a declared fs grant alone is
+    // still enforceable, so degradation has nothing to complain about.
+    for abi in 1..=3 {
+        let mut p = fs_grant_policy();
+        p.sandbox.allow_degraded = true;
+        assert!(landlock_abi_violations(&p, abi).is_empty(), "abi {abi}");
+    }
+}
+
+#[test]
+fn abi_v4_plus_declares_nothing_dropped() {
+    let mut p = bare_port_policy();
+    p.fs.read_only.push("/usr/**".to_string());
+    p.sandbox.allow_degraded = true;
+    assert!(landlock_abi_violations(&p, 4).is_empty());
+    assert!(landlock_abi_violations(&p, 7).is_empty());
+}

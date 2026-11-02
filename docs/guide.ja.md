@@ -1336,6 +1336,12 @@ allow glob は予約済み秘密パス（`/etc/passwd`、`/etc/shadow`、`/etc/s
 
 **引数の抽出は未認識フィールドでも fail-closed。** `params.arguments` と `params.inputResponses` の全文字列を、既知キーだけでなく分類する: パスフィールド（`path`・`file`・`dir`・`output`・`dest`・`destination`・`source`・`target`・`root`・`cwd`・`*Path`・`*_path`）、ネットワークフィールド（`url`・`host`・`uri`・`endpoint`・`origin`、および別名 `addr`・`address`・`peer`・`proxy`・`upstream`・`server`・`relay`・`socket`・`broker`・`ip`・`domain`・`remote`・`dial`・`connect`・`redirect`・`bind`・`listen` とその複数形 / `*Ip` 系スペル）、任意キーのリソース形の値（パス、`scheme://` URL、IP リテラル、`host:port`、`[v6]:port`）、任意キーの予約秘密リテラル（`.env`・`.ssh`・`.gnupg`・`.aws/credentials`）。ネットワークフィールド上の裸トークンはホストとして検査する — `server="api.example.com"` や `peer="api.example.com:8443"` は `host=` と同じ allow 判定に届く — `side_effect="read_only"` もそれらすべてを見る。上記の語彙に載らない文字列は、ツールが制限付き契約（fs の `allow`/`deny`/`require`、ツール `network` ブロック（`allow none` を含む）、`read_only`、グローバル outbound 規則）を持つとき、その値がリソースを指し得る形（区切り、`~`/`$`/`%`/`@` のシジル、ドットを含む）なら拒否する。裸の単語と宣言済みペイロードフィールド（`content`・`text`・`data`・`note`・`prompt`・`value` など）は従来どおり転送できるため、許可された `path="/ok"` という囮が別キーの未検査 `./secret` を認可することはもうない。識別・資格情報系のキーはペイロードでは**ない** — `id`・`user`・`username`・`token`・`secret`・`password`・`auth` はサーバ側で解決されるセレクタか、契約で宣言されていない資格情報を運ぶため、その値は未認識フィールドと同様に分類を経る。カスタムキーでリソース形文字列を正当に取るツールは、ツール毎の `deputy` `extract` ポインタでバインドするかフィールド名を変更する。
 
+#### 引数の意味内容は射程外
+
+上記のツール単位の検査は、引数の**値**（パスらしい文字列、ネットワークの到達先らしい文字列、ホストやソケットらしい文字列）を分類し、その到達先をツールの規則と照合する。引数の中に運ばれる自由形式の言語の意味内容までは解釈しない。引数がそのような言語の文であるツール（SQL クエリ、シェルのコマンドライン、スクリプト）は、ツールとして判定される — 呼び出し自体の可否と、文字列の中にあるパス形・ホスト形の断片が許可された到達先を指すかどうか — が、文そのものが何をするかは評価しない。クエリツールを許可してもクエリは縛られない: 許可された1文が、インタプリタの許す範囲で読み取り・変更・持ち出しを行え、一部の文はインタプリタ自身のホストへ脱出する — たとえば PostgreSQL の `COPY ... TO PROGRAM` はデータベースサーバの権限でシェルコマンドを実行する。
+
+実行主体がサンドボックスの外にいることもある: Warden が囲うのは MCP サーバのプロセスであり、クエリを実行するのはデータベースサーバのプロセスで、別ホストかもしれない。言語を運ぶツールの抑制はインタプリタ側の権限に属する — 最小権限のロールで接続する（スーパーユーザーを使わない、`COPY TO/FROM PROGRAM` のようなコマンド実行権限を与えない）。MCP 層のポリシーは到達範囲の制御（どのサーバを起動できるか、どのホストへ接続できるか）であって、文の制御ではない、という前提で扱うこと。
+
 #### `trajectory`
 
 オプトイン。デフォルトは **オフ** — ノードを省略するか `trajectory #false`。プロセス局所: 子プロセス 1 つ、[Confused Deputy](#confused_deputy_protection) と同じセッション状態。MRTR の `requestState` には**結びつけない**。`inputSchema` 上の同一ツール fs+net は CC-005（マニフェスト）であり、軌跡規則ではない。

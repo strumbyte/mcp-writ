@@ -65,7 +65,7 @@ pub(super) fn parse_gen_policy_args(
         .is_present();
 
     let unsafe_unsandboxed_discovery = noargs::flag("unsafe-unsandboxed-discovery")
-        .doc("Run tools/list discovery with the ambient environment (implies --live-discovery)")
+        .doc("Run tools/list discovery without the OS sandbox, inheriting the ambient environment (implies --live-discovery)")
         .take(&mut raw)
         .is_present();
 

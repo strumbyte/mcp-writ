@@ -24,6 +24,7 @@ pub struct Auditor {
     /// (`run --max-frame-bytes`; default [`crate::framing::DEFAULT_MAX_FRAME_BYTES`]).
     max_frame_bytes: usize,
     audit_logger: Arc<crate::audit_log::AuditLogger>,
+    tally: crate::auditor::proxy_state::SharedCallTally,
 }
 
 impl Auditor {
@@ -34,6 +35,9 @@ impl Auditor {
             fail_on: FailOn::DEFAULT,
             max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
             audit_logger: Arc::new(audit_logger),
+            tally: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::auditor::proxy_state::CallTally::default(),
+            )),
         }
     }
 
@@ -52,6 +56,13 @@ impl Auditor {
         self
     }
 
+    /// The session call tally the relay records into — the launch
+    /// path reads it back when the session ends to compute the
+    /// report's correction candidates.
+    pub fn call_tally(&self) -> crate::auditor::proxy_state::SharedCallTally {
+        self.tally.clone()
+    }
+
     pub async fn run<W, R>(&self, child_stdin: W, child_stdout: R) -> Result<(), AuditorError>
     where
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -63,6 +74,7 @@ impl Auditor {
             self.fail_on,
             self.max_frame_bytes,
             self.audit_logger.clone(),
+            self.tally.clone(),
             child_stdin,
             child_stdout,
         )

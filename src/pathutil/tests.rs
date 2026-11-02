@@ -652,19 +652,89 @@ fn f67_missing_suffix_under_replaceable_ancestor_is_refused() {
 #[cfg(unix)]
 #[test]
 fn f67_private_ancestors_still_resolve() {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     // Control case: a symlink whose parent is owner-only, plus
     // ordinary private dirs, keep authorizing normally.
     let dir = tempfile::tempdir().unwrap();
     let inside = dir.path().join("real");
     std::fs::create_dir(&inside).unwrap();
+    // The fixture pins its own modes: directory modes otherwise come
+    // from the process umask, and under a group-writable umask (0007)
+    // the ancestors would read as replaceable and the control case
+    // would fail for an environmental reason.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(inside.join("f"), b"x").unwrap();
     symlink(&inside, dir.path().join("alias")).unwrap();
 
     let spelled = dir.path().join("alias/f").to_string_lossy().into_owned();
     let resolved = resolve_for_authorization_with_cwd(&spelled, dir.path()).unwrap();
     assert!(resolved.ends_with("real/f"), "resolved={resolved}");
+}
+
+/// The authorization layer's counterpart of the f67 control and
+/// refusal cases, with DACLs in place of mode bits: an ancestor
+/// granting Everyone replace rights fails closed; the same tree
+/// with an owner/SYSTEM-only ancestor resolves. The ancestry walk
+/// inspects every level up to the volume root, so the fixture needs
+/// a root whose whole chain is write-restricted — a host whose temp
+/// ancestry already grants lower-trust workers `Modify` fails the
+/// resolve-case on the environment, not the fixture.
+#[cfg(windows)]
+#[test]
+fn windows_replaceable_ancestor_fails_closed() {
+    let Some(dir) = crate::testutil::restricted_tempdir() else {
+        crate::testutil::skip_unless_required("no write-restricted root for DACL fixture");
+        return;
+    };
+    let shared = dir.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    // The DACL goes on before the leaf exists, and the fixture ACEs
+    // carry OI/CI inheritance: applying a protected DACL to a
+    // container propagates to existing children by stripping their
+    // inherited ACEs, so a leaf created first would be left with an
+    // empty DACL and fail every read (os error 5) before the
+    // ancestor walk this test exercises is ever reached.
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;OICI;FA;;;WD)");
+    let leaf = shared.join("f.txt");
+    std::fs::write(&leaf, b"x").unwrap();
+    let leaf_str = leaf.to_string_lossy().into_owned();
+    assert!(
+        resolve_for_authorization(&leaf_str).is_err(),
+        "an ancestor granting Everyone replace rights must fail closed"
+    );
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)");
+    let resolved =
+        resolve_for_authorization(&leaf_str).expect("owner/SYSTEM-only ancestors must resolve");
+    assert!(resolved.ends_with("f.txt"), "{resolved}");
+}
+
+/// The f67 missing-suffix case on Windows: authorization runs
+/// before the target exists (a write destination), and a broadly
+/// replaceable ancestor refuses the not-yet-created path the same
+/// way it refuses an existing one. Same write-restricted-root
+/// requirement as the resolve test above.
+#[cfg(windows)]
+#[test]
+fn windows_missing_suffix_under_replaceable_ancestor_is_refused() {
+    let Some(dir) = crate::testutil::restricted_tempdir() else {
+        crate::testutil::skip_unless_required("no write-restricted root for DACL fixture");
+        return;
+    };
+    let shared = dir.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    let missing_str = shared.join("not-there.txt").to_string_lossy().into_owned();
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;;FA;;;WD)");
+    assert!(
+        resolve_for_authorization(&missing_str).is_err(),
+        "a missing suffix under a replaceable ancestor must refuse"
+    );
+    crate::testutil::set_dacl_from_sddl(&shared, "D:P(A;;FA;;;OW)(A;;FA;;;SY)");
+    assert!(
+        resolve_for_authorization(&missing_str).is_ok(),
+        "the same missing suffix under a restricted ancestor must resolve"
+    );
 }
 
 #[test]
