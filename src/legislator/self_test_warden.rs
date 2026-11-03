@@ -93,9 +93,67 @@ pub(crate) async fn collect_warden_evidence(
     #[cfg(target_os = "linux")]
     {
         let notes = warden_probe_policy_notes();
-        let prepared = prepare_warden_probe_policy(draft, tmpdir, command);
-        match tokio::time::timeout(
-            timeout,
+        // One deadline bounds the whole evidence operation — the
+        // carve's filesystem walk is as much a hang surface as the
+        // probe itself, and the walk checks that deadline internally:
+        // timing out the await could never stop a blocking scan
+        // already in flight.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let carve_deadline = std::time::Instant::now() + timeout;
+        // The probe's argument grants (`./**` for a bare argument,
+        // `dir/**` otherwise) are spelled the same as discovery's and
+        // leave reserved names just as reachable — carve them before
+        // the supplied command runs. The walk blocks on real I/O, so
+        // it runs off the async runtime; a failed or timed-out carve
+        // refuses the spawn.
+        let (draft_owned, command_owned, tmpdir_owned) =
+            (draft.clone(), command.to_vec(), tmpdir.to_path_buf());
+        let prepared = match tokio::time::timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                let mut p =
+                    prepare_warden_probe_policy(&draft_owned, &tmpdir_owned, &command_owned);
+                crate::legislator::tools_list::carve_arg_grants(
+                    &mut p,
+                    &command_owned,
+                    Some(carve_deadline),
+                )
+                .map(|()| p)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(Ok(p))) => p,
+            Ok(Ok(Err(e))) => {
+                return (
+                    WardenVerdict::Inconclusive,
+                    format!("cannot carve a secret-free probe grant: {e}"),
+                    SpawnStatus::NotAttempted,
+                    e.to_string(),
+                    notes,
+                );
+            }
+            Ok(Err(e)) => {
+                return (
+                    WardenVerdict::Inconclusive,
+                    format!("grant carving failed: {e}"),
+                    SpawnStatus::NotAttempted,
+                    e.to_string(),
+                    notes,
+                );
+            }
+            Err(_) => {
+                return (
+                    WardenVerdict::Inconclusive,
+                    "timed out carving a secret-free probe grant".to_string(),
+                    SpawnStatus::NotAttempted,
+                    "timed out".to_string(),
+                    notes,
+                );
+            }
+        };
+        match tokio::time::timeout_at(
+            deadline,
             run_warden_os_deny_probe(&prepared, command, tmpdir),
         )
         .await
