@@ -274,7 +274,7 @@ main-plan scope; it does not wait for the VM-extension PRs.
   [Cargo.toml](../Cargo.toml) (`version`, `repository`), and
   [releasing.md](releasing.md) describe. Record the compared values in
   the table below.
-- [ ] Distribution verification (post-publication): after the Release
+- [x] Distribution verification (post-publication): after the Release
   workflow publishes, confirm the actual release — the URL resolves,
   the tag matches the crate version, and all six archives plus
   `checksums-sha256.txt` exist with the documented contents (CLI,
@@ -308,6 +308,7 @@ post-publication verification.
 | 2026-11-04 | v0.5.1 release prep | Planned tag / version | `v<version>` tag triggers Release ([releasing.md](releasing.md) step 3); crate version `0.5.1` | working tree Cargo.toml `version = "0.5.1"` + Cargo.lock `0.5.1` → planned tag `v0.5.1` (uncommitted); [release.yml](../.github/workflows/release.yml) `version-check` job fails the pipeline when tag and manifest disagree | match |
 | 2026-11-04 | v0.5.1 release prep | Asset names | six archives + `checksums-sha256.txt` + `runners-checksums-sha256.txt` ([releasing.md](releasing.md)) | [release.yml](../.github/workflows/release.yml) release step emits `mcp-writ-{darwin,linux,windows}-{amd64,arm64}.{tar.gz,zip}` plus both checksum files | match |
 | 2026-11-04 | v0.5.1 release prep | Archive contents | CLI + matching-arch Linux runner + LICENSE + `policy.example.kdl` + docs; `windows-amd64` additionally `runners/mcp-secure-runner-windows-amd64.exe`, `mcp-secure-runner.exe`, `mcp-writ-wsb-relay.exe` ([releasing.md](releasing.md)) | `package()` in [release.yml](../.github/workflows/release.yml) copies exactly this set (plus README.md/README.ja.md) | match |
+| 2026-11-04 | v0.5.1 post-publication | Published release | six archives + `checksums-sha256.txt` + `runners-checksums-sha256.txt` with documented contents; tag `v0.5.1` matches crate `0.5.1` | [release v0.5.1](https://github.com/strumbyte/mcp-writ/releases/tag/v0.5.1) resolves, `draft: false`, `target_commitish: main`, 8 assets; `checksums-sha256.txt` lists all six archives and hashes verify against downloaded `linux-amd64`/`windows-amd64` archives; `windows-amd64.zip` carries `runners/mcp-secure-runner-windows-amd64.exe` + `mcp-secure-runner.exe` + `mcp-writ-wsb-relay.exe`; extracted `mcp-writ.exe --version` → `mcp-writ 0.5.1` | match |
 
 ### Publication-condition status (2026-10-05)
 
