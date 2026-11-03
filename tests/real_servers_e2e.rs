@@ -2427,8 +2427,28 @@ async fn fetch_stages() {
     let _stage_lock = STAGE_LOCK.lock().await;
     let spec = &FETCH;
     let (_t, root) = temp_root("mcp_writ_rs_fetch_");
-    let scratch = root.join("scratch");
-    std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+    // The destination-bound egress grant below forces the namespaced
+    // route — init covers /tmp with a private tmpfs there, so an fs
+    // allow rooted under /tmp can never resolve and the launch
+    // refuses the dead grant. The child's working dir therefore lives
+    // under a base the mount setup leaves reachable ($HOME on hosted
+    // runners; the test root as fallback). Other OSes mask nothing.
+    #[cfg(target_os = "linux")]
+    let scratch = {
+        let base = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| root.clone());
+        let s = base.join(format!("mcp-writ-fetch-scratch-{}", std::process::id()));
+        std::fs::create_dir_all(&s).expect("mkdir scratch under non-masked base");
+        s.canonicalize().unwrap_or(s)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let scratch = {
+        let s = root.join("scratch");
+        std::fs::create_dir_all(&s).expect("mkdir scratch");
+        s
+    };
 
     let argv = match server_argv(spec, &[]) {
         Some(a) => a,
