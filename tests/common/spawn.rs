@@ -199,11 +199,14 @@ pub fn sandbox_waiver_props() -> String {
         if below_v4 || super::binaries::linux_cgroup_v2_unwritable() {
             props.push_str(" require_lifetime_boundary=#false");
         }
-        return props;
+        props
     }
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         " require_lifetime_boundary=#false".to_string()
-    } else {
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
         String::new()
     }
 }
