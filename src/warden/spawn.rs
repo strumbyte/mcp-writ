@@ -1010,6 +1010,9 @@ impl Warden {
                 // terminal.
                 .stderr(std::process::Stdio::piped());
             apply_spawn_env(&mut cmd, opts);
+            if let Some(dir) = &opts.cwd {
+                cmd.current_dir(dir);
+            }
             let env_applied = env_block_applies(opts);
             let launch_tag = apply_unix_process_group_tokio(&mut cmd);
             // fd-exec handoff: the pin's CLOEXEC dups uncloak inside the
@@ -1491,6 +1494,9 @@ impl Warden {
             // stderr crosses to the terminal sanitized.
             .stderr(std::process::Stdio::piped());
         apply_spawn_env(&mut cmd, opts);
+        if let Some(dir) = &opts.cwd {
+            cmd.current_dir(dir);
+        }
         #[cfg(target_os = "macos")]
         if let Some(exe) = python_executable_override(&argv[0], program) {
             cmd.env("PYTHONEXECUTABLE", exe);

@@ -664,6 +664,23 @@ pub(crate) fn interpreter_prefix_dirs(command: &[String]) -> Vec<PathBuf> {
             return;
         }
         push(dirs, prefix);
+        // A venv names its base install in `pyvenv.cfg` — `home =` is
+        // the base's executable dir, and the install prefix sits one
+        // level up of a `bin`/`Scripts` spelling (or *is* `home` on
+        // Windows, where python.exe lives at the install root). A
+        // copied `python.exe` exposes the base nowhere else: without
+        // this the child dies at interpreter init with no stdlib.
+        if let Some(home) = pyvenv_home(prefix) {
+            let home_is_bin = home
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case("bin") || n == "sbin" || n == "Scripts")
+                .unwrap_or(false);
+            match (home_is_bin, home.parent()) {
+                (true, Some(base)) => push(dirs, base),
+                _ => push(dirs, &home),
+            }
+        }
     }
     let mut dirs = Vec::new();
     if let Some(argv0) = command.first() {
@@ -676,6 +693,35 @@ pub(crate) fn interpreter_prefix_dirs(command: &[String]) -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+/// The `home =` entry of a venv's `pyvenv.cfg` — the directory holding
+/// the base install's interpreter. `None` when the file is absent or
+/// carries no usable line.
+fn pyvenv_home(venv_root: &Path) -> Option<PathBuf> {
+    let cfg = std::fs::read_to_string(venv_root.join("pyvenv.cfg")).ok()?;
+    for line in cfg.lines() {
+        if let Some(value) = line.trim().strip_prefix("home") {
+            let value = value.trim_start_matches([' ', '=', '\t']).trim();
+            if !value.is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+    None
+}
+
+/// True when any argument is a relative path that exists — such an
+/// arg resolves against the launcher's cwd, so the discovery child
+/// must inherit it (and gains getcwd through that arg's `./` grant).
+fn needs_inherited_cwd(command: &[String]) -> bool {
+    command.iter().skip(1).any(|arg| {
+        if arg.starts_with('-') {
+            return false;
+        }
+        let path = Path::new(arg);
+        path.is_relative() && path.exists()
+    })
 }
 
 /// The nearest `node_modules` ancestor of each existing path argument.
@@ -784,13 +830,44 @@ pub(crate) fn arg_parent_dirs(command: &[String]) -> Vec<PathBuf> {
     dirs
 }
 
+/// Directories on PATH the child may exec helpers from — server
+/// subprocess machinery resolves `git`, `sh`, and friends by PATH, so
+/// the runtime surface needs them readable (and, under sandbox-exec,
+/// mappable). Entries already beneath the probe's base grants are
+/// skipped; a root covering the probe path keeps the deny evidence
+/// and is skipped too.
+fn path_dir_roots() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let Some(path) = std::env::var_os("PATH") else {
+        return dirs;
+    };
+    for dir in std::env::split_paths(&path) {
+        if !dir.is_dir() || !preserves_probe_deny(&dir) {
+            continue;
+        }
+        let resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if crate::legislator::self_test_warden::PROBE_BASE_DIRS
+            .iter()
+            .any(|root| resolved.starts_with(*root))
+        {
+            continue;
+        }
+        push(&mut dirs, &dir);
+    }
+    dirs
+}
+
 /// The runtime surface a real interpreter needs beyond the command's
-/// own tree: [`interpreter_prefix_dirs`] plus [`node_modules_roots`].
-/// Shared by the probe-policy grant emission and the carve-root
-/// computation so both spell the same set.
+/// own tree: [`interpreter_prefix_dirs`] plus [`node_modules_roots`]
+/// plus the PATH dirs helper subprocesses resolve from. Shared by the
+/// probe-policy grant emission and the carve-root computation so both
+/// spell the same set.
 pub(crate) fn runtime_grant_dirs(command: &[String]) -> Vec<PathBuf> {
     let mut dirs = interpreter_prefix_dirs(command);
     for dir in node_modules_roots(command) {
+        push(&mut dirs, &dir);
+    }
+    for dir in path_dir_roots() {
         push(&mut dirs, &dir);
     }
     dirs
@@ -1287,6 +1364,19 @@ async fn spawn_server_sandboxed(
         restrict_environment: true,
         allowed_names: Vec::new(),
         tmpdir: Some(tmp.clone()),
+        // The deny-by-default filesystem never grants the caller's
+        // workspace, and an ungranted inherited cwd makes getcwd(2)
+        // fail under sandbox-exec — which kills shells and the
+        // subprocess machinery servers like mcp-server-git rely on.
+        // Start the child in its (already write-granted) private
+        // tmpdir instead — unless a relative-path argument would
+        // resolve against the real cwd; that arg's `./` grant covers
+        // getcwd, and a tmp cwd would break its resolution.
+        cwd: if needs_inherited_cwd(command) {
+            None
+        } else {
+            Some(tmp.clone())
+        },
         ..Default::default()
     };
     // A discovery workload is a real spawn: dyld needs the same
@@ -1296,6 +1386,16 @@ async fn spawn_server_sandboxed(
     let opts = {
         let mut o = opts;
         o.exec_map_dirs = crate::warden::macos_sandbox::code_map_dirs(&resolved, command);
+        // Helpers the server may exec mid-discovery — `git` for
+        // mcp-server-git, `sh` for subprocess machinery — sit outside
+        // the command tree, and the profile grants the standard exec
+        // dirs read but not file-map-executable.
+        for d in ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/libexec"] {
+            o.exec_map_dirs.push(PathBuf::from(d));
+        }
+        for d in path_dir_roots() {
+            o.exec_map_dirs.push(d);
+        }
         o
     };
     // The verified image rides `lpApplicationName`; the child's argv[0]
