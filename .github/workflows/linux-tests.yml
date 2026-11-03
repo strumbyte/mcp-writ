@@ -47,6 +47,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # Same host setup ci.yml applies: `sandbox require_lifetime_boundary`
+      # needs a writable cgroup v2 root, which hosted runners withhold —
+      # delegate it so the boundary tests run enforced rather than waived.
+      - name: Delegate cgroup v2 root for supervised-launch tests
+        run: |
+          sudo chmod o+w /sys/fs/cgroup /sys/fs/cgroup/cgroup.procs || true
+          if test -w /sys/fs/cgroup; then
+            echo "cgroup v2 root delegated — lifetime-boundary tests run enforced"
+          else
+            echo "cgroup v2 root unwritable — fixtures will declare the waiver"
+          fi
+
       - name: Formatting
         run: cargo fmt --all -- --check
 

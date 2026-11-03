@@ -180,15 +180,26 @@ pub const FIXTURE_SYSCALLS_KDL: &str = concat!(
 /// `sandbox` properties a supervised launch on *this host* must declare
 /// — the waivers an operator would write. `require_lifetime_boundary`
 /// defaults on: macOS provides no kernel descendant-boundary mechanism
-/// at all, and a pre-ABI-4 Linux kernel cannot fully enforce the
-/// Landlock ruleset that pins a member cgroup, so both need the
-/// explicit `=#false`. The old kernel also needs `allow_degraded` for
-/// its partially enforced ruleset. Capable hosts get an empty string —
-/// no waiver is emitted where the boundary is enforceable.
+/// at all, a pre-ABI-4 Linux kernel cannot fully enforce the Landlock
+/// ruleset that pins a member cgroup, and a Linux host whose cgroup v2
+/// hierarchy the launcher cannot write (GitHub-hosted runners grant no
+/// delegated subtree) arms nothing — all three need the explicit
+/// `=#false`. The old kernel also needs `allow_degraded` for its
+/// partially enforced ruleset; a cgroup-less but fully enforcing host
+/// is not degraded. Capable hosts get an empty string — no waiver is
+/// emitted where the boundary is enforceable.
 pub fn sandbox_waiver_props() -> String {
     #[cfg(target_os = "linux")]
-    if super::binaries::linux_below_landlock_v4() {
-        return " allow_degraded=#true require_lifetime_boundary=#false".to_string();
+    {
+        let below_v4 = super::binaries::linux_below_landlock_v4();
+        let mut props = String::new();
+        if below_v4 {
+            props.push_str(" allow_degraded=#true");
+        }
+        if below_v4 || super::binaries::linux_cgroup_v2_unwritable() {
+            props.push_str(" require_lifetime_boundary=#false");
+        }
+        return props;
     }
     if cfg!(target_os = "macos") {
         " require_lifetime_boundary=#false".to_string()

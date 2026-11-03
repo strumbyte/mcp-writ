@@ -194,6 +194,17 @@ fn warden_probe_policy_notes() -> String {
         .to_string()
 }
 
+/// The system trees the probe policy grants read-only wherever they
+/// exist — an interpreter install prefix beneath one of these needs
+/// no new grant, so discovery must not spend its scan budget carving
+/// it either. `/etc/ssl` carries the OpenSSL configuration: Node
+/// reads `openssl.cnf` during early init and dies inside the sandbox
+/// without it, and the dir cannot cover WARDEN_PROBE_PATH, so the
+/// OS-deny evidence stands.
+pub(crate) const PROBE_BASE_DIRS: &[&str] = &[
+    "/usr", "/lib", "/lib64", "/bin", "/sbin", "/proc", "/dev", "/etc/ssl",
+];
+
 /// Build the diagnostic policy: tool FS empty, secret-overlay off, defaults Landlock only.
 pub fn prepare_warden_probe_policy(draft: &Policy, tmpdir: &Path, command: &[String]) -> Policy {
     let mut policy = draft.clone();
@@ -207,16 +218,20 @@ pub fn prepare_warden_probe_policy(draft: &Policy, tmpdir: &Path, command: &[Str
     // only the control file under `tmpdir`, the command's own directory,
     // and the runtime libraries below — broad workspace authority would
     // grant the diagnostic child rights the draft never asked for.
-    for path in [
-        "/usr/**",
-        "/lib/**",
-        "/lib64/**",
-        "/bin/**",
-        "/sbin/**",
-        "/proc/**",
-        "/dev/**",
-    ] {
-        push_landlock_dir(&mut policy.fs.read_only, path);
+    for dir in PROBE_BASE_DIRS {
+        push_landlock_dir(&mut policy.fs.read_only, &format!("{dir}/**"));
+    }
+    // libuv and CPython open `/dev/null` read-write for stdio
+    // redirection — a read-only `/dev/**` grant cannot satisfy the
+    // write half. A literal file spelling: the backend hands it
+    // file-scoped rights.
+    push_unique(&mut policy.fs.read_write, "/dev/null");
+    // The command's interpreter runtime: install prefixes above the
+    // `bin`/`Scripts` dir (stdlib, site-packages, lib/node_modules)
+    // and `node_modules` roots the entry point resolves dependencies
+    // from — the runtime profiles document these as required grants.
+    for dir in crate::legislator::tools_list::runtime_grant_dirs(command) {
+        push_landlock_dir(&mut policy.fs.read_only, &format!("{}/**", dir.display()));
     }
     push_landlock_dir(
         &mut policy.fs.read_write,
@@ -816,6 +831,17 @@ mod tests {
                     .iter()
                     .any(|p| p == &format!("{directory}/**"))
             );
+            // `/dev/null` is the intended *file* grant — libuv/CPython
+            // open it read-write for stdio, so it stays a literal
+            // spelling the backend hands file-scoped rights. Every
+            // other grant must name a directory: Landlock PathBeneath
+            // rejects file fds whose mask carries directory-only
+            // rights (EINVAL).
+            assert!(
+                prepared.fs.read_write.iter().any(|p| p == "/dev/null"),
+                "/dev/null must stay a literal read-write file grant: {:?}",
+                prepared.fs.read_write
+            );
             for path in prepared
                 .fs
                 .read_only
@@ -823,6 +849,9 @@ mod tests {
                 .chain(prepared.fs.read_write.iter())
             {
                 let base = path.trim_end_matches("/**").trim_end_matches("/*");
+                if base == "/dev/null" {
+                    continue;
+                }
                 assert!(
                     Path::new(base).is_dir(),
                     "Landlock grants must be directories (files EINVAL): {path}"
@@ -844,8 +873,9 @@ mod tests {
     #[test]
     fn warden_probe_policy_grants_no_workspace_authority() {
         // The diagnostic overlay must stay least-privilege: the only
-        // read-write grant is the control tmpdir — never the caller's
-        // workspace, which the draft policy did not ask for.
+        // read-write grants are the control tmpdir and `/dev/null`
+        // (libuv/CPython open it read-write for stdio) — never the
+        // caller's workspace, which the draft policy did not ask for.
         let tmpdir = tempfile::tempdir().unwrap();
         let kdl = r##"
             policy version=1
@@ -859,7 +889,7 @@ mod tests {
         let tmpdir_prefix = format!("{}", tmpdir.path().display());
         for spec in &prepared.fs.read_write {
             assert!(
-                spec.starts_with(&tmpdir_prefix),
+                spec.starts_with(&tmpdir_prefix) || spec == "/dev/null",
                 "read_write grant outside the control tmpdir: {spec}"
             );
         }

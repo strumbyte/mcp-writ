@@ -194,14 +194,66 @@ async fn copy_test_policy(
         },
         None => container_kernel_below_landlock_v4(engine).await,
     };
+    // `require_lifetime_boundary` also needs a writable cgroup v2
+    // hierarchy — an unprivileged container sees the delegated slice
+    // read-only (or a private cgroupns root whose cgroup.procs the
+    // guest root cannot write). Probe the real environment rather than
+    // infer it from the image. Undetermined reads as "cannot arm" —
+    // the waiver an operator must declare, never a silent skip.
+    let boundary_ok = match probe {
+        Some((image, _)) => guest_lifetime_boundary_usable(engine, image)
+            .await
+            .unwrap_or(false),
+        None => false,
+    };
+    let mut props = String::new();
     if degraded {
-        // A guest kernel that only partially enforces the ruleset also
-        // cannot meet `require_lifetime_boundary` — the fs rule pinning
-        // a member cgroup needs full enforcement — so the degraded case
-        // declares both waivers.
-        text.push_str("sandbox allow_degraded=#true require_lifetime_boundary=#false\n");
+        props.push_str(" allow_degraded=#true");
+    }
+    // A degraded kernel cannot meet the boundary either (the fs rule
+    // pinning a member cgroup needs full enforcement), so both waivers
+    // ride together there.
+    if degraded || !boundary_ok {
+        props.push_str(" require_lifetime_boundary=#false");
+    }
+    if !props.is_empty() {
+        text.push_str(&format!("sandbox{props}\n"));
     }
     std::fs::write(dst, text).map_err(|e| format!("failed to write test policy: {e}"))
+}
+
+/// Whether a container of `image` can arm the kernel-enforced
+/// descendant-lifetime boundary: create a private cgroup under the v2
+/// root and migrate a member into it. The probe runs `/bin/sh` — which
+/// the fixture base image ships — under the same default run flags the
+/// test containers use, so its answer tracks the real guest: an
+/// unprivileged container's read-only cgroupfs answers false.
+/// `None` means undetermined (CLI failure, timeout, non-zero exit).
+async fn guest_lifetime_boundary_usable(engine: &str, image: &str) -> Option<bool> {
+    let out = timeout(
+        Duration::from_secs(TIMEOUT_SECS),
+        Command::new(engine)
+            .args([
+                "run",
+                "--rm",
+                "--entrypoint",
+                "/bin/sh",
+                image,
+                "-c",
+                "d=/sys/fs/cgroup/mcp-writ-probe-$$; \
+                 test -f /sys/fs/cgroup/cgroup.controllers && mkdir \"$d\" || exit 1; \
+                 sleep 30 & p=$!; \
+                 echo $p > \"$d/cgroup.procs\"; rc=$?; \
+                 kill $p 2>/dev/null; wait 2>/dev/null; \
+                 rmdir \"$d\" 2>/dev/null; exit $rc",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(out.status.success())
 }
 
 /// Measure the guest kernel's Landlock ABI: run the runner binary's

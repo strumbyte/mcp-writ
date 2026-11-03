@@ -286,6 +286,13 @@ func parallelEcho(ctx context.Context, s *mcp.ClientSession) error {
 // An incompatibility must stay observable, not be hidden by a sandbox bypass.
 func fixturePolicy(binaryDir string) string {
 	path, _ := json.Marshal(filepath.ToSlash(binaryDir))
+	// Hosts that cannot arm the kernel-enforced lifetime boundary (an
+	// unwritable cgroup v2 hierarchy on Linux; macOS) take the same
+	// waiver the Rust fixtures emit — recorded, never silent.
+	sandbox := ""
+	if !lifetimeBoundarySatisfiable() {
+		sandbox = "sandbox require_lifetime_boundary=#false\n"
+	}
 	return fmt.Sprintf(`policy version=1
 defaults {
     filesystem {
@@ -306,7 +313,7 @@ defaults {
         allow "execve" "exit" "exit_group"
     }
 }
-profile "pathless" {
+%sprofile "pathless" {
     filesystem {
         allow none=#true
         require-path #false
@@ -318,5 +325,5 @@ server "go-runtime-fixture" {
     tool "runtime_stress" profile="pathless" side_effect="read_only"
     tool "blocked_echo" deny=#true
 }
-`, path)
+`, path, sandbox)
 }

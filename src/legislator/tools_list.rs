@@ -451,8 +451,10 @@ impl StdioSession {
 /// descendant process tree. `Plain` is the explicit
 /// `--unsafe-unsandboxed-discovery` downgrade.
 enum DiscoveryChild {
-    Sandboxed(crate::warden::RunningChild),
-    Plain(tokio::process::Child),
+    Sandboxed(Box<crate::warden::RunningChild>),
+    // tokio's Child is the wide variant on Windows — box both so the
+    // enum stays small on every platform (large_enum_variant).
+    Plain(Box<tokio::process::Child>),
 }
 
 impl DiscoveryChild {
@@ -501,13 +503,14 @@ async fn spawn_server(
     if opts.restrict_environment {
         if env_skip_sandbox() {
             return spawn_server_plain_restricted(command, inherit_stderr)
-                .map(|(c, t)| (DiscoveryChild::Plain(c), t));
+                .map(|(c, t)| (DiscoveryChild::Plain(Box::new(c)), t));
         }
         return spawn_server_sandboxed(command)
             .await
-            .map(|(c, t)| (DiscoveryChild::Sandboxed(c), Some(t)));
+            .map(|(c, t)| (DiscoveryChild::Sandboxed(Box::new(c)), Some(t)));
     }
-    spawn_server_plain_ambient(command, inherit_stderr).map(|(c, t)| (DiscoveryChild::Plain(c), t))
+    spawn_server_plain_ambient(command, inherit_stderr)
+        .map(|(c, t)| (DiscoveryChild::Plain(Box::new(c)), t))
 }
 
 /// True when `MCP_WRIT_SKIP_SANDBOX` is set truthy — the same rule
@@ -596,9 +599,10 @@ fn plain_spelling(path: &Path) -> PathBuf {
 
 /// The directories the probe walk grants for a discovery command — the
 /// executable's parent plus the parent of every path-valued argument
-/// (the workload's own tree). Canonicalized so the probe's `dir/**`
-/// spellings and literal parents compare equal through links, then
-/// stripped of verbatim prefixes so carved children stay in the
+/// (the workload's own tree), and any interpreter install prefix the
+/// base grants do not already cover. Canonicalized so the probe's
+/// `dir/**` spellings and literal parents compare equal through links,
+/// then stripped of verbatim prefixes so carved children stay in the
 /// spelled form the backends compare.
 fn command_parent_dirs(command: &[String]) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -611,6 +615,98 @@ fn command_parent_dirs(command: &[String]) -> Vec<PathBuf> {
     for parent in arg_parent_dirs(command) {
         push(&mut dirs, &parent);
     }
+    for dir in interpreter_prefix_dirs(command) {
+        push(&mut dirs, &dir);
+    }
+    dirs
+}
+
+/// The interpreter install prefixes the discovery sandbox must reach:
+/// a `bin`-adjacent executable's stdlib, `site-packages`, or
+/// `lib/node_modules` lives in the *sibling* `lib/` tree, which a bare
+/// executable-parent grant misses. Both spellings of argv0 contribute —
+/// a venv `python` resolves into its base install while the payload
+/// packages stay under the spelled venv tree — and a Windows `Scripts`
+/// dir is the venv analogue of `bin`. A `bin` already beneath the
+/// probe's base grants (`/usr/bin` → `/usr`) yields no prefix: the
+/// fixed dirs cover that install tree and carving it would scan the
+/// whole root.
+pub(crate) fn interpreter_prefix_dirs(command: &[String]) -> Vec<PathBuf> {
+    fn push_prefix(dirs: &mut Vec<PathBuf>, exe: &Path) {
+        let Some(parent) = exe.parent() else {
+            return;
+        };
+        let is_prefix_layout = parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.eq_ignore_ascii_case("bin") || n == "sbin" || n == "Scripts")
+            .unwrap_or(false);
+        let Some(prefix) = parent.parent().filter(|_| is_prefix_layout) else {
+            return;
+        };
+        // A `bin` already inside the probe's base grants — `/usr/bin`'s
+        // prefix is `/usr` itself — needs no new grant: the fixed dirs
+        // cover the whole install tree, and a carve root there would
+        // scan it all. Compare the canonical parent so a
+        // `/bin -> /usr/bin` link still reads as covered.
+        let resolved = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        if crate::legislator::self_test_warden::PROBE_BASE_DIRS
+            .iter()
+            .any(|root| resolved.starts_with(*root))
+        {
+            return;
+        }
+        // An empty or root prefix names no install tree — a `/`
+        // carve root would scan the entire filesystem.
+        if prefix.as_os_str().is_empty() || prefix.parent().is_none() {
+            return;
+        }
+        push(dirs, prefix);
+    }
+    let mut dirs = Vec::new();
+    if let Some(argv0) = command.first() {
+        if let Ok(resolved) = crate::workload::resolve_command_path(argv0) {
+            push_prefix(&mut dirs, &resolved);
+        }
+        let spelled = Path::new(argv0);
+        if spelled.exists() {
+            push_prefix(&mut dirs, spelled);
+        }
+    }
+    dirs
+}
+
+/// The nearest `node_modules` ancestor of each existing path argument.
+/// A server entry point under `node_modules/<pkg>/dist/` resolves its
+/// dependencies by walking *up* to the shared `node_modules` root —
+/// granting only the entry's own package directory leaves its sibling
+/// packages (the SDK, transport libs) unreadable inside the sandbox.
+fn node_modules_roots(command: &[String]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for arg in command.iter().skip(1) {
+        if arg.starts_with('-') {
+            continue;
+        }
+        let path = Path::new(arg);
+        if !path.exists() {
+            continue;
+        }
+        for ancestor in path.ancestors() {
+            if ancestor
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n == "node_modules")
+                .unwrap_or(false)
+            {
+                if preserves_probe_deny(ancestor) {
+                    push(&mut dirs, ancestor);
+                }
+                break;
+            }
+        }
+    }
     dirs
 }
 
@@ -621,6 +717,20 @@ fn push(list: &mut Vec<PathBuf>, dir: &Path) {
     if !list.contains(&dir) {
         list.push(dir);
     }
+}
+
+/// True when a candidate root keeps the probe's deny evidence: a
+/// resolved root covering the resolved WARDEN_PROBE_PATH would let the
+/// child serve the probe path, so it is rejected from the lists that
+/// feed both the policy grants and the discovery carve. Each side
+/// falls back to its spelled form when it cannot be resolved — the
+/// probe path is a Linux absolute path, so non-Linux hosts compare it
+/// as spelled (which never matches their roots).
+fn preserves_probe_deny(dir: &Path) -> bool {
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let probe = Path::new(crate::legislator::self_test::WARDEN_PROBE_PATH);
+    let probe = probe.canonicalize().unwrap_or_else(|_| probe.to_path_buf());
+    !probe.starts_with(&canonical)
 }
 
 /// The argument-parent carve roots alone — the self-test keeps its
@@ -660,14 +770,28 @@ pub(crate) fn arg_parent_dirs(command: &[String]) -> Vec<PathBuf> {
                 }
             })
         };
-        if let Some(parent) = parent {
-            // Keep parity with the probe walk: a grant covering
-            // WARDEN_PROBE_PATH would erase OS-deny evidence.
-            let canonical = parent.canonicalize().unwrap_or_else(|_| parent.clone());
-            if !Path::new(crate::legislator::self_test::WARDEN_PROBE_PATH).starts_with(&canonical) {
-                push(&mut dirs, &parent);
-            }
+        // Keep parity with the probe walk: a grant covering
+        // WARDEN_PROBE_PATH would erase OS-deny evidence.
+        if let Some(parent) = parent
+            && preserves_probe_deny(&parent)
+        {
+            push(&mut dirs, &parent);
         }
+    }
+    for dir in node_modules_roots(command) {
+        push(&mut dirs, &dir);
+    }
+    dirs
+}
+
+/// The runtime surface a real interpreter needs beyond the command's
+/// own tree: [`interpreter_prefix_dirs`] plus [`node_modules_roots`].
+/// Shared by the probe-policy grant emission and the carve-root
+/// computation so both spell the same set.
+pub(crate) fn runtime_grant_dirs(command: &[String]) -> Vec<PathBuf> {
+    let mut dirs = interpreter_prefix_dirs(command);
+    for dir in node_modules_roots(command) {
+        push(&mut dirs, &dir);
     }
     dirs
 }

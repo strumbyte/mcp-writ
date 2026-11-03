@@ -197,6 +197,63 @@ pub fn linux_below_landlock_v4() -> bool {
     kernel_release_below_landlock_v4(&release)
 }
 
+/// True when this host cannot arm the per-launch descendant-lifetime
+/// boundary — the capability `sandbox require_lifetime_boundary`
+/// demands. The probe performs the same steps a launch does: create a
+/// private cgroup under the v2 root, then migrate a process into it
+/// (which also requires write access on the common ancestor's
+/// `cgroup.procs`). GitHub-hosted runners expose the hierarchy but
+/// withhold both permissions, so every supervised launch would be
+/// refused — the waiver an operator must declare there.
+///
+/// The probe writes a spawned child's pid, never this process's own:
+/// membership moves the whole thread-group, and a test runner parked in
+/// a probe cgroup could not put itself back if its original
+/// `cgroup.procs` proves unwritable. A child that cannot spawn reads as
+/// "unavailable" — the launch would fare no better.
+#[cfg(target_os = "linux")]
+pub fn linux_cgroup_v2_unwritable() -> bool {
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    if !root.join("cgroup.controllers").exists() {
+        return true;
+    }
+    // Concurrent boundary probes in one process share the pid — the
+    // sequence keeps their dir names distinct, and a leftover from a
+    // killed probe retries on a fresh name rather than reading a
+    // `create_dir` collision as "unsupported".
+    static PROBE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let mut created = None;
+    for _ in 0..8 {
+        let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = root.join(format!(
+            "mcp-writ-boundary-probe-{}-{}",
+            std::process::id(),
+            seq
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                created = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return true,
+        }
+    }
+    let Some(dir) = created else { return true };
+    let mut child = match std::process::Command::new("/bin/sleep").arg("30").spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = std::fs::remove_dir(&dir);
+            return true;
+        }
+    };
+    let join_failed = std::fs::write(dir.join("cgroup.procs"), child.id().to_string()).is_err();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir(&dir);
+    join_failed
+}
+
 /// Same predicate as [`linux_below_landlock_v4`] applied to a kernel
 /// release string — the container tests ask the engine for *its* kernel
 /// (a remote or VM-based engine's kernel can differ from the CLI host's),
