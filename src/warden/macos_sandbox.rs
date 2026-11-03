@@ -1126,10 +1126,10 @@ pub(super) fn sbpl_profile_with_egress(
     }
     // getcwd(2) re-opens every `..` component — a directory read, not
     // traversal metadata. The private tmpdir's ancestor chain (the cwd
-    // a deny-by-default child is started in) gets a real read grant so
-    // shells and subprocess machinery can resolve their working
-    // directory; every other granted path's ancestors stay
-    // metadata-only.
+    // a deny-by-default child is started in) additionally gets a real
+    // read grant so shells and subprocess machinery can resolve their
+    // working directory; those dirs keep their traversal metadata
+    // below as well — the emits are additive.
     let readable_ancestors: std::collections::BTreeSet<String> =
         Path::new(&canonical_grant_path(tmpdir))
             .ancestors()
@@ -1138,7 +1138,6 @@ pub(super) fn sbpl_profile_with_egress(
             .filter(|s| s != "/")
             .collect();
     for s in &readable_ancestors {
-        ancestors.remove(s);
         let escaped = escape_sbpl_path(s)?;
         p.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
         fs_grant(

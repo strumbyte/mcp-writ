@@ -853,6 +853,20 @@ fn path_dir_roots() -> Vec<PathBuf> {
             continue;
         }
         push(&mut dirs, &dir);
+        // A `<prefix>/bin` PATH entry belongs to a toolchain prefix —
+        // binaries there link dylibs under the prefix's `lib`/`opt`
+        // siblings (Homebrew `/opt/homebrew`, `/usr/local`), the same
+        // `bin`-parent reasoning `interpreter_prefix_dirs` applies to
+        // argv[0]. The prefix must not cover the probe path either.
+        if matches!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some("bin" | "sbin" | "Scripts")
+        ) && let Some(prefix) = dir.parent()
+            && prefix.parent().is_some()
+            && preserves_probe_deny(prefix)
+        {
+            push(&mut dirs, prefix);
+        }
     }
     dirs
 }
