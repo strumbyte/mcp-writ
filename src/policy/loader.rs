@@ -270,13 +270,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nonexistent.kdl");
 
-        let result = load_policy_or_default(Some(&path));
-        assert!(result.is_err());
-        let err = result.expect_err("loading nonexistent file should fail");
+        let err =
+            load_policy_or_default(Some(&path)).expect_err("loading nonexistent file should fail");
         assert!(matches!(err, crate::error::PolicyError::FileRead(_)));
 
         assert!(
             load_policy_or_default_for_target(Some(&path), &ExecutionTarget::native()).is_err()
+        );
+        assert!(
+            load_policy_or_default_for_target_scanned(Some(&path), "", &ExecutionTarget::native())
+                .is_err()
         );
         assert!(load_policy_or_default_for_resolver(Some(&path)).is_err());
 
@@ -294,9 +297,13 @@ mod tests {
 
         assert!(load_policy_or_default(Some(&path)).is_err());
         assert!(
+            load_policy_or_default_for_target(Some(&path), &ExecutionTarget::native()).is_err()
+        );
+        assert!(
             load_policy_or_default_for_target_scanned(Some(&path), "", &ExecutionTarget::native())
                 .is_err()
         );
+        assert!(load_policy_or_default_for_resolver(Some(&path)).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -311,8 +318,30 @@ mod tests {
         std::fs::write(&path, "policy version=99\n").unwrap();
 
         assert!(load_policy_or_default(Some(&path)).is_err());
+        assert!(
+            load_policy_or_default_for_target(Some(&path), &ExecutionTarget::native()).is_err()
+        );
+        assert!(
+            load_policy_or_default_for_target_scanned(Some(&path), "", &ExecutionTarget::native())
+                .is_err()
+        );
+        assert!(load_policy_or_default_for_resolver(Some(&path)).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_or_default_none_returns_default_for_target_and_resolver() {
+        // `None` selects the embedded default — the only path that may
+        // produce it — at the remaining "or default" entry points.
+        let policy = load_policy_or_default_for_target(None, &ExecutionTarget::native())
+            .expect("default should not fail");
+        assert_eq!(policy.version, 1);
+        assert!(policy.tools.is_empty());
+
+        let policy = load_policy_or_default_for_resolver(None).expect("default should not fail");
+        assert_eq!(policy.version, 1);
+        assert!(policy.tools.is_empty());
     }
 
     #[test]
