@@ -1,3 +1,9 @@
+//! Policy loading treats an explicitly named file as authoritative:
+//! if it cannot be read, parsed, or validated, loading fails and
+//! callers stop. The embedded default policy is used only when no
+//! file was named (`None`); no entry point here falls back to it
+//! after a failed named load.
+
 use std::path::Path;
 
 use super::default_policy;
@@ -252,5 +258,102 @@ mod tests {
             .validate()
             .expect_err("HTTP without listen_addr should fail validation");
         assert!(matches!(err, crate::error::PolicyError::Validation(_)));
+    }
+
+    #[test]
+    fn test_or_default_some_missing_file_errors() {
+        // A named-but-missing file must fail, not fall back to the
+        // embedded default — for every "or default" entry point.
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+            .join("mcp_writ_test")
+            .join(format!("or_default_missing_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nonexistent.kdl");
+
+        let err =
+            load_policy_or_default(Some(&path)).expect_err("loading nonexistent file should fail");
+        assert!(matches!(err, crate::error::PolicyError::FileRead(_)));
+
+        assert!(
+            load_policy_or_default_for_target(Some(&path), &ExecutionTarget::native()).is_err()
+        );
+        assert!(
+            load_policy_or_default_for_target_scanned(Some(&path), "", &ExecutionTarget::native())
+                .is_err()
+        );
+        assert!(load_policy_or_default_for_resolver(Some(&path)).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_or_default_some_malformed_policy_errors() {
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+            .join("mcp_writ_test")
+            .join(format!("or_default_malformed_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.kdl");
+        std::fs::write(&path, "policy version=2\nthis is not valid kdl {{{\n").unwrap();
+
+        assert!(load_policy_or_default(Some(&path)).is_err());
+        assert!(
+            load_policy_or_default_for_target(Some(&path), &ExecutionTarget::native()).is_err()
+        );
+        assert!(
+            load_policy_or_default_for_target_scanned(Some(&path), "", &ExecutionTarget::native())
+                .is_err()
+        );
+        assert!(load_policy_or_default_for_resolver(Some(&path)).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_or_default_some_unsupported_version_errors() {
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+            .join("mcp_writ_test")
+            .join(format!("or_default_bad_version_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.kdl");
+        std::fs::write(&path, "policy version=99\n").unwrap();
+
+        assert!(load_policy_or_default(Some(&path)).is_err());
+        assert!(
+            load_policy_or_default_for_target(Some(&path), &ExecutionTarget::native()).is_err()
+        );
+        assert!(
+            load_policy_or_default_for_target_scanned(Some(&path), "", &ExecutionTarget::native())
+                .is_err()
+        );
+        assert!(load_policy_or_default_for_resolver(Some(&path)).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_or_default_none_returns_default_for_target_and_resolver() {
+        // `None` selects the embedded default — the only path that may
+        // produce it — at the remaining "or default" entry points.
+        let policy = load_policy_or_default_for_target(None, &ExecutionTarget::native())
+            .expect("default should not fail");
+        assert_eq!(policy.version, 1);
+        assert!(policy.tools.is_empty());
+
+        let policy = load_policy_or_default_for_resolver(None).expect("default should not fail");
+        assert_eq!(policy.version, 1);
+        assert!(policy.tools.is_empty());
+    }
+
+    #[test]
+    fn test_or_default_scanned_none_returns_default() {
+        let (policy, diagnostics) =
+            load_policy_or_default_for_target_scanned(None, "", &ExecutionTarget::native())
+                .expect("default should not fail");
+        assert_eq!(policy.version, 1);
+        assert!(policy.tools.is_empty());
+        // `LoadDiagnostics` has no `PartialEq`, so compare against the
+        // default field by field — both `Vec`s default to empty.
+        assert!(diagnostics.warnings.is_empty());
+        assert!(diagnostics.review_markers.is_empty());
     }
 }

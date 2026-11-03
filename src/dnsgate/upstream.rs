@@ -51,17 +51,20 @@ impl std::fmt::Display for ForwardError {
 /// TCP retry when the answer comes back truncated — the relay performs
 /// the fallback so UDP clients still receive full answers.
 ///
-/// `id`/`canonical` are the forwarded query's ID and question name —
-/// the answer must echo them or it is not ours.
+/// `id`/`canonical`/`qtype`/`qclass` are the forwarded query's ID,
+/// question name, and question fields — the answer must echo them or
+/// it is not ours.
 pub(crate) async fn forward_udp(
     upstream: SocketAddr,
     query: &[u8],
     id: u16,
     canonical: &str,
+    qtype: u16,
+    qclass: u16,
 ) -> Result<Vec<u8>, ForwardError> {
-    let resp = udp_exchange(upstream, query, id, canonical).await?;
+    let resp = udp_exchange(upstream, query, id, canonical, qtype, qclass).await?;
     if wire::response_truncated(&resp) {
-        return tcp_exchange(upstream, query, id, canonical).await;
+        return tcp_exchange(upstream, query, id, canonical, qtype, qclass).await;
     }
     Ok(resp)
 }
@@ -73,8 +76,10 @@ pub(crate) async fn forward_tcp(
     query: &[u8],
     id: u16,
     canonical: &str,
+    qtype: u16,
+    qclass: u16,
 ) -> Result<Vec<u8>, ForwardError> {
-    tcp_exchange(upstream, query, id, canonical).await
+    tcp_exchange(upstream, query, id, canonical, qtype, qclass).await
 }
 
 async fn udp_exchange(
@@ -82,6 +87,8 @@ async fn udp_exchange(
     query: &[u8],
     id: u16,
     canonical: &str,
+    qtype: u16,
+    qclass: u16,
 ) -> Result<Vec<u8>, ForwardError> {
     let bind_addr: SocketAddr = match upstream {
         SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
@@ -98,7 +105,7 @@ async fn udp_exchange(
     timeout(UPSTREAM_TIMEOUT, async {
         loop {
             let n = sock.recv(&mut buf).await.map_err(ForwardError::Io)?;
-            if wire::response_matches(&buf[..n], id, canonical) {
+            if wire::response_matches(&buf[..n], id, canonical, qtype, qclass) {
                 return Ok(buf[..n].to_vec());
             }
         }
@@ -112,6 +119,8 @@ async fn tcp_exchange(
     query: &[u8],
     id: u16,
     canonical: &str,
+    qtype: u16,
+    qclass: u16,
 ) -> Result<Vec<u8>, ForwardError> {
     timeout(UPSTREAM_TIMEOUT, async {
         let mut stream = TcpStream::connect(upstream)
@@ -134,7 +143,7 @@ async fn tcp_exchange(
             .read_exact(&mut resp)
             .await
             .map_err(ForwardError::Io)?;
-        if !wire::response_matches(&resp, id, canonical) {
+        if !wire::response_matches(&resp, id, canonical, qtype, qclass) {
             return Err(ForwardError::Mismatch);
         }
         Ok(resp)

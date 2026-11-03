@@ -605,7 +605,7 @@ where
                         && proxy_state::list_verification_required(&shared.policy, shared.fail_on)
                         && shared.list_generation.load(Ordering::SeqCst) == 0
                         && st.idle()
-                        && !shared.list_busy.swap(true, Ordering::SeqCst)
+                        && !shared.raise_list_gate().await
                     {
                         proxy_tools_list::begin_revalidation(shared, st).await?;
                     }
@@ -672,7 +672,7 @@ where
                     reason.as_str()
                 );
                 st.discard_pages();
-                shared.list_busy.store(true, Ordering::SeqCst);
+                shared.raise_list_gate().await;
                 // A client listing coalesced behind this internal one —
                 // held, or still in transit in the C2S pipe — is
                 // answered with this reason by the abort drain.
@@ -705,7 +705,7 @@ where
                         "tools/list response rejected while a revalidation is pending ({})",
                         reason.as_str()
                     );
-                    shared.list_busy.store(true, Ordering::SeqCst);
+                    shared.raise_list_gate().await;
                     // The bound client listing dies with the session —
                     // answer it on its own id first: it already crossed
                     // C2S, so the abort drain cannot correlate it (it is
@@ -1317,7 +1317,7 @@ where
         // can never verify; fail closed like any other rejected
         // internal response.
         st.discard_pages();
-        shared.list_busy.store(true, Ordering::SeqCst);
+        shared.raise_list_gate().await;
         // A client listing coalesced behind this internal one — held,
         // or still in transit in the C2S pipe — is answered with this
         // reason by the abort drain.
@@ -1363,7 +1363,7 @@ where
             // A revalidation or held list_changed outlives this listing
             // — fail the session like an in-flight revalidation error,
             // keeping the gate latched until the abort.
-            shared.list_busy.store(true, Ordering::SeqCst);
+            shared.raise_list_gate().await;
             // The bound client listing dies with the session — answer
             // it on its own id first: it already crossed C2S, so the
             // abort drain cannot correlate it (it is neither held nor

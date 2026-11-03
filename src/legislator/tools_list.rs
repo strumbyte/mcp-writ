@@ -2,7 +2,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -10,7 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::protocol::tools_list::{
-    MAX_PAGES, MAX_TOTAL_TOOLS, ToolsListParseError, parse_tools_list_response_page,
+    MAX_PAGES, MAX_TOTAL_PAGE_BYTES, MAX_TOTAL_TOOLS, ToolsListParseError,
+    parse_tools_list_response_page,
 };
 use crate::protocol::{
     MCP_VERSION_2025_11_25, MCP_VERSION_2026_07_28, ProtocolStep, SUPPORTED_PROTOCOL_VERSIONS,
@@ -36,6 +37,12 @@ struct PageAccumulator {
     tools: Vec<ToolDefinition>,
     reached_limit: bool,
     has_more_in_page: bool,
+    /// Cumulative serialized page bytes charged so far — the
+    /// aggregate budget the Auditor relay also enforces
+    /// (`MAX_TOTAL_PAGE_BYTES`): page-count and frame caps alone let
+    /// fifty near-limit pages retain hundreds of MiB of tool
+    /// definitions (schemas, annotations, raw JSON).
+    page_bytes: usize,
 }
 
 impl PageAccumulator {
@@ -44,7 +51,21 @@ impl PageAccumulator {
             tools: Vec::new(),
             reached_limit: false,
             has_more_in_page: false,
+            page_bytes: 0,
         }
+    }
+
+    /// Charge a received page line against the session byte budget —
+    /// before the page is retained, so an over-budget listing fails
+    /// closed without accumulating its tool definitions.
+    fn note_page_bytes(&mut self, bytes: usize, version_label: &str) -> Result<(), ToolsListError> {
+        self.page_bytes = self.page_bytes.saturating_add(bytes);
+        if self.page_bytes > MAX_TOTAL_PAGE_BYTES {
+            return Err(ToolsListError::PaginationIncomplete(format!(
+                "MCP {version_label} tools/list exceeded max accumulated page bytes ({MAX_TOTAL_PAGE_BYTES})"
+            )));
+        }
+        Ok(())
     }
 
     fn accept_page(&mut self, page_tools: Vec<ToolDefinition>) {
@@ -507,13 +528,29 @@ fn env_skip_sandbox() -> bool {
 /// private TMPDIR is the only writable surface, and the secrets
 /// overlay stays on — the server must not read credentials while
 /// answering the protocol handshake.
-fn discovery_policy(command: &[String], tmpdir: &Path) -> crate::policy::Policy {
+///
+/// Command-tree grants are carved around reserved secret names
+/// (`.env`, `.env.*`, `.ssh`, `.gnupg`, `.aws/credentials`): the
+/// overlay itself is an Auditor RPC check a discovery child never
+/// passes through, and no supported backend can subtract a child from
+/// a recursive parent grant — additive Landlock rules and DACL ACEs
+/// only widen access. A tree holding a reserved name therefore expands
+/// to per-entry grants for everything except the reserved paths
+/// (recursively, so deeper secrets carve too); a clean tree keeps its
+/// single root grant. A secret still covered by a grant the carve does
+/// not own — e.g. a command parent beneath a runtime directory —
+/// becomes an explicit `denied_paths` entry, which every backend
+/// refuses rather than silently re-allow.
+fn discovery_policy(
+    command: &[String],
+    tmpdir: &Path,
+) -> Result<crate::policy::Policy, ToolsListError> {
     let mut policy = crate::legislator::self_test_warden::prepare_warden_probe_policy(
         &crate::policy::Policy::default(),
         tmpdir,
         command,
     );
-    push_literal_dirs(&mut policy, command);
+    carve_command_grants(&mut policy, command)?;
     // `prepare_warden_probe_policy` waives the secrets overlay for the
     // self-test control file — a discovery server gets no such pass.
     policy.fs.secret_overlay = true;
@@ -522,47 +559,532 @@ fn discovery_policy(command: &[String], tmpdir: &Path) -> crate::policy::Policy 
     // RunningChild's best-effort process-tree sweep rather than
     // refusing outright.
     policy.sandbox.require_lifetime_boundary = false;
-    policy
+    Ok(policy)
 }
 
-/// Literal spellings of the directories `prepare_warden_probe_policy`
-/// grants as `dir/**`. Landlock strips the glob to the same root, so a
-/// literal entry is equivalent there — and it is the only spelling
-/// Windows DACL grants and macOS literal subpaths can express. The
-/// literal set mirrors the probe walk: the executable's parent plus
-/// the parent of every path-valued argument (the workload's own tree).
-fn push_literal_dirs(policy: &mut crate::policy::Policy, command: &[String]) {
-    fn push(list: &mut Vec<String>, dir: &Path) {
-        let dir = dir.to_string_lossy().into_owned();
-        if !list.contains(&dir) {
-            list.push(dir);
+/// Directory entries the secret scan may touch across all command-tree
+/// roots — a workload tree larger than this cannot be proven
+/// secret-free, so the spawn refuses rather than grant an unproven
+/// surface.
+const SECRET_SCAN_MAX_ENTRIES: usize = 262_144;
+
+/// Grants one command-tree root may produce when it carves around
+/// reserved names — a pathological sibling count beside a secret still
+/// keeps the ruleset bounded, and over the cap the spawn refuses.
+const SECRET_CARVE_MAX_GRANTS: usize = 4_096;
+
+/// A plain spelling for a policy-bound path: `canonicalize` returns
+/// `\\?\`-verbatim paths on Windows, and every downstream comparison
+/// is spelled — `resolve_grant_spelling` reads the `?` as a wildcard,
+/// and the LPAC/deny coverage checks compare literal strings. The
+/// carve emits only paths reachable beneath the parent, so stripping
+/// the prefix keeps the object identity while restoring the form the
+/// backends compare.
+fn plain_spelling(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
         }
     }
+    PathBuf::from(s.into_owned())
+}
+
+/// The directories the probe walk grants for a discovery command — the
+/// executable's parent plus the parent of every path-valued argument
+/// (the workload's own tree). Canonicalized so the probe's `dir/**`
+/// spellings and literal parents compare equal through links, then
+/// stripped of verbatim prefixes so carved children stay in the
+/// spelled form the backends compare.
+fn command_parent_dirs(command: &[String]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
     if let Some(argv0) = command.first()
         && let Ok(resolved) = crate::workload::resolve_command_path(argv0)
         && let Some(parent) = resolved.parent()
     {
-        push(&mut policy.fs.read_only, parent);
+        push(&mut dirs, parent);
     }
+    for parent in arg_parent_dirs(command) {
+        push(&mut dirs, &parent);
+    }
+    dirs
+}
+
+/// One canonical, verbatim-stripped carve root into `dirs`, deduped.
+fn push(list: &mut Vec<PathBuf>, dir: &Path) {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let dir = plain_spelling(&dir);
+    if !list.contains(&dir) {
+        list.push(dir);
+    }
+}
+
+/// The argument-parent carve roots alone — the self-test keeps its
+/// executable-parent grant untouched but must still carve the argument
+/// roots a bare argument's workspace falls under.
+pub(crate) fn arg_parent_dirs(command: &[String]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
     for arg in command.iter().skip(1) {
-        let path = Path::new(arg);
-        if !path.exists() {
+        // Same option guard as the probe walk — a bare `--mode` never
+        // names a path, so it earns no carve root.
+        if arg.starts_with('-') {
             continue;
         }
-        let parent = if path.is_dir() {
-            Some(path.to_path_buf())
-        } else {
+        let path = Path::new(arg);
+        // The same root rule `prepare_warden_probe_policy` grants —
+        // canonical parent for an existing argument, plain parent for
+        // a missing one. Any other root leaves its `dir/**` grant
+        // outside the carve and back inside the policy.
+        let parent = if path.exists() {
             path.canonicalize()
                 .ok()
                 .and_then(|c| c.parent().map(Path::to_path_buf))
                 .or_else(|| path.parent().map(Path::to_path_buf))
+        } else if !crate::pathutil::selector_plausible(arg) {
+            // Parity with the probe walk: a bare literal such as
+            // `stdio` is no path and contributes no carve root.
+            None
+        } else {
+            // A bare argument names a file beside the process — the
+            // probe grants the current directory for it, so an empty
+            // `parent()` normalizes to `.` for the same carve root.
+            path.parent().map(|p| {
+                if p.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    p.to_path_buf()
+                }
+            })
         };
         if let Some(parent) = parent {
             // Keep parity with the probe walk: a grant covering
             // WARDEN_PROBE_PATH would erase OS-deny evidence.
             let canonical = parent.canonicalize().unwrap_or_else(|_| parent.clone());
             if !Path::new(crate::legislator::self_test::WARDEN_PROBE_PATH).starts_with(&canonical) {
-                push(&mut policy.fs.read_only, &parent);
+                push(&mut dirs, &parent);
+            }
+        }
+    }
+    dirs
+}
+
+/// True when a `read_only` spelling grants exactly `dir` — `dir`,
+/// `dir/**`, or `dir/*` all reduce to the same root the carve
+/// replaces.
+fn grant_names_dir(entry: &str, dir: &Path) -> bool {
+    let mut base = entry.trim();
+    while let Some(rest) = base.strip_suffix("/**") {
+        base = rest;
+    }
+    while let Some(rest) = base.strip_suffix("/*") {
+        base = rest;
+    }
+    let base_path = Path::new(base);
+    if base_path == dir {
+        return true;
+    }
+    match (base_path.canonicalize(), dir.canonicalize()) {
+        (Ok(b), Ok(d)) => b == d,
+        _ => false,
+    }
+}
+
+/// Reserved basenames, mirroring the `secret_paths` overlay: `.ssh`
+/// and `.gnupg` are reserved as whole directories, `.env` and
+/// `.env.*` (minus the documented `.env.example` exclusion) as names,
+/// and `credentials` only beneath a `.aws` directory. Names compare
+/// ASCII-case-insensitively like the overlay.
+fn is_reserved_entry_name(name_lower: &str, inside_aws: bool) -> bool {
+    name_lower == ".ssh"
+        || name_lower == ".gnupg"
+        || name_lower == ".env"
+        || (name_lower.starts_with(".env.") && name_lower != ".env.example")
+        || (inside_aws && name_lower == "credentials")
+}
+
+/// A symlink or reparse point: its target resolves outside the
+/// spelling's own tree, so a grant on the node never covers it — such
+/// entries are skipped entirely rather than granted.
+fn is_reparse(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+/// One directory's carve outcome: `Clean` means nothing reserved was
+/// found anywhere beneath it (callers may grant the dir wholesale);
+/// `Grants` carries the per-entry replacements — clean subtrees keep
+/// their own root, everything else lists individually.
+enum Carve {
+    Clean,
+    Grants(Vec<PathBuf>),
+}
+
+/// Enumerate `dir` recursively and decide which of its entries may be
+/// granted. Reserved names are never granted (skipped outright, like
+/// symlinks and junctions found *inside* the tree — their targets were
+/// never beneath the spelled grant anyway); everything else keeps a
+/// literal grant. A reparse point *as the walked root* is an error:
+/// the spelled grant would resolve to an unproven target. `secrets`
+/// collects every reserved path seen so the caller can deny whatever
+/// some other grant still covers.
+fn carve_dir(
+    dir: &Path,
+    inside_aws: bool,
+    budget: &mut usize,
+    secrets: &mut Vec<PathBuf>,
+    deadline: Option<Instant>,
+) -> Result<Carve, String> {
+    // A deadline bounds the walk itself — dropping the await that
+    // watches it never stops a blocking scan already in flight. Check
+    // before the scan, per entry, and again before the outcome is
+    // granted so an expired deadline fails even for an empty
+    // directory or one expiring during the last entry.
+    let expired = || deadline.is_some_and(|d| Instant::now() >= d);
+    // Every carve outcome — a clean early-out included — respects the
+    // bound: a deadline that expired mid-walk must not still grant.
+    let clean_or_expired = |expired: bool| {
+        if expired {
+            Err("carve deadline expired".to_string())
+        } else {
+            Ok(Carve::Clean)
+        }
+    };
+    if expired() {
+        return Err("carve deadline expired".to_string());
+    }
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        // The root may have vanished between resolution and walk —
+        // treat it as clean so the spelled grant does what the old
+        // policy did (the backends skip unopenable paths anyway).
+        Err(_) => return clean_or_expired(expired()),
+    };
+    if is_reparse(&meta) {
+        // A reparse resolves outside the spelled tree — carving cannot
+        // prove its target secret-free, and `Clean` here would let the
+        // caller grant the link wholesale (the backend resolves it to
+        // the whole target). The caller resolves the root up front, so
+        // reaching this arm means the node was swapped beneath the
+        // walk or a nested check raced — either way, fail closed.
+        return Err(format!(
+            "'{}' is a symlink/reparse point — cannot prove the carved tree secret-free",
+            dir.display()
+        ));
+    }
+    if !meta.is_dir() {
+        return clean_or_expired(expired());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        // A directory the operator cannot read is unreadable to the
+        // same-uid server too — the wholesale grant hides nothing.
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            return clean_or_expired(expired());
+        }
+        Err(e) => return Err(format!("cannot enumerate '{}': {e}", dir.display())),
+    };
+    if expired() {
+        return Err("carve deadline expired".to_string());
+    }
+    let mut grants: Vec<PathBuf> = Vec::new();
+    let mut clean = true;
+    for entry in entries {
+        if expired() {
+            return Err("carve deadline expired".to_string());
+        }
+        let entry = entry.map_err(|e| format!("cannot enumerate '{}': {e}", dir.display()))?;
+        *budget = budget
+            .checked_sub(1)
+            .ok_or_else(|| "secret-path scan budget exhausted".to_string())?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if is_reserved_entry_name(&name, inside_aws) {
+            clean = false;
+            secrets.push(path);
+            continue;
+        }
+        let meta = match entry.path().symlink_metadata() {
+            Ok(m) => m,
+            // Unstattable entries (a dangling link, an exotic reparse)
+            // get no grant — they cannot be classified safely.
+            Err(_) => continue,
+        };
+        if meta.is_dir() && !is_reparse(&meta) {
+            match carve_dir(
+                &path,
+                inside_aws || name == ".aws",
+                budget,
+                secrets,
+                deadline,
+            )? {
+                Carve::Clean => grants.push(path),
+                Carve::Grants(children) => {
+                    clean = false;
+                    grants.extend(children);
+                }
+            }
+        } else if !meta.is_dir() && !is_reparse(&meta) {
+            grants.push(path);
+        }
+        // Reparse points and links fall through ungranted — their
+        // targets never were beneath the parent grant.
+    }
+    if expired() {
+        return Err("carve deadline expired".to_string());
+    }
+    if clean {
+        Ok(Carve::Clean)
+    } else {
+        Ok(Carve::Grants(grants))
+    }
+}
+
+/// Carve one command-tree root so no reserved secret name stays
+/// reachable beneath it. Returns the literal grant paths plus every
+/// reserved path found (for the coverage deny check).
+fn carved_grant_paths(
+    root: &Path,
+    budget: &mut usize,
+    deadline: Option<Instant>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    // A symlink or junction root resolves outside its own spelling —
+    // granting `root` wholesale would grant the target's tree,
+    // reserved secrets included. Carve must speak of the real tree the
+    // backend reaches; a reparse that cannot be resolved fails closed
+    // rather than guess (the link could also be re-pointed after this
+    // walk). A root that vanished between listing and walk keeps the
+    // spelled grant — nothing exists for it to hide.
+    let root = match std::fs::symlink_metadata(root) {
+        Ok(meta) if is_reparse(&meta) => {
+            let resolved = root.canonicalize().map_err(|e| {
+                format!(
+                    "cannot resolve reparse-point grant root '{}': {e}",
+                    root.display()
+                )
+            })?;
+            plain_spelling(&resolved)
+        }
+        _ => root.to_path_buf(),
+    };
+    let root = root.as_path();
+    let mut secrets = Vec::new();
+    let grants = match carve_dir(root, false, budget, &mut secrets, deadline)? {
+        Carve::Clean => vec![root.to_path_buf()],
+        Carve::Grants(g) => g,
+    };
+    if grants.len() > SECRET_CARVE_MAX_GRANTS {
+        return Err(format!(
+            "carving '{}' produces {} grants — the tree is too irregular to prove secret-free",
+            root.display(),
+            grants.len()
+        ));
+    }
+    Ok((grants, secrets))
+}
+
+/// Component-wise coverage for resolved paths. `path_covers` compares
+/// raw components, but secrets enumerated under a canonicalized parent
+/// carry `\\?\` verbatim prefixes while spelled grants may not — fold
+/// verbatim prefixes onto their plain spellings (and case-fold, the
+/// same rule the filesystem applies) so the comparison never splits on
+/// spelling alone.
+#[cfg(target_os = "windows")]
+fn resolved_path_covers(grant: &Path, target: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    fn fold(p: &Path) -> Vec<String> {
+        p.components()
+            .map(|c| match c {
+                Component::Prefix(pr) => match pr.kind() {
+                    Prefix::Disk(b) | Prefix::VerbatimDisk(b) => {
+                        format!("\\{}", (b as char).to_ascii_lowercase())
+                    }
+                    Prefix::UNC(s, n) | Prefix::VerbatimUNC(s, n) => format!(
+                        "\\\\{}\\{}",
+                        s.to_string_lossy().to_lowercase(),
+                        n.to_string_lossy().to_lowercase()
+                    ),
+                    Prefix::Verbatim(s) | Prefix::DeviceNS(s) => {
+                        format!("\\\\.\\{}", s.to_string_lossy().to_lowercase())
+                    }
+                },
+                other => other.as_os_str().to_string_lossy().to_lowercase(),
+            })
+            .collect()
+    }
+    let g = fold(grant);
+    let t = fold(target);
+    t.len() >= g.len() && t[..g.len()] == g[..]
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolved_path_covers(grant: &Path, target: &Path) -> bool {
+    crate::fsoverlap::path_covers(grant, target)
+}
+
+/// True when `grant` covers `secret` — on the spelling and on the
+/// resolved base, mirroring the Landlock overlap check exactly. The
+/// secret side is a real enumerated path, so it canonicalizes
+/// directly: `resolve_grant_spelling` would (correctly) refuse a
+/// `\\?\` verbatim spelling as carrying a wildcard.
+fn grant_covers_secret(grant: &str, secret: &Path) -> bool {
+    let secret_str = secret.to_string_lossy();
+    if crate::policy::validator::covers_or_same(grant, &secret_str) {
+        return true;
+    }
+    let Some(g) = crate::fsoverlap::resolve_grant_spelling(grant) else {
+        return false;
+    };
+    let s = secret
+        .canonicalize()
+        .unwrap_or_else(|_| secret.to_path_buf());
+    resolved_path_covers(&g, &s)
+}
+
+/// Replace the broad command-parent grants the probe policy spelled —
+/// its `dir/**` glob and the literal parent — with carved grants that
+/// leave no reserved secret reachable, and deny whatever a surviving
+/// grant still covers. A runtime-directory overlap (a command parent
+/// beneath `/usr`, say) lands in `denied_paths`, where every backend's
+/// own overlap checks refuse the launch rather than silently re-allow
+/// the secret.
+/// The resolved executable's parent, normalized the way `push`
+/// normalizes carve roots — an argument root that lands here doubles
+/// as the executable-parent grant and must be preserved, not carved.
+fn exe_parent_dir(command: &[String]) -> Option<PathBuf> {
+    let resolved = crate::workload::resolve_command_path(command.first()?).ok()?;
+    let parent = resolved.parent()?;
+    let canonical = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    Some(plain_spelling(&canonical))
+}
+
+/// Argument roots that coincide with the executable's own parent —
+/// preserving them keeps the `dir/**` grant the image needs while
+/// their reserved names still feed `denied_paths`.
+fn shared_exe_roots(command: &[String], arg_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let Some(exe_parent) = exe_parent_dir(command) else {
+        return Vec::new();
+    };
+    arg_roots
+        .iter()
+        .filter(|r| **r == exe_parent)
+        .cloned()
+        .collect()
+}
+
+fn carve_command_grants(
+    policy: &mut crate::policy::Policy,
+    command: &[String],
+) -> Result<(), ToolsListError> {
+    let args = arg_parent_dirs(command);
+    let preserve = shared_exe_roots(command, &args);
+    carve_roots(policy, &command_parent_dirs(command), &preserve, None)
+}
+
+/// The self-test side of the carve: the probe's argument-parent
+/// `dir/**` grants leave the same secrets reachable a discovery grant
+/// would, so they are carved identically — while its
+/// executable-parent grant (which Landlock needs to exec the probe
+/// image at all) stays untouched. `deadline` bounds the walk itself:
+/// a caller that times out an in-flight scan still stops.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn carve_arg_grants(
+    policy: &mut crate::policy::Policy,
+    command: &[String],
+    deadline: Option<Instant>,
+) -> Result<(), ToolsListError> {
+    let args = arg_parent_dirs(command);
+    let preserve = shared_exe_roots(command, &args);
+    carve_roots(policy, &args, &preserve, deadline)
+}
+
+fn carve_roots(
+    policy: &mut crate::policy::Policy,
+    parents: &[PathBuf],
+    preserve: &[PathBuf],
+    deadline: Option<Instant>,
+) -> Result<(), ToolsListError> {
+    // A preserved root keeps its `dir/**` grant — it doubles as the
+    // executable's own parent — so it is retained here and only
+    // *scanned* below; reserved names beneath it go to `denied_paths`,
+    // where every backend's covered-grant check refuses the launch.
+    policy.fs.read_only.retain(|entry| {
+        !parents
+            .iter()
+            .any(|p| grant_names_dir(entry, p) && !preserve.contains(p))
+    });
+    let mut budget = SECRET_SCAN_MAX_ENTRIES;
+    let mut secrets = Vec::new();
+    for parent in parents {
+        let (grants, found) =
+            carved_grant_paths(parent, &mut budget, deadline).map_err(|detail| {
+                ToolsListError::ProcessSpawn(io::Error::other(format!(
+                    "cannot carve a secret-free discovery grant for '{}': {detail}",
+                    parent.display()
+                )))
+            })?;
+        if preserve.contains(parent) {
+            // Preserve means keep the spelled `dir/**` — a platform
+            // whose grant filter dropped the spelling leaves nothing
+            // behind, so the carved children still land as grants or
+            // the parent loses access entirely.
+            if !policy
+                .fs
+                .read_only
+                .iter()
+                .any(|g| grant_names_dir(g, parent))
+            {
+                for grant in grants {
+                    let s = grant.to_string_lossy().into_owned();
+                    if !policy.fs.read_only.contains(&s) {
+                        policy.fs.read_only.push(s);
+                    }
+                }
+            }
+            secrets.extend(found);
+            continue;
+        }
+        for grant in grants {
+            let s = grant.to_string_lossy().into_owned();
+            if !policy.fs.read_only.contains(&s) {
+                policy.fs.read_only.push(s);
+            }
+        }
+        secrets.extend(found);
+    }
+    deny_covered_secrets(policy, &secrets);
+    Ok(())
+}
+
+/// Every reserved secret a surviving grant still covers becomes an
+/// explicit `denied_paths` entry — each backend's own overlap check
+/// refuses the launch rather than silently re-allowing the secret.
+/// Entries already denied are not duplicated.
+fn deny_covered_secrets(policy: &mut crate::policy::Policy, secrets: &[PathBuf]) {
+    for secret in secrets {
+        let covered = policy
+            .fs
+            .read_only
+            .iter()
+            .chain(policy.fs.read_write.iter())
+            .chain(policy.fs.executable.iter())
+            .any(|grant| grant_covers_secret(grant, secret));
+        if covered {
+            let s = secret.to_string_lossy().into_owned();
+            if !policy.fs.denied_paths.contains(&s) {
+                policy.fs.denied_paths.push(s);
             }
         }
     }
@@ -609,7 +1131,27 @@ async fn spawn_server_sandboxed(
     command: &[String],
 ) -> Result<(crate::warden::RunningChild, PathBuf), ToolsListError> {
     let tmp = create_discovery_tmpdir()?;
-    let policy = discovery_policy(command, &tmp);
+    // The secret-scan carve is synchronous filesystem traversal — a
+    // large command tree would stall the Tokio worker, so the policy
+    // build runs on the blocking pool. A panicking or cancelled task
+    // fails the spawn exactly like a policy error does.
+    let policy = match tokio::task::spawn_blocking({
+        let command = command.to_vec();
+        let tmp = tmp.clone();
+        move || discovery_policy(&command, &tmp)
+    })
+    .await
+    {
+        Ok(policy) => policy.inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&tmp);
+        })?,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(ToolsListError::ProcessSpawn(io::Error::other(format!(
+                "discovery policy worker failed: {e}"
+            ))));
+        }
+    };
     let resolved = crate::workload::resolve_command_path(&command[0]).map_err(|e| {
         let _ = std::fs::remove_dir_all(&tmp);
         ToolsListError::ProcessSpawn(io::Error::other(format!(
@@ -617,8 +1159,6 @@ async fn spawn_server_sandboxed(
             command[0]
         )))
     })?;
-    let mut argv = command.to_vec();
-    argv[0] = resolved.to_string_lossy().into_owned();
     let opts = crate::warden::SpawnOptions {
         restrict_environment: true,
         allowed_names: Vec::new(),
@@ -631,12 +1171,18 @@ async fn spawn_server_sandboxed(
     #[cfg(target_os = "macos")]
     let opts = {
         let mut o = opts;
-        o.exec_map_dirs =
-            crate::warden::macos_sandbox::code_map_dirs(std::path::Path::new(&argv[0]), &argv);
+        o.exec_map_dirs = crate::warden::macos_sandbox::code_map_dirs(&resolved, command);
         o
     };
+    // The verified image rides `lpApplicationName`; the child's argv[0]
+    // keeps the caller's spelling. `resolve_command_path` canonicalizes
+    // to a `\\?\` verbatim path on Windows, and a verbatim module path —
+    // whether as argv[0] or as the image name — leaves CLR children
+    // (powershell.exe, any .NET server) unable to load assemblies, so
+    // the program is handed over in plain spelling.
+    let program = plain_spelling(&resolved);
     match crate::warden::Warden::new(policy)
-        .spawn_child_async_with(&argv, &opts)
+        .spawn_child_async_exe_with(&program, command, &opts)
         .await
     {
         Ok(child) => Ok((child, tmp)),
@@ -873,6 +1419,7 @@ async fn fetch_mcp_2026_07_28_on_child(
         let line = session
             .recv_response(id, version, ProtocolStep::ToolsList, timeout)
             .await?;
+        pages.note_page_bytes(line.len(), MCP_VERSION_2026_07_28)?;
 
         if let Some(err) = parse_jsonrpc_error(&line) {
             if err.code == UNSUPPORTED_PROTOCOL_VERSION {
@@ -999,6 +1546,7 @@ async fn fetch_mcp_2025_11_25_on_child(
         let list_line = session
             .recv_response(list_id, version, ProtocolStep::ToolsList, timeout)
             .await?;
+        pages.note_page_bytes(list_line.len(), MCP_VERSION_2025_11_25)?;
         if let Some(err) = parse_jsonrpc_error(&list_line) {
             return Err(ToolsListError::Protocol {
                 protocol_version: version,
@@ -1028,6 +1576,555 @@ async fn fetch_mcp_2025_11_25_on_child(
 mod tests {
     use super::*;
 
+    /// A temp fixture mirroring a payload tree: secrets beside and
+    /// below the payload, clean siblings, and the non-secret
+    /// `.env.example` / `.aws/config` counterparts.
+    struct SecretFixture {
+        root: tempfile::TempDir,
+    }
+
+    impl SecretFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let r = root.path();
+            std::fs::write(r.join("server.py"), b"print('x')").unwrap();
+            std::fs::create_dir_all(r.join("lib")).unwrap();
+            std::fs::write(r.join("lib").join("util.py"), b"x = 1").unwrap();
+            // Secrets adjacent to the payload and one level deeper.
+            std::fs::write(r.join(".env"), b"KEY=x").unwrap();
+            std::fs::create_dir_all(r.join(".ssh")).unwrap();
+            std::fs::write(r.join(".ssh").join("id_rsa"), b"key").unwrap();
+            std::fs::create_dir_all(r.join(".gnupg")).unwrap();
+            std::fs::create_dir_all(r.join(".aws")).unwrap();
+            std::fs::write(r.join(".aws").join("credentials"), b"aws").unwrap();
+            std::fs::write(r.join(".aws").join("config"), b"region=x").unwrap();
+            std::fs::create_dir_all(r.join("config")).unwrap();
+            std::fs::write(r.join("config").join(".env.local"), b"KEY=x").unwrap();
+            std::fs::write(r.join("config").join("app.toml"), b"x").unwrap();
+            // Deliberately non-secret lookalikes that must stay granted.
+            std::fs::write(r.join(".env.example"), b"KEY=").unwrap();
+            Self { root }
+        }
+
+        fn path(&self, rel: &str) -> PathBuf {
+            self.root.path().join(rel)
+        }
+    }
+
+    fn grants_cover(grants: &[PathBuf], target: &Path) -> bool {
+        grants.iter().any(|g| {
+            let g = g.to_string_lossy();
+            crate::policy::validator::covers_or_same(&g, &target.to_string_lossy())
+                || target.starts_with(Path::new(g.as_ref()))
+        })
+    }
+
+    /// P1/F-discovery-secret: carving a payload tree must leave no
+    /// grant covering a reserved secret — adjacent or nested — while
+    /// keeping the payload and its clean siblings reachable.
+    #[test]
+    fn carve_leaves_no_reserved_path_covered() {
+        let fx = SecretFixture::new();
+        let mut budget = SECRET_SCAN_MAX_ENTRIES;
+        let (grants, secrets) = carved_grant_paths(fx.root.path(), &mut budget, None).unwrap();
+
+        for reserved in [
+            ".env",
+            ".ssh",
+            ".ssh/id_rsa",
+            ".gnupg",
+            ".aws/credentials",
+            "config/.env.local",
+        ] {
+            let p = fx.path(reserved);
+            assert!(
+                !grants_cover(&grants, &p),
+                "grant must not cover {reserved}: {grants:?}"
+            );
+        }
+        // `.ssh` is reserved as a whole directory — its contents are
+        // never enumerated, so the scan records the dir, not id_rsa.
+        for recorded in [
+            ".env",
+            ".ssh",
+            ".gnupg",
+            ".aws/credentials",
+            "config/.env.local",
+        ] {
+            assert!(
+                secrets.contains(&fx.path(recorded)),
+                "scan must record {recorded}"
+            );
+        }
+        for needed in ["server.py", ".env.example", "config/app.toml", "lib"] {
+            let p = fx.path(needed);
+            assert!(
+                grants_cover(&grants, &p),
+                "legitimate path must stay covered: {needed}"
+            );
+        }
+        // `.aws/config` is not reserved — the `.aws` dir is carved only
+        // around `credentials`.
+        let cfg = fx.path(".aws/config");
+        assert!(grants_cover(&grants, &cfg), "non-secret .aws contents stay");
+    }
+
+    /// P1: a clean tree keeps its single root grant — the common case
+    /// adds no rules.
+    #[test]
+    fn clean_tree_collapses_to_root_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("server.py"), b"x").unwrap();
+        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
+        std::fs::write(dir.path().join("lib").join("u.py"), b"x").unwrap();
+        let mut budget = SECRET_SCAN_MAX_ENTRIES;
+        let (grants, secrets) = carved_grant_paths(dir.path(), &mut budget, None).unwrap();
+        assert!(secrets.is_empty());
+        assert_eq!(grants, vec![dir.path().to_path_buf()]);
+    }
+
+    /// Create a directory symlink/junction — privileges are not always
+    /// available (Windows needs SeCreateSymbolicLinkPrivilege or dev
+    /// mode), so callers skip on `Err`.
+    #[cfg(unix)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    /// P1: a symlinked carve root resolves to its real tree — the
+    /// spelled grants name the target's paths (never the link, whose
+    /// wholesale grant would cover the target's reserved secrets).
+    /// Skips when the OS cannot mint the fixture link.
+    #[test]
+    fn carve_root_symlink_resolves_to_real_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("app.py"), b"x").unwrap();
+        std::fs::write(real.join(".env"), b"K=1").unwrap();
+        let link = dir.path().join("link");
+        if symlink_dir(&real, &link).is_err() {
+            eprintln!("symlink fixture unavailable — skipping");
+            return;
+        }
+        let mut budget = SECRET_SCAN_MAX_ENTRIES;
+        let (grants, secrets) = carved_grant_paths(&link, &mut budget, None).unwrap();
+        // The link spelling must not survive as a grant — the backend
+        // would resolve it to the target's whole tree, `.env` included.
+        assert!(!grants_cover(&grants, &link.join(".env")));
+        // The real tree is carved instead: `.env` recorded, payload granted.
+        let env = real.join(".env").canonicalize().unwrap();
+        assert!(
+            secrets
+                .iter()
+                .any(|s| resolved_path_covers(s, &env) && resolved_path_covers(&env, s)),
+            "resolved .env must be recorded"
+        );
+        let app = real.join("app.py").canonicalize().unwrap();
+        assert!(
+            grants
+                .iter()
+                .any(|g| resolved_path_covers(g, &app) && resolved_path_covers(&app, g)),
+            "payload file must keep its grant"
+        );
+    }
+
+    /// P1: a symlink *inside* the tree is never granted — the spelled
+    /// grant would resolve wherever the link points.
+    #[test]
+    fn carve_skips_symlink_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(".env"), b"K=1").unwrap();
+        let root = dir.path().join("payload");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("app.py"), b"x").unwrap();
+        if symlink_dir(&target, &root.join("link")).is_err() {
+            eprintln!("symlink fixture unavailable — skipping");
+            return;
+        }
+        let mut budget = SECRET_SCAN_MAX_ENTRIES;
+        let (grants, secrets) = carved_grant_paths(&root, &mut budget, None).unwrap();
+        // The link itself must never become a grant path — a spelled
+        // grant on the symlink would resolve to whatever it points at
+        // (the wholesale-target hole). A `root` grant over the spelled
+        // tree stays safe: backends cover the tree as spelled, not the
+        // link's target, which lives outside it.
+        assert!(
+            !grants.iter().any(|g| *g == root.join("link")),
+            "symlink must not be granted: {grants:?}"
+        );
+        // The link's target lives outside the carved root — the walk
+        // saw nothing reserved and the payload tree stays clean.
+        assert!(secrets.is_empty());
+    }
+
+    /// P1: a reparse root that cannot be resolved fails closed — its
+    /// spelled grant could never be proven secret-free.
+    #[test]
+    fn carve_unresolvable_reparse_root_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-target");
+        let link = dir.path().join("dangling");
+        if symlink_dir(&missing, &link).is_err() {
+            eprintln!("symlink fixture unavailable — skipping");
+            return;
+        }
+        let mut budget = SECRET_SCAN_MAX_ENTRIES;
+        assert!(carved_grant_paths(&link, &mut budget, None).is_err());
+    }
+
+    /// P1: `carve_dir` itself refuses a reparse root — `Clean` would
+    /// let the caller grant the link wholesale, so the walk must fail
+    /// closed even if the node was swapped beneath the resolution.
+    #[test]
+    fn carve_dir_refuses_reparse_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        if symlink_dir(&real, &link).is_err() {
+            eprintln!("symlink fixture unavailable — skipping");
+            return;
+        }
+        let mut budget = SECRET_SCAN_MAX_ENTRIES;
+        let mut secrets = Vec::new();
+        assert!(carve_dir(&link, false, &mut budget, &mut secrets, None).is_err());
+    }
+
+    /// P1: the scan budget refuses a tree it cannot prove secret-free
+    /// — discovery fails closed rather than grant the unexplored rest.
+    #[test]
+    fn carve_budget_exhaustion_fails_closed() {
+        let fx = SecretFixture::new();
+        let mut budget = 2usize; // far below the fixture's entry count
+        assert!(carved_grant_paths(fx.root.path(), &mut budget, None).is_err());
+    }
+
+    /// P1: a reserved path a surviving grant still covers lands in
+    /// `denied_paths` — every backend refuses on that overlap rather
+    /// than silently re-allowing it.
+    #[test]
+    fn covered_secret_becomes_explicit_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("server.py"), b"x").unwrap();
+        std::fs::write(dir.path().join(".env"), b"K=1").unwrap();
+        let mut policy = crate::policy::Policy::default();
+        // Simulate a runtime grant covering the command tree (e.g. a
+        // payload beneath /usr): the carve cannot reach through it.
+        policy
+            .fs
+            .read_only
+            .push(format!("{}/**", dir.path().display()));
+        // Mimic the probe's spelling so retain() does not drop it.
+        let mut budget = SECRET_SCAN_MAX_ENTRIES;
+        let parent = plain_spelling(&dir.path().canonicalize().unwrap());
+        let (grants, secrets) = carved_grant_paths(&parent, &mut budget, None).unwrap();
+        for g in grants {
+            if !policy
+                .fs
+                .read_only
+                .contains(&g.to_string_lossy().into_owned())
+            {
+                policy.fs.read_only.push(g.to_string_lossy().into_owned());
+            }
+        }
+        deny_covered_secrets(&mut policy, &secrets);
+        // Secrets are enumerated under a canonicalized parent, so the
+        // deny carries the resolved spelling — canonicalize the
+        // expectation the same way before comparing.
+        let env = dir.path().join(".env").canonicalize().unwrap();
+        assert!(
+            policy.fs.denied_paths.iter().any(|d| {
+                let d = Path::new(d);
+                resolved_path_covers(d, &env) && resolved_path_covers(&env, d)
+            }),
+            "covered secret must become a deny: {:?}",
+            policy.fs.denied_paths
+        );
+    }
+
+    /// The probe grants a directory argument's *parent* — the carve
+    /// must reach that same root or the broad `dir/**` grant survives
+    /// beside the carved children, reserved siblings included.
+    #[test]
+    fn discovery_policy_carves_dir_arg_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        let work = proj.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let env = proj.join(".env");
+        std::fs::write(&env, b"K=1").unwrap();
+        let command = vec![
+            "definitely-not-a-resolvable-tool".to_string(),
+            work.to_string_lossy().into_owned(),
+        ];
+        let policy = discovery_policy(&command, dir.path()).unwrap();
+        let env = env.canonicalize().unwrap();
+        let covered = policy
+            .fs
+            .read_only
+            .iter()
+            .any(|g| grant_covers_secret(g, &env));
+        if covered {
+            assert!(
+                policy.fs.denied_paths.iter().any(|d| {
+                    let d = Path::new(d);
+                    resolved_path_covers(d, &env) && resolved_path_covers(&env, d)
+                }),
+                "a surviving grant covers the reserved path with no deny: {:?}",
+                policy.fs.denied_paths
+            );
+        }
+    }
+
+    /// A bare argument names a file beside the process — the carve
+    /// root is the current directory, same as the probe grants, never
+    /// an empty path that would fail the walk.
+    #[test]
+    fn command_parent_dirs_normalizes_bare_args() {
+        let parents = command_parent_dirs(&[
+            "definitely-not-a-resolvable-tool".to_string(),
+            "missing-config.json".to_string(),
+        ]);
+        let cwd = plain_spelling(&std::env::current_dir().unwrap().canonicalize().unwrap());
+        assert!(
+            parents.contains(&cwd),
+            "bare arg must root at the current directory: {parents:?}"
+        );
+        assert!(parents.iter().all(|p| !p.as_os_str().is_empty()));
+    }
+
+    /// An already-expired deadline fails the walk even where nothing
+    /// would be scanned — the grant never outlives its bound.
+    #[test]
+    fn carve_deadline_expired_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = SECRET_SCAN_MAX_ENTRIES;
+        let past = Instant::now() - Duration::from_secs(1);
+        assert!(carved_grant_paths(dir.path(), &mut budget, Some(past)).is_err());
+        // The clean early-outs gate on the deadline too — a vanished
+        // root still fails closed rather than granting after expiry.
+        let missing = dir.path().join("no-such-dir");
+        assert!(carved_grant_paths(&missing, &mut budget, Some(past)).is_err());
+    }
+
+    /// The self-test carves argument roots like discovery while every
+    /// other grant — the executable-parent `dir/**` the probe needs to
+    /// exec its image — survives untouched.
+    #[test]
+    fn self_test_arg_carve_keeps_non_arg_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        let work = proj.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let env = proj.join(".env");
+        std::fs::write(&env, b"K=1").unwrap();
+        #[cfg(windows)]
+        let exe = "cmd";
+        #[cfg(not(windows))]
+        let exe = "echo";
+        let command = vec![exe.to_string(), work.to_string_lossy().into_owned()];
+        let mut policy = crate::legislator::self_test_warden::prepare_warden_probe_policy(
+            &crate::policy::Policy::default(),
+            dir.path(),
+            &command,
+        );
+        // The executable-parent grant Landlock needs to exec the probe
+        // image — spelled here as `prepare_warden_probe_policy` adds it
+        // on Linux (`push_landlock_dir` drops `\\?\`-verbatim spellings
+        // on Windows, so the test spells the grant itself).
+        let exe_parent = crate::workload::resolve_command_path(exe)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        policy
+            .fs
+            .read_only
+            .push(format!("{}/**", exe_parent.display()));
+        carve_arg_grants(&mut policy, &command, None).unwrap();
+        let exe_parent = exe_parent.canonicalize().unwrap();
+        assert!(
+            policy
+                .fs
+                .read_only
+                .iter()
+                .any(|g| grant_names_dir(g, &exe_parent)),
+            "executable-parent grant must survive: {:?}",
+            policy.fs.read_only
+        );
+        let env = env.canonicalize().unwrap();
+        if policy
+            .fs
+            .read_only
+            .iter()
+            .any(|g| grant_covers_secret(g, &env))
+        {
+            assert!(
+                policy.fs.denied_paths.iter().any(|d| {
+                    let d = Path::new(d);
+                    resolved_path_covers(d, &env) && resolved_path_covers(&env, d)
+                }),
+                "surviving grant covers .env with no deny: {:?}",
+                policy.fs.denied_paths
+            );
+        }
+    }
+
+    /// An argument parent that coincides with the executable's own
+    /// parent must not delete the access the image launches under: a
+    /// `dir/**` grant the probe already spelled stays and its reserved
+    /// names are denied, while a platform whose grant filter dropped
+    /// the spelling still gets the carved children — the parent keeps
+    /// access either way. The stand-in exe lives in a tempdir so no
+    /// file beside a real image is touched — nothing execs it, the
+    /// path only needs to resolve.
+    #[test]
+    fn shared_exe_parent_grant_preserved_and_secret_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let exe = dir.join("carve-shared-parent-exe");
+        std::fs::write(&exe, b"probe image").unwrap();
+        let arg_file = dir.join("carve-shared-parent-arg.txt");
+        let env = dir.join(".env");
+        std::fs::write(&arg_file, b"x").unwrap();
+        std::fs::write(&env, b"K=1").unwrap();
+
+        let command = vec![
+            exe.to_string_lossy().into_owned(),
+            arg_file.to_string_lossy().into_owned(),
+        ];
+        let mut policy = crate::legislator::self_test_warden::prepare_warden_probe_policy(
+            &crate::policy::Policy::default(),
+            dir,
+            &command,
+        );
+        carve_arg_grants(&mut policy, &command, None).unwrap();
+
+        // The parent's access survives either as its preserved
+        // `dir/**` (where the spelled grant landed) or as carved
+        // children (where a platform's grant filter dropped it).
+        let dir_canon = dir.canonicalize().unwrap();
+        let arg_canon = arg_file.canonicalize().unwrap();
+        let preserved = policy
+            .fs
+            .read_only
+            .iter()
+            .any(|g| grant_names_dir(g, &dir_canon));
+        let carved_cover = policy.fs.read_only.iter().any(|g| {
+            let g = Path::new(g);
+            resolved_path_covers(g, &arg_canon) && resolved_path_covers(&arg_canon, g)
+        });
+        assert!(
+            preserved || carved_cover,
+            "shared executable parent must keep access: {:?}",
+            policy.fs.read_only
+        );
+        // `.env` is never left covered-but-undenied: under a preserved
+        // `dir/**` it lands in `denied_paths`, under carved grants it
+        // simply has no grant.
+        let env_canon = env.canonicalize().unwrap();
+        if policy
+            .fs
+            .read_only
+            .iter()
+            .any(|g| grant_covers_secret(g, &env_canon))
+        {
+            assert!(
+                policy.fs.denied_paths.iter().any(|d| {
+                    let d = Path::new(d);
+                    resolved_path_covers(d, &env_canon) && resolved_path_covers(&env_canon, d)
+                }),
+                "secret under the preserved grant must be denied: {:?}",
+                policy.fs.denied_paths
+            );
+        }
+    }
+
+    /// Option spellings and punctuation-free literals are never
+    /// filesystem paths — `--mode` and `stdio` contribute neither a
+    /// carve root nor a probe grant.
+    #[test]
+    fn non_path_args_add_no_grant_or_carve_root() {
+        let command = vec![
+            "definitely-not-a-resolvable-tool".to_string(),
+            "--mode".to_string(),
+            "stdio".to_string(),
+        ];
+        let parents = command_parent_dirs(&command);
+        assert!(
+            parents.is_empty(),
+            "options and literals must yield no carve root: {parents:?}"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = crate::legislator::self_test_warden::prepare_warden_probe_policy(
+            &crate::policy::Policy::default(),
+            tmp.path(),
+            &command,
+        );
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert!(
+            !policy.fs.read_only.iter().any(|g| grant_names_dir(g, &cwd)),
+            "non-path args must not grant the current directory: {:?}",
+            policy.fs.read_only
+        );
+    }
+
+    /// The probe policy itself must spell that same access — a bare
+    /// argument's `//`-less parent becomes `./**`, not a dropped
+    /// grant.
+    #[test]
+    fn probe_policy_keeps_cwd_for_bare_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let command = vec![
+            "definitely-not-a-resolvable-tool".to_string(),
+            "missing-config.json".to_string(),
+        ];
+        let policy = crate::legislator::self_test_warden::prepare_warden_probe_policy(
+            &crate::policy::Policy::default(),
+            tmp.path(),
+            &command,
+        );
+        assert!(
+            policy.fs.read_only.iter().any(|g| g == "./**"),
+            "bare arg must retain current-directory access: {:?}",
+            policy.fs.read_only
+        );
+    }
+
+    /// F64/F-budget: page-count and per-frame caps alone let fifty
+    /// near-limit pages retain hundreds of MiB — the cumulative byte
+    /// budget must trip well before `MAX_PAGES`.
+    #[test]
+    fn page_byte_budget_fails_closed_before_page_limit() {
+        let mut acc = PageAccumulator::new();
+        let fat_page = 512 * 1024; // well under the 10 MiB frame cap
+        let mut charged = 0usize;
+        let mut err = None;
+        for _ in 0..MAX_PAGES {
+            match acc.note_page_bytes(fat_page, "test") {
+                Ok(()) => charged += 1,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect("near-limit pages must trip the aggregate budget");
+        assert!(matches!(err, ToolsListError::PaginationIncomplete(_)));
+        assert!(
+            charged < MAX_PAGES,
+            "budget must trip before the page count limit ({charged} pages charged)"
+        );
+        assert!(charged > 1, "a normal listing is nowhere near the cap");
+    }
+
     #[tokio::test]
     async fn test_fetch_tools_list_timeout() {
         #[cfg(windows)]
@@ -1043,7 +2140,10 @@ mod tests {
         let result = fetch_tools_list(&cmd, Some(Duration::from_millis(100))).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ToolsListError::Timeout { .. }));
+        assert!(
+            matches!(err, ToolsListError::Timeout { .. }),
+            "expected Timeout, got {err:?}"
+        );
     }
 
     #[tokio::test]

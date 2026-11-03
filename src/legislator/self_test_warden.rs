@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
@@ -93,9 +93,67 @@ pub(crate) async fn collect_warden_evidence(
     #[cfg(target_os = "linux")]
     {
         let notes = warden_probe_policy_notes();
-        let prepared = prepare_warden_probe_policy(draft, tmpdir, command);
-        match tokio::time::timeout(
-            timeout,
+        // One deadline bounds the whole evidence operation — the
+        // carve's filesystem walk is as much a hang surface as the
+        // probe itself, and the walk checks that deadline internally:
+        // timing out the await could never stop a blocking scan
+        // already in flight.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let carve_deadline = std::time::Instant::now() + timeout;
+        // The probe's argument grants (`./**` for a bare argument,
+        // `dir/**` otherwise) are spelled the same as discovery's and
+        // leave reserved names just as reachable — carve them before
+        // the supplied command runs. The walk blocks on real I/O, so
+        // it runs off the async runtime; a failed or timed-out carve
+        // refuses the spawn.
+        let (draft_owned, command_owned, tmpdir_owned) =
+            (draft.clone(), command.to_vec(), tmpdir.to_path_buf());
+        let prepared = match tokio::time::timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                let mut p =
+                    prepare_warden_probe_policy(&draft_owned, &tmpdir_owned, &command_owned);
+                crate::legislator::tools_list::carve_arg_grants(
+                    &mut p,
+                    &command_owned,
+                    Some(carve_deadline),
+                )
+                .map(|()| p)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(Ok(p))) => p,
+            Ok(Ok(Err(e))) => {
+                return (
+                    WardenVerdict::Inconclusive,
+                    format!("cannot carve a secret-free probe grant: {e}"),
+                    SpawnStatus::NotAttempted,
+                    e.to_string(),
+                    notes,
+                );
+            }
+            Ok(Err(e)) => {
+                return (
+                    WardenVerdict::Inconclusive,
+                    format!("grant carving failed: {e}"),
+                    SpawnStatus::NotAttempted,
+                    e.to_string(),
+                    notes,
+                );
+            }
+            Err(_) => {
+                return (
+                    WardenVerdict::Inconclusive,
+                    "timed out carving a secret-free probe grant".to_string(),
+                    SpawnStatus::NotAttempted,
+                    "timed out".to_string(),
+                    notes,
+                );
+            }
+        };
+        match tokio::time::timeout_at(
+            deadline,
             run_warden_os_deny_probe(&prepared, command, tmpdir),
         )
         .await
@@ -175,14 +233,33 @@ pub fn prepare_warden_probe_policy(draft: &Policy, tmpdir: &Path, command: &[Str
         );
     }
     for arg in command.iter().skip(1) {
+        // An option token is never a filesystem path — a file spelled
+        // `-x` is reached as `./-x`, so even a coincidental `--mode`
+        // file contributes no grant through the bare spelling.
+        if arg.starts_with('-') {
+            continue;
+        }
         let path = Path::new(arg);
         let parent = if path.exists() {
             path.canonicalize()
                 .ok()
                 .and_then(|c| c.parent().map(Path::to_path_buf))
                 .or_else(|| path.parent().map(Path::to_path_buf))
+        } else if !crate::pathutil::selector_plausible(arg) {
+            // A missing argument needs path-like punctuation to earn a
+            // grant — `stdio` is a literal value, while `config.json`
+            // and `sub/file` keep their parent.
+            None
         } else {
-            path.parent().map(Path::to_path_buf)
+            // A bare argument lives in the current directory — an
+            // empty `parent()` normalizes to `.`, not to nothing.
+            path.parent().map(|p| {
+                if p.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    p.to_path_buf()
+                }
+            })
         };
         if let Some(parent) = parent {
             // A grant covering WARDEN_PROBE_PATH would let the child serve

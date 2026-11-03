@@ -81,7 +81,12 @@ where
     // cannot see. A prior busy flag means a listing is in flight.
     // The gate stays raised until the verified emit or
     // resume_queued_revalidation drops it on this side.
-    let was_busy = shared.list_busy.swap(true, Ordering::SeqCst);
+    // The raise runs under `list_epoch`, which orders it against a
+    // tools/call's guarded recheck+write: a call that already holds the
+    // epoch finishes its dispatch before the gate flips (it
+    // legitimately predates the revalidation); a call that arrives
+    // after observes busy and unwinds.
+    let was_busy = shared.raise_list_gate().await;
     if st.hold_list_changed(line, was_busy) {
         return Ok(());
     }
@@ -545,7 +550,9 @@ where
             };
             st.bind_client(id, original);
         }
-        shared.list_busy.store(true, Ordering::SeqCst);
+        // Bound to a live client id (or internal) — keep calls denied
+        // through the remaining pages. Epoch-ordered like every raise.
+        shared.raise_list_gate().await;
     }
 
     let has_next_cursor = page

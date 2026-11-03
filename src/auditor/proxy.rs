@@ -66,6 +66,7 @@ where
         cancelled_list_id: Arc::new(tokio::sync::Mutex::new(None)),
         held_client_list: Arc::new(tokio::sync::Mutex::new(None)),
         internal_list_failure: Arc::new(tokio::sync::Mutex::new(None)),
+        list_epoch: Arc::new(tokio::sync::Mutex::new(())),
         list_generation: Arc::new(AtomicU64::new(0)),
         verified_tools: Arc::new(std::sync::Mutex::new(super::proxy_state::VerifiedToolSet {
             generation: 0,

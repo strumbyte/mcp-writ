@@ -38,6 +38,7 @@ fn shared_for_test_with(
         cancelled_list_id: Arc::new(Mutex::new(None)),
         held_client_list: Arc::new(Mutex::new(None)),
         internal_list_failure: Arc::new(tokio::sync::Mutex::new(None)),
+        list_epoch: Arc::new(tokio::sync::Mutex::new(())),
         list_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         verified_tools: Arc::new(std::sync::Mutex::new(
             crate::auditor::proxy_state::VerifiedToolSet {
