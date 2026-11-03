@@ -1131,9 +1131,27 @@ async fn spawn_server_sandboxed(
     command: &[String],
 ) -> Result<(crate::warden::RunningChild, PathBuf), ToolsListError> {
     let tmp = create_discovery_tmpdir()?;
-    let policy = discovery_policy(command, &tmp).inspect_err(|_| {
-        let _ = std::fs::remove_dir_all(&tmp);
-    })?;
+    // The secret-scan carve is synchronous filesystem traversal — a
+    // large command tree would stall the Tokio worker, so the policy
+    // build runs on the blocking pool. A panicking or cancelled task
+    // fails the spawn exactly like a policy error does.
+    let policy = match tokio::task::spawn_blocking({
+        let command = command.to_vec();
+        let tmp = tmp.clone();
+        move || discovery_policy(&command, &tmp)
+    })
+    .await
+    {
+        Ok(policy) => policy.inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&tmp);
+        })?,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(ToolsListError::ProcessSpawn(io::Error::other(format!(
+                "discovery policy worker failed: {e}"
+            ))));
+        }
+    };
     let resolved = crate::workload::resolve_command_path(&command[0]).map_err(|e| {
         let _ = std::fs::remove_dir_all(&tmp);
         ToolsListError::ProcessSpawn(io::Error::other(format!(
@@ -1964,14 +1982,15 @@ mod tests {
     /// `dir/**` grant the probe already spelled stays and its reserved
     /// names are denied, while a platform whose grant filter dropped
     /// the spelling still gets the carved children — the parent keeps
-    /// access either way. The exe is copied into a tempdir so no file
-    /// beside the real image is touched.
+    /// access either way. The stand-in exe lives in a tempdir so no
+    /// file beside a real image is touched — nothing execs it, the
+    /// path only needs to resolve.
     #[test]
     fn shared_exe_parent_grant_preserved_and_secret_denied() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let exe = dir.join("carve-shared-parent-exe");
-        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        std::fs::write(&exe, b"probe image").unwrap();
         let arg_file = dir.join("carve-shared-parent-arg.txt");
         let env = dir.join(".env");
         std::fs::write(&arg_file, b"x").unwrap();
