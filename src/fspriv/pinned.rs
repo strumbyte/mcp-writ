@@ -313,7 +313,7 @@ fn replaceable_path_exemptions() -> &'static std::sync::Mutex<std::collections::
 }
 
 /// Register `path` — exactly that path — as carrying the documented
-/// host-mount exemption described at [`REPLACEABLE_PATH_EXEMPTIONS`].
+/// host-mount exemption described at `REPLACEABLE_PATH_EXEMPTIONS`.
 /// The canonicalized spelling is stored when the object exists so a
 /// check arriving under an equal-but-different spelling still
 /// matches; a not-yet-created path is stored as spelled.
@@ -367,7 +367,7 @@ fn share_roots() -> &'static std::sync::Mutex<Vec<PathBuf>> {
 }
 
 /// Register `path` as a host-mounted share root for this process —
-/// see [`SHARE_ROOTS`]. The canonicalized spelling is stored when the
+/// see `SHARE_ROOTS`. The canonicalized spelling is stored when the
 /// root already exists so a check arriving under the canonical
 /// spelling still matches; a not-yet-created root is stored as
 /// spelled. Duplicates are ignored.

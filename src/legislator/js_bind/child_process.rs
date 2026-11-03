@@ -597,7 +597,7 @@ pub(crate) struct CpScan {
 ///
 /// Computed member keys (`child_process[name](…)`) are not "no exec"
 /// — this convenience wrapper answers only the `exec` half; the
-/// `unresolved` half lives on [`js_scan_cp_usage`], which the
+/// `unresolved` half lives on `js_scan_cp_usage`, which the
 /// capability pipeline consults to keep the tool denied.
 ///
 /// Prefer `js_scan_cp_usage` with a bindings table computed once per
