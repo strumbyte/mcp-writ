@@ -75,11 +75,13 @@ pub struct SpawnOptions {
     /// `macos_sandbox::staged_exec_dyld_fallback_dirs`. Empty elsewhere.
     pub exec_dyld_fallback: Vec<PathBuf>,
     /// Working directory the child starts in; `None` inherits the
-    /// launcher's. The discovery probe sets this to its private
-    /// (already read-write granted) tmpdir: a deny-by-default
-    /// filesystem cannot grant the caller's workspace, and under
-    /// sandbox-exec an ungranted inherited cwd makes `getcwd` fail,
-    /// which kills shells and subprocess machinery.
+    /// launcher's. Applied on the Unix and `sandbox-exec` supervised
+    /// routes — the Windows CreateProcess paths ignore it today.
+    /// The discovery probe sets this to its private (already
+    /// read-write granted) tmpdir: a deny-by-default filesystem cannot
+    /// grant the caller's workspace, and under sandbox-exec an
+    /// ungranted inherited cwd makes `getcwd` fail, which kills
+    /// shells and subprocess machinery.
     pub cwd: Option<PathBuf>,
 }
 

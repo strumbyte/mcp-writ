@@ -717,6 +717,9 @@ impl Warden {
                 env_opts.tmpdir = Some(tmpdir.path().to_path_buf());
             }
             apply_spawn_env(&mut cmd, &env_opts);
+            if let Some(dir) = &opts.cwd {
+                cmd.current_dir(dir);
+            }
             let env_applied = env_block_applies(&env_opts);
             if let Some(exe) = python_executable_override(command, program) {
                 cmd.env("PYTHONEXECUTABLE", exe);
