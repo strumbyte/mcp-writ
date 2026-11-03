@@ -176,6 +176,13 @@ jobs:
       # Everything the script touches then needs an absolute path.
       - name: check-server (unix)
         if: runner.os != 'Windows'
+        # The workspace checkout lives on a tree the host may share —
+        # the trusted-source gate refuses policy/audit paths whose
+        # ancestry grants another principal replace access. The e2e
+        # harness declares the same waiver for its launches; the
+        # launch report records it.
+        env:
+          MCP_WRIT_ALLOW_REPLACEABLE_PATHS: "1"
         working-directory: check-data
         run: |
           set -euo pipefail
@@ -230,6 +237,12 @@ jobs:
         # The policy grants check-data but not the workspace root, so the
         # step runs inside it and the child server inherits an allowed
         # cwd. Everything the script touches then needs an absolute path.
+        # Some hosted images carry a workspace DACL that grants other
+        # principals replace access — the trusted-source gate then
+        # refuses the workspace-resident policy/audit paths; the e2e
+        # harness declares the same waiver for its launches.
+        env:
+          MCP_WRIT_ALLOW_REPLACEABLE_PATHS: "1"
         working-directory: check-data
         run: |
           $ErrorActionPreference = 'Stop'
