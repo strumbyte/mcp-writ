@@ -265,7 +265,7 @@ fn is_dns_name(name: &str) -> bool {
 /// and `//`-less targets of unknown schemes — URI RRs resolve under
 /// scheme-specific rules (RFC 7553), so only schemes whose grammar
 /// this parser knows are opaque-passed.
-fn uri_host<'a>(target: &'a str) -> Result<Vec<&'a str>, ()> {
+fn uri_host(target: &str) -> Result<Vec<&str>, ()> {
     let (scheme, rest) = target.split_once(':').ok_or(())?;
     if scheme.is_empty()
         || !scheme.bytes().enumerate().all(|(i, b)| {
@@ -281,10 +281,9 @@ fn uri_host<'a>(target: &'a str) -> Result<Vec<&'a str>, ()> {
     if matches!(
         scheme.to_ascii_lowercase().as_str(),
         "http" | "https" | "ws" | "wss" | "ftp" | "file"
-    ) {
-        if rest.contains('\\') || !rest.starts_with("//") {
-            return Err(());
-        }
+    ) && (rest.contains('\\') || !rest.starts_with("//"))
+    {
+        return Err(());
     }
     let Some(auth) = rest.strip_prefix("//") else {
         return opaque_scheme_hosts(&scheme.to_ascii_lowercase(), rest);
@@ -843,13 +842,11 @@ pub(crate) fn parse_response(buf: &[u8], forwarded_name: &str) -> ParsedResponse
                     }
                 }
             }
-            RRTYPE_SOA | RRTYPE_NSEC => {
-                // Metadata, not destinations — structure validated,
-                // nothing collected.
-                if validate_metadata_rdata(buf, &rr).is_none() {
-                    decoded = false;
-                    break;
-                }
+            // Metadata, not destinations — structure validated, nothing
+            // collected; an invalid record is undecodable.
+            RRTYPE_SOA | RRTYPE_NSEC if validate_metadata_rdata(buf, &rr).is_none() => {
+                decoded = false;
+                break;
             }
             _ => {}
         }

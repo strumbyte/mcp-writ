@@ -790,12 +790,17 @@ async fn process_query(
     }
 
     // Authority/additional sections are relayed verbatim too — the
-    // names they reveal receive the same full name-policy judgment as
-    // the chain: an explicit deny refuses, and under `deny_all_others`
-    // a name no allow covers refuses as well. They never mint grants —
-    // they are judged destinations, not answers to this query.
+    // names they reveal are checked against explicit deny rules only.
+    // Allowlist non-membership must not refuse a merely referenced
+    // name: delegation NS/glue point outside the allow list on every
+    // ordinary response, these records mint nothing, and any query the
+    // workload derives from them re-enters this gate and is judged on
+    // its own. An explicit deny still fires — a response must not hand
+    // the workload an endpoint the policy already forbids.
     for name in &parsed.extra_names {
-        if let Verdict::Deny(reason) = name_policy::evaluate(&core.outbound, name).verdict {
+        if let Verdict::Deny(reason) = name_policy::evaluate(&core.outbound, name).verdict
+            && reason.rule().is_some()
+        {
             core.emit_denied(
                 &eval.canonical,
                 Some(q.qtype),

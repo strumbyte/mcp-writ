@@ -616,17 +616,36 @@ fn command_parent_dirs(command: &[String]) -> Vec<PathBuf> {
         push(&mut dirs, parent);
     }
     for arg in command.iter().skip(1) {
-        let path = Path::new(arg);
-        if !path.exists() {
+        // Same option guard as the probe walk — a bare `--mode` never
+        // names a path, so it earns no carve root.
+        if arg.starts_with('-') {
             continue;
         }
-        let parent = if path.is_dir() {
-            Some(path.to_path_buf())
-        } else {
+        let path = Path::new(arg);
+        // The same root rule `prepare_warden_probe_policy` grants —
+        // canonical parent for an existing argument, plain parent for
+        // a missing one. Any other root leaves its `dir/**` grant
+        // outside the carve and back inside the policy.
+        let parent = if path.exists() {
             path.canonicalize()
                 .ok()
                 .and_then(|c| c.parent().map(Path::to_path_buf))
                 .or_else(|| path.parent().map(Path::to_path_buf))
+        } else if !crate::pathutil::selector_plausible(arg) {
+            // Parity with the probe walk: a bare literal such as
+            // `stdio` is no path and contributes no carve root.
+            None
+        } else {
+            // A bare argument names a file beside the process — the
+            // probe grants the current directory for it, so an empty
+            // `parent()` normalizes to `.` for the same carve root.
+            path.parent().map(|p| {
+                if p.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    p.to_path_buf()
+                }
+            })
         };
         if let Some(parent) = parent {
             // Keep parity with the probe walk: a grant covering
@@ -982,9 +1001,8 @@ async fn spawn_server_sandboxed(
     command: &[String],
 ) -> Result<(crate::warden::RunningChild, PathBuf), ToolsListError> {
     let tmp = create_discovery_tmpdir()?;
-    let policy = discovery_policy(command, &tmp).map_err(|e| {
+    let policy = discovery_policy(command, &tmp).inspect_err(|_| {
         let _ = std::fs::remove_dir_all(&tmp);
-        e
     })?;
     let resolved = crate::workload::resolve_command_path(&command[0]).map_err(|e| {
         let _ = std::fs::remove_dir_all(&tmp);
@@ -993,8 +1011,6 @@ async fn spawn_server_sandboxed(
             command[0]
         )))
     })?;
-    let mut argv = command.to_vec();
-    argv[0] = resolved.to_string_lossy().into_owned();
     let opts = crate::warden::SpawnOptions {
         restrict_environment: true,
         allowed_names: Vec::new(),
@@ -1007,12 +1023,18 @@ async fn spawn_server_sandboxed(
     #[cfg(target_os = "macos")]
     let opts = {
         let mut o = opts;
-        o.exec_map_dirs =
-            crate::warden::macos_sandbox::code_map_dirs(std::path::Path::new(&argv[0]), &argv);
+        o.exec_map_dirs = crate::warden::macos_sandbox::code_map_dirs(&resolved, command);
         o
     };
+    // The verified image rides `lpApplicationName`; the child's argv[0]
+    // keeps the caller's spelling. `resolve_command_path` canonicalizes
+    // to a `\\?\` verbatim path on Windows, and a verbatim module path —
+    // whether as argv[0] or as the image name — leaves CLR children
+    // (powershell.exe, any .NET server) unable to load assemblies, so
+    // the program is handed over in plain spelling.
+    let program = plain_spelling(&resolved);
     match crate::warden::Warden::new(policy)
-        .spawn_child_async_with(&argv, &opts)
+        .spawn_child_async_exe_with(&program, command, &opts)
         .await
     {
         Ok(child) => Ok((child, tmp)),
@@ -1552,14 +1574,14 @@ mod tests {
             secrets
                 .iter()
                 .any(|s| resolved_path_covers(s, &env) && resolved_path_covers(&env, s)),
-            "resolved .env must be recorded: {secrets:?}"
+            "resolved .env must be recorded"
         );
         let app = real.join("app.py").canonicalize().unwrap();
         assert!(
             grants
                 .iter()
                 .any(|g| resolved_path_covers(g, &app) && resolved_path_covers(&app, g)),
-            "payload file must keep its grant: {grants:?}"
+            "payload file must keep its grant"
         );
     }
 
@@ -1679,6 +1701,108 @@ mod tests {
         );
     }
 
+    /// The probe grants a directory argument's *parent* — the carve
+    /// must reach that same root or the broad `dir/**` grant survives
+    /// beside the carved children, reserved siblings included.
+    #[test]
+    fn discovery_policy_carves_dir_arg_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        let work = proj.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let env = proj.join(".env");
+        std::fs::write(&env, b"K=1").unwrap();
+        let command = vec![
+            "definitely-not-a-resolvable-tool".to_string(),
+            work.to_string_lossy().into_owned(),
+        ];
+        let policy = discovery_policy(&command, dir.path()).unwrap();
+        let env = env.canonicalize().unwrap();
+        let covered = policy
+            .fs
+            .read_only
+            .iter()
+            .any(|g| grant_covers_secret(g, &env));
+        if covered {
+            assert!(
+                policy.fs.denied_paths.iter().any(|d| {
+                    let d = Path::new(d);
+                    resolved_path_covers(d, &env) && resolved_path_covers(&env, d)
+                }),
+                "a surviving grant covers the reserved path with no deny: {:?}",
+                policy.fs.denied_paths
+            );
+        }
+    }
+
+    /// A bare argument names a file beside the process — the carve
+    /// root is the current directory, same as the probe grants, never
+    /// an empty path that would fail the walk.
+    #[test]
+    fn command_parent_dirs_normalizes_bare_args() {
+        let parents = command_parent_dirs(&[
+            "definitely-not-a-resolvable-tool".to_string(),
+            "missing-config.json".to_string(),
+        ]);
+        let cwd = plain_spelling(&std::env::current_dir().unwrap().canonicalize().unwrap());
+        assert!(
+            parents.contains(&cwd),
+            "bare arg must root at the current directory: {parents:?}"
+        );
+        assert!(parents.iter().all(|p| !p.as_os_str().is_empty()));
+    }
+
+    /// Option spellings and punctuation-free literals are never
+    /// filesystem paths — `--mode` and `stdio` contribute neither a
+    /// carve root nor a probe grant.
+    #[test]
+    fn non_path_args_add_no_grant_or_carve_root() {
+        let command = vec![
+            "definitely-not-a-resolvable-tool".to_string(),
+            "--mode".to_string(),
+            "stdio".to_string(),
+        ];
+        let parents = command_parent_dirs(&command);
+        assert!(
+            parents.is_empty(),
+            "options and literals must yield no carve root: {parents:?}"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = crate::legislator::self_test_warden::prepare_warden_probe_policy(
+            &crate::policy::Policy::default(),
+            tmp.path(),
+            &command,
+        );
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert!(
+            !policy.fs.read_only.iter().any(|g| grant_names_dir(g, &cwd)),
+            "non-path args must not grant the current directory: {:?}",
+            policy.fs.read_only
+        );
+    }
+
+    /// The probe policy itself must spell that same access — a bare
+    /// argument's `//`-less parent becomes `./**`, not a dropped
+    /// grant.
+    #[test]
+    fn probe_policy_keeps_cwd_for_bare_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let command = vec![
+            "definitely-not-a-resolvable-tool".to_string(),
+            "missing-config.json".to_string(),
+        ];
+        let policy = crate::legislator::self_test_warden::prepare_warden_probe_policy(
+            &crate::policy::Policy::default(),
+            tmp.path(),
+            &command,
+        );
+        assert!(
+            policy.fs.read_only.iter().any(|g| g == "./**"),
+            "bare arg must retain current-directory access: {:?}",
+            policy.fs.read_only
+        );
+    }
+
     /// F64/F-budget: page-count and per-frame caps alone let fifty
     /// near-limit pages retain hundreds of MiB — the cumulative byte
     /// budget must trip well before `MAX_PAGES`.
@@ -1721,7 +1845,10 @@ mod tests {
         let result = fetch_tools_list(&cmd, Some(Duration::from_millis(100))).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ToolsListError::Timeout { .. }));
+        assert!(
+            matches!(err, ToolsListError::Timeout { .. }),
+            "expected Timeout, got {err:?}"
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
@@ -175,14 +175,33 @@ pub fn prepare_warden_probe_policy(draft: &Policy, tmpdir: &Path, command: &[Str
         );
     }
     for arg in command.iter().skip(1) {
+        // An option token is never a filesystem path — a file spelled
+        // `-x` is reached as `./-x`, so even a coincidental `--mode`
+        // file contributes no grant through the bare spelling.
+        if arg.starts_with('-') {
+            continue;
+        }
         let path = Path::new(arg);
         let parent = if path.exists() {
             path.canonicalize()
                 .ok()
                 .and_then(|c| c.parent().map(Path::to_path_buf))
                 .or_else(|| path.parent().map(Path::to_path_buf))
+        } else if !crate::pathutil::selector_plausible(arg) {
+            // A missing argument needs path-like punctuation to earn a
+            // grant — `stdio` is a literal value, while `config.json`
+            // and `sub/file` keep their parent.
+            None
         } else {
-            path.parent().map(Path::to_path_buf)
+            // A bare argument lives in the current directory — an
+            // empty `parent()` normalizes to `.`, not to nothing.
+            path.parent().map(|p| {
+                if p.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    p.to_path_buf()
+                }
+            })
         };
         if let Some(parent) = parent {
             // A grant covering WARDEN_PROBE_PATH would let the child serve
