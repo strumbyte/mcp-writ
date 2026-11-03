@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, watch};
 
@@ -259,6 +259,27 @@ pub(crate) struct ProxyShared<W> {
     /// on a real request id — the drain then skips its `id: null`
     /// fallback, the abort being observable already.
     pub(crate) internal_list_failure: Arc<Mutex<Option<(String, bool)>>>,
+    /// Dispatch epoch shared by the C2S `tools/call` write path and
+    /// every S2C-side `list_busy` raise. The final verified-set recheck
+    /// and the bounded child write run inside one hold of this mutex,
+    /// and [`ProxyShared::raise_list_gate`] acquires it before raising
+    /// the gate — so the gate can never flip between the recheck and
+    /// the write. A call either completes its dispatch before a
+    /// revalidation begins (it legitimately predates the new epoch) or
+    /// observes the raised gate and unwinds; the old check-then-write
+    /// ordering let a stale-generation call cross *after* `list_busy`
+    /// had already gone up.
+    ///
+    /// It is a `tokio::sync::Mutex` because the dispatch side holds it
+    /// across an `await`; a raise site only runs the atomic swap inside
+    /// it, so no lock-order cycle exists (epoch → child_stdin on the
+    /// dispatch side; epoch alone on the raise side). The epoch-held
+    /// write is bounded by `EPOCH_CHILD_WRITE_BUDGET`: the raise side
+    /// is also the task draining the child's stdout, so an unbounded
+    /// write into a full stdin pipe would deadlock with it. C2S-side
+    /// raises (`arm_tools_list`) run on the same task as the dispatch
+    /// and cannot interleave with it — they keep their plain CAS.
+    pub(crate) list_epoch: Arc<Mutex<()>>,
     /// Verified tools/list generation: `0` while no verified manifest has
     /// been published, bumped once per successful verification — after
     /// the committed `tools_list.verified` record and before `list_busy`
@@ -288,6 +309,18 @@ pub(crate) struct ProxyShared<W> {
     pub(crate) abort_tx: watch::Sender<bool>,
 }
 
+impl<W> ProxyShared<W> {
+    /// Raise the tools/list busy gate under the dispatch epoch —
+    /// every S2C-side false→true transition goes through this so the
+    /// raise can never interleave between a `tools/call`'s final
+    /// verified-set recheck and its child write (see `list_epoch`).
+    /// Returns the prior flag value, like `swap(true)`.
+    pub(crate) async fn raise_list_gate(&self) -> bool {
+        let _epoch = self.list_epoch.lock().await;
+        self.list_busy.swap(true, Ordering::SeqCst)
+    }
+}
+
 // Manual impl: `W` lives behind `Arc<Mutex<Option<W>>>`, so cloning a
 // direction handle must not require `W: Clone`.
 impl<W> Clone for ProxyShared<W> {
@@ -310,6 +343,7 @@ impl<W> Clone for ProxyShared<W> {
             cancelled_list_id: self.cancelled_list_id.clone(),
             held_client_list: self.held_client_list.clone(),
             internal_list_failure: self.internal_list_failure.clone(),
+            list_epoch: self.list_epoch.clone(),
             list_generation: self.list_generation.clone(),
             verified_tools: self.verified_tools.clone(),
             last_list_template: self.last_list_template.clone(),

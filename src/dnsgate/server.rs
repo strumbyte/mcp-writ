@@ -661,10 +661,26 @@ async fn process_query(
 
     let resp = match transport {
         Transport::Udp => {
-            upstream::forward_udp(core.config.upstream, &fwd, q.id, &eval.canonical).await
+            upstream::forward_udp(
+                core.config.upstream,
+                &fwd,
+                q.id,
+                &eval.canonical,
+                q.qtype,
+                q.qclass,
+            )
+            .await
         }
         Transport::Tcp => {
-            upstream::forward_tcp(core.config.upstream, &fwd, q.id, &eval.canonical).await
+            upstream::forward_tcp(
+                core.config.upstream,
+                &fwd,
+                q.id,
+                &eval.canonical,
+                q.qtype,
+                q.qclass,
+            )
+            .await
         }
     };
     let resp = match resp {
@@ -767,6 +783,42 @@ async fn process_query(
                 core.config.refusal.as_str(),
                 peer,
                 Some(&format!("resolved-addr={addr}")),
+            )
+            .await;
+            return wire::refusal_answer(pkt, Some(&q), core.config.refusal.rcode());
+        }
+    }
+
+    // Authority/additional sections are relayed verbatim too — the
+    // names they reveal receive the same full name-policy judgment as
+    // the chain: an explicit deny refuses, and under `deny_all_others`
+    // a name no allow covers refuses as well. They never mint grants —
+    // they are judged destinations, not answers to this query.
+    for name in &parsed.extra_names {
+        if let Verdict::Deny(reason) = name_policy::evaluate(&core.outbound, name).verdict {
+            core.emit_denied(
+                &eval.canonical,
+                Some(q.qtype),
+                reason.decision(),
+                reason.rule(),
+                core.config.refusal.as_str(),
+                peer,
+                Some(&format!("section-name={name}")),
+            )
+            .await;
+            return wire::refusal_answer(pkt, Some(&q), core.config.refusal.rcode());
+        }
+    }
+    for addr in &parsed.extra_addrs {
+        if let Some((decision, rule)) = denied_addr(&core.outbound, addr) {
+            core.emit_denied(
+                &eval.canonical,
+                Some(q.qtype),
+                decision,
+                Some(rule.as_str()),
+                core.config.refusal.as_str(),
+                peer,
+                Some(&format!("section-addr={addr}")),
             )
             .await;
             return wire::refusal_answer(pkt, Some(&q), core.config.refusal.rcode());

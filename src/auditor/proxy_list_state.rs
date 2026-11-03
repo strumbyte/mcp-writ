@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::auditor::session::RpcId;
-use crate::protocol::tools_list::{MAX_PAGES, MAX_TOTAL_TOOLS};
+use crate::protocol::tools_list::{MAX_PAGES, MAX_TOTAL_PAGE_BYTES, MAX_TOTAL_TOOLS};
 use crate::tool_def::ToolDefinition;
 
 /// Bound on retained listing-level result members (`resultType`,
@@ -19,7 +19,8 @@ pub(super) const MAX_RESULT_EXTRA_BYTES: usize = 64 * 1024;
 /// Cumulative parsed bytes across every page of one tools/list
 /// collection — each page response can carry a full frame, so the
 /// collection itself needs a byte budget separate from the page cap.
-pub(super) const MAX_LIST_PAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Shared with the Legislator discovery client.
+pub(super) const MAX_LIST_PAGE_BYTES: usize = MAX_TOTAL_PAGE_BYTES;
 
 #[derive(Default)]
 pub(crate) struct S2cListState {

@@ -669,21 +669,80 @@ pub(crate) async fn write_client_frame<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// The frame bytes themselves — newline-terminated JSON. Shared by the
+/// unbounded and epoch-bounded writers so both serialize identically.
+async fn write_frame_bytes<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    line: &str,
+) -> Result<(), AuditorError> {
+    writer.write_all(line.as_bytes()).await.map_err(io_err)?;
+    writer.write_all(b"\n").await.map_err(io_err)?;
+    writer.flush().await.map_err(io_err)?;
+    Ok(())
+}
+
+/// Lock `out`, fail closed when the writer is gone, and write the
+/// frame. Kept small so the epoch variant can hold the same guard
+/// across a bounded write and a poisoning `take` in one critical
+/// section.
+fn locked_child_writer<'a, W: tokio::io::AsyncWrite + Unpin>(
+    guard: &'a mut tokio::sync::MutexGuard<'_, Option<W>>,
+) -> Result<&'a mut W, AuditorError> {
+    guard.as_mut().ok_or_else(|| {
+        io_err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "child stdin is closed",
+        ))
+    })
+}
+
 pub(crate) async fn write_child_frame<W: tokio::io::AsyncWrite + Unpin>(
     out: &tokio::sync::Mutex<Option<W>>,
     line: &str,
 ) -> Result<(), AuditorError> {
     let mut guard = out.lock().await;
-    let writer = guard.as_mut().ok_or_else(|| {
-        io_err(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "child stdin is closed",
-        ))
-    })?;
-    writer.write_all(line.as_bytes()).await.map_err(io_err)?;
-    writer.write_all(b"\n").await.map_err(io_err)?;
-    writer.flush().await.map_err(io_err)?;
-    Ok(())
+    write_frame_bytes(locked_child_writer(&mut guard)?, line).await
+}
+
+/// Hard bound on a child-stdin write that runs inside the `list_epoch`
+/// dispatch critical section — a deadlock bound, not a latency target.
+/// The S2C raises this section serializes against live on the task that
+/// drains the child's stdout (`raise_list_gate` takes the epoch): an
+/// unbounded write into a full stdin pipe would wait on the child
+/// reading, the child on its stdout draining, and the drain on this
+/// epoch — a cycle. On expiry the call unwinds like any write error; a
+/// partially-written frame makes the stream untrustworthy anyway.
+pub(crate) const EPOCH_CHILD_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `write_child_frame` bounded by [`EPOCH_CHILD_WRITE_BUDGET`] — for the
+/// epoch-held `tools/call` dispatch path only; every other caller
+/// keeps the unbounded form.
+///
+/// The `out` guard is held across the bounded write *and* the timeout
+/// cleanup, in one critical section: a cancelled write may have
+/// committed a partial frame, so on timeout the writer is taken while
+/// still locked — a writer already queued on the mutex then wakes to
+/// `None` and fails closed instead of appending onto corrupt bytes
+/// before the session abort unwinds.
+pub(crate) async fn write_child_frame_epoch<W: tokio::io::AsyncWrite + Unpin>(
+    out: &tokio::sync::Mutex<Option<W>>,
+    line: &str,
+) -> Result<(), AuditorError> {
+    let mut guard = out.lock().await;
+    let result = {
+        let writer = locked_child_writer(&mut guard)?;
+        tokio::time::timeout(EPOCH_CHILD_WRITE_BUDGET, write_frame_bytes(writer, line)).await
+    };
+    match result {
+        Ok(r) => r,
+        Err(_) => {
+            guard.take();
+            Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "child stdin write stalled inside the list epoch",
+            )))
+        }
+    }
 }
 
 /// Declared `params._meta["io.modelcontextprotocol/protocolVersion"]` of a
@@ -841,6 +900,84 @@ mod tests {
         .unwrap();
         assert_eq!(data, b"{}\n");
         assert!(write_child_frame(&s2c_reference, "{}").await.is_err());
+    }
+
+    /// The epoch-held write must not wait forever: a wedged child
+    /// (duplex never read) is refused after `EPOCH_CHILD_WRITE_BUDGET`
+    /// so a `list_busy` raise queued on the epoch can still proceed.
+    /// Runs the real bound — ~5 s of wall clock.
+    #[tokio::test]
+    async fn epoch_write_times_out_on_wedged_child() {
+        use tokio::io::AsyncReadExt;
+        let (writer, mut reader) = tokio::io::duplex(64);
+        let shared = Arc::new(tokio::sync::Mutex::new(Some(writer)));
+        let big = "x".repeat(4096); // far over the 64-byte duplex buffer
+        let start = std::time::Instant::now();
+        let result = write_child_frame_epoch(&shared, &big).await;
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() >= EPOCH_CHILD_WRITE_BUDGET,
+            "refusal must come from the bound, not an early pipe error"
+        );
+        // A timed-out write may have committed a partial frame — the
+        // writer must be closed so no later frame appends onto the
+        // corrupt tail: the child sees EOF, and further writes fail
+        // closed rather than extending a poisoned stream.
+        assert!(shared.lock().await.is_none());
+        let mut buf = [0u8; 4096];
+        let _ = reader.read(&mut buf).await; // drain the partial bytes
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 0); // EOF
+        assert!(write_child_frame(&shared, "{}").await.is_err());
+        assert!(write_child_frame_epoch(&shared, "{}").await.is_err());
+    }
+
+    /// A writer already queued on `child_stdin` when the epoch write
+    /// times out must wake to a closed stream — not acquire the lock
+    /// first and append onto the partial frame. The take and the
+    /// blocked write share one guard hold, so the queue can never
+    /// interleave between timeout and close.
+    #[tokio::test]
+    async fn epoch_timeout_closes_ahead_of_queued_writer() {
+        use tokio::io::AsyncReadExt;
+        let (writer, mut reader) = tokio::io::duplex(64);
+        let shared = Arc::new(tokio::sync::Mutex::new(Some(writer)));
+        // Stalled epoch write: 4 KiB into a 64-byte pipe nobody drains —
+        // the first 64 bytes land, the rest parks inside the budget.
+        let stalled = tokio::spawn({
+            let shared = shared.clone();
+            async move { write_child_frame_epoch(&shared, &"a".repeat(4096)).await }
+        });
+        tokio::task::yield_now().await; // let the stalled write take the lock
+        let queued = tokio::spawn({
+            let shared = shared.clone();
+            async move { write_child_frame(&shared, "{}").await }
+        });
+        assert!(stalled.await.unwrap().is_err());
+        assert!(
+            queued.await.unwrap().is_err(),
+            "queued write must not append onto the partial frame"
+        );
+        // The child reads only the partial bytes, then EOF — the
+        // competing frame never made the stream.
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got.len(), 64);
+        assert!(got.iter().all(|b| *b == b'a'));
+    }
+
+    /// A drained child still takes the frame promptly — the bound only
+    /// fires on a genuine stall.
+    #[tokio::test]
+    async fn epoch_write_succeeds_when_child_drains() {
+        use tokio::io::AsyncReadExt;
+        let (writer, mut reader) = tokio::io::duplex(64);
+        let shared = Arc::new(tokio::sync::Mutex::new(Some(writer)));
+        let drain = tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            let _ = reader.read(&mut buf).await;
+        });
+        write_child_frame_epoch(&shared, "{}").await.unwrap();
+        drop(drain);
     }
 
     #[test]

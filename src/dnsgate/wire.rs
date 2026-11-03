@@ -33,12 +33,36 @@ pub(crate) const RCODE_REFUSED: u8 = 5;
 // Record types the codec names explicitly; every other type is carried
 // by number (`TYPE<n>` in audit details) and relayed uninterpreted.
 pub(crate) const RRTYPE_A: u16 = 1;
+pub(crate) const RRTYPE_NS: u16 = 2;
+pub(crate) const RRTYPE_MD: u16 = 3;
+pub(crate) const RRTYPE_MF: u16 = 4;
 pub(crate) const RRTYPE_CNAME: u16 = 5;
-pub(crate) const RRTYPE_DNAME: u16 = 39;
+pub(crate) const RRTYPE_SOA: u16 = 6;
+pub(crate) const RRTYPE_MB: u16 = 7;
+pub(crate) const RRTYPE_MG: u16 = 8;
+pub(crate) const RRTYPE_MR: u16 = 9;
+pub(crate) const RRTYPE_WKS: u16 = 11;
+pub(crate) const RRTYPE_PTR: u16 = 12;
+pub(crate) const RRTYPE_MX: u16 = 15;
+pub(crate) const RRTYPE_AFSDB: u16 = 18;
+pub(crate) const RRTYPE_RT: u16 = 21;
+pub(crate) const RRTYPE_NSAP_PTR: u16 = 23;
+pub(crate) const RRTYPE_PX: u16 = 26;
 pub(crate) const RRTYPE_AAAA: u16 = 28;
+pub(crate) const RRTYPE_SRV: u16 = 33;
+pub(crate) const RRTYPE_NAPTR: u16 = 35;
+pub(crate) const RRTYPE_KX: u16 = 36;
+pub(crate) const RRTYPE_DNAME: u16 = 39;
 pub(crate) const RRTYPE_OPT: u16 = 41;
+pub(crate) const RRTYPE_IPSECKEY: u16 = 45;
+pub(crate) const RRTYPE_NSEC: u16 = 47;
+pub(crate) const RRTYPE_HIP: u16 = 55;
+pub(crate) const RRTYPE_TALINK: u16 = 58;
 pub(crate) const RRTYPE_SVCB: u16 = 64;
 pub(crate) const RRTYPE_HTTPS: u16 = 65;
+pub(crate) const RRTYPE_LP: u16 = 107;
+pub(crate) const RRTYPE_URI: u16 = 256;
+pub(crate) const RRTYPE_AMTRELAY: u16 = 260;
 
 /// A decoded client query — everything the pipeline needs to evaluate
 /// the name, rebuild an upstream query, and echo the question back in

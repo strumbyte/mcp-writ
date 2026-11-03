@@ -12,6 +12,14 @@ pub const MAX_PAGES: usize = 50;
 /// enforce this aggregate budget.
 pub const MAX_TOTAL_TOOLS: usize = 1000;
 
+/// Cumulative serialized bytes across every page of one `tools/list`
+/// collection. Page-count and per-frame caps do not bound memory — each
+/// of the `MAX_PAGES` pages can fill a whole frame and retained
+/// tool definitions carry schemas, annotations, and the raw JSON — so
+/// both the Legislator accumulator and the Auditor relay charge every
+/// received page line against this session budget and fail closed.
+pub const MAX_TOTAL_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
 /// JSON parse or shape failure of one `tools/list` response payload.
 /// The Legislator `ToolsListError` type converts this into its `ParseError`
 /// variant via `From`.

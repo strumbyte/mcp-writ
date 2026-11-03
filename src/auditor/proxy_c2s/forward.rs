@@ -14,7 +14,8 @@ use crate::auditor::proxy_rpc::{self, ExtractedRequest, TrackedRequest};
 use crate::auditor::proxy_state::{MAX_ORIGINAL_TOOLS_LIST_BYTES, ProxyShared};
 use crate::auditor::proxy_wire::{
     build_error_response, build_jsonrpc_error, deny_explanation, extract_raw_id,
-    extract_tool_name_from_line, join_audit_details, write_child_frame, write_client_frame,
+    extract_tool_name_from_line, join_audit_details, write_child_frame, write_child_frame_epoch,
+    write_client_frame,
 };
 use crate::auditor::session::{RpcId, SessionState};
 use crate::error::AuditorError;
@@ -842,10 +843,40 @@ where
     // and deny rather than let the call execute against a tool set that
     // may have moved. `verified_tools` is authoritative: the names a
     // call was admitted against cannot change without its generation.
-    if let Some(expected) = expected_list_gen
-        && (shared.list_busy.load(Ordering::SeqCst)
-            || shared.verified_tools.lock().unwrap().generation != expected)
-    {
+    //
+    // The recheck and the write hold one `list_epoch` critical section:
+    // every gate raise (`handle_list_changed` and the other S2C sites)
+    // acquires the same guard first, so the gate can never flip between
+    // this check and the dispatch. A raise queued behind us runs only
+    // after the frame is written — the call legitimately predates the
+    // revalidation — and a call queued behind a raise observes busy and
+    // unwinds. Without the epoch a raise could land in the gap after
+    // the check, letting a stale-generation call cross after
+    // revalidation had already begun.
+    //
+    // The epoch-held write is bounded (`EPOCH_CHILD_WRITE_BUDGET`): the
+    // raises this section serializes against run on the S2C task that
+    // drains the child's stdout, so an unbounded write into a full
+    // stdin pipe would deadlock — the write waits on the child reading,
+    // the child on its stdout draining, the drain on this epoch. And
+    // the stale-check's denial (wire rollback, corrective audit, client
+    // error) runs only after the guard drops: a blocked client write or
+    // wire lock must not stretch the critical section either.
+    let dispatched = if let Some(expected) = expected_list_gen {
+        let _epoch = shared.list_epoch.lock().await;
+        if shared.list_busy.load(Ordering::SeqCst)
+            || shared.verified_tools.lock().unwrap().generation != expected
+        {
+            // `None` records the stale verdict; the epoch drops before
+            // the denial work below.
+            None
+        } else {
+            Some(write_child_frame_epoch(&shared.child_stdin, line).await)
+        }
+    } else {
+        Some(write_child_frame(&shared.child_stdin, line).await)
+    };
+    let Some(result) = dispatched else {
         shared.wire.lock().await.rollback_forwarded_request(undo);
         if let Some(verdict) = audit_verdict {
             // The pre-write record claimed `forwarded=true`; reconcile
@@ -868,8 +899,7 @@ where
         )
         .await?;
         return Ok(false);
-    }
-    let result = write_child_frame(&shared.child_stdin, line).await;
+    };
     if let Some(verdict) = audit_verdict
         && result.is_err()
     {
@@ -1103,6 +1133,7 @@ mod tests {
                 cancelled_list_id: Arc::new(Mutex::new(None)),
                 held_client_list: Arc::new(Mutex::new(None)),
                 internal_list_failure: Arc::new(tokio::sync::Mutex::new(None)),
+                list_epoch: Arc::new(tokio::sync::Mutex::new(())),
                 list_generation: Arc::new(AtomicU64::new(0)),
                 verified_tools: Arc::new(std::sync::Mutex::new(
                     crate::auditor::proxy_state::VerifiedToolSet {
@@ -1196,6 +1227,139 @@ mod tests {
         .unwrap();
         assert!(!forwarded, "a raised busy gate must refuse the forward");
         assert!(shared.wire.lock().await.get(C2S, &id).is_none());
+    }
+
+    /// F-dispatch-race: the recheck+write critical section is serialized
+    /// against the gate raise by `list_epoch`. With the dispatch queued
+    /// on the epoch ahead of a `list_changed` raise, the frame must
+    /// reach the child *before* the gate flips — the call legitimately
+    /// predates the revalidation.
+    #[tokio::test]
+    async fn dispatch_holding_epoch_writes_before_gate_raise() {
+        let (shared, _rx, mut child_read) = shared_for_test();
+        set_verified(&shared, 1, &["t"]);
+
+        // Hold the epoch so both contenders queue behind us; tokio's
+        // mutex grants waiters FIFO, so spawn order fixes the winner.
+        let epoch_guard = shared.list_epoch.lock().await;
+
+        let shared_dispatch = shared.clone();
+        let dispatch = tokio::spawn(async move {
+            let id = RpcId::from_u64(7);
+            let ext = ExtractedRequest::default();
+            register_and_forward_impl(
+                &shared_dispatch,
+                CALL_LINE,
+                "tools/call",
+                &id,
+                "7",
+                SupportedProtocolVersion::Mcp2025November25,
+                &ext,
+                true,
+                Some(McpVerdict::Allow(AllowReason::RuleAllow)),
+                Some(1),
+            )
+            .await
+        });
+        // Let the dispatch run to its epoch acquisition point.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let shared_raise = shared.clone();
+        let raise = tokio::spawn(async move { shared_raise.raise_list_gate().await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(epoch_guard);
+        let forwarded = dispatch.await.unwrap().unwrap();
+        let was_busy = raise.await.unwrap();
+
+        assert!(
+            forwarded,
+            "the dispatch held the epoch first — its write predates the raise"
+        );
+        assert!(!was_busy, "the raise must observe the gate still down");
+        assert!(
+            shared.list_busy.load(Ordering::SeqCst),
+            "the raise must own the gate afterwards"
+        );
+        let mut buf = vec![0u8; CALL_LINE.len() + 8];
+        let n = tokio::io::AsyncReadExt::read(&mut child_read, &mut buf)
+            .await
+            .unwrap();
+        assert!(
+            buf[..n]
+                .windows(CALL_LINE.len())
+                .any(|w| w == CALL_LINE.as_bytes()),
+            "the tools/call frame must reach the child before the gate rose"
+        );
+    }
+
+    /// F-dispatch-race, opposite winner: the `list_changed` raise queued
+    /// on the epoch first — the stale-generation call that arrives after
+    /// observes the raised gate and unwinds instead of writing.
+    #[tokio::test]
+    async fn dispatch_behind_gate_raise_unwinds_without_write() {
+        let (shared, _rx, mut child_read) = shared_for_test();
+        set_verified(&shared, 1, &["t"]);
+
+        let epoch_guard = shared.list_epoch.lock().await;
+
+        let shared_raise = shared.clone();
+        let raise = tokio::spawn(async move { shared_raise.raise_list_gate().await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let shared_dispatch = shared.clone();
+        let dispatch = tokio::spawn(async move {
+            let id = RpcId::from_u64(7);
+            let ext = ExtractedRequest::default();
+            register_and_forward_impl(
+                &shared_dispatch,
+                CALL_LINE,
+                "tools/call",
+                &id,
+                "7",
+                SupportedProtocolVersion::Mcp2025November25,
+                &ext,
+                true,
+                Some(McpVerdict::Allow(AllowReason::RuleAllow)),
+                Some(1),
+            )
+            .await
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(epoch_guard);
+        let was_busy = raise.await.unwrap();
+        let forwarded = dispatch.await.unwrap().unwrap();
+
+        assert!(!was_busy);
+        assert!(
+            !forwarded,
+            "a call queued behind the raise must see the gate and refuse"
+        );
+        assert!(shared.list_busy.load(Ordering::SeqCst));
+        let id = RpcId::from_u64(7);
+        assert!(
+            shared.wire.lock().await.get(C2S, &id).is_none(),
+            "the refused registration must be unwound"
+        );
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::io::AsyncReadExt::read(&mut child_read, &mut buf),
+        )
+        .await;
+        assert!(
+            read.is_err(),
+            "no frame may reach the child after the gate rose"
+        );
     }
 
     /// F10: with the admission generation still current and no
