@@ -592,6 +592,9 @@ mod imp {
                     )
                 })
                 .unwrap_or_default(),
+            // `run` keeps the launcher's cwd — only discovery moves the
+            // child into its private tmpdir.
+            cwd: None,
         };
         // Plus the dirs dyld will load the runtime's own libraries and
         // modules from — without exec-map on them the child dies in dyld.
