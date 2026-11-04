@@ -1308,12 +1308,8 @@ fn deny_covered_secrets(policy: &mut crate::policy::Policy, secrets: &[PathBuf])
 fn create_discovery_tmpdir() -> Result<PathBuf, ToolsListError> {
     let tmp = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
         .join(format!(
-            "mcp-writ-discover-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
+            "mcp-writ-discover-{}",
+            crate::fspriv::unique_suffix()
         ));
     // Exclusive create at the requested mode: the private TMPDIR
     // never exists first with default (or pre-existing) permissions.
