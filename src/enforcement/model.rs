@@ -563,13 +563,19 @@ pub enum PinCheck {
     /// to the launched executable or its first payload argument — a
     /// path correspondence, not a content check.
     BindPath,
-    /// The binding pass also re-hashed the target's content — applies
-    /// to the executable and to a payload-matched script.
+    /// The binding pass also re-proved the target's content is the
+    /// pinned bytes — held-object identity plus its stamp, re-hashing
+    /// only when the object provably changed or the stamp cannot rule
+    /// it out (inside the filesystem's timestamp granularity, or where
+    /// the fs clock can be rolled back) — applies to the
+    /// executable and to a payload-matched script.
     BindContent,
     /// The pre-spawn pass re-confirmed the path correspondence
     /// immediately before spawn.
     PreSpawnPath,
-    /// The pre-spawn pass re-hashed the content. Nothing holds the file
+    /// The pre-spawn pass re-proved the content of the held object
+    /// about to exec — its stamp held, or the re-hash confirmed the
+    /// pinned bytes after a detected change. Nothing holds the file
     /// immutable between this last check and `exec` — that residual
     /// window is the launch's acknowledged hash-to-exec gap.
     PreSpawnContent,

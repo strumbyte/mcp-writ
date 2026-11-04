@@ -412,7 +412,8 @@ async fn test_reverify_respells_normalized_entrypoint_path() {
     let spelled = format!("{}/./server.py", dir.display());
     let argv = vec!["python3".to_string(), spelled];
     let logger = AuditLogger::to_tracing();
-    let pin = reverify_immediately_before_spawn(&argv, &exe, &entries, &logger, true).unwrap();
+    let pin =
+        reverify_immediately_before_spawn(&argv, &exe, &entries, &logger, true, None).unwrap();
     let plan = pin.fd_exec_plan(&argv, &exe).unwrap();
     let rewritten = plan.exec_argv(&argv);
     assert_eq!(rewritten[1], script.display().to_string());
@@ -467,7 +468,7 @@ async fn test_reverify_rejects_payload_spelled_through_shared_dir() {
     let logger = AuditLogger::to_tracing();
     let argv = vec!["python3".to_string(), link.to_string_lossy().into_owned()];
     assert!(
-        reverify_immediately_before_spawn(&argv, &exe, &entries, &logger, false).is_err(),
+        reverify_immediately_before_spawn(&argv, &exe, &entries, &logger, false, None).is_err(),
         "a payload spelling through a replaceable ancestor must refuse"
     );
 
@@ -479,7 +480,7 @@ async fn test_reverify_rejects_payload_spelled_through_shared_dir() {
         "python3".to_string(),
         private_link.to_string_lossy().into_owned(),
     ];
-    reverify_immediately_before_spawn(&argv, &exe, &entries, &logger, false)
+    reverify_immediately_before_spawn(&argv, &exe, &entries, &logger, false, None)
         .expect("a link under a write-restricted parent stays acceptable");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -625,6 +626,266 @@ fn test_hash_open_file_matches_path_hash() {
         hash_file(&path).unwrap()
     );
     drop(file);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The verified-workload pipeline: verify mints a held pin per
+/// launch-identity target, and bind plus reverify prove those pins by
+/// held-object identity and stamp — the pathname re-reads are gone,
+/// while the spawn pin keeps the same shape and the same checks.
+#[tokio::test]
+async fn test_verified_workload_carries_pins_across_stages() {
+    let dir = make_test_dir("wl_carry");
+    let exe = dir.join("python3");
+    let script = dir.join("server.py");
+    std::fs::write(&exe, b"interp bytes").unwrap();
+    std::fs::write(&script, b"entry").unwrap();
+
+    let entries = vec![
+        HashEntry {
+            server_name: "s".to_string(),
+            hash_type: HashType::Binary,
+            hash_value: hash_file(&exe).unwrap(),
+            target: exe.to_string_lossy().into_owned(),
+            approved: None,
+        },
+        HashEntry {
+            server_name: "s".to_string(),
+            hash_type: HashType::Entrypoint,
+            hash_value: hash_file(&script).unwrap(),
+            target: script.to_string_lossy().into_owned(),
+            approved: None,
+        },
+    ];
+    let argv = vec!["python3".to_string(), script.to_string_lossy().into_owned()];
+    let logger = AuditLogger::to_tracing();
+    let mut verified = VerifiedWorkload::new();
+    verified
+        .verify_server_hashes("s", &entries, &logger)
+        .expect("verify mints the held pins");
+    bind_launched_workload(&argv, &exe, &entries, &logger, Some(&mut verified))
+        .expect("bind proves the held pins fresh");
+    // `true` — the namespaced handoff — keeps the trusted-source gate
+    // out of a test focused on the pin pipeline.
+    let pin = reverify_immediately_before_spawn(
+        &argv,
+        &exe,
+        &entries,
+        &logger,
+        true,
+        Some(&mut verified),
+    )
+    .expect("reverify consumes the pins into the spawn pin");
+    assert!(pin.verify_spawn_path(&exe).is_ok());
+
+    drop(pin);
+    let _ = logger.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A workload pin fails closed when the object changes after verify:
+/// the same-inode rewrite moves the held handle's stamp, and the
+/// re-hash that the stamp summons decides the mismatch — the stamp
+/// detects, it does not substitute for the digest.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_verified_workload_tamper_between_stages_fails() {
+    let dir = make_test_dir("wl_tamper");
+    let exe = dir.join("server.bin");
+    std::fs::write(&exe, b"good").unwrap();
+    let entries = vec![HashEntry {
+        server_name: "s".to_string(),
+        hash_type: HashType::Binary,
+        hash_value: hash_file(&exe).unwrap(),
+        target: exe.to_string_lossy().into_owned(),
+        approved: None,
+    }];
+    let argv = vec![exe.to_string_lossy().into_owned()];
+    let logger = AuditLogger::to_tracing();
+    let mut verified = VerifiedWorkload::new();
+    verified
+        .verify_server_hashes("s", &entries, &logger)
+        .unwrap();
+
+    std::fs::write(&exe, b"evil").unwrap();
+    assert!(
+        bind_launched_workload(&argv, &exe, &entries, &logger, Some(&mut verified)).is_err(),
+        "a post-verify rewrite must fail the bind's freshness proof"
+    );
+
+    let _ = logger.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The stamp shortcut refuses a stamp whose recorded ctime sits inside
+/// the filesystem's timestamp-granularity window — a same-tick rewrite
+/// could merge into it — and trusts one provably older.
+#[cfg(unix)]
+#[test]
+fn test_stamp_timestamp_window_gate() {
+    use super::pin::FileStamp;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now();
+    let secs = now.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let stamp = FileStamp {
+        size: 4,
+        mtime: secs,
+        mtime_nsec: 0,
+        ctime: secs,
+        ctime_nsec: 0,
+        recorded: now,
+        ctime_kernel_owned: true,
+    };
+    // ctime at the record instant — a write in the same tick would be
+    // indistinguishable, so the stamp cannot stand for content.
+    assert!(!stamp.outside_timestamp_window());
+    // ctime an hour behind the record — any later write lands in a
+    // strictly newer tick, so the stamp stands.
+    let old = FileStamp {
+        ctime: secs - 3600,
+        ..stamp
+    };
+    assert!(old.outside_timestamp_window());
+    // The same old ctime without the clock guarantee — a filesystem
+    // whose ctime can be restored (fuse/network/vfat-class) never gets
+    // the digest check skipped.
+    let untrusted_clock = FileStamp {
+        ctime_kernel_owned: false,
+        ..old
+    };
+    assert!(!untrusted_clock.outside_timestamp_window());
+    // A ctime *after* the recorded wall clock (clock skew or a fs that
+    // reports future times) also fails closed to the re-hash path.
+    let future = FileStamp {
+        ctime: secs + 3600,
+        ..stamp
+    };
+    assert!(!future.outside_timestamp_window());
+}
+
+/// The fs-type gate: kernel-managed filesystems own their ctime;
+/// fuse/network/unknown magics do not — the guarantee is denied unless
+/// positively identified.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_ftype_owns_ctime() {
+    use super::pin::ftype_owns_ctime;
+    // ext4 / tmpfs / overlayfs own their clock — the stamp may stand.
+    assert!(ftype_owns_ctime(0xEF53));
+    assert!(ftype_owns_ctime(0x0102_1994));
+    assert!(ftype_owns_ctime(0x794C_7630));
+    // FUSE, NFS, 9P and anything unidentified do not — re-hash instead.
+    assert!(!ftype_owns_ctime(0x6573_5546));
+    assert!(!ftype_owns_ctime(0x6969));
+    assert!(!ftype_owns_ctime(0x0102_1997));
+    assert!(!ftype_owns_ctime(0));
+    assert!(!ftype_owns_ctime(-1));
+}
+
+/// A pathname retargeted to a different object between verify and bind
+/// re-pins on the object now named and re-hashes it — the pathname-read
+/// judgment the held pin replaces, still fail-closed on new bytes.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_verified_workload_retargeted_path_fails() {
+    let dir = make_test_dir("wl_retarget");
+    let exe = dir.join("server.bin");
+    std::fs::write(&exe, b"good").unwrap();
+    let entries = vec![HashEntry {
+        server_name: "s".to_string(),
+        hash_type: HashType::Binary,
+        hash_value: hash_file(&exe).unwrap(),
+        target: exe.to_string_lossy().into_owned(),
+        approved: None,
+    }];
+    let argv = vec![exe.to_string_lossy().into_owned()];
+    let logger = AuditLogger::to_tracing();
+    let mut verified = VerifiedWorkload::new();
+    verified
+        .verify_server_hashes("s", &entries, &logger)
+        .unwrap();
+
+    std::fs::rename(&exe, dir.join("original.bin")).unwrap();
+    std::fs::write(&exe, b"evil").unwrap();
+    assert!(
+        bind_launched_workload(&argv, &exe, &entries, &logger, Some(&mut verified)).is_err(),
+        "a retargeted path must re-hash into a mismatch"
+    );
+
+    let _ = logger.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A retarget whose new object carries identical bytes re-anchors the
+/// pin — the same digest proves the same bytes, and the launch's
+/// freshness chain continues on the object now named.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_verified_workload_retarget_same_bytes_reanchors() {
+    let dir = make_test_dir("wl_reanchor");
+    let exe = dir.join("server.bin");
+    std::fs::write(&exe, b"good").unwrap();
+    let entries = vec![HashEntry {
+        server_name: "s".to_string(),
+        hash_type: HashType::Binary,
+        hash_value: hash_file(&exe).unwrap(),
+        target: exe.to_string_lossy().into_owned(),
+        approved: None,
+    }];
+    let argv = vec![exe.to_string_lossy().into_owned()];
+    let logger = AuditLogger::to_tracing();
+    let mut verified = VerifiedWorkload::new();
+    verified
+        .verify_server_hashes("s", &entries, &logger)
+        .unwrap();
+
+    std::fs::rename(&exe, dir.join("original.bin")).unwrap();
+    std::fs::write(&exe, b"good").unwrap();
+    bind_launched_workload(&argv, &exe, &entries, &logger, Some(&mut verified))
+        .expect("identical bytes re-anchor the pin");
+    let pin = reverify_immediately_before_spawn(
+        &argv,
+        &exe,
+        &entries,
+        &logger,
+        true,
+        Some(&mut verified),
+    )
+    .expect("reverify keeps the re-anchored pin");
+    assert!(pin.verify_spawn_path(&exe).is_ok());
+
+    drop(pin);
+    let _ = logger.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The pinless callers keep the historical pathname re-hash — a
+/// rewrite between the entry hash and bind is still caught by the
+/// second read rather than a held object.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_pinless_bind_still_detects_rewrites() {
+    let dir = make_test_dir("pinless_tamper");
+    let exe = dir.join("server.bin");
+    std::fs::write(&exe, b"good").unwrap();
+    let entries = vec![HashEntry {
+        server_name: "s".to_string(),
+        hash_type: HashType::Binary,
+        hash_value: hash_file(&exe).unwrap(),
+        target: exe.to_string_lossy().into_owned(),
+        approved: None,
+    }];
+    let argv = vec![exe.to_string_lossy().into_owned()];
+    let logger = AuditLogger::to_tracing();
+
+    std::fs::write(&exe, b"evil").unwrap();
+    assert!(
+        bind_launched_workload(&argv, &exe, &entries, &logger, None).is_err(),
+        "the pinless bind's pathname re-read must still catch a rewrite"
+    );
+
+    let _ = logger.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 

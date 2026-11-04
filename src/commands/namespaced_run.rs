@@ -471,19 +471,22 @@ mod imp {
                     .iter()
                     .map(|e| e.server_name.as_str())
                     .collect();
+                // Verify mints a held pin per launch-identity target;
+                // bind and reverify consume them — no pathname re-read.
+                let mut verified = crate::verifier::hash::VerifiedWorkload::new();
                 for s_name in server_names {
-                    crate::verifier::hash::verify_server_hashes(
-                        s_name,
-                        &policy.hash_entries,
-                        &audit_logger,
-                    )
-                    .map_err(|e| format!("supply chain verification failed for '{s_name}': {e}"))?;
+                    verified
+                        .verify_server_hashes(s_name, &policy.hash_entries, &audit_logger)
+                        .map_err(|e| {
+                            format!("supply chain verification failed for '{s_name}': {e}")
+                        })?;
                 }
                 crate::verifier::hash::bind_launched_workload(
                     &command_argv,
                     &resolved_exe,
                     &policy.hash_entries,
                     &audit_logger,
+                    Some(&mut verified),
                 )
                 .map_err(|e| format!("supply chain verification failed: {e}"))?;
                 crate::verifier::hash::reverify_immediately_before_spawn(
@@ -494,6 +497,7 @@ mod imp {
                     // init bind-mounts the verified bytes over the
                     // entrypoint path — the no-permission contract.
                     true,
+                    Some(&mut verified),
                 )
                 .map_err(|e| format!("supply chain verification failed at spawn: {e}"))
             };

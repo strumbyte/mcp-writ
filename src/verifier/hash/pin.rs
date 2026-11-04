@@ -12,9 +12,13 @@ use std::path::Path;
 #[cfg(any(unix, windows))]
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{VerifyError, hash_file, hash_open_file};
+#[cfg(unix)]
+use super::format_sha256;
+use super::{VerifyError, VerifyResult, hash_file, hash_open_file};
 use crate::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
 use crate::policy::{HashEntry, HashType};
 #[cfg(any(unix, windows))]
@@ -78,14 +82,141 @@ fn same_open_object(path: &Path, file: &std::fs::File) -> bool {
 /// descriptor at spawn verification. A held fd does not block writers
 /// on Unix, so an in-place rewrite of a pinned file leaves the identity
 /// check green while carrying unverified bytes; the stamp catches it.
+/// `recorded` is the wall clock at stamp time, not file state: it
+/// bounds how fresh a ctime must look before the stamp may stand for
+/// the bytes — see [`FileStamp::outside_timestamp_window`].
+/// `ctime_kernel_owned` records whether the filesystem's clock is one
+/// userspace cannot roll back — bookkeeping like `recorded`, not file
+/// state, so `same_state` compares neither.
 #[cfg(unix)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    size: u64,
-    mtime: i64,
-    mtime_nsec: i64,
-    ctime: i64,
-    ctime_nsec: i64,
+#[derive(Clone, Copy)]
+pub(crate) struct FileStamp {
+    pub(crate) size: u64,
+    pub(crate) mtime: i64,
+    pub(crate) mtime_nsec: i64,
+    pub(crate) ctime: i64,
+    pub(crate) ctime_nsec: i64,
+    pub(crate) recorded: std::time::SystemTime,
+    pub(crate) ctime_kernel_owned: bool,
+}
+
+/// How stale a recorded ctime must be before a stamp may stand for the
+/// object's bytes: a filesystem timestamp merges two writes that land
+/// in the same tick, so a stamp whose recorded ctime sits inside one
+/// granularity window of the wall clock at record time cannot prove a
+/// same-tick rewrite did not merge into it. FAT-class filesystems tick
+/// at 2 s — the bound covers the coarsest clock the pin can meet.
+#[cfg(unix)]
+const STAMP_GRANULARITY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The `f_type` values whose filesystems own their ctime: on a local,
+/// kernel-managed filesystem the VFS bumps ctime on every change and
+/// no userspace API rolls it back, so a stamp's recorded ctime can only
+/// look unchanged when nothing was written. FUSE- and network-class
+/// mounts report whatever their server fabricates, and vfat-class
+/// mounts have no ctime at all (it mirrors the settable mtime) — both
+/// let a rewrite restore the recorded stamp, so they are denied by
+/// absence from this list, as is any magic not positively identified.
+#[cfg(target_os = "linux")]
+pub(crate) fn ftype_owns_ctime(magic: i128) -> bool {
+    const EXT_SUPER: i128 = 0xEF53; // ext2/3/4
+    const XFS: i128 = 0x5846_5342;
+    const BTRFS: i128 = 0x9123_683E;
+    const TMPFS: i128 = 0x0102_1994;
+    const OVERLAYFS: i128 = 0x794C_7630;
+    const F2FS: i128 = 0xF2F5_2010;
+    const ZFS: i128 = 0x2FC1_2FC1;
+    const JFS: i128 = 0x3153_464A;
+    const REISERFS: i128 = 0x5265_4973;
+    const BCACHEFS: i128 = 0xCA45_1A4E;
+    const NILFS2: i128 = 0x3434;
+    // Read-only filesystems: content cannot be rewritten at all, so the
+    // stamp question is moot — trust their clock by construction.
+    const SQUASHFS: i128 = 0x7371_7368;
+    const EROFS: i128 = 0xE0F5_E1E0;
+    matches!(
+        magic,
+        EXT_SUPER
+            | XFS
+            | BTRFS
+            | TMPFS
+            | OVERLAYFS
+            | F2FS
+            | ZFS
+            | JFS
+            | REISERFS
+            | BCACHEFS
+            | NILFS2
+            | SQUASHFS
+            | EROFS
+    )
+}
+
+/// Whether the filesystem holding `file` owns its ctime — the guarantee
+/// the stamp shortcut needs before the recorded ctime may stand for
+/// the bytes. One `fstatfs` per stamp, no read.
+#[cfg(target_os = "linux")]
+pub(crate) fn ctime_clock_kernel_owned(file: &std::fs::File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::fstatfs(file.as_raw_fd(), buf.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let buf = unsafe { buf.assume_init() };
+    // `f_type` is signed on glibc and unsigned on musl — a widened
+    // comparison keeps both spellings.
+    ftype_owns_ctime(buf.f_type as i128)
+}
+
+/// Non-Linux Unix keeps no probe: the guarantee is unavailable, so the
+/// stamp always falls to the re-hash path — the conservative behavior
+/// this shortcut replaced.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ctime_clock_kernel_owned(_file: &std::fs::File) -> bool {
+    false
+}
+
+#[cfg(unix)]
+impl FileStamp {
+    /// File-state equality — `recorded` and `ctime_kernel_owned` are
+    /// bookkeeping about the stamp, not state, so neither is compared.
+    fn same_state(&self, other: &FileStamp) -> bool {
+        self.size == other.size
+            && self.mtime == other.mtime
+            && self.mtime_nsec == other.mtime_nsec
+            && self.ctime == other.ctime
+            && self.ctime_nsec == other.ctime_nsec
+    }
+
+    /// The recorded ctime as a `SystemTime`, when it converts.
+    fn ctime_as_time(&self) -> Option<std::time::SystemTime> {
+        use std::time::{Duration, UNIX_EPOCH};
+        let nsec = self.ctime_nsec.clamp(0, 999_999_999) as u32;
+        if self.ctime >= 0 {
+            UNIX_EPOCH.checked_add(Duration::new(self.ctime as u64, nsec))
+        } else {
+            UNIX_EPOCH.checked_sub(Duration::new(self.ctime.unsigned_abs(), nsec))
+        }
+    }
+
+    /// Whether the stamp may stand for the object's bytes without a
+    /// re-hash — true only when the filesystem owns its ctime (no
+    /// userspace rollback) AND the recorded ctime sits more than
+    /// [`STAMP_GRANULARITY`] behind the wall clock at record time, so
+    /// any later write must land in a strictly newer tick and move the
+    /// stamp. Without the clock guarantee, or inside the window where a
+    /// same-tick rewrite could merge into the recorded tick, the caller
+    /// must re-hash through the held handle and let the digest decide.
+    pub(crate) fn outside_timestamp_window(&self) -> bool {
+        self.ctime_kernel_owned
+            && self.ctime_as_time().is_some_and(|ctime| {
+                self.recorded
+                    .duration_since(ctime)
+                    .is_ok_and(|age| age > STAMP_GRANULARITY)
+            })
+    }
 }
 
 /// The recorded state of an open object at hash time. Unix keeps real
@@ -101,6 +232,9 @@ struct OpenStamp;
 #[cfg(unix)]
 fn record_stamp(file: &std::fs::File) -> io::Result<OpenStamp> {
     use std::os::unix::fs::MetadataExt;
+    // Sample the wall clock first so `recorded` never post-dates the
+    // state below — the window check only gets more conservative.
+    let recorded = std::time::SystemTime::now();
     let m = file.metadata()?;
     Ok(FileStamp {
         size: m.size(),
@@ -108,6 +242,8 @@ fn record_stamp(file: &std::fs::File) -> io::Result<OpenStamp> {
         mtime_nsec: m.mtime_nsec(),
         ctime: m.ctime(),
         ctime_nsec: m.ctime_nsec(),
+        recorded,
+        ctime_kernel_owned: ctime_clock_kernel_owned(file),
     })
 }
 
@@ -118,12 +254,21 @@ fn record_stamp(_file: &std::fs::File) -> io::Result<OpenStamp> {
 
 #[cfg(unix)]
 fn stamp_unchanged(file: &std::fs::File, recorded: &OpenStamp) -> bool {
-    record_stamp(file).is_ok_and(|stamp| stamp == *recorded)
+    record_stamp(file).is_ok_and(|stamp| stamp.same_state(recorded))
 }
 
 #[cfg(not(unix))]
 fn stamp_unchanged(_file: &std::fs::File, _recorded: &OpenStamp) -> bool {
     true
+}
+
+#[cfg(not(unix))]
+impl OpenStamp {
+    /// No granularity window to defend: the held share mode already
+    /// blocks writers, so the stamp always stands.
+    fn outside_timestamp_window(&self) -> bool {
+        true
+    }
 }
 
 /// `(volume serial, file index)` for a Windows handle — the stable
@@ -154,6 +299,364 @@ fn fs_file_identity(path: &Path) -> Option<(u64, u64)> {
         .and_then(|f| windows_file_identity(&f))
 }
 
+/// The verified launch workload — one held pin per binary/entrypoint
+/// hash entry, minted as the entries verified: the kept-open object,
+/// the stamp recorded before hashing, and the verified digest. Bind
+/// and reverify consume these instead of re-reading the targets by
+/// pathname — their freshness proof is the held object's identity plus
+/// its stamp, with a content re-hash only when the object provably
+/// changed (D-6). Entries that bind nothing at launch (lockfile and
+/// docker-manifest hashes) are verified but held by no pin.
+///
+/// Pins are index-aligned with the `hash_entries` slice the workload
+/// verified against — bind/reverify must be handed the same slice.
+pub struct VerifiedWorkload {
+    pins: Vec<(usize, HeldTarget)>,
+}
+
+/// A launch-identity target verified under a held handle — see
+/// [`VerifiedWorkload`]. `digest` equals `expected` whenever the pin is
+/// healthy: verify enforced it and every freshness re-check restores
+/// the invariant or fails.
+struct HeldTarget {
+    hash_type: HashType,
+    /// `entry.target` — the manifest spelling, reused as the error
+    /// label; the pin was opened through it at verify.
+    target: String,
+    /// `entry.hash_value` — the pinned digest.
+    expected: String,
+    file: std::fs::File,
+    stamp: OpenStamp,
+    /// The held object's verified digest — `expected`, restated.
+    digest: String,
+}
+
+impl HeldTarget {
+    /// Open `path` pinned, stamp it, hash the held object, and prove
+    /// the stamp held across the read — the pinless mint: callers
+    /// without a workload re-establish the same anchor a
+    /// [`VerifiedWorkload`] pin carries. `expected` is the computed
+    /// digest itself — a bare mint verifies no pin, only freshness.
+    fn open_fresh(
+        path: &Path,
+        hash_type: HashType,
+        target: String,
+    ) -> Result<Self, VerifyError> {
+        let mut file = open_pinned(path).map_err(|error| VerifyError::FileError {
+            hash_type,
+            target: target.clone(),
+            error,
+        })?;
+        let stamp = record_stamp(&file).map_err(|error| VerifyError::FileError {
+            hash_type,
+            target: target.clone(),
+            error,
+        })?;
+        let digest = hash_open_file(&mut file).map_err(|error| VerifyError::FileError {
+            hash_type,
+            target: target.clone(),
+            error,
+        })?;
+        if !stamp_unchanged(&file, &stamp) {
+            return Err(VerifyError::Mismatch {
+                hash_type,
+                target,
+                expected: "a consistent read of the pinned object".to_string(),
+                actual: "file modified during hashing".to_string(),
+            });
+        }
+        Ok(Self {
+            hash_type,
+            target,
+            expected: digest.clone(),
+            file,
+            stamp,
+            digest,
+        })
+    }
+
+    /// Freshness without a read on the happy path: `path` must still
+    /// name the held object and the object's stamp must hold — the
+    /// verified digest stands. A retargeted `path` re-pins on the
+    /// object it now names and re-hashes it — the pathname re-read
+    /// judgment this check replaces, where identical bytes re-anchor
+    /// the pin and anything else is a mismatch. A changed stamp falls
+    /// back to a content re-hash through the held handle — the stamp
+    /// only *detects*; the digest still decides (D-6).
+    fn revalidate(&mut self, path: &Path) -> Result<(), VerifyError> {
+        if !same_open_object(path, &self.file) {
+            let mut file = open_pinned(path).map_err(|error| self.file_error(error))?;
+            let stamp = record_stamp(&file).map_err(|error| self.file_error(error))?;
+            let actual = hash_open_file(&mut file).map_err(|error| self.file_error(error))?;
+            if actual != self.expected {
+                return Err(self.mismatch(actual));
+            }
+            self.file = file;
+            self.stamp = stamp;
+            self.digest = actual;
+            return Ok(());
+        }
+        // The stamp shortcut holds only when the recorded ctime is
+        // provably older than the record window — a stamp inside the
+        // filesystem's timestamp granularity cannot rule out a
+        // same-tick rewrite, so it falls to the digest like any moved
+        // stamp.
+        if stamp_unchanged(&self.file, &self.stamp) && self.stamp.outside_timestamp_window() {
+            return Ok(());
+        }
+        // A moved stamp re-reads through the held handle — stamp the
+        // object *before* the read and prove the stamp held across it,
+        // so a mid-read rewrite cannot anchor the pin on hybrid bytes.
+        let pre = record_stamp(&self.file).map_err(|error| self.file_error(error))?;
+        let actual = hash_open_file(&mut self.file).map_err(|error| self.file_error(error))?;
+        if !stamp_unchanged(&self.file, &pre) {
+            return Err(VerifyError::Mismatch {
+                hash_type: self.hash_type,
+                target: self.target.clone(),
+                expected: "a consistent read of the pinned object".to_string(),
+                actual: "file modified during hashing".to_string(),
+            });
+        }
+        if actual != self.expected {
+            return Err(self.mismatch(actual));
+        }
+        self.stamp = pre;
+        self.digest = actual;
+        Ok(())
+    }
+
+    /// The strict form of [`Self::revalidate`]: `path` must still name
+    /// the *held* object — a retarget is a mismatch outright rather
+    /// than a re-pin, for callers where re-anchoring would silently
+    /// bind a different object than the pin covered. Stamp handling is
+    /// unchanged: a changed stamp re-hashes and the digest decides.
+    fn revalidate_held(&mut self, path: &Path) -> Result<(), VerifyError> {
+        if !same_open_object(path, &self.file) {
+            return Err(VerifyError::Mismatch {
+                hash_type: self.hash_type,
+                target: self.target.clone(),
+                expected: "the pinned object".to_string(),
+                actual: "pathname now resolves to a different object".to_string(),
+            });
+        }
+        if stamp_unchanged(&self.file, &self.stamp) && self.stamp.outside_timestamp_window() {
+            return Ok(());
+        }
+        let pre = record_stamp(&self.file).map_err(|error| self.file_error(error))?;
+        let actual = hash_open_file(&mut self.file).map_err(|error| self.file_error(error))?;
+        if !stamp_unchanged(&self.file, &pre) {
+            return Err(VerifyError::Mismatch {
+                hash_type: self.hash_type,
+                target: self.target.clone(),
+                expected: "a consistent read of the pinned object".to_string(),
+                actual: "file modified during hashing".to_string(),
+            });
+        }
+        if actual != self.expected {
+            return Err(self.mismatch(actual));
+        }
+        self.stamp = pre;
+        self.digest = actual;
+        Ok(())
+    }
+
+    fn file_error(&self, error: io::Error) -> VerifyError {
+        VerifyError::FileError {
+            hash_type: self.hash_type,
+            target: self.target.clone(),
+            error,
+        }
+    }
+
+    fn mismatch(&self, actual: String) -> VerifyError {
+        VerifyError::Mismatch {
+            hash_type: self.hash_type,
+            target: self.target.clone(),
+            expected: self.expected.clone(),
+            actual,
+        }
+    }
+}
+
+impl Default for VerifiedWorkload {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VerifiedWorkload {
+    /// An empty workload — [`Self::verify_server_hashes`] fills it.
+    pub fn new() -> Self {
+        Self { pins: Vec::new() }
+    }
+
+    /// `verify_server_hashes` over `server_name`'s entries, minting a
+    /// held pin for each launch-identity target (binary and entrypoint
+    /// hashes): the target opens pinned, stamps before hashing, and is
+    /// hashed through the kept handle — handle, stamp, and digest all
+    /// stay with the workload so later stages never re-read the object
+    /// by path. Other entry types hash by path as before. The
+    /// `hash.verified` / `hash.mismatch` audit events are emitted at
+    /// this stage — the only place they are.
+    pub fn verify_server_hashes(
+        &mut self,
+        server_name: &str,
+        hash_entries: &[HashEntry],
+        audit_logger: &AuditLogger,
+    ) -> Result<VerifyResult, VerifyError> {
+        let entries: Vec<(usize, &HashEntry)> = hash_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.server_name == server_name)
+            .collect();
+
+        if entries.is_empty() {
+            tracing::warn!(
+                server = server_name,
+                "No hash entries in policy for server; allowing startup"
+            );
+            return Ok(VerifyResult::NoEntries);
+        }
+
+        let correlation_id = Uuid::now_v7();
+
+        for (i, entry) in entries {
+            let target_path = Path::new(&entry.target);
+            let outcome = if matches!(
+                entry.hash_type,
+                HashType::Binary | HashType::Entrypoint
+            ) {
+                HeldTarget::mint(entry, target_path)
+                    .map(|held| (held.digest.clone(), Some(held)))
+            } else {
+                hash_file(target_path)
+                    .map(|digest| (digest, None))
+                    .map_err(|error| VerifyError::FileError {
+                        hash_type: entry.hash_type,
+                        target: entry.target.clone(),
+                        error,
+                    })
+            };
+
+            let (actual_hash, held) = match outcome {
+                Ok(pair) => pair,
+                Err(source) => {
+                    let mut evt = AuditEvent::new(
+                        correlation_id,
+                        EventType::HashMismatch,
+                        Severity::Critical,
+                        Outcome::Failure,
+                        Action::Denied,
+                    );
+                    evt.target_server = Some(server_name.to_string());
+                    evt.details = Some(match &source {
+                        VerifyError::Mismatch {
+                            expected, actual, ..
+                        } => format!(
+                            "{} mismatch for '{}': expected {}, got {}",
+                            entry.hash_type.as_str(),
+                            entry.target,
+                            expected,
+                            actual
+                        ),
+                        VerifyError::FileError { error, .. } => format!(
+                            "{} target '{}' unreadable: {}",
+                            entry.hash_type.as_str(),
+                            entry.target,
+                            error
+                        ),
+                        VerifyError::UnboundWorkload { .. } => {
+                            unreachable!("the verify stage never binds")
+                        }
+                    });
+                    audit_logger.log(evt);
+                    return Err(source);
+                }
+            };
+
+            if actual_hash != entry.hash_value {
+                let mut evt = AuditEvent::new(
+                    correlation_id,
+                    EventType::HashMismatch,
+                    Severity::Critical,
+                    Outcome::Failure,
+                    Action::Denied,
+                );
+                evt.target_server = Some(server_name.to_string());
+                evt.details = Some(format!(
+                    "{} mismatch for '{}': expected {}, got {}",
+                    entry.hash_type.as_str(),
+                    entry.target,
+                    entry.hash_value,
+                    actual_hash
+                ));
+                audit_logger.log(evt);
+
+                return Err(VerifyError::Mismatch {
+                    hash_type: entry.hash_type,
+                    target: entry.target.clone(),
+                    expected: entry.hash_value.clone(),
+                    actual: actual_hash,
+                });
+            }
+
+            // Hash matches — emit success event
+            let mut evt = AuditEvent::new(
+                correlation_id,
+                EventType::HashVerified,
+                Severity::Info,
+                Outcome::Success,
+                Action::Allowed,
+            );
+            evt.target_server = Some(server_name.to_string());
+            evt.details = Some(format!(
+                "{} verified for '{}'",
+                entry.hash_type.as_str(),
+                entry.target
+            ));
+            audit_logger.log(evt);
+
+            if let Some(held) = held {
+                self.pins.push((i, held));
+            }
+        }
+
+        Ok(VerifyResult::Verified)
+    }
+
+    /// The held pin minted for `hash_entries[index]` — `None` when the
+    /// entry carries no launch identity (lockfile/docker) or the
+    /// workload was verified against a different slice.
+    fn pin_for(&mut self, index: usize) -> Option<&mut HeldTarget> {
+        self.pins
+            .iter_mut()
+            .find(|(i, _)| *i == index)
+            .map(|(_, held)| held)
+    }
+
+    /// Take the held pin minted for `hash_entries[index]` — the spawn
+    /// pin consumes the handle outright.
+    fn take_pin(&mut self, index: usize) -> Option<HeldTarget> {
+        self.pins
+            .iter()
+            .position(|(i, _)| *i == index)
+            .map(|pos| self.pins.remove(pos).1)
+    }
+}
+
+impl HeldTarget {
+    /// Mint the verify-stage pin for `entry`: open `path` on the
+    /// replacement-preventing share mode (Windows) or the identity
+    /// anchor fd (Unix), stamp it, hash the held object, and prove the
+    /// stamp held across the read so a mid-read rewrite cannot mint a
+    /// pin over hybrid bytes.
+    fn mint(entry: &HashEntry, path: &Path) -> Result<Self, VerifyError> {
+        let mut held = Self::open_fresh(path, entry.hash_type, entry.target.clone())?;
+        held.expected = entry.hash_value.clone();
+        Ok(held)
+    }
+}
+
 /// After verifying configured hash entries, require the launched argv to
 /// name those same objects — the verify-A-exec-B binding. A `binary-hash`
 /// or `entrypoint-hash` target that canonicalizes to the resolved
@@ -161,19 +664,30 @@ fn fs_file_identity(path: &Path) -> Option<(u64, u64)> {
 /// `entrypoint-hash` target matching the first payload argument is
 /// re-hashed against its pin (`same_file` is path correspondence only,
 /// so the payload match needs the content read).
+///
+/// `verified` carries the held pins `verify_server_hashes` minted — one
+/// per binary/entrypoint target — and the content judgment becomes the
+/// held object's identity plus its recorded stamp: a full read happens
+/// only when the object provably changed (a retargeted path or a stale
+/// stamp — the stamp never substitutes for the digest, it summons it).
+/// `None` keeps the historical pathname re-hash for callers holding no
+/// pins (`run-image`-style paths and pinless tests).
 pub fn bind_launched_workload(
     argv: &[String],
     resolved_exe: &Path,
     hash_entries: &[HashEntry],
     audit_logger: &AuditLogger,
+    verified: Option<&mut VerifiedWorkload>,
 ) -> Result<(), VerifyError> {
     if hash_entries.is_empty() {
         return Ok(());
     }
+    let mut verified = verified;
 
-    let identity_entries: Vec<&HashEntry> = hash_entries
+    let identity_entries: Vec<(usize, &HashEntry)> = hash_entries
         .iter()
-        .filter(|e| matches!(e.hash_type, HashType::Binary | HashType::Entrypoint))
+        .enumerate()
+        .filter(|(_, e)| matches!(e.hash_type, HashType::Binary | HashType::Entrypoint))
         .collect();
 
     if identity_entries.is_empty() {
@@ -195,33 +709,63 @@ pub fn bind_launched_workload(
         });
     }
 
-    let exe_hash = hash_file(resolved_exe).map_err(|error| VerifyError::FileError {
-        hash_type: HashType::Binary,
-        target: resolved_exe.display().to_string(),
-        error,
-    })?;
+    // The exe's content digest — read once up front for pinless
+    // callers, as before (the eager read also surfaces an unreadable
+    // exe as `FileError` even when no entry matches it). With a
+    // workload each covering entry's held pin proves the same fact
+    // without a read; a stray pinless entry still falls back lazily.
+    let mut exe_hash: Option<String> = None;
+    if verified.is_none() {
+        exe_hash = Some(hash_file(resolved_exe).map_err(|error| {
+            VerifyError::FileError {
+                hash_type: HashType::Binary,
+                target: resolved_exe.display().to_string(),
+                error,
+            }
+        })?);
+    }
 
     let mut matched_exe = false;
     let mut matched_binary = false;
-    for entry in &identity_entries {
+    for &(i, entry) in &identity_entries {
         let target = Path::new(&entry.target);
-        if same_file(target, resolved_exe) {
-            if entry.hash_value != exe_hash {
-                return Err(VerifyError::Mismatch {
-                    hash_type: entry.hash_type,
-                    target: entry.target.clone(),
-                    expected: entry.hash_value.clone(),
-                    actual: exe_hash,
-                });
-            }
-            matched_exe = true;
-            matched_binary |= entry.hash_type == HashType::Binary;
+        if !same_file(target, resolved_exe) {
+            continue;
         }
+        match verified.as_deref_mut().and_then(|w| w.pin_for(i)) {
+            Some(pin) => pin.revalidate(resolved_exe)?,
+            None => {
+                let actual = match exe_hash.clone() {
+                    Some(h) => h,
+                    None => {
+                        let h = hash_file(resolved_exe).map_err(|error| {
+                            VerifyError::FileError {
+                                hash_type: HashType::Binary,
+                                target: resolved_exe.display().to_string(),
+                                error,
+                            }
+                        })?;
+                        exe_hash = Some(h.clone());
+                        h
+                    }
+                };
+                if entry.hash_value != actual {
+                    return Err(VerifyError::Mismatch {
+                        hash_type: entry.hash_type,
+                        target: entry.target.clone(),
+                        expected: entry.hash_value.clone(),
+                        actual,
+                    });
+                }
+            }
+        }
+        matched_exe = true;
+        matched_binary |= entry.hash_type == HashType::Binary;
     }
 
     let has_binary = identity_entries
         .iter()
-        .any(|e| e.hash_type == HashType::Binary);
+        .any(|(_, e)| e.hash_type == HashType::Binary);
     if has_binary && !matched_exe {
         let mut evt = AuditEvent::new(
             Uuid::now_v7(),
@@ -243,16 +787,18 @@ pub fn bind_launched_workload(
 
     let payload_arg = first_payload_arg_with_exe(argv, Some(resolved_exe));
     let mut payload_bound = false;
-    for entry in identity_entries
+    for &(i, entry) in identity_entries
         .iter()
-        .filter(|e| e.hash_type == HashType::Entrypoint)
+        .filter(|(_, e)| e.hash_type == HashType::Entrypoint)
     {
         let target = Path::new(&entry.target);
-        // An entrypoint pinned at the executable was hash-compared in the
-        // identity loop above. A payload match needs its own content check:
-        // `same_file` compares canonicalized paths only, so path
+        // An entrypoint pinned at the executable was covered in the
+        // identity loop above. A payload match needs its own freshness
+        // proof: `same_file` compares canonicalized paths only, so path
         // correspondence alone would let a script swapped in after the
-        // first verification launch under the stale pin.
+        // first verification launch under the stale pin — the held
+        // pin's stamp (or its re-hash when the stamp moves) decides, or
+        // the historical pathname read for pinless callers.
         let payload_match = payload_arg.is_some_and(|arg| same_file(Path::new(arg), target));
         let at_exe = same_file(target, resolved_exe);
         let found = at_exe || payload_match;
@@ -278,18 +824,23 @@ pub fn bind_launched_workload(
         }
         if payload_match && !at_exe {
             payload_bound = true;
-            let actual = hash_file(target).map_err(|error| VerifyError::FileError {
-                hash_type: HashType::Entrypoint,
-                target: entry.target.clone(),
-                error,
-            })?;
-            if actual != entry.hash_value {
-                return Err(VerifyError::Mismatch {
-                    hash_type: entry.hash_type,
-                    target: entry.target.clone(),
-                    expected: entry.hash_value.clone(),
-                    actual,
-                });
+            match verified.as_deref_mut().and_then(|w| w.pin_for(i)) {
+                Some(pin) => pin.revalidate(target)?,
+                None => {
+                    let actual = hash_file(target).map_err(|error| VerifyError::FileError {
+                        hash_type: HashType::Entrypoint,
+                        target: entry.target.clone(),
+                        error,
+                    })?;
+                    if actual != entry.hash_value {
+                        return Err(VerifyError::Mismatch {
+                            hash_type: entry.hash_type,
+                            target: entry.target.clone(),
+                            expected: entry.hash_value.clone(),
+                            actual,
+                        });
+                    }
+                }
             }
         }
     }
@@ -681,12 +1232,13 @@ impl SpawnPin {
 }
 
 /// Copy the bytes `file` names into an object a local writer cannot
-/// modify, then prove the copy still hashes to `expected` — a source
-/// rewritten between the earlier verification and this snapshot
-/// produces a digest mismatch and the launch fails closed. The staged
-/// object, not the original pathname, is what the child execs. Only the
-/// *executable* rides this path — a payload-bound entrypoint is an
-/// interpreted script, and the interpreter must see its real path.
+/// modify, hashing the stream as it is copied — one read produces both
+/// the staged object and its digest, and a source rewritten between
+/// the earlier verification and this snapshot produces a digest
+/// mismatch that fails the launch closed. The staged object, not the
+/// original pathname, is what the child execs. Only the *executable*
+/// rides this path — a payload-bound entrypoint is an interpreted
+/// script, and the interpreter must see its real path.
 ///
 /// Linux uses a `memfd` sealed `WRITE|GROW|SHRINK|SEAL` — no principal,
 /// not even this process, can change the bytes afterwards. Other Unix
@@ -709,8 +1261,10 @@ fn immutable_snapshot(
         target: label.to_string(),
         error,
     };
-    let (mut snap, staging) = snapshot_object(file, label).map_err(file_error)?;
-    let actual = hash_open_file(&mut snap).map_err(file_error)?;
+    // The digest rides out of the copy — the bytes the child will exec
+    // hashed `expected` at the moment they were written, so no second
+    // read of the staged object is needed to say so.
+    let (snap, staging, actual) = snapshot_object(file, label).map_err(file_error)?;
     if actual != expected {
         return Err(VerifyError::Mismatch {
             hash_type,
@@ -722,13 +1276,42 @@ fn immutable_snapshot(
     Ok((snap, staging))
 }
 
+/// Copy `source`'s bytes into `dest`, hashing the stream as it passes —
+/// one traversal produces both the staged object and the digest proving
+/// the bytes copied are the pinned ones. `source` is a clone of the
+/// held pin rewound to offset zero, so the held handle's own position
+/// stays intact.
+#[cfg(unix)]
+fn copy_and_hash(source: &mut std::fs::File, dest: &mut std::fs::File) -> io::Result<String> {
+    use std::io::{Read, Write};
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = source.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+        dest.write_all(&buffer[..n])?;
+    }
+    Ok(format_sha256(hasher.finalize()))
+}
+
+/// The staged snapshot: `(open snapshot file, staging, digest)` —
+/// `staging` is `Some((dir, object))` only on the private-file path,
+/// and `digest` is computed in [`copy_and_hash`] while the bytes are
+/// copied.
+#[cfg(unix)]
+type SnapshotObject = (std::fs::File, Option<(PathBuf, PathBuf)>, String);
+
 /// The Linux snapshot: a private `memfd` sealed against every write —
 /// the object `/proc/self/fd/N` execs cannot change afterwards.
 #[cfg(target_os = "linux")]
 fn snapshot_object(
     file: &std::fs::File,
     label: &str,
-) -> io::Result<(std::fs::File, Option<(PathBuf, PathBuf)>)> {
+) -> io::Result<SnapshotObject> {
     use std::io::{Seek, Write};
     use std::os::unix::io::FromRawFd;
 
@@ -744,14 +1327,14 @@ fn snapshot_object(
     let mut snap = unsafe { std::fs::File::from_raw_fd(fd) };
     let mut source = file.try_clone()?;
     source.seek(io::SeekFrom::Start(0))?;
-    io::copy(&mut source, &mut snap)?;
+    let digest = copy_and_hash(&mut source, &mut snap)?;
     snap.flush()?;
     let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((snap, None))
+    Ok((snap, None, digest))
 }
 
 /// Non-Linux Unix has no sealed exec object and cannot exec an fd
@@ -761,22 +1344,19 @@ fn snapshot_object(
 /// the staged path itself, so the dir must outlive the child's exec
 /// (the plan is held for the session).
 #[cfg(all(unix, not(target_os = "linux")))]
-fn snapshot_object(
-    file: &std::fs::File,
-    _label: &str,
-) -> io::Result<(std::fs::File, Option<(PathBuf, PathBuf)>)> {
+fn snapshot_object(file: &std::fs::File, _label: &str) -> io::Result<SnapshotObject> {
     use std::io::{Seek, Write};
 
     let dir = crate::fspriv::create_private_tempdir("exec-snapshot")?;
     let path = dir.join("object");
-    let staging = (|| -> io::Result<()> {
+    let staging = (|| -> io::Result<String> {
         let mut source = file.try_clone()?;
         source.seek(io::SeekFrom::Start(0))?;
         let mut out = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)?;
-        io::copy(&mut source, &mut out)?;
+        let digest = copy_and_hash(&mut source, &mut out)?;
         out.flush()?;
         out.sync_all()?;
         use std::os::unix::fs::PermissionsExt;
@@ -785,12 +1365,15 @@ fn snapshot_object(
         // entrypoint never comes through here: it launches by its real
         // path so the interpreter's module resolution keeps working.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500))?;
-        Ok(())
+        Ok(digest)
     })();
-    if staging.is_err() {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    staging?;
+    let digest = match staging {
+        Ok(digest) => digest,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
     let snap = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -798,7 +1381,7 @@ fn snapshot_object(
             return Err(e);
         }
     };
-    Ok((snap, Some((dir, path))))
+    Ok((snap, Some((dir, path)), digest))
 }
 
 #[cfg(windows)]
@@ -1039,9 +1622,14 @@ pub(super) fn simplify_verbatim(path: PathBuf) -> PathBuf {
 }
 
 /// Re-run the binding checks immediately before spawn — the launched
-/// executable and any payload-matched entrypoint script are re-hashed
-/// once more, so a file swapped in after the initial verification fails
-/// closed.
+/// executable and any payload-matched entrypoint script re-prove the
+/// pin once more, so a file swapped in after the initial verification
+/// fails closed. With a `VerifiedWorkload` the proof is the held
+/// object's identity plus its recorded stamp — the verified digest
+/// stands without a read, and only an object that provably changed
+/// (retargeted path or moved stamp) is re-hashed, the stamp summoning
+/// the digest check rather than replacing it. Pinless callers get the
+/// historical re-hash mint.
 ///
 /// The returned [`SpawnPin`] keeps the verified objects open through
 /// the spawn — and for the session: on Windows the share mode makes
@@ -1063,60 +1651,64 @@ pub(super) fn simplify_verbatim(path: PathBuf) -> PathBuf {
 /// asserts init will bind the verified copy over the script's path
 /// inside the child's mount namespace, so the host-side trusted-source
 /// contract is not load-bearing for this launch and is skipped (the
-/// pin, re-hash, and mount handoff still bind the bytes). Every other
-/// route passes `false` and keeps the full gate.
+/// pin, freshness proof, and mount handoff still bind the bytes).
+/// Every other route passes `false` and keeps the full gate.
 pub fn reverify_immediately_before_spawn(
     argv: &[String],
     resolved_exe: &Path,
     hash_entries: &[HashEntry],
     audit_logger: &AuditLogger,
     entrypoint_mount_handoff: bool,
+    verified: Option<&mut VerifiedWorkload>,
 ) -> Result<SpawnPin, VerifyError> {
-    bind_launched_workload(argv, resolved_exe, hash_entries, audit_logger)?;
+    let mut verified = verified;
+    bind_launched_workload(
+        argv,
+        resolved_exe,
+        hash_entries,
+        audit_logger,
+        verified.as_deref_mut(),
+    )?;
     #[cfg(not(unix))]
     let _ = entrypoint_mount_handoff;
 
-    let identity_entries: Vec<&HashEntry> = hash_entries
+    let identity_entries: Vec<(usize, &HashEntry)> = hash_entries
         .iter()
-        .filter(|e| matches!(e.hash_type, HashType::Binary | HashType::Entrypoint))
+        .enumerate()
+        .filter(|(_, e)| matches!(e.hash_type, HashType::Binary | HashType::Entrypoint))
         .collect();
 
-    // Anchor the verified executable on a held handle and prove the
-    // held bytes are the pinned bytes — the digest is computed from the
-    // open object, not a pathname re-open.
-    let mut exe_file = open_pinned(resolved_exe).map_err(|error| VerifyError::FileError {
-        hash_type: HashType::Binary,
-        target: resolved_exe.display().to_string(),
-        error,
-    })?;
-    // Stamp before hashing, not after: a held fd does not block writers
-    // on Unix, so an in-place rewrite during the read must change the
-    // stamp — recording only after hashing would accept unverified bytes.
-    let exe_stamp = record_stamp(&exe_file).map_err(|error| VerifyError::FileError {
-        hash_type: HashType::Binary,
-        target: resolved_exe.display().to_string(),
-        error,
-    })?;
-    let held_exe = hash_open_file(&mut exe_file).map_err(|error| VerifyError::FileError {
-        hash_type: HashType::Binary,
-        target: resolved_exe.display().to_string(),
-        error,
-    })?;
-    if !stamp_unchanged(&exe_file, &exe_stamp) {
-        return Err(VerifyError::Mismatch {
-            hash_type: HashType::Binary,
-            target: resolved_exe.display().to_string(),
-            expected: "the pinned executable object".to_string(),
-            actual: "file modified during hashing".to_string(),
-        });
-    }
-    for entry in &identity_entries {
-        if same_file(Path::new(&entry.target), resolved_exe) && entry.hash_value != held_exe {
+    // The spawn pin anchors on the held handle the verify stage minted
+    // for the first entry covering the resolved exe (bind already
+    // proved a cover exists whenever pins bind this launch). Without a
+    // workload the exe is opened pinned and hashed here — the
+    // historical mint.
+    let covering = identity_entries
+        .iter()
+        .map(|(i, _)| *i)
+        .find(|i| same_file(Path::new(&hash_entries[*i].target), resolved_exe));
+    let mut exe_held = match covering
+        .and_then(|i| verified.as_deref_mut().and_then(|w| w.take_pin(i)))
+    {
+        Some(pin) => pin,
+        None => HeldTarget::open_fresh(
+            resolved_exe,
+            HashType::Binary,
+            resolved_exe.display().to_string(),
+        )?,
+    };
+    // Freshness at mint: the held object must still digest to the pin
+    // — identity plus stamp decide on the happy path; an object that
+    // provably changed re-hashes through the held handle (the stamp
+    // summons the digest check, it does not substitute for it — D-6).
+    exe_held.revalidate_held(resolved_exe)?;
+    for &(_, entry) in &identity_entries {
+        if same_file(Path::new(&entry.target), resolved_exe) && entry.hash_value != exe_held.digest {
             return Err(VerifyError::Mismatch {
                 hash_type: entry.hash_type,
                 target: entry.target.clone(),
                 expected: entry.hash_value.clone(),
-                actual: held_exe,
+                actual: exe_held.digest.clone(),
             });
         }
     }
@@ -1125,9 +1717,9 @@ pub fn reverify_immediately_before_spawn(
     // an interpreter's spawn opens the script by pathname, so the held
     // handle is what `verify_spawn_path` re-checks identity against.
     let mut entrypoint = None;
-    for entry in identity_entries
+    for &(i, entry) in identity_entries
         .iter()
-        .filter(|e| e.hash_type == HashType::Entrypoint)
+        .filter(|(_, e)| e.hash_type == HashType::Entrypoint)
     {
         let target = Path::new(&entry.target);
         // The interpreter opens the argv spelling, not the manifest
@@ -1183,62 +1775,87 @@ pub fn reverify_immediately_before_spawn(
                 }
             })?;
         }
-        let mut file = open_pinned(&payload_path).map_err(|error| VerifyError::FileError {
-            hash_type: HashType::Entrypoint,
-            target: entry.target.clone(),
-            error,
-        })?;
-        // Same ordering as the executable pin: stamp at open, re-check
-        // after hashing so a mid-read rewrite fails closed.
-        let stamp = record_stamp(&file).map_err(|error| VerifyError::FileError {
-            hash_type: HashType::Entrypoint,
-            target: entry.target.clone(),
-            error,
-        })?;
-        // The argv spelling must name the manifest target's object —
-        // a retarget between the same-file check and the pin open is a
-        // mismatch, not a skip.
-        if !same_open_object(target, &file) {
-            return Err(VerifyError::Mismatch {
-                hash_type: HashType::Entrypoint,
-                target: entry.target.clone(),
-                expected: "the manifest entrypoint object".to_string(),
-                actual: "argv payload path resolves to a different object".to_string(),
-            });
-        }
-        let held = hash_open_file(&mut file).map_err(|error| VerifyError::FileError {
-            hash_type: HashType::Entrypoint,
-            target: entry.target.clone(),
-            error,
-        })?;
-        if held != entry.hash_value {
-            return Err(VerifyError::Mismatch {
-                hash_type: HashType::Entrypoint,
-                target: entry.target.clone(),
-                expected: entry.hash_value.clone(),
-                actual: held,
-            });
-        }
-        if !stamp_unchanged(&file, &stamp) {
-            return Err(VerifyError::Mismatch {
-                hash_type: HashType::Entrypoint,
-                target: entry.target.clone(),
-                expected: "the pinned entrypoint object".to_string(),
-                actual: "file modified during hashing".to_string(),
-            });
-        }
+        let held = match verified
+            .as_deref_mut()
+            .and_then(|w| w.take_pin(i))
+        {
+            // The pin was minted on the manifest target; the child's
+            // spawn opens the argv spelling — it must still name the
+            // verified object (strict — the historical gate does not
+            // re-anchor here either), then the stamp holds or the
+            // held-handle re-hash decides.
+            Some(mut pin) => {
+                pin.revalidate_held(&payload_path)?;
+                pin
+            }
+            // No held pin (pinless caller): open the argv spelling
+            // pinned, prove it names the manifest object, then hash
+            // the held bytes — the historical mint.
+            None => {
+                let mut file =
+                    open_pinned(&payload_path).map_err(|error| VerifyError::FileError {
+                        hash_type: HashType::Entrypoint,
+                        target: entry.target.clone(),
+                        error,
+                    })?;
+                let stamp = record_stamp(&file).map_err(|error| VerifyError::FileError {
+                    hash_type: HashType::Entrypoint,
+                    target: entry.target.clone(),
+                    error,
+                })?;
+                if !same_open_object(target, &file) {
+                    return Err(VerifyError::Mismatch {
+                        hash_type: HashType::Entrypoint,
+                        target: entry.target.clone(),
+                        expected: "the manifest entrypoint object".to_string(),
+                        actual: "argv payload path resolves to a different object".to_string(),
+                    });
+                }
+                let digest = hash_open_file(&mut file).map_err(|error| {
+                    VerifyError::FileError {
+                        hash_type: HashType::Entrypoint,
+                        target: entry.target.clone(),
+                        error,
+                    }
+                })?;
+                if digest != entry.hash_value {
+                    return Err(VerifyError::Mismatch {
+                        hash_type: HashType::Entrypoint,
+                        target: entry.target.clone(),
+                        expected: entry.hash_value.clone(),
+                        actual: digest,
+                    });
+                }
+                if !stamp_unchanged(&file, &stamp) {
+                    return Err(VerifyError::Mismatch {
+                        hash_type: HashType::Entrypoint,
+                        target: entry.target.clone(),
+                        expected: "the pinned entrypoint object".to_string(),
+                        actual: "file modified during hashing".to_string(),
+                    });
+                }
+                HeldTarget {
+                    hash_type: HashType::Entrypoint,
+                    target: entry.target.clone(),
+                    expected: entry.hash_value.clone(),
+                    file,
+                    stamp,
+                    digest,
+                }
+            }
+        };
         entrypoint = Some(PinnedEntry {
             path: payload_path,
-            file,
+            file: held.file,
             digest: entry.hash_value.clone(),
-            stamp,
+            stamp: held.stamp,
         });
     }
 
     Ok(SpawnPin {
-        exe: exe_file,
-        exe_stamp,
-        exe_digest: held_exe,
+        exe: exe_held.file,
+        exe_stamp: exe_held.stamp,
+        exe_digest: exe_held.digest,
         entrypoint,
     })
 }
