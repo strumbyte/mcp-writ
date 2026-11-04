@@ -121,19 +121,19 @@ server "mcp-filesystem" {
 
     // ─── Launch-target hashes (supply chain, verified before spawn) ───
     // `generate-policy` emits these for the launch argv; `run` verifies
-    // every target once through a held handle, binds binary/entrypoint to
-    // the launched executable or its first payload argument, then
-    // re-proves the pinned objects immediately before spawn — held-object
-    // identity plus stamp, re-hashing only on a detected change or a
-    // stamp that cannot rule one out (inside the fs timestamp
-    // granularity, or where the fs clock can be rolled back). A
-    // mismatch fails closed.
+    // every target before spawn, but held-handle verification applies to
+    // binary/entrypoint targets only: bound to the launched executable
+    // or its first payload argument, then re-proved immediately before
+    // spawn — held-object identity plus stamp, re-hashing only on a
+    // detected change or a stamp that cannot rule one out (inside the
+    // fs timestamp granularity, or where the fs clock can be rolled
+    // back). A mismatch fails closed.
     //
     //   binary-hash "sha256:<64hex>" target="/opt/mcp-server/my-mcp-server"
     //   // for `python server.py` / `node index.js`, the script is pinned too:
     //   entrypoint-hash "sha256:<64hex>" target="/opt/mcp-server/server.py"
     //   // lockfile-hash / docker-manifest-hash verify extra artifacts but
-    //   // cannot bind the process alone.
+    //   // cannot bind the process alone — verified once, no handle held.
     //
     // Digests cover THIS host's files — recompute them on the deployment
     // host and regenerate when the server or its interpreter is updated.
