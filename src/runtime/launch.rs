@@ -28,8 +28,10 @@ use crate::warden::{RunningChild, Warden, WardenReport};
 /// image ENV handling and tests).
 pub struct LaunchConfig {
     /// Command argv as the caller spelled it; `argv[0]` is resolved and
-    /// verified here but keeps its spelling as the child's `argv[0]` —
-    /// the resolved path is exec'd as the process image. Must be non-empty.
+    /// verified here. The child keeps its spelling as `argv[0]` — except
+    /// under a pinned Unix `#!` expansion, which heads argv with the
+    /// interpreter instead — while the resolved path is exec'd as the
+    /// process image. Must be non-empty.
     pub argv: Vec<String>,
     pub policy: Policy,
     pub fail_on: FailOn,
@@ -174,8 +176,11 @@ pub enum LaunchError {
 }
 
 /// Shared sequence: resolve argv0 → verify hashes → bind → reverify →
-/// Warden spawn → `take_io` → `Auditor` relay on a spawned task. The
-/// child keeps the caller's `argv[0]` in every case.
+/// Warden spawn → `take_io` → `Auditor` relay on a spawned task. A
+/// non-expanded launch keeps the caller's `argv[0]`; a pinned Unix `#!`
+/// launch expands to the interpreter launch the kernel would perform, so
+/// the child's `argv[0]` is the interpreter and the caller's spelling
+/// moves to the script argument.
 ///
 /// What the spawn execs splits three ways: a pinned executable image
 /// runs the pinned object itself — an inherited `/proc/self/fd`
@@ -549,10 +554,12 @@ pub async fn launch(
 
     // The child execs `resolved_exe` — the canonicalized, hash-verified
     // image — while `argv` keeps the caller's spelling as the child's
-    // argv[0]: a venv `bin/python` locates `pyvenv.cfg` relative to it
-    // (on macOS, where CPython ignores argv[0], the Warden passes the
-    // spelling via PYTHONEXECUTABLE). Passing the symlink itself to
-    // spawn would exec the unverified link.
+    // argv[0] on a non-expanded launch (a pinned `#!` expansion heads
+    // argv with the interpreter instead): a venv `bin/python` locates
+    // `pyvenv.cfg` relative to it (on macOS, where CPython ignores
+    // argv[0], the Warden passes the spelling via PYTHONEXECUTABLE).
+    // Passing the symlink itself to spawn would exec the unverified
+    // link.
     if let Some(reason) = sandbox_skip_reason {
         tracing::warn!("sandboxing disabled ({reason})");
     }

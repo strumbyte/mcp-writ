@@ -91,10 +91,12 @@ hide a dependency from the scan. Its owning workflows are listed in the
   `allowed_names` and passes them through every spawn variant, so the
   restriction applies identically under `--dry-run` and
   `MCP_WRIT_SKIP_SANDBOX`. `EnvironmentPolicy::default()` is `restrict:
-  true`, so `spawn_env_pairs` returns the restricted base set — `PATH`, the
-  temp vars, the Windows system vars, plus each `allow`ed name copied from
-  the parent — even when the policy has no `environment` node at all. It
-  returns `None` only when `restrict` is false and no `tmpdir` override is
+  true`, so `spawn_env_pairs` returns the restricted base set — `PATH` and
+  the Windows system vars, plus each `allow`ed name copied from the parent;
+  `TMPDIR`/`TMP`/`TEMP` are not in the base set — they reach the child only
+  when the launch supplies a `tmpdir` override or the policy `allow`s them
+  — even when the policy has no `environment` node at all. It returns
+  `None` only when `restrict` is false and no `tmpdir` override is
   pending: inside a launch that means `inherit-parent #true` was declared,
   so ambient inheritance is always an explicit downgrade opt-in, never the
   absent-node default.

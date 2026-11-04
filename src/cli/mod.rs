@@ -176,13 +176,14 @@ pub struct CheckArgs {
     pub report: Option<PathBuf>,
     pub verbose: u8,
     /// Trailing `-- <command>` — the server's launch argv. The server
-    /// is spawned (restricted environment, no OS sandbox) to fetch its
-    /// `tools/list` for `tools-list-hash` re-verification, and the argv
-    /// re-checks that `binary-hash`/`entrypoint-hash` `target=`s bind
-    /// the resolved executable or its payload the way
-    /// `bind_launched_workload` would require at `run`. Without it,
-    /// tools-list pins are reported `unverified` and binding is not
-    /// re-evaluated.
+    /// is spawned exactly like `generate-policy` live discovery —
+    /// inside the Warden sandbox (restricted environment, deny-all
+    /// egress, private TMPDIR) — to fetch its `tools/list` for
+    /// `tools-list-hash` re-verification, and the argv re-checks that
+    /// `binary-hash`/`entrypoint-hash` `target=`s bind the resolved
+    /// executable or its payload the way `bind_launched_workload`
+    /// would require at `run`. Without it, tools-list pins are
+    /// reported `unverified` and binding is not re-evaluated.
     pub command: Vec<String>,
     /// A parse/semantic error captured for the machine-readable
     /// `invalid` result.
