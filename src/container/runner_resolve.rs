@@ -197,12 +197,10 @@ mod tests {
     /// Create a unique temporary directory under std::env::temp_dir().
     /// Returns the path. Caller is responsible for cleanup.
     fn make_temp_dir(label: &str) -> PathBuf {
-        let id = std::process::id();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mcp_writ_test_{label}_{id}_{ts}")); // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_writ_test_{label}_{}",
+            crate::fspriv::unique_suffix()
+        )); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         fs::create_dir_all(&dir).unwrap();
         dir
     }
