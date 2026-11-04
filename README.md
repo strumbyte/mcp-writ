@@ -413,11 +413,14 @@ container), never a silent substitute.
   node exists; its `allow` entries pass named parent variables through,
   and ambient inheritance returns only via `inherit-parent #true`.
 - **Before spawn:** `binary-hash` / `entrypoint-hash` pins on the launch
-  target are verified, bound to the resolved executable / first payload
-  argument, and re-verified immediately before `exec` — the executable
-  and a matched entrypoint script are both re-hashed there, so a script
-  swapped in after the first check fails closed instead of passing on
-  path correspondence alone. The executable then execs the pinned
+  target are verified once through a held handle, bound to the resolved
+  executable / first payload argument, and re-verified immediately
+  before `exec` — each stage proves the held object's identity and its
+  recorded stamp, re-hashing the content only when the object provably
+  changed or the stamp cannot rule it out (inside the filesystem's
+  timestamp granularity, or where the fs clock can be rolled back), so
+  a script swapped in after the first check fails closed
+  instead of passing on path correspondence alone. The executable then execs the pinned
   object itself — an inherited `/proc/self/fd` snapshot on Linux, an
   owner-only staged copy on other Unix, the real path under the held
   share-mode pin on Windows — so a swap after the last check cannot

@@ -290,8 +290,12 @@ fn launch_notes(
             IdentityKind::ImageDigest | IdentityKind::ImageTag => {}
         }
         mutable.push(
-            "the pinned files are re-hashed at binding and again immediately before spawn; \
-             the executable image then execs a hash-verified snapshot of the pinned \
+            "the pinned files re-prove their content at binding and again immediately \
+             before spawn — the held object's stamp standing for the verified bytes, \
+             re-hashing only when the object provably changed or the stamp cannot \
+             rule it out (inside the filesystem's timestamp granularity, or where \
+             the fs clock can be rolled back); the executable image \
+             then execs a hash-verified snapshot of the pinned \
              object — on Linux through an inherited /proc/self/fd descriptor, on other \
              Unix through a copy staged in an owner-only directory, on Windows through \
              the share-mode-held handle — while a payload-bound entrypoint script \

@@ -133,12 +133,12 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **タスク**
 
-- [ ] 修正前の計測を記録する: Linux 実機で、ハッシュ固定あり／なしの起動から `initialize` 応答までの時間と、`strace -e read` または `/proc/<pid>/io` の `rchar` で読取量を取る。対象は Python と Node.js の実在サーバー（`tests/real_servers_e2e.rs` の fixture を使う）。SHA 拡張命令の有無（`/proc/cpuinfo` の `sha_ni`）を記録する
-- [ ] `verify_server_hashes` の段階で、pin 対象の実行ファイルと entrypoint を保持ハンドル（`open_pinned`）で開き、stamp を記録してからハッシュし、ハンドルと stamp・ダイジェストを `VerifiedWorkload`（名称は担当PRで確定）として後段に渡す。`hash.verified`／`hash.mismatch` の監査イベントはこの 1 回で出す
-- [ ] `bind_launched_workload` と `reverify_immediately_before_spawn` は、パス名から開き直してハッシュする代わりに、保持ハンドルの同一性（`same_open_object`）と stamp の不変を確認する。stamp が変わっていれば内容を再ハッシュして判定する（stamp だけで内容検証を代替しない — D-6）。保持ハンドルを持たない経路（`run-image` など）は従来どおり。`require_trusted_source_file` ゲート（E-10 の対象）は読み直しの対象外として残し、順序（信頼判定 → ハッシュ）を変えない
-- [ ] スナップショット（`snapshot_object`）は保持ハンドルから複製しながらダイジェストを計算し、複製後の別読みをなくす。複製したバイト列のダイジェストが pin と一致しなければ fail-closed
-- [ ] `code_identity` の報告（どの検査点を通ったか）は従来どおりの項目を出す。読取回数が減っても「検証した検査点」の表現は変えない
-- [ ] 修正後の計測を同じ条件で取り、guide 英日 §8.2 に「起動コストの目安（ファイルサイズ・CPU・回数）」として載せる。目標は読取回数 6 → 2、Node.js 119 MiB で 3.3 s → 1.2 s 以下（SHA 拡張命令なし）
+- [x] 修正前の計測を記録する: Linux 実機で、ハッシュ固定あり／なしの起動から `initialize` 応答までの時間と、`strace -e read` または `/proc/<pid>/io` の `rchar` で読取量を取る。対象は Python と Node.js の実在サーバー（`tests/real_servers_e2e.rs` の fixture を使う）。SHA 拡張命令の有無（`/proc/cpuinfo` の `sha_ni`）を記録する
+- [x] `verify_server_hashes` の段階で、pin 対象の実行ファイルと entrypoint を保持ハンドル（`open_pinned`）で開き、stamp を記録してからハッシュし、ハンドルと stamp・ダイジェストを `VerifiedWorkload`（名称は担当PRで確定）として後段に渡す。`hash.verified`／`hash.mismatch` の監査イベントはこの 1 回で出す
+- [x] `bind_launched_workload` と `reverify_immediately_before_spawn` は、パス名から開き直してハッシュする代わりに、保持ハンドルの同一性（`same_open_object`）と stamp の不変を確認する。stamp が変わっていれば内容を再ハッシュして判定する（stamp だけで内容検証を代替しない — D-6）。保持ハンドルを持たない経路（`run-image` など）は従来どおり。`require_trusted_source_file` ゲート（E-10 の対象）は読み直しの対象外として残し、順序（信頼判定 → ハッシュ）を変えない
+- [x] スナップショット（`snapshot_object`）は保持ハンドルから複製しながらダイジェストを計算し、複製後の別読みをなくす。複製したバイト列のダイジェストが pin と一致しなければ fail-closed
+- [x] `code_identity` の報告（どの検査点を通ったか）は従来どおりの項目を出す。読取回数が減っても「検証した検査点」の表現は変えない
+- [ ] 修正後の計測を同じ条件で取り、guide 英日 §8.2 に「起動コストの目安（ファイルサイズ・CPU・回数）」として載せる。目標は読取回数 6 → 2、Node.js 119 MiB で 3.3 s → 1.2 s 以下（SHA 拡張命令なし） — **未了**: 現行の §8.2 記載値は `sha_ni` あり・112 MiB イメージ・0.57 s → 0.33 s の別基準で計測したもので、要求基準（Node.js 119 MiB・SHA 拡張命令なし）の修正前後計測（読取回数・起動時間）は未取得
 
 **検証:** T-BASE、T-IDENTITY（`workload_hash_e2e` の既存試験 — 差し替え検出・inline eval 拒否・`python -m` 非固定 — が全て通ること）。加えて、hash 中の書き換えを `stamp_unchanged` が検出する既存試験と、保持ハンドルを持たない経路の回帰を対で固定する。デバッグビルドで 30 秒を超えていた Node.js の試験（レポート「評価の前提」）が単独実行で短縮されることを記録する。
 

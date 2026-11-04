@@ -3,16 +3,17 @@ use std::io::{self, Read, Seek};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
-use crate::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
+use crate::audit_log::AuditLogger;
 use crate::policy::{HashEntry, HashType};
 
 mod pin;
 
 #[cfg(unix)]
 pub use pin::FdExecPlan;
-pub use pin::{SpawnPin, bind_launched_workload, reverify_immediately_before_spawn};
+pub use pin::{
+    SpawnPin, VerifiedWorkload, bind_launched_workload, reverify_immediately_before_spawn,
+};
 
 const BUFFER_SIZE: usize = 8192;
 
@@ -169,100 +170,17 @@ impl std::error::Error for VerifyError {}
 /// - If no entries exist for the server: logs a warning and returns `Ok(NoEntries)`.
 /// - If all entries match: emits `HashVerified` audit events and returns `Ok(Verified)`.
 /// - On first mismatch or file error: emits `HashMismatch` audit event and returns `Err`.
+///
+/// Each target is hashed exactly once; for binary/entrypoint entries
+/// the read runs through a pinned handle whose stamp is proved across
+/// the read (`VerifiedWorkload`'s mint), so the same check the launch
+/// pipeline stands behind applies here without holding the pins.
 pub fn verify_server_hashes(
     server_name: &str,
     hash_entries: &[HashEntry],
     audit_logger: &AuditLogger,
 ) -> Result<VerifyResult, VerifyError> {
-    let entries: Vec<&HashEntry> = hash_entries
-        .iter()
-        .filter(|e| e.server_name == server_name)
-        .collect();
-
-    if entries.is_empty() {
-        tracing::warn!(
-            server = server_name,
-            "No hash entries in policy for server; allowing startup"
-        );
-        return Ok(VerifyResult::NoEntries);
-    }
-
-    let correlation_id = Uuid::now_v7();
-
-    for entry in &entries {
-        let target_path = Path::new(&entry.target);
-
-        let actual_hash = match hash_file(target_path) {
-            Ok(h) => h,
-            Err(error) => {
-                let mut evt = AuditEvent::new(
-                    correlation_id,
-                    EventType::HashMismatch,
-                    Severity::Critical,
-                    Outcome::Failure,
-                    Action::Denied,
-                );
-                evt.target_server = Some(server_name.to_string());
-                evt.details = Some(format!(
-                    "{} target '{}' unreadable: {}",
-                    entry.hash_type.as_str(),
-                    entry.target,
-                    error
-                ));
-                audit_logger.log(evt);
-
-                return Err(VerifyError::FileError {
-                    hash_type: entry.hash_type,
-                    target: entry.target.clone(),
-                    error,
-                });
-            }
-        };
-
-        if actual_hash != entry.hash_value {
-            let mut evt = AuditEvent::new(
-                correlation_id,
-                EventType::HashMismatch,
-                Severity::Critical,
-                Outcome::Failure,
-                Action::Denied,
-            );
-            evt.target_server = Some(server_name.to_string());
-            evt.details = Some(format!(
-                "{} mismatch for '{}': expected {}, got {}",
-                entry.hash_type.as_str(),
-                entry.target,
-                entry.hash_value,
-                actual_hash
-            ));
-            audit_logger.log(evt);
-
-            return Err(VerifyError::Mismatch {
-                hash_type: entry.hash_type,
-                target: entry.target.clone(),
-                expected: entry.hash_value.clone(),
-                actual: actual_hash,
-            });
-        }
-
-        // Hash matches — emit success event
-        let mut evt = AuditEvent::new(
-            correlation_id,
-            EventType::HashVerified,
-            Severity::Info,
-            Outcome::Success,
-            Action::Allowed,
-        );
-        evt.target_server = Some(server_name.to_string());
-        evt.details = Some(format!(
-            "{} verified for '{}'",
-            entry.hash_type.as_str(),
-            entry.target
-        ));
-        audit_logger.log(evt);
-    }
-
-    Ok(VerifyResult::Verified)
+    pin::VerifiedWorkload::new().verify_server_hashes(server_name, hash_entries, audit_logger)
 }
 
 #[cfg(test)]

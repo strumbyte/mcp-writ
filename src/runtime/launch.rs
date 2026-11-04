@@ -198,10 +198,15 @@ pub enum LaunchError {
 /// `fspriv` trusted-source gate and on the namespaced route by init's
 /// verified bind mount.
 ///
-/// Ordering is fixed: verify → bind → reverify reruns the binding —
-/// including the content re-hash — immediately before spawn, narrowing
-/// but not closing the hash-to-exec window. `code_identity` in the
-/// report records which check points each pin passed.
+/// Ordering is fixed: verify → bind → reverify reruns the binding
+/// immediately before spawn, narrowing but not closing the
+/// hash-to-exec window. The verify stage mints one held pin per
+/// launch-identity target; bind and reverify re-prove those pins by
+/// object identity and stamp — re-hashing only when an object provably
+/// changed — so the fixed pipeline's content guarantee is the digest
+/// computed through the held handle rather than repeated pathname
+/// reads. `code_identity` in the report records which check points
+/// each pin passed.
 /// Signal waiting and shutdown are NOT part of this function.
 ///
 /// A [`LaunchReport`] is assembled for every outcome of [`launch`]: it is
@@ -475,8 +480,12 @@ pub async fn launch(
             .iter()
             .map(|e| e.server_name.as_str())
             .collect();
+        // The verify stage mints a held pin per binary/entrypoint
+        // target; bind and reverify consume the workload's pins
+        // instead of re-reading the targets by path.
+        let mut verified = hash::VerifiedWorkload::new();
         for s_name in server_names {
-            match hash::verify_server_hashes(s_name, &policy.hash_entries, audit_logger) {
+            match verified.verify_server_hashes(s_name, &policy.hash_entries, audit_logger) {
                 Ok(_) => identity.mark_server_verified(s_name),
                 Err(source) => {
                     identity.mark_server_failed(s_name, &source);
@@ -500,9 +509,13 @@ pub async fn launch(
                 }
             }
         }
-        if let Err(source) =
-            hash::bind_launched_workload(&argv, &resolved_exe, &policy.hash_entries, audit_logger)
-        {
+        if let Err(source) = hash::bind_launched_workload(
+            &argv,
+            &resolved_exe,
+            &policy.hash_entries,
+            audit_logger,
+            Some(&mut verified),
+        ) {
             let detail = format!("supply chain verification failed: {source}");
             let report = fail(failure_report(
                 launch_id,
@@ -532,6 +545,7 @@ pub async fn launch(
             &policy.hash_entries,
             audit_logger,
             entrypoint_mount_handoff,
+            Some(&mut verified),
         ) {
             Ok(pin) => spawn_pin = Some(pin),
             Err(source) => {

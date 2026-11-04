@@ -302,6 +302,7 @@ async fn test_bind_launched_workload_rejects_unrelated_exe() {
         &other,
         &entries,
         &logger,
+        None,
     )
     .unwrap_err();
     assert!(matches!(err, VerifyError::UnboundWorkload { .. }));
@@ -330,6 +331,7 @@ async fn test_bind_rejects_lockfile_only_hashes() {
         &exe,
         &entries,
         &logger,
+        None,
     )
     .unwrap_err();
     assert!(matches!(err, VerifyError::UnboundWorkload { .. }));
@@ -363,7 +365,7 @@ async fn test_bind_rejects_inline_eval_flags() {
         vec![py.to_string_lossy().into_owned(), "-Ecprint(1)".into()],
         vec![py.to_string_lossy().into_owned(), "-cprint(1)".into()],
     ] {
-        let err = bind_launched_workload(&argv, &py, &entries, &logger).unwrap_err();
+        let err = bind_launched_workload(&argv, &py, &entries, &logger, None).unwrap_err();
         assert!(
             matches!(err, VerifyError::UnboundWorkload { .. }),
             "{argv:?}"
@@ -396,7 +398,7 @@ async fn test_bind_entrypoint_reports_ambiguous_boundary() {
         "--not-a-node-flag".into(),
         script.to_string_lossy().into_owned(),
     ];
-    let err = bind_launched_workload(&argv, &node, &entries, &logger).unwrap_err();
+    let err = bind_launched_workload(&argv, &node, &entries, &logger, None).unwrap_err();
     match err {
         VerifyError::UnboundWorkload { reason, .. } => {
             assert!(reason.contains("--not-a-node-flag"), "{reason}");
@@ -439,7 +441,7 @@ async fn test_bind_entrypoint_rehashes_payload_content() {
             approved: None,
         },
     ];
-    bind_launched_workload(&argv, &node, &ok, &logger).unwrap();
+    bind_launched_workload(&argv, &node, &ok, &logger, None).unwrap();
 
     // A pin for different content rejects on path correspondence alone:
     // the script must still hash to the pinned value at re-verify time.
@@ -451,7 +453,7 @@ async fn test_bind_entrypoint_rehashes_payload_content() {
         target: script.to_string_lossy().into_owned(),
         approved: None,
     }];
-    let err = bind_launched_workload(&argv, &node, &stale, &logger).unwrap_err();
+    let err = bind_launched_workload(&argv, &node, &stale, &logger, None).unwrap_err();
     assert!(
         matches!(
             err,
@@ -489,7 +491,7 @@ async fn test_bind_entrypoint_only_refuses_unpinned_interpreter() {
         node.to_string_lossy().into_owned(),
         script.to_string_lossy().into_owned(),
     ];
-    let err = bind_launched_workload(&argv, &node, &entries, &logger).unwrap_err();
+    let err = bind_launched_workload(&argv, &node, &entries, &logger, None).unwrap_err();
     match err {
         VerifyError::UnboundWorkload { reason, .. } => {
             assert!(reason.contains("binary-hash"), "{reason}");
@@ -533,7 +535,7 @@ async fn test_bind_refuses_payload_pin_on_unmodeled_exe() {
         worker.to_string_lossy().into_owned(),
         script.to_string_lossy().into_owned(),
     ];
-    let err = bind_launched_workload(&argv, &worker, &entries, &logger).unwrap_err();
+    let err = bind_launched_workload(&argv, &worker, &entries, &logger, None).unwrap_err();
     match err {
         VerifyError::UnboundWorkload { reason, .. } => {
             assert!(reason.contains("modeled option grammar"), "{reason}");
@@ -575,7 +577,7 @@ async fn test_bind_modeled_interpreter_binds() {
         python.to_string_lossy().into_owned(),
         script.to_string_lossy().into_owned(),
     ];
-    bind_launched_workload(&argv, &python, &entries, &logger).unwrap();
+    bind_launched_workload(&argv, &python, &entries, &logger, None).unwrap();
     let _ = logger.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
