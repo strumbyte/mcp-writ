@@ -519,7 +519,7 @@ fn rel_label(root: &Path, p: &Path) -> String {
 /// Stale sentences that contradicted the implementation and must not
 /// return to the docs (PR-01, 2026-11). Each entry is
 /// `(phrase, exempt_marker)`: a hit is not an error when the same
-/// paragraph also carries the marker — `inherit-parent #true`
+/// sentence also carries the marker — `inherit-parent #true`
 /// descriptions legitimately discuss the ambient-inheritance option
 /// the env phrases used to misstate. The list is limited to sentences
 /// fixed in that PR; generic wording is not registered.
@@ -566,6 +566,12 @@ fn collect_kdl_examples(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// A character that ends a sentence in either documentation language —
+/// the scope `check_forbidden_phrases`'s exempt marker is limited to.
+fn is_sentence_end(c: char) -> bool {
+    matches!(c, '.' | '!' | '?' | '。' | '！' | '？')
+}
+
 /// Paragraph-aware scan for `FORBIDDEN_PHRASES`: prose hard-wraps a
 /// sentence across source lines, and `//` comments in the `*.kdl`
 /// examples wrap the same way, so each paragraph's lines are trimmed —
@@ -574,9 +580,9 @@ fn collect_kdl_examples(root: &Path) -> Vec<PathBuf> {
 /// ATX heading is its own block even without a blank line, so it ends
 /// the paragraph too and is scanned alone — a marker in the heading
 /// cannot exempt the next paragraph's claims. Errors name the source
-/// line the match begins on, and a paragraph carrying the phrase's
-/// `exempt_marker` is skipped as an option description, the same role
-/// the per-line marker played before.
+/// line the match begins on, and the phrase's `exempt_marker` exempts
+/// only the sentence that carries it — a marker elsewhere in the
+/// paragraph does not cover a stale claim in another sentence.
 fn check_forbidden_phrases(label: &str, text: &str, errors: &mut Vec<String>) {
     let mut paragraphs: Vec<Vec<(usize, &str)>> = Vec::new();
     let mut paragraph: Vec<(usize, &str)> = Vec::new();
@@ -604,13 +610,24 @@ fn check_forbidden_phrases(label: &str, text: &str, errors: &mut Vec<String>) {
             .collect::<Vec<_>>()
             .join(" ");
         for &(phrase, exempt) in FORBIDDEN_PHRASES {
-            if exempt.is_some_and(|m| joined.contains(m)) {
-                continue;
-            }
             let mut at = 0;
             while let Some(hit) = joined[at..].find(phrase) {
                 let pos = at + hit;
                 at = pos + phrase.len();
+                // The marker exempts only the sentence carrying it: a
+                // marker elsewhere in the paragraph does not cover a
+                // stale claim in another sentence.
+                let sentence_start = joined[..pos]
+                    .rfind(is_sentence_end)
+                    .map(|i| i + joined[i..].chars().next().unwrap().len_utf8())
+                    .unwrap_or(0);
+                let sentence_end = joined[at..]
+                    .find(is_sentence_end)
+                    .map(|i| at + i)
+                    .unwrap_or(joined.len());
+                if exempt.is_some_and(|m| joined[sentence_start..sentence_end].contains(m)) {
+                    continue;
+                }
                 // Map the normalized offset back to its source line:
                 // line `k` covers `len + 1` joined bytes (content plus
                 // the join space), so the match's first byte lands on
@@ -778,6 +795,33 @@ fn forbidden_phrases_match_across_wraps() {
         errors,
         ["x.md:2: forbidden stale wording `inherits the full parent environment`"]
     );
+}
+
+#[test]
+fn forbidden_phrases_marker_covers_only_its_sentence() {
+    let mut errors = Vec::new();
+    // A marker in one sentence of a paragraph does not exempt a stale
+    // claim in another sentence of the same paragraph.
+    check_forbidden_phrases(
+        "x.md",
+        "ambient inheritance stays opt-in via `inherit-parent #true`. The \
+         child inherits the full parent environment\n",
+        &mut errors,
+    );
+    assert_eq!(
+        errors,
+        ["x.md:1: forbidden stale wording `inherits the full parent environment`"]
+    );
+    // A marker in the same sentence as the claim still exempts it —
+    // the option description is the marker's purpose.
+    errors.clear();
+    check_forbidden_phrases(
+        "x.md",
+        "the child inherits the full parent environment only under \
+         `inherit-parent #true`\n",
+        &mut errors,
+    );
+    assert!(errors.is_empty());
 }
 
 #[test]

@@ -87,8 +87,10 @@ and writes a standalone draft policy carrying the discovered
 `tools-list-hash` — it does not read `policy.kdl`. Two explicit
 downgrades exist: `--unsafe-unsandboxed-discovery` runs the server with
 the ambient environment (keep unreviewed servers inside a throwaway VM
-or container there), and `MCP_WRIT_SKIP_SANDBOX` drops only the OS
-sandbox while keeping the restricted environment:
+or container there), and `MCP_WRIT_SKIP_SANDBOX` drops the OS sandbox
+and the Warden's descendant teardown while keeping the restricted
+environment and private TMPDIR — surviving descendant processes are
+not cleaned up, so do not rely on this downgrade to reap them:
 
 ```sh
 mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- "$(command -v mcp-server-filesystem)" /srv/mcp-data

@@ -90,7 +90,9 @@ EOF
 明示的なダウングレードは2通りあり、`--unsafe-unsandboxed-discovery`
 は周囲の環境のまま実行します（未レビューのサーバーは使い捨ての
 VM かコンテナの中に限定してください）。`MCP_WRIT_SKIP_SANDBOX` は
-制限環境を維持したまま OS サンドボックスだけを外します。
+OS サンドボックスと子孫プロセスの寿命管理を外し、制限環境と専用
+TMPDIR は維持します — 残存する子孫プロセスは回収されないため、
+後始末には当てにしないでください。
 
 ```sh
 mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- "$(command -v mcp-server-filesystem)" /srv/mcp-data
