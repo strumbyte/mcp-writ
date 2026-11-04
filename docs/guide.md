@@ -3470,26 +3470,67 @@ interpreter a `#!` line selects when a script launches directly —
 `generate-policy` flags the latter as a `// REVIEW:` item, and every such
 residual is enumerated in the launch report's `code_identity.mutable`.
 
-Startup cost, measured (WSL2, kernel 6.18, x86-64, `sha_ni` present):
-pinning `node` v22.11.0 (a 112 MiB image) plus an
-`entrypoint-hash` on a 5.4 KiB script, the pinned launch reads the
-executable **twice** end to end — once at initial verification, once as
-the sealed snapshot is written and hashed in the same pass — and the
-entrypoint **once** (binding and the pre-spawn re-check run against the
-retained handle and its recorded stamp, re-hashing only when the object
-provably changed, the stamp sits inside the filesystem's timestamp
-granularity where a same-tick rewrite could hide, or the filesystem's
-clock is not kernel-owned and a recorded ctime could be restored). The earlier pipeline
-read the executable six times and the entrypoint four. Under
-`strace -ff`, traced `read` bytes for one launch fell from ~674 MiB to
-~226 MiB, and median spawn-to-`initialize` for a real
-`@modelcontextprotocol/server-filesystem` stdio server (5 reps,
-`MCP_WRIT_SKIP_SANDBOX=1`) dropped from 0.57 s to 0.33 s. A binary-only
-pin on a small interpreter (`/usr/bin/python3.12`, 8 MiB) shows the same
-pass reduction but no measurable wall-clock change — interpreter startup
-dominates at that size. Read accounting used syscall byte totals because
-this kernel does not expose `/proc/<pid>/io` (`rchar`); on hosts that do,
-the same figures are available there.
+Startup cost, measured (WSL2, kernel 6.18, x86-64): pinning `node`
+v22.20.0 (a 117.5 MiB image) plus an `entrypoint-hash` on a 5.4 KiB
+script, the pinned launch reads the executable **twice** end to end —
+once at initial verification, once as the sealed snapshot is written and
+hashed in the same pass — and the entrypoint **once** (binding and the
+pre-spawn re-check run against the retained handle and its recorded
+stamp, re-hashing only when the object provably changed, the stamp sits
+inside the filesystem's timestamp granularity where a same-tick rewrite
+could hide, or the filesystem's clock is not kernel-owned and a recorded
+ctime could be restored). The earlier pipeline read the executable six
+times and the entrypoint four. Under `strace -ff`, the guard's `read`
+bytes on the executable fell from ~470 MiB to ~235 MiB and total traced
+`read` bytes per launch from ~589 MiB to ~237 MiB; median
+spawn-to-`initialize` for a real `@modelcontextprotocol/server-filesystem`
+stdio server (7 reps, `MCP_WRIT_SKIP_SANDBOX=1`) dropped from 1.15 s to
+0.56 s on a build forced onto the software SHA-256 backend
+(`sha2_backend="soft"` — the same compression path a CPU without SHA
+extensions takes; `sha_ni` is present on this host). The same host's
+`sha_ni`-enabled build measured 0.57 s to 0.33 s on `node` v22.11.0
+(112 MiB, 5 reps). A binary-only pin on a small interpreter
+(`python3.12`, 7.6 MiB) shows the same pass reduction — guard `read`
+bytes on the executable fell from ~31 MiB to ~15 MiB — but little
+wall-clock change (0.39 s to 0.35 s) since interpreter startup dominates
+at that size. Read accounting used syscall byte totals because this
+kernel does not expose `/proc/<pid>/io` (`rchar`); on hosts that do, the
+same figures are available there.
+
+Argument-classification cost, measured (same host and build settings):
+the `tools/call` inspection path no longer scales with single-argument
+size the way it did at `f00e28a`. Median round-trip latency for one
+`{"note": "<payload>"}` call through `run` — same scripted stdio
+fixture, `MCP_WRIT_SKIP_SANDBOX=1`, 9 reps — next to a direct
+connection to the same server:
+
+| argument size | direct | proxy, pre-change | proxy, current |
+| ---: | ---: | ---: | ---: |
+| 64 B | 0.11 ms | 0.29 ms | 0.25 ms |
+| 64 KiB | 0.17 ms | 1.13 ms | 0.96 ms |
+| 1 MiB | 2.03 ms | 113.5 ms | 13.1 ms |
+
+The proxy-side increment over the direct connection falls from ~111 ms
+to ~11 ms at 1 MiB — past the halving target. Inside `check_request`
+the classified walk dropped from ~97 ms to ~6–8 ms per 1 MiB call and
+`perf stat` instructions from ~344 G to ~18 G; a `perf` profile puts
+the pre-change cost mostly on NFKC normalization (~46 %) and UTF-8
+lossy decode (~9 %), while normalization-related samples are under 1 %
+after the change. The reduction is reuse and early exit, not skipped
+inspection: ASCII values borrow through NFKC (the identity on ASCII)
+instead of collecting, callers pass the single `normalize_fs_argument`
+result to `is_secret_path_normalized` /
+`looks_like_network_target_normalized` rather than let each callee
+normalize again, compacted-URI copies are built only when a `:` scheme
+marker exists, and a printable-ASCII token carrying no selector
+punctuation (`/` `\` `:` `~` `$` `%` `@` `.`) provably normalizes to
+itself and fails every shape test, so classification jumps to the key
+and overlay checks. The secret-path overlay itself is not skippable —
+`resolve_for_authorization` (~9 bounded path-lookup syscalls per call,
+independent of argument size) can land a bare token on a reserved
+spelling through the cwd or a symlinked ancestor — but its lexical
+gate keeps the common miss cheap. Classification output is unchanged
+on every input; only the compute path moved.
 
 ### 8.3 Residual risks in egress destination control
 

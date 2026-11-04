@@ -325,7 +325,67 @@ fn walk_json_targets(
     }
 }
 
+/// Printable-ASCII value carrying none of the selector punctuation
+/// (`/` `\` `:` `~` `$` `%` `@` `.`) that [`crate::pathutil::selector_plausible`]
+/// keys on. Such a token provably normalizes to itself — no `%` to
+/// decode, no strippable control byte, no `:` to form a `file:` scheme,
+/// and NFKC is the ASCII identity — and none of the value-shape tests
+/// (`starts_with_file_scheme`, `looks_like_path`,
+/// `looks_like_network_target`, `looks_like_host_or_socket`) can match
+/// it, so classification reduces to the key vocabulary and the
+/// secret-path overlay.
+fn is_plain_ascii_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|b| {
+            (0x20..=0x7E).contains(&b)
+                && !matches!(b, b'/' | b'\\' | b':' | b'~' | b'$' | b'%' | b'@' | b'.')
+        })
+}
+
+/// [`classify_target_string`] for values [`is_plain_ascii_token`]
+/// cleared: normalization is the identity and every shape test is
+/// provably false, so `normalized` is `value` itself and only the
+/// key-driven checks and the secret-path overlay remain — applied in
+/// the same order as the general path.
+fn classify_plain_token(key: &str, value: &str, out: &mut ExtractedTargets) {
+    if crate::pathutil::is_path_field_value(key, value) {
+        out.push(TargetSlot::Path, value.to_string());
+        return;
+    }
+    if crate::pathutil::is_network_field_name(key) {
+        // The general path's `://` / `//` and host-or-socket branches
+        // are unreachable without `:` or a separator; `dns_name_shape`
+        // makes the same host-vs-URL call it makes there.
+        if crate::pathutil::dns_name_shape(value) {
+            out.push(
+                TargetSlot::Host,
+                crate::policy::canonicalize_policy_host(value),
+            );
+        } else {
+            out.push(TargetSlot::Url, value.to_string());
+        }
+        return;
+    }
+    // Reserved secret spellings are filesystem targets under *any* key —
+    // the overlay still runs on a plain token because resolution can
+    // pull a `.ssh`/`etc` segment in from the cwd or a symlinked parent.
+    if crate::secret_paths::is_secret_path_normalized(value, value) {
+        out.push(TargetSlot::Path, value.to_string());
+        return;
+    }
+    if crate::pathutil::is_known_payload_field_name(key) {
+        return;
+    }
+    out.push(TargetSlot::Unclassified, value.to_string());
+}
+
 fn classify_target_string(key: &str, value: &str, out: &mut ExtractedTargets) {
+    // A plain ASCII token carries no encoding the normalizer could
+    // rewrite and no punctuation the shape tests could key on — skip
+    // straight to the key-driven and overlay checks.
+    if is_plain_ascii_token(value) {
+        return classify_plain_token(key, value, out);
+    }
     // Same Auditor-time normalize as overlay (bounded percent-decode + WHATWG
     // C0 strip + file: → path) so `file\t://` / `%66ile%0A://` become paths.
     let normalized = match crate::pathutil::normalize_fs_argument(value) {
@@ -347,7 +407,10 @@ fn classify_target_string(key: &str, value: &str, out: &mut ExtractedTargets) {
     }
     // URL-shaped values (including on path/target keys) are network targets.
     // Otherwise `path=https://…` would skip the read_only host/URL check.
-    if crate::pathutil::looks_like_network_target(&normalized) {
+    // `normalized` is already normalized — the normalized-input variant
+    // skips the check's embedded decode round unless NFKC left a fresh
+    // `%` escape behind (fullwidth `％`), where it keeps the second pass.
+    if crate::pathutil::looks_like_network_target_normalized(&normalized) {
         let key_l = key.to_ascii_lowercase();
         if key_l == "host" || key_l == "hosts" || key_l == "hostname" {
             out.push(
@@ -400,8 +463,11 @@ fn classify_target_string(key: &str, value: &str, out: &mut ExtractedTargets) {
     }
     // Reserved secret spellings are filesystem targets under *any* key —
     // an unrecognized field name cannot hide `.env` or `.ssh/…` from the
-    // overlay or an fs allow-list.
-    if crate::secret_paths::is_secret_path(&normalized) {
+    // overlay or an fs allow-list. `normalized` is already the
+    // `normalize_fs_argument` output, so it is passed as both phases;
+    // the overlay still runs the value's own second decode round for
+    // spellings where NFKC left a fresh `%` escape (fullwidth `％`).
+    if crate::secret_paths::is_secret_path_normalized(&normalized, &normalized) {
         out.push(TargetSlot::Path, normalized);
         return;
     }
@@ -413,4 +479,175 @@ fn classify_target_string(key: &str, value: &str, out: &mut ExtractedTargets) {
     // non-selector — restricted callers refuse it rather than forward
     // an unchecked target.
     out.push(TargetSlot::Unclassified, normalized);
+}
+
+/// Pre-PR-03 argument classification, frozen for the differential test
+/// in `tests::targets` — proves the plain-token fast path and the
+/// shared normalization plumbing change no extracted-target outcome.
+/// Bodies are verbatim HEAD except for module qualification, and they
+/// call the `reference` (HEAD) normalization/overlay implementations
+/// so the comparison is independent of every PR-03 code path.
+#[cfg(test)]
+pub(crate) mod reference {
+    use super::*;
+
+    /// Same driver as [`collect_argument_targets`], classifying through
+    /// the frozen HEAD body.
+    pub(crate) fn collect(json: &nojson::RawJson<'_>) -> ExtractedTargets {
+        let mut out = ExtractedTargets::new();
+        if let Some(args) = json
+            .value()
+            .to_member("params")
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|p| p.to_member("arguments").ok()?.optional())
+        {
+            walk(args, "", 0, &mut out);
+        }
+        if let Some(input_responses) = params_member(json, "inputResponses") {
+            walk(input_responses, "", 0, &mut out);
+        }
+        out
+    }
+
+    fn walk(
+        val: nojson::RawJsonValue<'_, '_>,
+        key: &str,
+        depth: u32,
+        out: &mut ExtractedTargets,
+    ) {
+        if depth > MAX_JSON_NESTING || out.truncated {
+            return;
+        }
+        match val.kind() {
+            nojson::JsonValueKind::Object => {
+                if let Ok(obj) = val.to_object() {
+                    for (k, v) in obj {
+                        if out.truncated {
+                            return;
+                        }
+                        let key_owned = k
+                            .to_unquoted_string_str()
+                            .map(|s| s.into_owned())
+                            .unwrap_or_default();
+                        walk(v, &key_owned, depth + 1, out);
+                    }
+                }
+            }
+            nojson::JsonValueKind::Array => {
+                if let Ok(arr) = val.to_array() {
+                    for elem in arr {
+                        if out.truncated {
+                            return;
+                        }
+                        walk(elem, key, depth + 1, out);
+                    }
+                }
+            }
+            _ => {
+                out.leaves += 1;
+                if out.leaves > MAX_INSPECTED_LEAVES {
+                    out.truncated = true;
+                    return;
+                }
+                if let Ok(s) = val.to_unquoted_string_str() {
+                    classify_reference(key, s.as_ref(), out);
+                }
+            }
+        }
+    }
+
+    /// Verbatim pre-PR-03 [`classify_target_string`].
+    fn classify_reference(key: &str, value: &str, out: &mut ExtractedTargets) {
+        // Same Auditor-time normalize as overlay (bounded percent-decode +
+        // WHATWG C0 strip + file: → path) so `file\t://` / `%66ile%0A://`
+        // become paths.
+        let normalized = match crate::pathutil::reference::normalize_fs_argument(value) {
+            Ok(n) => n,
+            Err(_) => {
+                out.push(TargetSlot::Path, value.to_string());
+                return;
+            }
+        };
+
+        if crate::pathutil::starts_with_file_scheme(&normalized)
+            || crate::pathutil::looks_like_path(&normalized)
+        {
+            if normalized != value {
+                out.push_noncanonical(value.to_string(), normalized.clone());
+            }
+            out.push(TargetSlot::Path, normalized);
+            return;
+        }
+        // URL-shaped values (including on path/target keys) are network
+        // targets. Otherwise `path=https://…` would skip the read_only
+        // host/URL check.
+        if crate::pathutil::reference::looks_like_network_target(&normalized) {
+            let key_l = key.to_ascii_lowercase();
+            if key_l == "host" || key_l == "hosts" || key_l == "hostname" {
+                out.push(
+                    TargetSlot::Host,
+                    crate::policy::canonicalize_policy_host(&normalized),
+                );
+            } else {
+                out.push(TargetSlot::Url, value.to_string());
+            }
+            return;
+        }
+        // Unambiguous endpoint spellings are network targets under any
+        // key — an IP literal, `[v6]:port`, or `host:port` under
+        // `dest`/`destination`/`target` is an address, not a filename.
+        if crate::pathutil::looks_like_host_or_socket(&normalized) {
+            out.push(
+                TargetSlot::Host,
+                crate::policy::canonicalize_policy_host(&normalized),
+            );
+            return;
+        }
+        if crate::pathutil::is_path_field_value(key, &normalized)
+            || crate::pathutil::looks_like_path(value)
+        {
+            if normalized != value {
+                out.push_noncanonical(value.to_string(), normalized.clone());
+            }
+            out.push(TargetSlot::Path, normalized);
+            return;
+        }
+        if crate::pathutil::is_network_field_name(key) {
+            // `scheme://`/`//` spellings are URL arguments. A bare token
+            // on a network field names a host (with or without a `:port`
+            // — the evaluator folds the qualifier away), so it is
+            // checked as a host rather than refused as a malformed URL.
+            // Anything else is an unparseable selector and keeps the
+            // invalid-URL deny path.
+            if value.contains("://") || value.starts_with("//") {
+                out.push(TargetSlot::Url, value.to_string());
+            } else if crate::pathutil::looks_like_host_or_socket(&normalized)
+                || crate::pathutil::dns_name_shape(&normalized)
+            {
+                out.push(
+                    TargetSlot::Host,
+                    crate::policy::canonicalize_policy_host(&normalized),
+                );
+            } else {
+                out.push(TargetSlot::Url, value.to_string());
+            }
+            return;
+        }
+        // Reserved secret spellings are filesystem targets under *any*
+        // key — an unrecognized field name cannot hide `.env` or
+        // `.ssh/…` from the overlay or an fs allow-list.
+        if crate::secret_paths::reference::is_secret_path(&normalized) {
+            out.push(TargetSlot::Path, normalized);
+            return;
+        }
+        // Declared non-selector payload fields carry opaque content.
+        if crate::pathutil::is_known_payload_field_name(key) {
+            return;
+        }
+        // A string under no recognized vocabulary cannot be proven a
+        // non-selector — restricted callers refuse it rather than
+        // forward an unchecked target.
+        out.push(TargetSlot::Unclassified, normalized);
+    }
 }

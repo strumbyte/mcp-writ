@@ -769,3 +769,49 @@ fn share_root_exemption_is_scoped_to_registered_descendants() {
     resolve_for_authorization(&spelling)
         .unwrap_or_else(|e| panic!("descendant of a registered share root must resolve: {e}"));
 }
+
+// -- PR-03 differential: current vs frozen HEAD implementations ----
+
+/// Every normalization-facing entry must return the same verdict as
+/// its frozen HEAD copy on the shared argument corpus — the PR-03
+/// changes are allowed to remove work, not to change answers.
+#[test]
+fn pr03_corpus_matches_reference() {
+    for value in crate::testutil::argument_classification_corpus() {
+        assert_eq!(
+            normalize_fs_argument(&value),
+            reference::normalize_fs_argument(&value),
+            "normalize_fs_argument diverged: {value:?}"
+        );
+        assert_eq!(
+            percent_decode_bounded(&value),
+            reference::percent_decode_bounded(&value),
+            "percent_decode_bounded diverged: {value:?}"
+        );
+        assert_eq!(
+            looks_like_network_target(&value),
+            reference::looks_like_network_target(&value),
+            "looks_like_network_target diverged: {value:?}"
+        );
+        assert_eq!(
+            uri_scheme_slot_is_dirty(&value),
+            reference::uri_scheme_slot_is_dirty(&value),
+            "uri_scheme_slot_is_dirty diverged: {value:?}"
+        );
+        assert_eq!(
+            is_opaque_file_uri(&value),
+            reference::is_opaque_file_uri(&value),
+            "is_opaque_file_uri diverged: {value:?}"
+        );
+        // The normalized-input variant must agree with the raw-input
+        // original on an already-normalized string.
+        if let Ok(normalized) = normalize_fs_argument(&value) {
+            assert_eq!(
+                looks_like_network_target_normalized(&normalized),
+                reference::looks_like_network_target(&normalized),
+                "looks_like_network_target_normalized diverged on \
+                 normalized {normalized:?} (raw {value:?})"
+            );
+        }
+    }
+}

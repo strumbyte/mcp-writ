@@ -4,6 +4,7 @@
 //! normalized, and canonicalized when the object exists) rather than on the
 //! original attacker-controlled string.
 
+use std::borrow::Cow;
 use std::net::Ipv4Addr;
 use std::path::{Component, Path, PathBuf};
 
@@ -532,6 +533,25 @@ pub fn looks_like_network_target(value: &str) -> bool {
     false
 }
 
+/// [`looks_like_network_target`] for a value that is already the
+/// [`normalize_fs_argument`] output — the embedded re-normalize is the
+/// identity there, so the same check runs without a second decode pass.
+/// One exception: NFKC can *introduce* a `%` escape after the bounded
+/// decode already ran (fullwidth `％` → `%`), and only another decode
+/// round reveals that spelling's `file:` URI / `.`/`..` path. Those
+/// still owe the second pass, so they take the full check.
+pub(crate) fn looks_like_network_target_normalized(normalized: &str) -> bool {
+    if normalized.contains('%') {
+        return looks_like_network_target(normalized);
+    }
+    if starts_with_file_scheme(normalized)
+        || (looks_like_path(normalized) && !normalized.contains("://"))
+    {
+        return false;
+    }
+    normalized.contains("://") || (normalized.starts_with("//") && normalized.len() > 2)
+}
+
 /// Maximum percent-decode rounds for Auditor-time path arguments.
 ///
 /// Caps double/triple encoding without an open-redirect style decode loop.
@@ -620,8 +640,15 @@ pub fn compact_uri_for_scheme_sniff(input: &str) -> String {
         .collect()
 }
 
-fn nfkc(input: &str) -> String {
-    input.nfkc().collect()
+/// NFKC is the identity on pure ASCII — borrow the input instead of
+/// walking every char through the compatibility tables. Non-ASCII
+/// values still get the full normalization.
+fn nfkc(input: &str) -> Cow<'_, str> {
+    if input.is_ascii() {
+        Cow::Borrowed(input)
+    } else {
+        Cow::Owned(input.nfkc().collect())
+    }
 }
 
 /// RFC 3986 scheme, ASCII only: `[A-Za-z][A-Za-z0-9+.-]*`.
@@ -643,7 +670,7 @@ fn uri_scheme_slot(sniff: &str) -> Option<&str> {
 /// variation selectors, Braille blank, Hangul filler, …). Not a denylist.
 pub fn uri_scheme_slot_is_dirty(raw: &str) -> bool {
     let decoded = match percent_decode_bounded(raw) {
-        Ok(d) => nfkc(&d),
+        Ok(d) => nfkc(&d).into_owned(),
         Err(_) => return true,
     };
     let compacted = compact_uri_for_scheme_sniff(&decoded);
@@ -677,6 +704,15 @@ fn decode_then_strip_c0(input: &str) -> Result<String, String> {
 pub fn percent_decode_bounded(input: &str) -> Result<String, String> {
     if input.contains('\0') {
         return Err("empty or NUL-containing path".to_string());
+    }
+    // Printable ASCII without '%': nothing decodes and none of the
+    // stripped control ranges apply, so the loop below would return
+    // the input after a single round-trip.
+    if input
+        .bytes()
+        .all(|b| (0x20..=0x7E).contains(&b) && b != b'%')
+    {
+        return Ok(input.to_string());
     }
     let mut current = strip_scheme_splitting_controls(input);
     for _ in 0..PERCENT_DECODE_MAX_ROUNDS {
@@ -853,7 +889,7 @@ pub(crate) fn parse_ipv4_whatwg(host: &str) -> Option<Ipv4Addr> {
 /// `file:` with no `//` authority and a non-absolute remainder (`file:etc/passwd`).
 pub fn is_opaque_file_uri(raw: &str) -> bool {
     let decoded = match percent_decode_bounded(raw) {
-        Ok(d) => nfkc(&d),
+        Ok(d) => nfkc(&d).into_owned(),
         Err(_) => return false,
     };
     let compacted = compact_uri_for_scheme_sniff(&decoded);
@@ -885,14 +921,26 @@ pub fn normalize_fs_argument(raw: &str) -> Result<String, String> {
     if raw.is_empty() {
         return Err("empty or NUL-containing path".to_string());
     }
-    let decoded = nfkc(&percent_decode_bounded(raw)?);
-    let compacted = compact_uri_for_scheme_sniff(&decoded);
-    if let Some(from_uri) =
-        file_uri_to_fs_path(&decoded).or_else(|| file_uri_to_fs_path(&compacted))
+    let decoded_raw = percent_decode_bounded(raw)?;
+    let decoded = match nfkc(&decoded_raw) {
+        // ASCII: NFKC is the identity — keep the decoded buffer.
+        Cow::Borrowed(_) => decoded_raw,
+        Cow::Owned(s) => s,
+    };
+    // `file:` needs a literal `:` — without one no amount of whitespace
+    // or format-noise compaction can form the scheme, so the compacted
+    // copy is only built when it could matter.
+    let compacted = decoded
+        .contains(':')
+        .then(|| compact_uri_for_scheme_sniff(&decoded));
+    if let Some(from_uri) = file_uri_to_fs_path(&decoded)
+        .or_else(|| compacted.as_deref().and_then(file_uri_to_fs_path))
     {
-        return Ok(nfkc(&percent_decode_bounded(&from_uri)?));
+        return Ok(nfkc(&percent_decode_bounded(&from_uri)?).into_owned());
     }
-    if starts_with_file_scheme(&decoded) || starts_with_file_scheme(&compacted) {
+    if starts_with_file_scheme(&decoded)
+        || compacted.as_deref().is_some_and(starts_with_file_scheme)
+    {
         // A `file:` value that produced no path — a non-local
         // `file://host` authority, a pathless URI — must fail closed:
         // falling back to the raw spelling would let a remote share
@@ -1253,6 +1301,124 @@ pub fn selector_plausible(value: &str) -> bool {
         return true;
     }
     v.contains('.')
+}
+
+/// Pre-PR-03 implementations of the argument-normalization functions,
+/// frozen for the differential tests that prove the complexity work
+/// changed no verdict (`tests.rs` runs the shared corpus against both).
+/// Bodies are verbatim HEAD except for the old owned-`String` `nfkc`
+/// spelled `nfkc_string`.
+#[cfg(test)]
+pub(crate) mod reference {
+    use super::*;
+
+    /// HEAD `nfkc` — always walks the compatibility tables.
+    fn nfkc_string(input: &str) -> String {
+        input.nfkc().collect()
+    }
+
+    /// HEAD `percent_decode_bounded` — no printable-ASCII early return.
+    pub(crate) fn percent_decode_bounded(input: &str) -> Result<String, String> {
+        if input.contains('\0') {
+            return Err("empty or NUL-containing path".to_string());
+        }
+        let mut current = strip_scheme_splitting_controls(input);
+        for _ in 0..PERCENT_DECODE_MAX_ROUNDS {
+            let next = decode_then_strip_c0(&current)?;
+            if next == current {
+                return Ok(current);
+            }
+            current = next;
+        }
+        let next = decode_then_strip_c0(&current)?;
+        if next != current {
+            return Err("percent-encoding did not stabilize within decode cap".to_string());
+        }
+        Ok(current)
+    }
+
+    /// HEAD `normalize_fs_argument`.
+    pub(crate) fn normalize_fs_argument(raw: &str) -> Result<String, String> {
+        if raw.is_empty() {
+            return Err("empty or NUL-containing path".to_string());
+        }
+        let decoded = nfkc_string(&percent_decode_bounded(raw)?);
+        let compacted = compact_uri_for_scheme_sniff(&decoded);
+        if let Some(from_uri) =
+            file_uri_to_fs_path(&decoded).or_else(|| file_uri_to_fs_path(&compacted))
+        {
+            return Ok(nfkc_string(&percent_decode_bounded(&from_uri)?));
+        }
+        if starts_with_file_scheme(&decoded) || starts_with_file_scheme(&compacted) {
+            return Err("file: URI does not name a local filesystem path".to_string());
+        }
+        Ok(decoded)
+    }
+
+    /// HEAD `looks_like_network_target`.
+    pub(crate) fn looks_like_network_target(value: &str) -> bool {
+        if starts_with_file_scheme(value) {
+            return false;
+        }
+        if let Ok(normalized) = normalize_fs_argument(value)
+            && (starts_with_file_scheme(&normalized)
+                || (looks_like_path(&normalized) && !normalized.contains("://")))
+        {
+            return false;
+        }
+        if value.contains("://") {
+            return true;
+        }
+        if value.starts_with("//") && value.len() > 2 {
+            return true;
+        }
+        false
+    }
+
+    /// HEAD `uri_scheme_slot_is_dirty`.
+    pub(crate) fn uri_scheme_slot_is_dirty(raw: &str) -> bool {
+        let decoded = match percent_decode_bounded(raw) {
+            Ok(d) => nfkc_string(&d),
+            Err(_) => return true,
+        };
+        let compacted = compact_uri_for_scheme_sniff(&decoded);
+        let sniff = if compacted.contains("://") {
+            compacted.as_str()
+        } else if decoded.contains("://") {
+            decoded.as_str()
+        } else {
+            return false;
+        };
+        match uri_scheme_slot(sniff) {
+            Some(scheme) => !is_ascii_uri_scheme(scheme),
+            None => true,
+        }
+    }
+
+    /// HEAD `is_opaque_file_uri`.
+    pub(crate) fn is_opaque_file_uri(raw: &str) -> bool {
+        let decoded = match percent_decode_bounded(raw) {
+            Ok(d) => nfkc_string(&d),
+            Err(_) => return false,
+        };
+        let compacted = compact_uri_for_scheme_sniff(&decoded);
+        for candidate in [&decoded, &compacted] {
+            if !starts_with_file_scheme(candidate) {
+                continue;
+            }
+            let Some(rest) = after_file_scheme(candidate) else {
+                continue;
+            };
+            let rest = strip_url_query_fragment(rest).replace('\\', "/");
+            if rest.starts_with("//") || rest.starts_with('/') || looks_like_windows_abs(&rest) {
+                return false;
+            }
+            if !rest.is_empty() {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]
