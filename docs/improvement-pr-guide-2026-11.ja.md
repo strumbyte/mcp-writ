@@ -1,14 +1,35 @@
-# mcp-writ 改善計画 PR別実装手順書（2026-10-27）
+# mcp-writ 改善計画 PR別実装手順書（2026-10-27、2026-11-04 更新）
 
 作成日: 2026-10-27
+更新日: 2026-11-04（基準コミットを `f00e28a` に更新 — 後述の「基準以降の変化」参照）
 
 状態: **計画のみ**。各PRの実装・環境更新・コミット・ブランチ作成・push・GitHub PR作成は、別途指示があるまで行いません。以下の共通手順にある実装・PR操作は、将来の実装着手時の手順です。
 
-[改善計画（評価レポート対応版）](improvement-plan-2026-11.ja.md)を目的・範囲・ロードマップの正とし、本書をPR単位の作業順序の正とします。基準コミットは `2f87236`（merge #92、`main` の先端）。対象箇所が基準から変わった場合は、本書の事実・依存・試験を更新します。事実・行番号は `2f87236` のコード読解で照合しました（ビルド・テスト未実行。性能値はレポート側の Linux 実機計測に依る）。
+[改善計画（評価レポート対応版）](improvement-plan-2026-11.ja.md)を目的・範囲・ロードマップの正とし、本書をPR単位の作業順序の正とします。基準コミットは `f00e28a`（`main` の先端、v0.5.1 公開後の検証記録）。対象箇所が基準から変わった場合は、本書の事実・依存・試験を更新します。行番号は `f00e28a` のコード読解で照合しました（ビルド・テスト未実行。性能値はレポート側の Linux 実機計測に依る）。
+
+## 基準以降の変化（`2f87236` → `f00e28a`）と各PRへの影響
+
+計画時の基準 `2f87236`（merge #92）から、v0.5.1 リリースを挟んで #93〜#97 と後続の修正が入りました。各PRの前提への影響は次のとおりです（詳細は各PR節）。
+
+| 基準以降の変更 | 影響するPR |
+|---|---|
+| **探索（`--live-discovery`）が既定で Warden サンドボックス内に**。`tools_list.rs` の `DiscoveryOptions.restrict_environment` は「Warden 経路（deny-all egress・コマンドツリー＋インタプリタprefixのfs・専用TMPDIR・制限環境・secret overlay）か、文書化された ambient ダウングレードか」を選ぶ意味に変わり、`spawn_server_sandboxed`（同 `1345`）が fail-closed で組み込みポリシー下の spawn を行う。`--unsafe-unsandboxed-discovery` は ambient 継承のダウングレード、`MCP_WRIT_SKIP_SANDBOX` は制限環境のみの plain spawn（`1441`・警告あり） | **E-08 は実装済み**（警告文は「runs inside the Warden sandbox (restricted environment, deny-all egress, private TMPDIR)」に更新済み）。**B-06・PR-09 の中核は実装済み**で、PR-09 は残件（文書・フラグ名の結論記録）のみに縮小 |
+| `policy-authoring.md:154`・`policy-authoring.ja.md:120` が「discovery は OS サンドボックス内で動かない」と記述したまま — **実装が先行したため新たな実装との乖離（過少記述）**。README・quickstart の「制限した環境で実行」も実態より弱い記述に | PR-01（E-04 の修正方向が反転＋対象追加） |
+| `sandbox require_lifetime_boundary`（既定 `#true`）— カーネル強制の子孫 teardown が取れない経路での supervised launch を拒否（security-fix #93）。`ci.yml`・`linux-tests.yml`・`mcp-servers.yml` に cgroup v2 委譲ステップ追加（`platform-tests.yml` は `workflow_call` の再利用ワークフローとして区別） | PR-07（ワークフロー変更点）、PR-11（調査入力の追加） |
+| 信頼ソースの強制：ポリシー読込と、payload-bound entrypoint の native Unix 起動で `fspriv::require_trusted_source_file`（pin.rs `1174`）— 低い信頼の主体が置換できるパス・祖先を持つスクリプトの起動は fail-closed。**guide/policy-authoring/README に未記載の新しい起動拒否** | PR-01（新規 E-10）、PR-02（前提に追加） |
+| 監査スキーマ `"2.0"`：`session_id` を全レコードに付与、`policy.loaded` の `source=` を percent-encode、`tools_list.filtered` の outcome を `success` に変更（docs/archive/migration.{md,ja.md} に移行注記） | PR-04（details 追加時の規約） |
+| 起動レポートに `correction_candidates`（未呼出ツール・根拠付き拒否ターゲット）とセッション呼出 tally、replaceable-paths opt-out の記録 | PR-04（隣接機能として注記）、PR-08（B-07 関連） |
+| `select.rs` に `masked_fs_root`（覆われる木の下の fs **許可**を方式選択時の違反として報告）— 基準時点で既存だが前提の記述を補強。`masked_namespace_root` は相変わらず pin 済み entrypoint のみ（`select.rs:772`、launch.rs `152`、namespaced_run.rs `575`）。`err_stage_hint`（spawn.rs `164`）に exec ENOENT の masked-tree ヒントはまだ無い | PR-05（前提の更新。fs 許可は既に選択時検査済み、ワークロード側は未対応のまま） |
+| `verify_server_hashes`（hash.rs `172`）・`bind_launched_workload`（pin.rs `164`）・`reverify_immediately_before_spawn`（同 `1064`）・`snapshot_object`（同 `728`/`764`）の多段読み直しは継続。保持ハンドル＋stamp の機構（`open_pinned`・`record_stamp`・`stamp_unchanged`・`same_open_object`）は既に整っている | PR-02（前提の更新） |
+| ワークフローに `schedule` トリガーは依然無し。`test-matrix.md` に Workflow inventory 表（`8`〜）が整備済み。`releasing.md` に release-gate（タグは default branch 到達可能＋maintainer 権限＋`release` 環境の承認） | PR-07（前提の更新） |
+| `guide.md`/`guide.ja.md`/`policy-authoring` が更新され、スクリプトの実パス起動と `exe_exec=path`（Windows）の説明は記載済み。Windows 実行ファイル側の「share-mode で保持したハンドルを exec」と読める表現が残る（guide.md `429`・`3362`、guide.ja.md `354`・`1882`、policy-authoring.md `168` ほか） | PR-01（E-06 の範囲を縮小） |
+| `docs/modules.md`・`examples/policies/*.kdl`・README 英日・quickstart 英日は無変更。E-01・E-02・E-03・E-05・E-09 は前提どおり残存 | PR-01 |
+| v0.5.1 を公開済み（`Cargo.toml` version=0.5.1、公開後検証を test-matrix.md に記録） | リリース節（次版は引き続き v0.6 想定） |
+| 結合試験の分割：`tests/plan_report_e2e/`・`tests/dns_gate_e2e/`・`tests/mcp_wire_e2e/`・`tests/wslc_container_e2e/` がディレクトリ形式のターゲットに（`--test` 名は不変） | 検証セットの実行方法は不変 |
 
 本書のPR番号は本計画内の番号です。前身の手順書 [archive/improvement-pr-guide-2026-10.ja.md](archive/improvement-pr-guide-2026-10.ja.md) の PR-01〜36 とは無関係で、前身の PR を指すときは「前身の PR-xx」と書きます。
 
-ロードマップ対応: P0 の PR-01 は次版（v0.6 想定）のタグ前に必須、P1 の PR-02〜05・PR-07 は含める範囲をリリース時に判断、P2 の PR-06・PR-08〜11 は次版以降です。バージョンを上げる条件と手順は、作業の流れの中のリリース節（[次版](#release-next)）に記載します — その時点で確認するものなので、先読みは不要です。
+ロードマップ対応: P0 の PR-01 は次版（v0.6 想定）のタグ前に必須、P1 の PR-02〜05・PR-07 は含める範囲をリリース時に判断、P2 の PR-06・PR-08・PR-10・PR-11 は次版以降です。PR-09 は基準以降に中核が実装済み（探索が既定で Warden 内）で、D-2 の結論も記録済み — 残件は PR-01 の文書に織り込み済みです。バージョンを上げる条件と手順は、作業の流れの中のリリース節（[次版](#release-next)）に記載します — その時点で確認するものなので、先読みは不要です。
 
 ## 共通手順
 
@@ -43,7 +64,7 @@
 - [PR-06 草案の `policy version=3` 出力と、ツール単位 deny ワイルドカードの警告](#pr-06)
 - [PR-07 CI の定期実行と検証記録の件数](#pr-07)
 - [PR-08 運用文書 — ドライバ配置、版の追加手順、直列構成、SECURITY.md](#pr-08)
-- [PR-09 探索への OS サンドボックス適用（opt-in）とフラグ名](#pr-09)
+- [PR-09 探索の OS サンドボックス適用 — 実装済み・結論記録済み（残件は文書のみ、PR-01 内）](#pr-09)
 - [PR-10 ファジング基盤と PoC 昇格基準](#pr-10)
 - [PR-11 後継機構・新 ABI の評価（調査のみ）](#pr-11)
 - [リリース: 次版（v0.6 想定）— PR-01 の完了後（PR-02〜05・07 は含める範囲を判断）](#release-next)
@@ -52,49 +73,51 @@
 
 | PR | 優先度 | 依存・順序 | 主な変更先 |
 |---|---|---|---|
-| PR-01 | P0 | 最初に実施（文書・例・コメントのみ。境界の過大表示と権限拡大を誘う不変条件を先に正す） | `docs/modules.md`、`examples/policies/{fetch,filesystem}.kdl`、README 英日、quickstart 英日、guide 英日、policy-authoring 英日、`src/runtime/launch.rs`（コメント）、`src/commands/generate_policy.rs`（警告文）、`tests/docs_check.rs`、`tests/kdl_policy_e2e.rs` |
+| PR-01 | P0 | 最初に実施（文書・例・コメント・試験コードのみ。境界の過大表示と権限拡大を誘う不変条件を先に正す） | `docs/modules.md`、`examples/policies/{fetch,filesystem}.kdl`、README 英日、quickstart 英日、guide 英日、policy-authoring 英日、`src/runtime/launch.rs`（コメント）、`tests/docs_check.rs`、`tests/kdl_policy_e2e.rs` |
 | PR-02 | P1 | なし。D-6 の判断で残すハッシュ段を確定する | `src/verifier/hash.rs`、`src/verifier/hash/pin.rs`、`src/runtime/launch.rs`（スナップショット）、`tests/workload_hash_e2e.rs` |
 | PR-03 | P1 | なし。D-4 の判断で削減手段を確定する。PR-04 と `targets.rs` が重なるため PR-04 より先にマージ | `src/auditor/checker/targets.rs`、`src/secret_paths.rs`、`src/pathutil.rs` |
 | PR-04 | P1 | PR-03 の後（`targets.rs`・`sub_policy.rs` が重なる）。D-5 の判断で宣言の形を確定する | `src/policy/kdl_parse`、`src/policy/mod.rs`、`src/policy/validator.rs`、`src/auditor/checker/sub_policy.rs`、`src/legislator/policy_generator.rs`、policy-authoring 英日 |
 | PR-05 | P1 | なし。D-8 の判断で `auto` の扱いを確定する | `src/warden/select.rs`、`src/warden/namespaced/{launch,init}.rs`、`src/warden/plan/mod.rs`、`src/commands/namespaced_run.rs`、guide 英日、`tests/linux_mechanism_e2e.rs` |
 | PR-06 | P2 | PR-04 の後（`kdl_parse`・`policy_generator.rs` が重なる）。D-1・D-3 の判断で着手を決める | `src/legislator/policy_generator.rs`、`src/policy/kdl_parse/leaves.rs`、`src/policy/validator.rs`、`src/commands/check.rs`、policy-authoring 英日 |
-| PR-07 | P1 | なし。D-10 の判断で頻度を確定する | `.github/workflows/ci.yml`、`.github/workflows/linux-tests.yml`、`docs/test-matrix.md`、前身の手順書「PRを閉じるとき」 |
+| PR-07 | P1 | なし。D-10 の判断で頻度を確定する | `.github/workflows/ci.yml`、`.github/workflows/linux-tests.yml`、`.github/workflows/mcp-servers.yml`、`docs/test-matrix.md`、前身の手順書「PRを閉じるとき」 |
 | PR-08 | P2 | PR-01 の後（README・guide が重なる）。D-7 の判断で SECURITY.md を決める | guide 英日、README 英日、`SECURITY.md`（新規）、`docs/releasing.md` |
-| PR-09 | P2 | PR-01 の後（`generate_policy.rs` の警告文が重なる）。D-2 の判断で着手を決める | `src/commands/generate_policy.rs`、`src/legislator/tools_list.rs`、`src/cli/parse_gen_policy.rs`、`src/warden`（組み込みプロファイル）、guide 英日 |
+| PR-09 | —（実装済み） | 中核は v0.5.1 で実装済み。D-2 の結論は改善計画 §5 に記録済み。文書の残件は PR-01 に織り込み済み（E-04・E-10） | （文書は PR-01 の対象と同じ） |
 | PR-10 | P2 | なし | `fuzz/`（新規）、`src/framing.rs`・`src/warden/namespaced` の入力境界、guide 英日、`docs/test-matrix.md` |
 | PR-11 | P2 | なし。調査のみでコード変更を含まない | `docs/validation/`（調査記録）、改善計画 |
 
-PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が分かれているので並行できます。PR-04 は PR-03 の後、PR-06 は PR-04 の後、PR-08・PR-09 は PR-01 の後に着手します。PR-10・PR-11 は他と重なりません。
+PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が分かれているので並行できます。PR-04 は PR-03 の後、PR-06 は PR-04 の後、PR-08 は PR-01 の後に着手します。PR-10・PR-11 は他と重なりません。PR-09 は実装・D-2 の結論記録とも済みのため着手対象外です（残る文書追従は PR-01）。
 
 <a id="pr-01"></a>
 
 ### PR-01 文書・例の即時修正（環境変数の既定、fetch.kdl、探索の実態、スクリプト起動の表記）
 
-対応論点: 改善計画 §1 E-01〜E-09、§3 R-04。直接依存: なし。着手・公開条件: P0 — 次版のタグ前に必須。最初に実施する。
+対応論点: 改善計画 §1 E-01〜E-09（E-08 は実装済み）、§3 R-04、新規 E-10。直接依存: なし。着手・公開条件: P0 — 次版のタグ前に必須。最初に実施する。
 
-**目的:** 実装と食い違う記述のうち、保守者を権限拡大へ誘導するもの（E-01）、写すと動かない例（E-03）、境界を実装より強く見せるもの（E-05・E-06）を正す。あわせて、同じ乖離が再発したら `docs_check` と例ファイルの読込試験で止まるようにする。コードの挙動は変えない。
+**目的:** 実装と食い違う記述のうち、保守者を権限拡大へ誘導するもの（E-01）、写すと動かない例（E-03）、境界を実装と違って見せるもの（E-05・E-06・E-04・E-10）を正す。E-04 は v0.5.1 で探索が既定で Warden 内になったため、修正方向が「サンドボックスの外で動くと警告する」から「既定で Warden 内で動くことと、ambient ダウングレードの注意」を書くに変わった。あわせて、同じ乖離が再発したら `docs_check` と例ファイルの読込試験で止まるようにする。コードの挙動は変えない。
 
-**主な変更先:** [modules.md](modules.md)、[examples/policies/fetch.kdl](../examples/policies/fetch.kdl)、[examples/policies/filesystem.kdl](../examples/policies/filesystem.kdl)、README 英日、quickstart 英日、guide 英日、policy-authoring 英日、[runtime/launch.rs](../src/runtime/launch.rs)（コメント）、[commands/generate_policy.rs](../src/commands/generate_policy.rs)（警告文）、[tests/docs_check.rs](../tests/docs_check.rs)、[tests/kdl_policy_e2e.rs](../tests/kdl_policy_e2e.rs)
+**主な変更先:** [modules.md](modules.md)、[examples/policies/fetch.kdl](../examples/policies/fetch.kdl)、[examples/policies/filesystem.kdl](../examples/policies/filesystem.kdl)、README 英日、quickstart 英日、guide 英日、policy-authoring 英日、[runtime/launch.rs](../src/runtime/launch.rs)（コメント）、[tests/docs_check.rs](../tests/docs_check.rs)、[tests/kdl_policy_e2e.rs](../tests/kdl_policy_e2e.rs)
 
 **タスク**
 
-- [ ] E-01: modules.md L91–94 を実装に合わせる — `EnvironmentPolicy::default()` は `restrict: true`、`runtime/launch.rs` がそれを `SpawnOptions.restrict_environment` に写し、`spawn_env_pairs` は `restrict_environment` のとき制限済みブロックを返す。親環境がそのまま届くのは `inherit-parent #true` を宣言したときだけ。文面はレポート §4.3 の置き換え案を基に、[warden/env.rs](../src/warden/env.rs) の実装と突き合わせて確定する
-- [ ] E-02: filesystem.kdl L45–49 と fetch.kdl L63–64 のコメントを「ノードを省略しても起動契約が同じ制限を適用する。空ノードは意図の明示。親環境が戻るのは `inherit-parent #true` のときだけ」に改める
-- [ ] E-03: fetch.kdl の本文 L94–97 からツール単位の `deny host="*"` を外し、`allow host="<FETCH_HOST>"` だけの閉じた許可リストにする。直前のコメントに「ツール単位では `host="*"` は姿勢ではなく通常の規則で、同じブロックの allow より先に評価される」を書く。冒頭コメント L40–41 の例も同様に 1 行にする。policy-authoring 英日の tool `network` の節に同じ規則を明記する（D-1 の警告は PR-06）
-- [ ] E-03 の試験: `tests/kdl_policy_e2e.rs` に、`examples/policies/*.kdl` を全件読み込み、各ツール単位 `network` の allow 先が同じブロックの deny に覆われていないことを固定する試験を足す（`denied_hosts` に `*` があり `allowed_hosts` が非空なら失敗）。fetch.kdl の `<FETCH_HOST>` は試験側で置換して読み込む
-- [ ] E-04: README.md L134–135、README.ja.md L118–119、quickstart.md L83–84、quickstart.ja.md L85–86 に、探索が渡す環境（`PATH`、Windows は `SYSTEMROOT`・`WINDIR`・`PATHEXT` も、専用の一時ディレクトリ）と「OS サンドボックスの外で動くため、審査前のサーバーは使い捨ての VM かコンテナの中でだけ探索する」を書く。文面はレポート §4.3 の置き換え案を基にする
-- [ ] E-08（警告文）: `generate_policy.rs` L33–38 の WARNING を「OS サンドボックスの外で実行する。実行ユーザーが触れる全てのファイルと通信先に届く。審査前のサーバーは使い捨ての VM かコンテナで」に改める。フラグ名は変えない（PR-09）
-- [ ] E-05: README.md L412–421、README.ja.md L389–391 を、実行ファイル（pin 済みオブジェクトから起動。Windows は share-mode pin を保持したまま実パス）と entrypoint スクリプト（実パスで起動。隙間が閉じるのは Linux namespaced と Windows のみ）を書き分けた文に改める。guide §8.2 の記述と語を揃える
-- [ ] E-06: guide.md L429・L3298、guide.ja.md L354・L1875、policy-authoring 英日（`share-mode` を含む 3 箇所）の Windows の表記を「share-mode pin を保持したまま実パスで起動」に改める。差し替え防止の効果の記述は変えない
-- [ ] E-07: `runtime/launch.rs` L170–177 の関数コメントを、pin あり実行ファイル／pin なし実行ファイル／entrypoint スクリプトの 3 通りで書き分ける（レポート §4.3 の置き換え案を基にし、`524-533`・`649-655`・`912-917` の既存コメントと矛盾しないようにする）
-- [ ] E-09: guide.md L72・guide.ja.md L72 の構成図 Layer 3 のラベルを「Confused Deputy (deputy role + extraction rules)」相当に改める。本文の攻撃表（L87 付近）は更新済みなので触らない
-- [ ] 再発防止: `tests/docs_check.rs` に「実装と矛盾する既知の文」の不在を固定する否定語句の一覧を足す。最低限、`inherits the full parent environment`／`inherits the whole parent environment`（E-01・E-02。ただし `inherit-parent #true` の説明文は除外できる書き方にする）、`share-mode-held handle on Windows`（E-06）、`in a restricted environment, and records`（E-04）を登録する。一覧は本PRで直した文に限り、一般的な語句は登録しない
+- [x] E-01: modules.md L88–94 を実装に合わせる — `EnvironmentPolicy::default()` は `restrict: true`（[policy/mod.rs](../src/policy/mod.rs) `135-141`）、`runtime/launch.rs` がそれを `SpawnOptions.restrict_environment` に写し、`spawn_env_pairs` は `restrict_environment` のとき制限済みブロックを返す。親環境がそのまま届くのは `inherit-parent #true` を宣言したときだけ。文面はレポート §4.3 の置き換え案を基に、[warden/env.rs](../src/warden/env.rs) の実装と突き合わせて確定する — **済**: `restrict: true` 既定（ノード未宣言でも制限済みブロック）と `inherit-parent #true` による明示的降格の説明に書き換え。同種の残存コメント（src/warden/mod.rs L26-27）も併せて修正
+- [x] E-02: filesystem.kdl L44–51 と fetch.kdl L62–67 のコメントを「ノードを省略しても起動契約が同じ制限を適用する。空ノードは意図の明示。親環境が戻るのは `inherit-parent #true` のときだけ」に改める — **済**: 両ファイルとも指示どおりの記述に改訂
+- [x] E-03: fetch.kdl の本文 L94–97 からツール単位の `deny host="*"` を外し、`allow host="<FETCH_HOST>"` だけの閉じた許可リストにする。直前のコメントに「ツール単位では `host="*"` は姿勢ではなく通常の規則で、同じブロックの allow より先に評価される」を書く。冒頭コメント L37–44 の例も同様に 1 行にする。policy-authoring 英日の tool `network` の節に同じ規則を明記する（D-1 の警告は PR-06） — **済**: 本文・冒頭例とも `allow` 単独行に改め、deny-first 規則のコメントを追加。policy-authoring.md L520・policy-authoring.ja.md L487 に同規則を明記
+- [x] E-03 の試験: `tests/kdl_policy_e2e.rs` に、`examples/policies/*.kdl` を全件読み込み、各ツール単位 `network` の allow 先が同じブロックの deny に覆われていないことを固定する試験を足す（`denied_hosts` に `*` があり `allowed_hosts` が非空なら失敗）。fetch.kdl の `<FETCH_HOST>` は試験側で置換して読み込む — **済**: `example_policies_tool_network_allows_are_reachable` を追加（スクラッチツリーへコピーして `<FETCH_HOST>` 置換、Linux-native 固定ターゲットで読込。`allowed_cidrs`・`egress_rules` も allow 側として判定）。`cargo test --locked --test kdl_policy_e2e` 40/40 PASS。**追記（レビュー指摘対応）**: allow 側の判定を `!egress_rules.is_empty()` から `allow_specified`（宣言の存証）に修正 — deny ルールも同じリストに入るため非空判定では allow 無しの `deny host="*"` 単体で誤発火し得たうえ、合成時の deny-wins プルーニングで遮蔽された allow はロード後のリストから既に消えているため、生存ルールを見ても遮蔽を検出できなかった。あわせて検出範囲を拡張: 「宣言済み allow 側が空 × host/cidr deny 非空」のシグネチャで、ワイルドカードに限らない部分遮蔽（`deny host="*.x"` + `allow host="a.x"` 等）や `deny` + `allow none` の冗長綴りも捕捉し、`deny cidr` の全宛先覆い（`0.0.0.0/0`・`::/0`、生存する allow 側が全て IP リテラル・cidr のとき）は別条件で検査する。一部の allow が生存する混合遮蔽（遮蔽済み＋到達可能が同居）はロード後に原理上区別不能なため対象外
+- [x] E-04（修正方向が反転）: README.md L133–135、README.ja.md L117–119、quickstart.md L83–85、quickstart.ja.md L85–87 に、探索が**既定で Warden サンドボックス内で動く**ことを書く — 制限環境（`PATH`、Windows は `SYSTEMROOT`・`WINDIR`・`PATHEXT` も、専用の一時ディレクトリ）、deny-all egress、コマンドツリー＋インタプリタprefixの fs 表面、secret overlay。あわせて `MCP_WRIT_SKIP_SANDBOX`（制限環境のみ）と `--unsafe-unsandboxed-discovery`（ambient 継承）の 2 つのダウングレードを区別し、ambient 側だけに「審査前のサーバーは使い捨ての VM かコンテナの中で」の注意を残す。実装との照合は [tools_list.rs](../src/legislator/tools_list.rs) `243-263`・`528-566`・`1345-1459` を正とする — **済**: 4 文書すべて記述。あわせて guide 英日の `--live-discovery` / `--unsafe-unsandboxed-discovery` オプション表・`check -- <command>` の spawn 説明、`src/commands/check.rs`・`src/cli/parse_check.rs` のコメントも同旨に修正。**追記（レビュー指摘対応）**: `src/cli/mod.rs` の `CheckArgs::command` コメントに同じ古い記述（`restricted environment, no OS sandbox`）が残存していたため同旨に修正
+- [x] E-04 の新規乖離: policy-authoring.md L154（`does not run discovery inside an OS sandbox`）と policy-authoring.ja.md L120（同旨）は実装と逆になったため最優先で正す — 既定は Warden 内、`--unsafe-unsandboxed-discovery` が ambient のダウングレード。L155 の `inherit-parent #true` の説明は実装どおりなので触らない — **済**: 既定 Warden 内（制限環境・deny-all egress・private TMPDIR・fs 表面・secret overlay・fail-closed）と 2 ダウングレードの区別、ambient 側への使い捨て VM/コンテナ注意を記述。L155 は未変更
+- [ ] ~~E-08（警告文）~~: **実装済み**。`generate_policy.rs` L33–38 の WARNING は「the server runs inside the Warden sandbox (restricted environment, deny-all egress, private TMPDIR)」に更新され、L26–30 の static-only の案内も実態どおり。対象外とする（残る文書更新は E-04）。フラグ名の結論は D-2 に記録する
+- [x] E-05: README.md L412–426、README.ja.md L384–397 を、実行ファイル（pin 済みオブジェクトから起動。Windows は share-mode pin を保持したまま実パス）と entrypoint スクリプト（実パスで起動。隙間が閉じるのは Linux namespaced と Windows のみ）を書き分けた文に改める。guide §8.2 の記述と語を揃える。あわせて native Unix の信頼ソースゲート（E-10）への参照を入れる — **済**: 実行ファイル（fd/staged/実パス＋保持中 share-mode ピン）と entrypoint スクリプト（実パス起動＋native Unix 信頼ソースゲート）を書き分け、配置指針も追加
+- [x] E-06: guide.md L429・L3358–3373、guide.ja.md L354・L1882、policy-authoring.md L168（および ja 対応箇所）の Windows 実行ファイル側の表記を「share-mode pin を保持したまま実パスで起動」に改める。スクリプト側の実パス起動と `exe_exec=fd|staged|path` の記述は更新済みなので触らない。差し替え防止の効果の記述は変えない — **済**: 計 6 箇所を「share-mode ピンを保持した実パス」表記に修正。スクリプト側記述と差し替え防止の効果説明は未変更
+- [x] E-07: `runtime/launch.rs` L176–184 の関数コメントを、pin あり実行ファイル／pin なし実行ファイル／entrypoint スクリプトの 3 通りで書き分ける（レポート §4.3 の置き換え案を基にし、`548-559`・`649-657`・`955-972` の既存コメントと矛盾しないようにする） — **済**: 「splits three ways」で 3 通りに書き分け（pin なし実行ファイルは `resolved_exe` 実パス — `fd_exec_plan` の `None` 分岐と照合済み）
+- [x] E-09: guide.md L72・guide.ja.md L72 の構成図 Layer 3 のラベルを「Confused Deputy (deputy role + extraction rules)」相当に改める。本文の攻撃表（L87 付近）は更新済みなので触らない — **済**: 英 `deputy role + extraction rules`・日 `deputy ロール + 抽出規則` に変更。攻撃表は未変更
+- [x] E-10（新規、実装先行の未記載）: payload-bound entrypoint の native Unix 起動が `fspriv::require_trusted_source_file`（pin.rs `1172-1181`）を要求することを guide 英日 §8.2・policy-authoring 英日・README 英日の pin の節に書く — 要件（スクリプトとその祖先が低い信頼の主体による置換を拒否すること）、満たさない場合の fail-closed 拒否、namespaced 経路が init の verified mount で例外になること、を明記する。低い信頼の別主体が置換・書込できる場所にスクリプトを置くと起動できないため、配置の指針も添える。ポリシー読込側の同ゲート（policy/loader.rs）は別経路の要件であり、本項目の文書化対象には含めない — **済**: 6 ファイル（guide 英日 §8.2・policy-authoring 英日・README 英日）に要件・fail-closed・namespaced 例外・配置指針（所有者制限ツリー、`MCP_WRIT_ALLOW_REPLACEABLE_PATHS` opt-out）を記述。ポリシー読込側のゲートは未記述のまま
+- [x] 再発防止: `tests/docs_check.rs` に「実装と矛盾する既知の文」の不在を固定する否定語句の一覧を足す。最低限、`inherits the full parent environment`／`inherits the whole parent environment`（E-01・E-02。ただし `inherit-parent #true` の説明文は除外できる書き方にする）、`share-mode-held handle on Windows`（E-06）、`in a restricted environment, and records`（E-04）、`does not run discovery inside an OS sandbox` と `OS サンドボックス内での探索では`（E-04 新規乖離）を登録する。一覧は本PRで直した文に限り、一般的な語句は登録しない — **済**: `FORBIDDEN_PHRASES` に指定語句＋`OS サンドボックス内での検出では` 変体を登録。行単位の `inherit-parent` 免除、`improvement-`/`security_report` パス免除、`examples/**/*.kdl` 走査も追加。`cargo test --locked --test docs_check` 11/11 PASS
 
-**検証:** T-DOC、T-POLICY（例ファイルの読込試験）、T-BASE（`launch.rs`・`generate_policy.rs` のコメント・文字列変更があるため）。`generate-policy --live-discovery` の警告文を固定している既存試験があれば期待値を更新する。
+**検証:** T-DOC、T-POLICY（例ファイルの読込試験）、T-BASE（`launch.rs` のコメント変更があるため）。警告文を固定する既存試験は無い（`tests/` 内に該当文字列の固定は存在しない — `f00e28a` 照合）。
 
-**完了条件:** E-01〜E-09 の各箇所が実装と一致し、`docs_check` の否定語句一覧と例ファイルの読込試験が通る。コードの挙動（解析結果・判定・監査）は変わらない。
+**完了条件:** E-01〜E-07・E-09・E-10 の各箇所が実装と一致し、`docs_check` の否定語句一覧と例ファイルの読込試験が通る。コードの挙動（解析結果・判定・監査）は変わらない。
 
-**移行・戻し方:** 文書・例・コメント・警告文の変更のみ。fetch.kdl を継承している利用者は、ツール単位の `deny host="*"` を外すと許可先が通るようになる（従来は全拒否だった）。これは例の修正であり、ポリシー言語の意味は変えない。
+**移行・戻し方:** 文書・例・コメントの変更のみ。fetch.kdl を継承している利用者は、ツール単位の `deny host="*"` を外すと許可先が通るようになる（従来は全拒否だった）。これは例の修正であり、ポリシー言語の意味は変えない。E-04・E-10 は実装先行でドキュメントが遅れているものの訂正であり、利用者の既存ポリシーには影響しない。
 
 <a id="pr-02"></a>
 
@@ -104,16 +127,16 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **目的:** `binary-hash`／`entrypoint-hash` を宣言した起動で、同じファイルを段階ごとに全読みしている箇所を減らし、保証に必要な「exec する保持オブジェクトから計算したダイジェストが pin と一致する」を 1 回の読取で満たす。検証の順序（verify → bind → reverify → spawn）と fail-closed の判定は変えない。
 
-**前提（HEAD）:** `verify_hashes`（[hash.rs](../src/verifier/hash.rs) `95`・`195`）、`bind_launched_workload`（[pin.rs](../src/verifier/hash/pin.rs) `198`・`281`）、`reverify_immediately_before_spawn` 内の bind 再実行（同 `1057`）と保持ハンドルの再ハッシュ（`1081`・`1161`）、スナップショットの照合（`708`）が、それぞれ 8 KiB バッファでファイル全体を読む。レポートの計測では Python 31 MB を 6 回（178 MiB）、Node.js 119 MiB を 6 回（715 MiB）読み、起動から `initialize` 応答までが 0.86 s／3.3 s（SHA 拡張命令の無い CPU）。
+**前提（HEAD `f00e28a`）:** `verify_server_hashes`（[hash.rs](../src/verifier/hash.rs) `172`、エントリごとに `hash_file` で全読み、`BUFFER_SIZE` 8 KiB）、`bind_launched_workload`（[pin.rs](../src/verifier/hash/pin.rs) `164` — exe を `198`、payload を `281` でそれぞれパス名から全読み）、`reverify_immediately_before_spawn`（同 `1064` — `1071` で bind を丸ごと再実行 = exe+payload の再ハッシュ、さらに保持ハンドルの再ハッシュ `1096`・payload `1205`）、`immutable_snapshot`→`snapshot_object`（`700-723`・`728`/`764` — `io::copy` で複製しながら `hash_open_file` で照合）が、同じ内容を段階ごとに全読みする。基準以降に payload-bound entrypoint の `require_trusted_source_file` ゲート（`1172-1181`）が加わった（判定はするが読み直しはしない）。保持ハンドル＋stamp の機構（`open_pinned`・`record_stamp`・`stamp_unchanged`・`same_open_object` `54`）は既に整っているため、作業はパス名からの冗長な再ハッシュの削減に絞れる。レポートの計測では Python 31 MB を 6 回（178 MiB）、Node.js 119 MiB を 6 回（715 MiB）読み、起動から `initialize` 応答までが 0.86 s／3.3 s（SHA 拡張命令の無い CPU）。payload-bound の解釈型起動では現状その回数を上回る。
 
 **主な変更先:** [verifier/hash.rs](../src/verifier/hash.rs)、[verifier/hash/pin.rs](../src/verifier/hash/pin.rs)、[runtime/launch.rs](../src/runtime/launch.rs)（スナップショット生成）、[tests/workload_hash_e2e.rs](../tests/workload_hash_e2e.rs)、guide 英日 §8.2（起動コストの目安）
 
 **タスク**
 
 - [ ] 修正前の計測を記録する: Linux 実機で、ハッシュ固定あり／なしの起動から `initialize` 応答までの時間と、`strace -e read` または `/proc/<pid>/io` の `rchar` で読取量を取る。対象は Python と Node.js の実在サーバー（`tests/real_servers_e2e.rs` の fixture を使う）。SHA 拡張命令の有無（`/proc/cpuinfo` の `sha_ni`）を記録する
-- [ ] `verify_hashes` の段階で、pin 対象の実行ファイルと entrypoint を保持ハンドル（`open_pinned`）で開き、stamp を記録してからハッシュし、ハンドルと stamp・ダイジェストを `VerifiedWorkload`（名称は担当PRで確定）として後段に渡す。`hash.verified`／`hash.mismatch` の監査イベントはこの 1 回で出す
-- [ ] `bind_launched_workload` と `reverify_immediately_before_spawn` は、パス名から開き直してハッシュする代わりに、保持ハンドルの同一性（`same_open_object`）と stamp の不変を確認する。stamp が変わっていれば内容を再ハッシュして判定する（stamp だけで内容検証を代替しない — D-6）。保持ハンドルを持たない経路（`run-image` など）は従来どおり
-- [ ] スナップショット（`snapshot_object`、`708`）は保持ハンドルから複製しながらダイジェストを計算し、複製後の別読みをなくす。複製したバイト列のダイジェストが pin と一致しなければ fail-closed
+- [ ] `verify_server_hashes` の段階で、pin 対象の実行ファイルと entrypoint を保持ハンドル（`open_pinned`）で開き、stamp を記録してからハッシュし、ハンドルと stamp・ダイジェストを `VerifiedWorkload`（名称は担当PRで確定）として後段に渡す。`hash.verified`／`hash.mismatch` の監査イベントはこの 1 回で出す
+- [ ] `bind_launched_workload` と `reverify_immediately_before_spawn` は、パス名から開き直してハッシュする代わりに、保持ハンドルの同一性（`same_open_object`）と stamp の不変を確認する。stamp が変わっていれば内容を再ハッシュして判定する（stamp だけで内容検証を代替しない — D-6）。保持ハンドルを持たない経路（`run-image` など）は従来どおり。`require_trusted_source_file` ゲート（E-10 の対象）は読み直しの対象外として残し、順序（信頼判定 → ハッシュ）を変えない
+- [ ] スナップショット（`snapshot_object`）は保持ハンドルから複製しながらダイジェストを計算し、複製後の別読みをなくす。複製したバイト列のダイジェストが pin と一致しなければ fail-closed
 - [ ] `code_identity` の報告（どの検査点を通ったか）は従来どおりの項目を出す。読取回数が減っても「検証した検査点」の表現は変えない
 - [ ] 修正後の計測を同じ条件で取り、guide 英日 §8.2 に「起動コストの目安（ファイルサイズ・CPU・回数）」として載せる。目標は読取回数 6 → 2、Node.js 119 MiB で 3.3 s → 1.2 s 以下（SHA 拡張命令なし）
 
@@ -131,7 +154,7 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **目的:** `tools/call` の引数が大きいときの検査コストを、検査の省略ではなく計算量の削減で下げる。「秘密パスの予約綴りはどの欄名でも検査する」「語彙外の欄の資源らしい文字列は制限契約のあるツールで拒否する」の 2 つの規則は変えない。
 
-**前提（HEAD）:** [checker/targets.rs](../src/auditor/checker/targets.rs) `328-416` の `classify_target_string` は、全文字列に `normalize_fs_argument` を掛け、`is_secret_path`（[secret_paths.rs](../src/secret_paths.rs) `242-255`）が内部で再度 `normalize_fs_argument` と `reserved_after_normalize`（NFKC 2 回・`resolve_for_authorization`）を実行する。`is_known_payload_field_name`（`409`）はその後。レポートの callgrind では 1 MiB の要求 1 回あたり約 24 億命令、`is_secret_path` が約 64%（NFKC 約 48%）、`normalize_fs_argument` が約 49%。
+**前提（HEAD `f00e28a`）:** [checker/targets.rs](../src/auditor/checker/targets.rs) `328-416` の `classify_target_string` は、全文字列に `normalize_fs_argument` を掛け、`is_secret_path`（[secret_paths.rs](../src/secret_paths.rs) `242-255`）が内部で再度 `normalize_fs_argument` と `reserved_after_normalize`（NFKC 2 回・`resolve_for_authorization` `229`）を実行する。`is_known_payload_field_name`（`409`）はその後。構造は基準時点と不変。レポートの callgrind では 1 MiB の要求 1 回あたり約 24 億命令、`is_secret_path` が約 64%（NFKC 約 48%）、`normalize_fs_argument` が約 49%。
 
 **主な変更先:** [checker/targets.rs](../src/auditor/checker/targets.rs)、[secret_paths.rs](../src/secret_paths.rs)、[pathutil.rs](../src/pathutil.rs)
 
@@ -158,7 +181,7 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **目的:** 名前や文章を独自のキーで受け取るサーバー（記憶・課題管理など）で、正当な呼び出しが「宣言されていない資源の指定かもしれない」として拒否される問題に、ポリシー側で「この欄は資源を指さない」と宣言する手段を設ける。宣言は「語彙外の欄の拒否」だけを免除し、秘密パスの予約綴りと明確な資源形（`scheme://`、IP リテラル、`host:port`）の分類は宣言があっても従来どおり行う。
 
-**前提（HEAD）:** [sub_policy.rs](../src/auditor/checker/sub_policy.rs) `130-171` は、制限契約（fs 規則・tool `network`・`read_only`・全体の outbound 規則）のあるツールで、`extracted.unclassified` のうち `selector_plausible` な値を拒否する。既知の payload 欄は [pathutil.rs](../src/pathutil.rs) `1128-1247` の固定一覧で、ポリシーから足せない。回避策の `deputy extract` は資源を束縛する側で、自由記述の宣言には使えない。
+**前提（HEAD `f00e28a`）:** [sub_policy.rs](../src/auditor/checker/sub_policy.rs) `130-171`（拒否自体は `158-171`）は、制限契約（fs 規則・tool `network`・`read_only`・全体の outbound 規則）のあるツールで、`extracted.unclassified` のうち `selector_plausible` な値を拒否する。既知の payload 欄は [pathutil.rs](../src/pathutil.rs) `1118`〜（`is_known_payload_field_name` `1137`）の固定一覧で、ポリシーから足せない。`ToolPolicy`（[policy/mod.rs](../src/policy/mod.rs) `319-357`）に宣言用の欄は無い。回避策の `deputy extract` は資源を束縛する側で、自由記述の宣言には使えない。基準以降に起動レポートの `correction_candidates`（[enforcement/model.rs](../src/enforcement/model.rs) `682-711` — 未呼出ツールと根拠付き拒否ターゲットをセッション終了時に出す）が加わったが、これはレビュー補助であって宣言手段ではなく、B-04 の解にはならない。
 
 **主な変更先:** [policy/kdl_parse](../src/policy/kdl_parse)、[policy/mod.rs](../src/policy/mod.rs)（`ToolPolicy`）、[policy/validator.rs](../src/policy/validator.rs)、[policy/kdl_inherit](../src/policy/kdl_inherit)（継承・v3 の合成）、[checker/sub_policy.rs](../src/auditor/checker/sub_policy.rs)、[checker/targets.rs](../src/auditor/checker/targets.rs)、[legislator/policy_generator.rs](../src/legislator/policy_generator.rs)、policy-authoring 英日、guide 英日 §4
 
@@ -167,7 +190,7 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 - [ ] 修正前に失敗する再現試験を書く: 制限契約のあるツールに `{"name": "Acme Corp.", "observations": ["Joined in 2021.", "contact alice@example.com"]}` を渡すと拒否され、同じ入力で `.ssh/id_rsa` や `https://evil.example/` を含む値は宣言後も拒否されることを対で固定する
 - [ ] ツール単位の宣言を追加する（名称は担当PRで確定。候補: `tool "x" { arguments { opaque "name" "observations" } }`）。`policy version=2` 以上の未知属性拒否に正規登録し、v1 では読込エラーにする。欄名は `params.arguments` の最上位キーと、JSON Pointer（`deputy extract` と同じ記法）の両方を受ける。継承は和集合（v3 の規則と同じ）、v2 でも和集合とする（狭める意味の属性ではないため）
 - [ ] 分類側: 宣言された欄の文字列は `TargetSlot::Unclassified` に入れない。ただし `is_secret_path` が真の値、`starts_with_file_scheme`・`looks_like_network_target`・`looks_like_host_or_socket` が真の値は従来どおり分類する（宣言は語彙外の拒否だけを免除する）。`read_only` の URL 拒否も従来どおり
-- [ ] `check`／`plan` の表示: 宣言された欄の一覧をツールごとに出し、「この欄は資源らしい文字列でも転送される」ことを運用者に見せる。監査の `tool_call.allowed` の details に宣言で通した欄の件数を残す（値は残さない）
+- [ ] `check`／`plan` の表示: 宣言された欄の一覧をツールごとに出し、「この欄は資源らしい文字列でも転送される」ことを運用者に見せる。監査の `tool_call.allowed` の details に宣言で通した欄の件数を残す（値は残さない）。details の追加は監査スキーマ `"2.0"`（`session_id` 全レコード付与・`policy.loaded` `source=` percent-encode 済み）の規約に従い、schema の変更が要る形なら版を上げる判断を記録する
 - [ ] `generate-policy`: `args_schema` で `type: string`（配列要素を含む）かつ `format` の無い欄を、コメントアウトした候補（`// arguments { opaque "name" }` と `// REVIEW: opaque: enable only for fields that never carry a path, host or URL`）として出す。有効な KDL としては投入しない。REVIEW の種別台帳（前身の PR-31 の `MarkerKind`）に `opaque-candidate` を足す
 - [ ] 文書: policy-authoring 英日の冒頭近く（ポリシーを書き始める前の節）に「引数はどう分類され、何が拒否されるか」と「自由記述の欄の宣言」「`deputy extract` との違い」を移す。guide §4 の該当段落（`guide.md:2311`）から参照する
 - [ ] `tests/real_servers_e2e.rs` の memory 系サーバーの試験に、点・`@`・空白を含む正当な値（"Acme Corp."、"contact alice@example.com"）を宣言ありで通し、宣言なしで拒否される対を足す
@@ -186,7 +209,7 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **目的:** namespaced 経路の init が私的 tmpfs で覆う木（`/run` は常に、`/tmp` は resolv.conf の bind 元が必要なとき）の下に実行ファイル・ペイロードがあるとき、exec の `ENOENT` ではなく起動前に理由付きで判定する。`auto` は方式選択の設計表どおり native（要求を満たす場合）へ回り、理由を plan／report／監査に残す。
 
-**前提（HEAD）:** [select.rs](../src/warden/select.rs) `700-712` の `masked_namespace_root` は、[namespaced/launch.rs](../src/warden/namespaced/launch.rs) `152-163` と [namespaced_run.rs](../src/commands/namespaced_run.rs) `555` で pin 済み entrypoint にだけ適用される。実行ファイル本体、pin なしのペイロード、`plan` は検査しない。`/tmp` を覆う理由は [namespaced/init.rs](../src/warden/namespaced/init.rs) `284-298`（memfd は `mount(2)` の source にできないため、bind 元を `/tmp` 上の私的 tmpfs に置く）。
+**前提（HEAD `f00e28a`）:** [select.rs](../src/warden/select.rs) `772` の `masked_namespace_root` は、[namespaced/launch.rs](../src/warden/namespaced/launch.rs) `152-164` と [namespaced_run.rs](../src/commands/namespaced_run.rs) `568-598` で pin 済み entrypoint にだけ適用される。実行ファイル本体、pin なしのペイロード、`plan` は検査しない — `SelectionInput`（select.rs `51-87`）にワークロードのパスを渡す欄自体が無い。一方で fs **許可**については `masked_fs_root`（select.rs `697`、glob-aware の表記走査）が `namespaced_policy_violations`（`596-630`）で選択時の違反として既に報告する（基準時点で既存。「ワークロードの可視性」を追加する際の直近の先例）。`/tmp` を覆う理由は [namespaced/init.rs](../src/warden/namespaced/init.rs) の `redirect_resolv_conf`（`294-321`、呼出 `961`、文書 `38-45`）— memfd は `mount(2)` の source にできないため、bind 元を `/tmp` 上の私的 tmpfs に置く。`tmp_mask_planned()` は select.rs `681` に実在する（resolv.conf を canonicalize して判定。試験注入点は未設置）。`err_stage_hint`（namespaced/spawn.rs `164-190`）は proc-mount／unshare／idmap の EPERM にだけヒントを持ち、`exec errno=2` 向けは無い。
 
 **主な変更先:** [warden/select.rs](../src/warden/select.rs)（`decide` の入力）、[warden/namespaced/launch.rs](../src/warden/namespaced/launch.rs)、[warden/namespaced/init.rs](../src/warden/namespaced/init.rs)、[warden/plan/mod.rs](../src/warden/plan/mod.rs)、[commands/namespaced_run.rs](../src/commands/namespaced_run.rs)、guide 英日（Linux の方式選択・§7 切り分け表）、[tests/linux_mechanism_e2e.rs](../tests/linux_mechanism_e2e.rs)
 
@@ -237,21 +260,21 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **目的:** 重い結合テストを含むワークフローを `main` に対して定期実行し、未リリースの先端に対する実行証跡を残す。手動 dispatch と pr-checks.yml（前身の D-1）は変えない。
 
-**前提（HEAD）:** [ci.yml](../.github/workflows/ci.yml)・[linux-tests.yml](../.github/workflows/linux-tests.yml)・[platform-tests.yml](../.github/workflows/platform-tests.yml)・[mcp-servers.yml](../.github/workflows/mcp-servers.yml) に `schedule` トリガーは無い。レポートは `66e08c9` に対する CI 実行が Actions 一覧に無かったこと、前身の PR-31〜36 の記録に実行件数が無いことを指摘している。
+**前提（HEAD `f00e28a`）:** [ci.yml](../.github/workflows/ci.yml)・[linux-tests.yml](../.github/workflows/linux-tests.yml)・[platform-tests.yml](../.github/workflows/platform-tests.yml)・[mcp-servers.yml](../.github/workflows/mcp-servers.yml) に `schedule` トリガーは依然無い。基準以降、ci.yml・linux-tests.yml・mcp-servers.yml に `require_lifetime_boundary` の実測のため cgroup v2 ルート委譲ステップが加わり、mcp-servers.yml には check-server の replaceable-paths waiver 宣言が入った — 定期実行を足す際はこれらのステップを壊さない。test-matrix.md には Workflow inventory 表（`8`〜、`Trigger` 列で dispatch／call を集約）が既に整っている。レポートは `66e08c9` に対する CI 実行が Actions 一覧に無かったこと、前身の PR-31〜36 の記録に実行件数が無いことを指摘している。
 
 **主な変更先:** `.github/workflows/ci.yml`、`.github/workflows/linux-tests.yml`、`.github/workflows/mcp-servers.yml`、[docs/test-matrix.md](test-matrix.md)、前身の手順書「PRを閉じるとき」
 
 **タスク**
 
-- [ ] `ci.yml` と `linux-tests.yml` に `schedule`（週 1 回、`main`）を加える。`mcp-servers.yml` は公式サーバーの版更新で壊れやすいので、同じ頻度で加えるか手動のままにするかを担当PRで決め、理由を test-matrix.md に書く。実 AArch64 のレグは self-hosted／有料ランナーの有無で判断する
+- [ ] `ci.yml` と `linux-tests.yml` に `schedule`（週 1 回、`main`）を加える。`platform-tests.yml` は対象外とする — `workflow_call` で release.yml から呼ばれる再利用ワークフローであり、定期実行を足すと release 経路と二重に走るため（理由を test-matrix.md に書く）。`mcp-servers.yml` は公式サーバーの版更新で壊れやすいので、同じ頻度で加えるか手動のままにするかを担当PRで決め、理由を test-matrix.md に書く。実 AArch64 のレグは self-hosted／有料ランナーの有無で判断する
 - [ ] `schedule` 実行の失敗を見落とさない手段を決める（Actions の通知、または README のバッジ）。issue の自動起票はしない（D-10）
-- [ ] [test-matrix.md](test-matrix.md) の Workflow inventory に `schedule` 列を足し、各ワークフローの頻度と対象ブランチを書く
+- [ ] [test-matrix.md](test-matrix.md) の Workflow inventory（`8`〜）の `Trigger` 列を `schedule` の頻度まで拡張するか `schedule` 列を足し、各ワークフローの頻度と対象ブランチを書く
 - [ ] 前身の手順書「PRを閉じるとき」に「実行した試験の件数（pass／fail／skip）を記録する」を明記する。前身の PR-31〜36 の検証欄に、次に実行したときの件数を追記する（遡っての再実行は求めない）
-- [ ] [docs/releasing.md](releasing.md) の手順に「タグ前に、直近の `schedule` 実行が当該コミットかその祖先で成功していること」を足す
+- [ ] [docs/releasing.md](releasing.md) の手順 2（6 ワークフローの成功確認）に「直近の `schedule` 実行が当該コミットかその祖先で成功していること」を足す（release-gate の手順は既に記載済み — 触らない）
 
 **検証:** ワークフローの構文（`actionlint` があれば）、`workflow_dispatch` での試走 1 回。T-DOC。
 
-**完了条件:** `main` の先端に対する結合テストの実行結果が、手動操作なしに週 1 回 Actions に残る。
+**完了条件:** `main` の先端に対する結合テストの実行結果が、手動操作なしに週 1 回 Actions に残る。`platform-tests.yml` を含め対象外としたワークフローの除外理由が test-matrix.md に記録されている。
 
 **移行・戻し方:** トリガーの追加のみ。pr-checks.yml と手動 dispatch は不変。
 
@@ -267,7 +290,7 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **タスク**
 
-- [ ] B-07: guide 英日の `--isolation` の節に、OS ごとにエンジン（docker／podman／buildah／Apple container）を管理者所有の場所に置く手順を書く — Linux はパッケージ管理の `/usr/bin`、macOS は Homebrew の `/opt/homebrew/bin` が利用者所有になる事情と `MCP_WRIT_*_EXE` の個別指定、Windows は `Program Files` 配下。`MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS=1` は本番で使わないことを再掲する
+- [ ] B-07: guide 英日の `--isolation` の節に、OS ごとにエンジン（docker／podman／buildah／Apple container）を管理者所有の場所に置く手順を書く — Linux はパッケージ管理の `/usr/bin`、macOS は Homebrew の `/opt/homebrew/bin` が利用者所有になる事情と `MCP_WRIT_*_EXE` の個別指定、Windows は `Program Files` 配下。`MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS=1` は本番で使わないことを再掲する（基準以降に opt-out が起動レポートに記録されるようになった — その記録先の説明も足す）。判定規則自体は guide.md `313-334` に既記載なので、そこから参照する形で運用手順に絞る
 - [ ] B-01: MCP の版を追加するときの手順を modules.md または guide の保守者向け節に書く — [protocol/mod.rs](../src/protocol/mod.rs) の版一覧、[policy/mcp.rs](../src/policy/mcp.rs) の通過規則（版・方向・種別・メソッド）、`server/discover`／`initialize` の交渉経路、`tests/protocol_versions.rs`、capability matrix、guide の対応版の記述、の各更新点を列挙する。前身の D-4 の「版の追加は閉じた台帳への追加として別途判断する」を手順の入口にする
 - [ ] R-01: guide 英日に、リモート MCP ゲートウェイ製品と直列に置く構成（クライアント → ゲートウェイ → `mcp-writ run` → ローカルサーバー）の例と、どちらが何を担うかの境界を書く。製品名は挙げず、役割（認証・集中管理・応答検査はゲートウェイ、ローカルの隔離・引数検査・監査は mcp-writ）で書く
 - [ ] D-7: `SECURITY.md` を置く — 報告窓口（GitHub の private vulnerability reporting）、受付確認と初回評価の目安日数、対象の版（最新リリースと `main`）、PoC 経路（`unotify-run`・`ebpf-run`・`macos-proxy-run`）は対象外、公開までの調整方針。README 英日からリンクする
@@ -281,29 +304,27 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 <a id="pr-09"></a>
 
-### PR-09 探索への OS サンドボックス適用（opt-in）とフラグ名
+### PR-09 探索への OS サンドボックス適用 — 実装済み・結論記録済み（残件は文書のみ、PR-01 内）
 
-対応論点: 改善計画 §1 E-08、§2 B-06（D-2 の第 2 段）。直接依存: PR-01（警告文が重なる）。着手・公開条件: P2 — 次版以降。D-2 の判断で着手を決める。
+対応論点: 改善計画 §1 E-08、§2 B-06（D-2 の第 2 段）。状態: **基準 `2f87236` 以降に実装され、v0.5.1 に含まれる**。実装は計画の「opt-in（`--discovery-sandbox`）」とは違う形を取った — 既定で Warden 内、ambient 継承は明示的なダウングレードのみ。より強い既定挙動なので、計画の中核目的は達成済みと判断する。
 
-**目的:** `generate-policy --live-discovery` の探索を、ポリシー無しでも Warden の中で実行できる opt-in を設ける。フラグ名を実態（環境変数の継承）に合わせる。既定の探索の挙動は変えない。
+**実装済みの内容（HEAD `f00e28a` 照合）:**
 
-**前提（HEAD）:** [legislator/tools_list.rs](../src/legislator/tools_list.rs) `430-506` は `tokio::process::Command` で直接起動し、`restrict_environment` のとき `env_clear` と専用 TMPDIR を与える。`--unsafe-unsandboxed-discovery` はこの `restrict_environment` を外すだけ（[commands/generate_policy.rs](../src/commands/generate_policy.rs) `40`）。
+- 探索の子プロセスは既定で Warden 経由（`tools_list.rs` `spawn_server_sandboxed` `1345-1459`・`discovery_policy` `243-263`・`528-566`）。組み込みプロファイル: deny-all egress、fs は解決済み実行ファイルの prefix／コマンドツリー／インタプリタprefix（`node_modules`・PATH helper・引数の親を含む実行時導出）、書込は専用 TMPDIR のみ、制限環境、secret overlay 有効
+- ポリシー構築は blocking pool 上で失敗時 fail-closed、子プロセスは `RunningChild` で子孫まで所有。`MCP_WRIT_SKIP_SANDBOX` は OS サンドボックスと子孫プロセスの寿命管理を外し、制限環境と専用 TMPDIR は維持、`--unsafe-unsandboxed-discovery` が ambient 継承のフルダウングレード
+- 警告文・static-only 案内は実態どおりに更新済み（E-08 解消）
+- 層の規則: 実装は `tools_list.rs` が `Warden::spawn_child_async_exe_with` を直接呼ぶ形。計画の「commands 層から stdio を渡す」分離は取らなかった — T-LAYER で許容されていることを確認し、判断を記録する
 
-**主な変更先:** [commands/generate_policy.rs](../src/commands/generate_policy.rs)、[legislator/tools_list.rs](../src/legislator/tools_list.rs)、[cli/parse_gen_policy.rs](../src/cli/parse_gen_policy.rs)、[warden](../src/warden)（組み込みの探索プロファイル）、guide 英日 §4.3、README 英日
+**残件（コード変更・記録作業とも無し）:**
 
-**タスク**
+- D-2 の結論は改善計画 §5 に記録済み: 「既定で Warden 内、`--unsafe-unsandboxed-discovery` が唯一の ambient ダウングレード」で着地し、`--inherit-ambient-environment` への改名は「OS サンドボックスまで外す実態を過小表示する」として不採用
+- 文書の追従は PR-01 の E-04・E-10 に織り込み済み（本項目では触らない）
 
-- [ ] `--inherit-ambient-environment` を正式名として追加し、`--unsafe-unsandboxed-discovery` は同じ意味の非推奨別名として残す（help に「deprecated alias」と出す）。解析結果（`CliOutput`）は同じ値になることを `tests_parse.rs` で固定する
-- [ ] `--discovery-sandbox` を追加する。ポリシーファイルを要求せず、組み込みプロファイル — network 全拒否、filesystem は解決済み実行ファイルの prefix と cwd（およびペイロードのパッケージツリー。前身の PR-32 の `build_runtime_seed_grants` と同じ解決）を読取、専用 TMPDIR のみ書込、`defaults.environment` は既定の制限 — を Warden に渡して探索の子プロセスを起動する。Linux は `auto`（namespaced／native）、macOS・Windows は各 OS の既定機構。適用できない制御は `plan` と同じ形で stderr に出し、`allow_degraded` 相当の緩和はしない（探索が失敗したら `--static-only` か VM での探索を案内する）
-- [ ] 探索プロファイルは `tools_list.rs` 側に新しいサンドボックス経路を作らず、`runtime/launch.rs` の spawn 経路（`SpawnOptions`）を再利用する。層の規則（legislator は第 4 層、runtime は第 5 層）に反するため、`tools_list.rs` から直接呼べない — `commands/generate_policy.rs`（第 7 層）が spawn 済みの子プロセスの stdio を `tools_list` に渡す形に分ける。T-LAYER で確認する
-- [ ] 既定（フラグなし）の探索は従来どおり Warden なしで動くことを snapshot 試験で固定し、PR-01 の警告文は既定のときだけ出す。`--discovery-sandbox` のときは「探索は OS サンドボックス内」と適用状態を出す
-- [ ] guide 英日 §4.3 と README 英日の手順 1 に `--discovery-sandbox` を足し、「それでも審査前のサーバーは使い捨て環境で」の注意は残す（探索プロファイルは最小権限の近似で、ツール単位の判定は無い）
+**検証:** 実装済み部分は v0.5.1 の検証記録で確認済み。
 
-**検証:** T-BASE、T-LAYER、`tests/self_test.rs`・`tests/real_servers_e2e.rs`（Node／Python サーバーの探索が `--discovery-sandbox` で成功し、`tools-list-hash` が既定の探索と一致すること）。
+**完了条件:** 充足済み — 実装は v0.5.1 に含まれ、D-2 の結論は改善計画 §5 に記録済み。文書の追従（E-04・E-10）は PR-01 の完了条件に含まれる。
 
-**完了条件:** `--discovery-sandbox` で探索した草案が既定の探索と同じ `tools-list-hash` を持ち、探索中のサーバーの network が OS 層で拒否される（fixture で確認）。既定の探索は不変。
-
-**移行・戻し方:** フラグの追加と別名の追加のみ。旧名は残す。
+**移行・戻し方:** 実装は既にリリース済み。本項目は記録のみ。
 
 <a id="pr-10"></a>
 
@@ -362,11 +383,14 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 実装PRではなく、ここに到達した時点で確認する条件と手順です。バージョン更新・タグ付け・リリース実行は git／リリース操作のため、実施は別途指示を受けてから行います。
 
+**現状（`f00e28a` 時点）:** `0.5.1` がリリース・検証済み（`3530b5a` で版更新、`f00e28a` で post-publication verification 記録）。v0.5.1 には PR-09 の中核（探索の既定 Warden 化）・E-08・監査スキーマ 2.0・`require_lifetime_boundary`・信頼ソースゲート・`correction_candidates` 等が既に含まれる。次版の起点はこの v0.5.1 以降のコミット。
+
 **到達条件 — 全て満たしたらバージョンを上げる**
 
 - [ ] PR-01（P0）がマージ済み
 - [ ] PR-02〜05・PR-07（P1）のうち当該リリースに含める範囲を決め、マージ済み
 - [ ] 前身の手順書の PR-30〜36（次版の範囲）がマージ済み — `2f87236` 時点で全てマージ済み
+- [x] PR-09 の残件（D-2 の結論記録）が反映済み — 実装は v0.5.1 に含まれ、結論は改善計画 §5 に記録済み
 - [ ] 判断事項 D-1〜D-10（改善計画 §5）のうち、含める PR に関わるものの結論が記録されている
 - [ ] 含める項目が確定した時点で版番号を決めた
 - [ ] PR-01 で改めた境界の記述（スクリプト起動・探索の実態・環境変数の既定）が、当該コミットの実装と照合済み

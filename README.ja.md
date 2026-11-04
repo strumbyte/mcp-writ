@@ -115,8 +115,11 @@ mcp-writ generate-policy --live-discovery --output draft.kdl \
 ```
 
 `generate-policy` は npm の shim を解決してパッケージの `dist/index.js`
-にたどり着き、制限した環境で `tools/list` を実行して、検証できた内容を
-記録します — ドラフトの抜粋:
+にたどり着き、Warden サンドボックス内で `tools/list` を実行して
+（制限環境・deny-all の外向き通信・private TMPDIR・コマンドツリーへの
+fs 許可・secret overlay — `--unsafe-unsandboxed-discovery` が周囲環境
+実行の明示的な opt-out で、未レビューのサーバーは使い捨ての VM か
+コンテナの中に限定します）、検証できた内容を記録します — ドラフトの抜粋:
 
 ```kdl
 server "auto-generated" {
@@ -386,10 +389,28 @@ server "my-mcp-server" {
   `exec` 直前に再検証します。再検証では実行ファイルと、第 1
   ペイロード引数に一致した entrypoint の両方を内容で再ハッシュします
   — 初回検証の後で差し替えられたスクリプトは、パス一致だけでは通らず
-  fail-closed で拒否します。さらに `exec` はパス名ではなく pin 済み
-  オブジェクト自体をマップします（Unix では fd/ステージ済みスナップ
-  ショット、Windows では share-mode で保持したハンドル）。これらのピンを宣言したポリシーでは、ハッシュ不一致と
-  inline eval の起動は fail-closed で拒否します。argv から束縛できないペイロード（`python -m`、`npx`）
+  fail-closed で拒否します。実行ファイルは pin 済みオブジェクト自体を
+  exec します — Linux では継承した `/proc/self/fd` スナップショット、
+  その他の Unix では所有者専用のステージ済みコピー、Windows では
+  保持した share-mode ピンの下の実パス — ため、最終チェック後の
+  差し替えで未検証のバイトを混ぜられません。ペイロードに束縛された
+  entrypoint スクリプトは実パスで起動します — インタプリタが再オープン
+  して相対 import・兄弟 import（Node では `node_modules` の祖先探索）
+  を解決する必要があり、スナップショットのパス表記では担えないためです。
+  native Unix でその実パスを開くのは `fspriv` の trusted-source ゲートの
+  下でのみ安全です — スクリプトが root または実行ユーザーの所有で
+  group/other の書き込みがなく、すべての祖先が下位の主体による置換・
+  書き込みを拒否すること — これを証明できない起動は fail-closed で
+  拒否します（`MCP_WRIT_ALLOW_REPLACEABLE_PATHS` が監査される明示的な
+  opt-out）。pin するスクリプトは他者所有や group/other 共有の
+  ディレクトリではなく所有者制御のツリーに置いてください —
+  ユーザーまたは root の制御する祖先（sticky な `/tmp` を含む）の
+  下にあるユーザー所有のスクリプトは受理されます。
+  namespaced 経路で init が検証して bind-mount した場合だけがこの
+  ゲートの例外で、Windows ではセッション中保持される share-mode ピンが
+  変更・リネーム・置換を拒否します。これらのピンを宣言したポリシーでは、
+  ハッシュ不一致と inline eval の起動は fail-closed で拒否します。
+  argv から束縛できないペイロード（`python -m`、`npx`）
   は pin されません — `generate-policy` はハッシュを捏造せず
   `// REVIEW:` コメントでギャップを記録します。そのような
   ペイロードを pin するには、解決済みエントリポイントを直接起動し

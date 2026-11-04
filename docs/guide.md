@@ -69,7 +69,7 @@ graph LR
     end
 
     subgraph "Layer 3: Session Tracking (opt-in)"
-        S1["Confused Deputy<br/>(fixed tool names)"]
+        S1["Confused Deputy<br/>(deputy role + extraction rules)"]
     end
 
     W1 --> W2 --> W3 --> A1 --> A2 --> S1
@@ -426,7 +426,7 @@ mcp-writ run --policy policy.kdl --audit-log /var/log/mcp-audit.jsonl -- ./my-se
 
 **Hash v4 re-pin:** Canonical bytes are prefixed with `mcp-guard-tools-list-v4:`. The digest includes `name`, `description`, optional `title`, `inputSchema`, `outputSchema`, `annotations`, `icons`, `execution`, and `_meta` (key-sorted JSON per tool). There is no v3 compatibility. `generate-policy --live-discovery` emits a v4 `tools-list-hash` with a re-pin comment. Existing policies pinned under v3 must be regenerated.
 
-**Launch-target hash verification:** When the policy's `server` block carries `binary-hash` / `entrypoint-hash` / `lockfile-hash` / `docker-manifest-hash` entries, `run` verifies them before the server process exists. The order is fixed: (1) `argv[0]` is resolved to a canonical path, (2) every configured target file is hashed and compared (`hash.verified` / `hash.mismatch` audit events), (3) the workload is **bound** — a `binary-hash` target must canonicalize to the launched executable (a mismatch is `hash.mismatch` and fails the launch), an `entrypoint-hash` target must be the launched executable or its first payload argument (`server.py` in `python server.py`), and (4) the binding re-runs immediately before spawn — the executable's content is re-hashed, and a separate entrypoint script is re-checked for both path correspondence and content, so a file swapped in after the initial verification is caught fail-closed. The spawn then execs the *pinned object* for the executable rather than the pathname — an inherited `/proc/self/fd` descriptor on Linux, a staged copy in an owner-only directory on other Unixes, the share-mode-held handle on Windows — so a pathname swap or an in-place rewrite after the last check cannot substitute unverified bytes. A payload-bound `entrypoint-hash` script launches differently — through its real path: the interpreter opens the script by name, realpaths it, and resolves sibling/relative imports (and Node's `node_modules` ancestor walk) from that directory, which an fd pseudo-path or a sibling-less staged copy cannot carry — so its exec-time guarantee is the pre-spawn same-object + stamp re-check (on Windows the share-mode pin also stays held for the session, blocking a swap outright — the pinned files cannot be modified, renamed, or replaced for the session's duration, so an in-place upgrade while the server runs fails the same way as a swap; on the Linux namespaced route init re-hashes the pinned object through the inherited fd, stages the verified bytes on the namespace's private tmpfs, and mounts that copy read-only over the script's path — anchoring the pinned content for the session). The audit record distinguishes the two: `server.connected` carries `exe_exec=fd|staged|path` (`path` on Windows, where the real path launches under the share-mode pin) and `entrypoint_exec=path`. What stays unpinned is code the workload opens later by name (imports, plugins, downloads) — see [the inspection boundary](#81-the-inspection-boundary--checked-arguments-vs-server-behavior). The launch report's `code_identity` records which check points each pin passed. Any verification failure exits `run` with `Supply chain verification failed` and never reaches spawn. Hash entries that are only `lockfile-hash` / `docker-manifest-hash` cannot bind a process, and inline evaluation (`-c` / `-e` / `--eval` / `--command`; `-p` / `--print` on node, `-E` on perl — including attached spellings like `-c'…'` and `--eval=…` / `--print=…`, and clusters like `-Ec'…'` or `-pe'…'`) is never hash-bindable — both fail closed. `python -m <module>` and `npx <pkg>` cannot bind their payload from argv either; `generate-policy` therefore emits `binary-hash` for the interpreter plus a `// REVIEW:` comment naming the unbound payload, and never fabricates a hash for it. The *first payload argument* is the first non-option token after the interpreter once the operands of known value-taking options (`--require` / `-r`, `--import`, `--loader`, `--input-type`, `-W`, `-X`, and similar) are skipped; an unlisted option that takes a value can still leave its operand pinned as the entrypoint, so confirm the emitted `target=` names the real script. A script launched directly (`./server.py` or a PATH-installed entry script) is pinned itself, but the interpreter its `#!` line selects is not — the draft flags that with a `// REVIEW:` comment. Delegating launchers (`env`, `py`, `npx`, `uvx` / `uv run`, `npm exec`, `docker run`, `sudo`, `timeout`, and similar) pin only the launcher binary — the draft records that the command they select is unbound. Because the digests cover this host's files (interpreter paths, virtualenv pythons, script locations), recompute them on the deployment host — `generate-policy` emits that reminder as a REVIEW comment — and regenerate the draft when the server or its interpreter is updated.
+**Launch-target hash verification:** When the policy's `server` block carries `binary-hash` / `entrypoint-hash` / `lockfile-hash` / `docker-manifest-hash` entries, `run` verifies them before the server process exists. The order is fixed: (1) `argv[0]` is resolved to a canonical path, (2) every configured target file is hashed and compared (`hash.verified` / `hash.mismatch` audit events), (3) the workload is **bound** — a `binary-hash` target must canonicalize to the launched executable (a mismatch is `hash.mismatch` and fails the launch), an `entrypoint-hash` target must be the launched executable or its first payload argument (`server.py` in `python server.py`), and (4) the binding re-runs immediately before spawn — the executable's content is re-hashed, and a separate entrypoint script is re-checked for both path correspondence and content, so a file swapped in after the initial verification is caught fail-closed. The spawn then execs the *pinned object* for the executable rather than the pathname — an inherited `/proc/self/fd` descriptor on Linux, a staged copy in an owner-only directory on other Unixes, the real path under the share-mode pin held for the session on Windows — so a pathname swap or an in-place rewrite after the last check cannot substitute unverified bytes. A payload-bound `entrypoint-hash` script launches differently — through its real path: the interpreter opens the script by name, realpaths it, and resolves sibling/relative imports (and Node's `node_modules` ancestor walk) from that directory, which an fd pseudo-path or a sibling-less staged copy cannot carry — so its exec-time guarantee is the pre-spawn same-object + stamp re-check (on Windows the share-mode pin also stays held for the session, blocking a swap outright — the pinned files cannot be modified, renamed, or replaced for the session's duration, so an in-place upgrade while the server runs fails the same way as a swap; on the Linux namespaced route init re-hashes the pinned object through the inherited fd, stages the verified bytes on the namespace's private tmpfs, and mounts that copy read-only over the script's path — anchoring the pinned content for the session). The audit record distinguishes the two: `server.connected` carries `exe_exec=fd|staged|path` (`path` on Windows, where the real path launches under the share-mode pin) and `entrypoint_exec=path`. What stays unpinned is code the workload opens later by name (imports, plugins, downloads) — see [the inspection boundary](#81-the-inspection-boundary--checked-arguments-vs-server-behavior). The launch report's `code_identity` records which check points each pin passed. Any verification failure exits `run` with `Supply chain verification failed` and never reaches spawn. Hash entries that are only `lockfile-hash` / `docker-manifest-hash` cannot bind a process, and inline evaluation (`-c` / `-e` / `--eval` / `--command`; `-p` / `--print` on node, `-E` on perl — including attached spellings like `-c'…'` and `--eval=…` / `--print=…`, and clusters like `-Ec'…'` or `-pe'…'`) is never hash-bindable — both fail closed. `python -m <module>` and `npx <pkg>` cannot bind their payload from argv either; `generate-policy` therefore emits `binary-hash` for the interpreter plus a `// REVIEW:` comment naming the unbound payload, and never fabricates a hash for it. The *first payload argument* is the first non-option token after the interpreter once the operands of known value-taking options (`--require` / `-r`, `--import`, `--loader`, `--input-type`, `-W`, `-X`, and similar) are skipped; an unlisted option that takes a value can still leave its operand pinned as the entrypoint, so confirm the emitted `target=` names the real script. A script launched directly (`./server.py` or a PATH-installed entry script) is pinned itself, but the interpreter its `#!` line selects is not — the draft flags that with a `// REVIEW:` comment. Delegating launchers (`env`, `py`, `npx`, `uvx` / `uv run`, `npm exec`, `docker run`, `sudo`, `timeout`, and similar) pin only the launcher binary — the draft records that the command they select is unbound. Because the digests cover this host's files (interpreter paths, virtualenv pythons, script locations), recompute them on the deployment host — `generate-policy` emits that reminder as a REVIEW comment — and regenerate the draft when the server or its interpreter is updated.
 
 **Stdio Proxy Flow:**
 
@@ -539,8 +539,8 @@ mcp-writ generate-policy [OPTIONS] -- <mcp-server-command> [args...]
 | `--binary <path>` | `-b` | *(command[0])* | Path to binary to inspect (defaults to first element of command) |
 | `--output <path>` | `-o` | *(stdout)* | Write generated policy to file |
 | `--verbose` | `-v` | off | Increase log verbosity |
-| `--live-discovery` | | off | Execute the MCP server to discover tools (not the default) |
-| `--unsafe-unsandboxed-discovery` | | off | Live discovery with the ambient environment |
+| `--live-discovery` | | off | Execute the MCP server inside the Warden sandbox (restricted environment, deny-all egress, private TMPDIR) to discover tools (not the default) |
+| `--unsafe-unsandboxed-discovery` | | off | Live discovery without the OS sandbox, in the ambient environment — the explicit downgrade |
 | `--static-only` | | **on** | Do not execute the server; inspect the binary only |
 | `--project <dir>` | | *(none)* | Analyze a project directory for permission hints (explicit dir or script parent only; no CWD fallback) |
 | `--self-test` | | off | After drafting, spawn the server **via Warden** (restricted env + private TMPDIR, 8s) and collect Auditor / Warden evidence. Auditor probes are `checker::check_request` (not a live proxy). Warden `pass` is Linux SIGSYS only. Spawn failure is `inconclusive`, not `skipped`. Reports a `probe-policy:` overlay distinct from the original draft. Draft aid only — does not auto-apply. Never uses `--unsafe-unsandboxed-discovery` |
@@ -1801,7 +1801,12 @@ mcp-writ check --policy policy.kdl
 
 # tools-list-hash + launch binding: `-- <command>` is the server's
 # launch argv — spawned exactly like `generate-policy` live discovery
-# (restricted environment) for a fresh tools/list, and the argv also
+# (inside the Warden sandbox: restricted environment, deny-all egress,
+# private TMPDIR; `MCP_WRIT_SKIP_SANDBOX=1` takes the same documented
+# downgrade here — the OS sandbox and descendant teardown step aside
+# while the restricted environment and private TMPDIR stay — so an
+# unreviewed server still belongs inside a throwaway VM or container)
+# for a fresh tools/list, and the argv also
 # re-checks that binary-hash/entrypoint-hash targets still bind the launch
 mcp-writ check --policy policy.kdl -- python server.py
 
@@ -3359,8 +3364,9 @@ Where use-time enforcement exists, the gap closes:
   verify → bind → re-verify chain ends with the spawn executing the
   *pinned object* rather than the pathname for the executable image —
   an inherited `/proc/self/fd` descriptor on Linux, a staged copy in an
-  owner-only directory on other Unixes, the share-mode-held handle on
-  Windows — so a pathname swap or an in-place rewrite after the last
+  owner-only directory on other Unixes, the real path under the
+  share-mode pin held for the session on Windows — so a pathname swap
+  or an in-place rewrite after the last
   check cannot substitute unverified bytes. A payload-bound entrypoint
   script launches through its real path instead — an interpreter
   resolves its module and imports relative to that path, which a
@@ -3436,6 +3442,27 @@ dependency set. Recompute the digests on the deployment host and
 regenerate when the package or interpreter is updated —
 [`check`](#415-check--policy-drift-re-verification) re-verifies the same
 pins in CI.
+
+On native Unix the pinned script launches through its real path, so the
+launch is gated on that path being a trusted source
+(`fspriv::require_trusted_source_file`): the script must be a regular
+file owned by root or the effective user with no group/other write, and
+every ancestor directory — on both the spelled and the canonical path —
+must refuse replacement or write by a lower-trust principal (no foreign
+owner, no non-sticky group/world-writable directory). A launch that
+cannot prove this fails closed: a foreign-owned file or ancestor, or a
+group/world-writable directory without the sticky bit (a group-shared
+checkout, a world-writable install), is refused outright. A location
+the current user owns and can write qualifies on the same contract —
+a script under user- or root-controlled ancestors, including a sticky
+shared one such as `/tmp`, needs no opt-out —
+`MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1` is the explicit, audited opt-out
+for intentionally shared trees. The namespaced
+route is the one exception: init bind-mounts the re-verified bytes over
+the path inside the namespace, so the interpreter opens an object the
+host side can no longer swap. On Windows the share-mode pin held for the
+session plays the same role — the pinned files cannot be modified,
+renamed, or replaced while the server runs.
 
 What stays unpinned either way: modules the interpreter loads at run time
 (imports, `--require`/`--import` payloads, plugins, downloads) and the

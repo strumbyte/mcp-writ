@@ -1677,3 +1677,133 @@ fn test_policy_resolve_version_diff_kdl_comments() {
         "the composed document still follows: {stdout}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Example policies: tool-network deny coverage
+// ═══════════════════════════════════════════════════════════════════
+
+/// Every `examples/policies/*.kdl` must load, and no tool-level `network`
+/// block may declare an allow side its `deny` rules leave unreachable:
+/// at tool level `host="*"`/`cidr` is an ordinary rule evaluated before
+/// the block's allows (deny-first), so every allow a deny covers is
+/// dead — and an `allow none` spelled beside denies carries no weight
+/// either. Compose-time deny-wins pruning already removes a covered
+/// allow, so the check keys on `allow_specified` — the declaration
+/// marker that survives the prune — never on the allow lists
+/// themselves. Loading runs under a fixed Linux-native target — the
+/// examples carry Linux syscall baselines — so the check is host-OS
+/// independent.
+#[test]
+fn example_policies_tool_network_allows_are_reachable() {
+    use mcp_writ::execution::{ExecutionTarget, TargetArch, TargetOs};
+    use mcp_writ::policy::EgressDest;
+
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/policies");
+    let dir = make_test_dir("example_policies");
+    let dst = dir.path().join("policies");
+    std::fs::create_dir_all(dst.join("runtime")).unwrap();
+    // Copy each policy into a scratch tree so the `<FETCH_HOST>`
+    // placeholder is substituted without touching the checked-in file;
+    // `extends "runtime/<rt>.kdl"` resolves relative to the policy's dir.
+    for entry in std::fs::read_dir(&src).unwrap().flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("kdl") {
+            let text = std::fs::read_to_string(&p)
+                .unwrap()
+                .replace("<FETCH_HOST>", "fetch.example.com");
+            std::fs::write(dst.join(p.file_name().unwrap()), text).unwrap();
+        }
+    }
+    for entry in std::fs::read_dir(src.join("runtime")).unwrap().flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("kdl") {
+            std::fs::copy(&p, dst.join("runtime").join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    let target = ExecutionTarget {
+        host_os: TargetOs::Linux,
+        substrate_os: TargetOs::Linux,
+        workload_os: TargetOs::Linux,
+        workload_arch: TargetArch::X86_64,
+        ..ExecutionTarget::native()
+    };
+    for entry in std::fs::read_dir(&dst).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("kdl") {
+            continue;
+        }
+        let policy = mcp_writ::policy::kdl_loader::load_kdl_policy_for_target(&path, "", &target)
+            .unwrap_or_else(|e| panic!("{} must load: {e}", path.display()));
+        for tool in &policy.tools {
+            let Some(net) = &tool.network else { continue };
+            // A deny-only block is fine — the lint guards declared
+            // allow sides (`allow` entries or `allow none`), which
+            // `allow_specified` records even after compose-time
+            // deny-wins pruning empties the lists a covering deny
+            // shadowed.
+            if !net.allow_specified {
+                continue;
+            }
+            let reachable_allow = !net.allowed_hosts.is_empty()
+                || !net.allowed_cidrs.is_empty()
+                || net.egress_rules.iter().any(|r| r.allow);
+            // Declared allow side, nothing reachable, and a host/cidr
+            // deny that can explain it: every `allow` beside the deny
+            // was covered — `deny host="*"` or a `deny cidr` supernet
+            // prunes the lot, an exact or wildcard-pattern sibling
+            // prunes one — or `allow none` was spelled beside denies
+            // that carry no weight; both shapes mislead the same way.
+            // `unix=` denies are a separate transport and never
+            // explain a dead allow side, while a surviving `unix=`
+            // allow keeps the side live.
+            let dead_allow_side =
+                !reachable_allow && (!net.denied_hosts.is_empty() || !net.denied_cidrs.is_empty());
+            // `deny cidr="0.0.0.0/0"` / `"::/0"` covers every IP-literal
+            // destination of its family; a name-spelled allow still
+            // passes the name layer, so the shadow is total only when
+            // every surviving allow-side entry is an IP literal or a
+            // cidr the deny covers — an emptied allow side qualifies
+            // vacuously.
+            let deny_all_v4 = net.denied_cidrs.iter().any(|c| c == "0.0.0.0/0");
+            let deny_all_v6 = net.denied_cidrs.iter().any(|c| c == "::/0");
+            let covered = |ip: std::net::IpAddr| {
+                (ip.is_ipv4() && deny_all_v4) || (ip.is_ipv6() && deny_all_v6)
+            };
+            let cidr_addr = |c: &String| {
+                c.split('/')
+                    .next()
+                    .and_then(|a| a.parse::<std::net::IpAddr>().ok())
+            };
+            let cidr_shadows_all = (deny_all_v4 || deny_all_v6)
+                && net
+                    .allowed_hosts
+                    .iter()
+                    .all(|h| h.parse::<std::net::IpAddr>().is_ok_and(covered))
+                && net
+                    .allowed_cidrs
+                    .iter()
+                    .all(|c| cidr_addr(c).is_some_and(covered))
+                && net
+                    .egress_rules
+                    .iter()
+                    .filter(|r| r.allow)
+                    .all(|r| match &r.dest {
+                        EgressDest::Host(h) => h.parse::<std::net::IpAddr>().is_ok_and(covered),
+                        EgressDest::Cidr(c) => cidr_addr(c).is_some_and(covered),
+                        EgressDest::Unix(_) => false,
+                    });
+            if dead_allow_side || cidr_shadows_all {
+                panic!(
+                    "{}: tool '{}' declares an allow side that no destination \
+                     can reach beside the block's `deny` rules — covered \
+                     `allow` entries are shadowed (deny-first; pruned at \
+                     compose) and an `allow none` beside denies carries no \
+                     weight. Tool-level denies are ordinary rules, not \
+                     postures",
+                    path.display(),
+                    tool.name
+                );
+            }
+        }
+    }
+}

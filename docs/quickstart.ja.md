@@ -82,9 +82,17 @@ EOF
 
 ## 3. ツール一覧の検出
 
-`generate-policy --live-discovery` は制限環境でサーバーを起動して
-`tools/list` を問い合わせ、検出した `tools-list-hash` を含む独立した草案
-ポリシーを書き出します（`policy.kdl` は読み込みません）。
+`generate-policy --live-discovery` は Warden サンドボックス内でサーバー
+を起動して（制限環境・deny-all の外向き通信・private TMPDIR・
+コマンドツリーへの fs 許可・secret overlay）`tools/list` を
+問い合わせ、検出した `tools-list-hash` を含む独立した草案ポリシーを
+書き出します（`policy.kdl` は読み込みません）。
+明示的なダウングレードは2通りあり、`--unsafe-unsandboxed-discovery`
+は周囲の環境のまま実行します（未レビューのサーバーは使い捨ての
+VM かコンテナの中に限定してください）。`MCP_WRIT_SKIP_SANDBOX` は
+OS サンドボックスと子孫プロセスの寿命管理を外し、制限環境と専用
+TMPDIR は維持します — 残存する子孫プロセスは回収されないため、
+後始末には当てにしないでください。
 
 ```sh
 mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- "$(command -v mcp-server-filesystem)" /srv/mcp-data

@@ -516,6 +516,137 @@ fn rel_label(root: &Path, p: &Path) -> String {
         .join("/")
 }
 
+/// Stale sentences that contradicted the implementation and must not
+/// return to the docs (PR-01, 2026-11). Each entry is
+/// `(phrase, exempt_marker)`: a hit is not an error when the same
+/// sentence also carries the marker — `inherit-parent #true`
+/// descriptions legitimately discuss the ambient-inheritance option
+/// the env phrases used to misstate. The list is limited to sentences
+/// fixed in that PR; generic wording is not registered.
+const FORBIDDEN_PHRASES: &[(&str, Option<&str>)] = &[
+    (
+        "inherits the full parent environment",
+        Some("inherit-parent"),
+    ),
+    (
+        "inherits the whole parent environment",
+        Some("inherit-parent"),
+    ),
+    ("share-mode-held handle on Windows", None),
+    ("in a restricted environment, and records", None),
+    ("does not run discovery inside an OS sandbox", None),
+    ("OS サンドボックス内での探索では", None),
+    ("OS サンドボックス内での検出では", None),
+];
+
+/// Meta-documents that quote the stale text on purpose — improvement
+/// plans record the divergence they fix, security reports quote the
+/// evidence they rejected — exempt from `FORBIDDEN_PHRASES` by path
+/// substring (matched against the `/`-joined repo-relative label).
+const PHRASE_CHECK_EXEMPT_PATHS: &[&str] = &["improvement-", "security_report"];
+
+/// `*.kdl` under `examples/`, recursively — the example policies carry
+/// the same prose claims the forbidden list guards.
+fn collect_kdl_examples(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "kdl") {
+                out.push(p.clone());
+            }
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                walk(&p, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root.join("examples"), &mut out);
+    out.sort();
+    out
+}
+
+/// A character that ends a sentence in either documentation language —
+/// the scope `check_forbidden_phrases`'s exempt marker is limited to.
+fn is_sentence_end(c: char) -> bool {
+    matches!(c, '.' | '!' | '?' | '。' | '！' | '？')
+}
+
+/// Paragraph-aware scan for `FORBIDDEN_PHRASES`: prose hard-wraps a
+/// sentence across source lines, and `//` comments in the `*.kdl`
+/// examples wrap the same way, so each paragraph's lines are trimmed —
+/// a leading `//` dropped — and joined with one space before matching;
+/// a stale claim split at the wrap would otherwise slip through. An
+/// ATX heading is its own block even without a blank line, so it ends
+/// the paragraph too and is scanned alone — a marker in the heading
+/// cannot exempt the next paragraph's claims. Errors name the source
+/// line the match begins on, and the phrase's `exempt_marker` exempts
+/// only the sentence that carries it — a marker elsewhere in the
+/// paragraph does not cover a stale claim in another sentence.
+fn check_forbidden_phrases(label: &str, text: &str, errors: &mut Vec<String>) {
+    let mut paragraphs: Vec<Vec<(usize, &str)>> = Vec::new();
+    let mut paragraph: Vec<(usize, &str)> = Vec::new();
+    for (i, raw) in py_lines(text).iter().enumerate() {
+        let line = raw.trim();
+        let content = line.strip_prefix("//").map(str::trim_start).unwrap_or(line);
+        if content.is_empty() || content.starts_with('#') {
+            if !paragraph.is_empty() {
+                paragraphs.push(std::mem::take(&mut paragraph));
+            }
+            if !content.is_empty() {
+                paragraphs.push(vec![(i + 1, content)]);
+            }
+        } else {
+            paragraph.push((i + 1, content));
+        }
+    }
+    if !paragraph.is_empty() {
+        paragraphs.push(paragraph);
+    }
+    for paragraph in paragraphs {
+        let joined = paragraph
+            .iter()
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join(" ");
+        for &(phrase, exempt) in FORBIDDEN_PHRASES {
+            let mut at = 0;
+            while let Some(hit) = joined[at..].find(phrase) {
+                let pos = at + hit;
+                at = pos + phrase.len();
+                // The marker exempts only the sentence carrying it: a
+                // marker elsewhere in the paragraph does not cover a
+                // stale claim in another sentence.
+                let sentence_start = joined[..pos]
+                    .rfind(is_sentence_end)
+                    .map(|i| i + joined[i..].chars().next().unwrap().len_utf8())
+                    .unwrap_or(0);
+                let sentence_end = joined[at..]
+                    .find(is_sentence_end)
+                    .map(|i| at + i)
+                    .unwrap_or(joined.len());
+                if exempt.is_some_and(|m| joined[sentence_start..sentence_end].contains(m)) {
+                    continue;
+                }
+                // Map the normalized offset back to its source line:
+                // line `k` covers `len + 1` joined bytes (content plus
+                // the join space), so the match's first byte lands on
+                // the line whose cumulative window reaches `pos`.
+                let mut end = 0;
+                for &(line, content) in &paragraph {
+                    end += content.len() + 1;
+                    if pos < end {
+                        errors.push(format!(
+                            "{label}:{line}: forbidden stale wording `{phrase}`"
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The full check; error lines are identical to the Python script's.
 fn check_all(root: &Path) -> (usize, Vec<String>) {
     let link_re = Regex::new(&format!(
@@ -577,6 +708,17 @@ fn check_all(root: &Path) -> (usize, Vec<String>) {
             }
         }
     }
+    for (path, text) in &documents {
+        let label = rel_label(root, path);
+        if !PHRASE_CHECK_EXEMPT_PATHS.iter().any(|x| label.contains(x)) {
+            check_forbidden_phrases(&label, text, &mut errors);
+        }
+    }
+    for path in collect_kdl_examples(root) {
+        let label = rel_label(root, &path);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{label}: {e}"));
+        check_forbidden_phrases(&label, &text, &mut errors);
+    }
     (documents.len(), errors)
 }
 
@@ -604,6 +746,82 @@ fn prose_drops_fenced_blocks() {
     let text =
         "pre\n```rust\n[x](a.md)\n```\nmid\n~~~\n[y](b.md)\n~~~~\n````\n[z](c.md)\n```\nend\n";
     assert_eq!(prose(text), "pre\nmid");
+}
+
+#[test]
+fn forbidden_phrases_match_across_wraps() {
+    let mut errors = Vec::new();
+    // A stale claim wrapped at a paragraph line break still matches,
+    // and the error names the source line the match begins on.
+    check_forbidden_phrases(
+        "x.md",
+        "the child still\ninherits the full parent\nenvironment here\n",
+        &mut errors,
+    );
+    assert_eq!(
+        errors,
+        ["x.md:2: forbidden stale wording `inherits the full parent environment`"]
+    );
+    // `//` comment wraps (the `*.kdl` examples) join the same way.
+    errors.clear();
+    check_forbidden_phrases(
+        "x.kdl",
+        "// the child still\n// inherits the full parent\n// environment\n",
+        &mut errors,
+    );
+    assert_eq!(errors.len(), 1);
+    // A paragraph carrying the exempt marker is an option description;
+    // a blank line splits the scan, so the second paragraph matches.
+    errors.clear();
+    check_forbidden_phrases(
+        "x.md",
+        "only under `inherit-parent #true` does the child\ninherit the full parent \
+         environment\n\ninherits the full parent\nenvironment\n",
+        &mut errors,
+    );
+    assert_eq!(
+        errors,
+        ["x.md:4: forbidden stale wording `inherits the full parent environment`"]
+    );
+    // An ATX heading ends the paragraph without a blank line, so a
+    // marker in the heading cannot exempt the next paragraph's claim.
+    errors.clear();
+    check_forbidden_phrases(
+        "x.md",
+        "## `inherit-parent` semantics\ninherits the full parent environment\n",
+        &mut errors,
+    );
+    assert_eq!(
+        errors,
+        ["x.md:2: forbidden stale wording `inherits the full parent environment`"]
+    );
+}
+
+#[test]
+fn forbidden_phrases_marker_covers_only_its_sentence() {
+    let mut errors = Vec::new();
+    // A marker in one sentence of a paragraph does not exempt a stale
+    // claim in another sentence of the same paragraph.
+    check_forbidden_phrases(
+        "x.md",
+        "ambient inheritance stays opt-in via `inherit-parent #true`. The \
+         child inherits the full parent environment\n",
+        &mut errors,
+    );
+    assert_eq!(
+        errors,
+        ["x.md:1: forbidden stale wording `inherits the full parent environment`"]
+    );
+    // A marker in the same sentence as the claim still exempts it —
+    // the option description is the marker's purpose.
+    errors.clear();
+    check_forbidden_phrases(
+        "x.md",
+        "the child inherits the full parent environment only under \
+         `inherit-parent #true`\n",
+        &mut errors,
+    );
+    assert!(errors.is_empty());
 }
 
 #[test]

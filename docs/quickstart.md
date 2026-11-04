@@ -80,9 +80,17 @@ stays fail-closed until you add `allow` entries for your own data root
 
 ## 3. Discover the tool surface
 
-`generate-policy --live-discovery` launches the server in a restricted
-environment, queries `tools/list`, and writes a standalone draft policy
-carrying the discovered `tools-list-hash` — it does not read `policy.kdl`:
+`generate-policy --live-discovery` launches the server inside the Warden
+sandbox — restricted environment, deny-all egress, private TMPDIR,
+command-tree filesystem grants, secret overlay — queries `tools/list`,
+and writes a standalone draft policy carrying the discovered
+`tools-list-hash` — it does not read `policy.kdl`. Two explicit
+downgrades exist: `--unsafe-unsandboxed-discovery` runs the server with
+the ambient environment (keep unreviewed servers inside a throwaway VM
+or container there), and `MCP_WRIT_SKIP_SANDBOX` drops the OS sandbox
+and the Warden's descendant teardown while keeping the restricted
+environment and private TMPDIR — surviving descendant processes are
+not cleaned up, so do not rely on this downgrade to reap them:
 
 ```sh
 mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- "$(command -v mcp-server-filesystem)" /srv/mcp-data

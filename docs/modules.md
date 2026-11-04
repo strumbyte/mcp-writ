@@ -86,12 +86,20 @@ hide a dependency from the scan. Its owning workflows are listed in the
 - Workload verification precedes spawn. Linux restrictions run in the child,
   and Windows handles, Job objects and ACL restoration retain clear ownership.
 - `defaults.environment` restriction is part of the launch contract, not the
-  OS sandbox: `runtime/launch.rs` builds `SpawnOptions.allowed_names` from the
-  policy and passes it through every spawn variant, so the allowlist applies
-  identically under `--dry-run` and `MCP_WRIT_SKIP_SANDBOX`. When the policy
-  has no `environment` node the child inherits the full parent environment —
-  `spawn_env_pairs` must keep returning `None` in that case so `Command`
-  keeps its default inheritance.
+  OS sandbox: `runtime/launch.rs` copies `policy.environment.restrict` and
+  `policy.environment.allowed` into `SpawnOptions.restrict_environment` and
+  `allowed_names` and passes them through every spawn variant, so the
+  restriction applies identically under `--dry-run` and
+  `MCP_WRIT_SKIP_SANDBOX`. `EnvironmentPolicy::default()` is `restrict:
+  true`, so `spawn_env_pairs` returns the restricted base set — `PATH` and
+  the Windows system vars, plus each `allow`ed name copied from the parent;
+  `TMPDIR`/`TMP`/`TEMP` are not in the base set — they reach the child only
+  when the launch supplies a `tmpdir` override or the policy `allow`s them
+  — even when the policy has no `environment` node at all. It returns
+  `None` only when `restrict` is false and no `tmpdir` override is
+  pending: inside a launch that means `inherit-parent #true` was declared,
+  so ambient inheritance is always an explicit downgrade opt-in, never the
+  absent-node default.
 - The enforcement report keeps intent and observation separate. An
   `EnforcementPlan` entry states what a launch intends to enforce (and
   why anything was skipped or cannot be expressed); an
