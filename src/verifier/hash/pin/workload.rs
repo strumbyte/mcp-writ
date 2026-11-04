@@ -104,6 +104,17 @@ impl HeldTarget {
             let mut file = open_pinned(path).map_err(|error| self.file_error(error))?;
             let stamp = record_stamp(&file).map_err(|error| self.file_error(error))?;
             let actual = hash_open_file(&mut file).map_err(|error| self.file_error(error))?;
+            // Same rule as `open_fresh`: prove the stamp held across the
+            // read, so a mid-read rewrite cannot anchor the re-pinned
+            // object on hybrid bytes.
+            if !stamp_unchanged(&file, &stamp) {
+                return Err(VerifyError::Mismatch {
+                    hash_type: self.hash_type,
+                    target: self.target.clone(),
+                    expected: "a consistent read of the pinned object".to_string(),
+                    actual: "file modified during hashing".to_string(),
+                });
+            }
             if actual != self.expected {
                 return Err(self.mismatch(actual));
             }
@@ -238,12 +249,8 @@ impl VerifiedWorkload {
 
         for (i, entry) in entries {
             let target_path = Path::new(&entry.target);
-            let outcome = if matches!(
-                entry.hash_type,
-                HashType::Binary | HashType::Entrypoint
-            ) {
-                HeldTarget::mint(entry, target_path)
-                    .map(|held| (held.digest.clone(), Some(held)))
+            let outcome = if matches!(entry.hash_type, HashType::Binary | HashType::Entrypoint) {
+                HeldTarget::mint(entry, target_path).map(|held| (held.digest.clone(), Some(held)))
             } else {
                 hash_file(target_path)
                     .map(|digest| (digest, None))

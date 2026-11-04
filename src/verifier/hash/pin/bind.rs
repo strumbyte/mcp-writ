@@ -20,10 +20,10 @@ use super::workload::VerifiedWorkload;
 /// After verifying configured hash entries, require the launched argv to
 /// name those same objects — the verify-A-exec-B binding. A `binary-hash`
 /// or `entrypoint-hash` target that canonicalizes to the resolved
-/// executable is content-compared against the exe's digest; an
-/// `entrypoint-hash` target matching the first payload argument is
-/// re-hashed against its pin (`same_file` is path correspondence only,
-/// so the payload match needs the content read).
+/// executable is content-proved against its held pin; an
+/// `entrypoint-hash` target matching the first payload argument needs
+/// the same freshness proof (`same_file` is path correspondence only,
+/// so the payload match cannot stand on the path alone).
 ///
 /// `verified` carries the held pins `verify_server_hashes` minted — one
 /// per binary/entrypoint target — and the content judgment becomes the
@@ -76,13 +76,13 @@ pub fn bind_launched_workload(
     // without a read; a stray pinless entry still falls back lazily.
     let mut exe_hash: Option<String> = None;
     if verified.is_none() {
-        exe_hash = Some(hash_file(resolved_exe).map_err(|error| {
-            VerifyError::FileError {
+        exe_hash = Some(
+            hash_file(resolved_exe).map_err(|error| VerifyError::FileError {
                 hash_type: HashType::Binary,
                 target: resolved_exe.display().to_string(),
                 error,
-            }
-        })?);
+            })?,
+        );
     }
 
     let mut matched_exe = false;
@@ -98,13 +98,12 @@ pub fn bind_launched_workload(
                 let actual = match exe_hash.clone() {
                     Some(h) => h,
                     None => {
-                        let h = hash_file(resolved_exe).map_err(|error| {
-                            VerifyError::FileError {
+                        let h =
+                            hash_file(resolved_exe).map_err(|error| VerifyError::FileError {
                                 hash_type: HashType::Binary,
                                 target: resolved_exe.display().to_string(),
                                 error,
-                            }
-                        })?;
+                            })?;
                         exe_hash = Some(h.clone());
                         h
                     }

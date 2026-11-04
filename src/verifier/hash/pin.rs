@@ -17,14 +17,14 @@ mod workload;
 
 #[cfg(test)]
 pub(crate) use anchor::open_pinned;
+pub use bind::bind_launched_workload;
 #[cfg(unix)]
 pub use plan::FdExecPlan;
 #[cfg(all(test, windows))]
 pub(crate) use spawn::simplify_verbatim;
-#[cfg(all(target_os = "linux", test))]
-pub(crate) use stamp::ftype_owns_ctime;
+pub use spawn::{SpawnPin, reverify_immediately_before_spawn};
 #[cfg(all(unix, test))]
 pub(crate) use stamp::FileStamp;
-pub use bind::bind_launched_workload;
-pub use spawn::{SpawnPin, reverify_immediately_before_spawn};
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use stamp::ftype_owns_ctime;
 pub use workload::VerifiedWorkload;

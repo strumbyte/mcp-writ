@@ -962,7 +962,7 @@ A launch report carries:
 Inside `code_identity`, each pin's `checks` lists the points where its
 check ran and passed, in launch order: `initial` (configured target
 hashed before binding), `bind_path` + `bind_content` (path correspondence
-and content re-hash at workload binding), `pre_spawn_path` +
+and the held pin's content proof at workload binding), `pre_spawn_path` +
 `pre_spawn_content` (the same checks re-run immediately before spawn),
 `image_inspect` (the image's manifest digest matched at inspect). A point
 absent from the list did not run or did not pass — `result` and the
@@ -3490,6 +3490,8 @@ pass reduction but no measurable wall-clock change — interpreter startup
 dominates at that size. Read accounting used syscall byte totals because
 this kernel does not expose `/proc/<pid>/io` (`rchar`); on hosts that do,
 the same figures are available there.
+
+### 8.3 Residual risks in egress destination control
 
 These risks belong to the egress-enforcement paths —
 [`dns-gate`](#49-dns-gate--policy-evaluating-dns-resolver) plus an

@@ -351,23 +351,23 @@ pub fn reverify_immediately_before_spawn(
         .iter()
         .map(|(i, _)| *i)
         .find(|i| same_file(Path::new(&hash_entries[*i].target), resolved_exe));
-    let mut exe_held = match covering
-        .and_then(|i| verified.as_deref_mut().and_then(|w| w.take_pin(i)))
-    {
-        Some(pin) => pin,
-        None => HeldTarget::open_fresh(
-            resolved_exe,
-            HashType::Binary,
-            resolved_exe.display().to_string(),
-        )?,
-    };
+    let mut exe_held =
+        match covering.and_then(|i| verified.as_deref_mut().and_then(|w| w.take_pin(i))) {
+            Some(pin) => pin,
+            None => HeldTarget::open_fresh(
+                resolved_exe,
+                HashType::Binary,
+                resolved_exe.display().to_string(),
+            )?,
+        };
     // Freshness at mint: the held object must still digest to the pin
     // — identity plus stamp decide on the happy path; an object that
     // provably changed re-hashes through the held handle (the stamp
     // summons the digest check, it does not substitute for it — D-6).
     exe_held.revalidate_held(resolved_exe)?;
     for &(_, entry) in &identity_entries {
-        if same_file(Path::new(&entry.target), resolved_exe) && entry.hash_value != exe_held.digest {
+        if same_file(Path::new(&entry.target), resolved_exe) && entry.hash_value != exe_held.digest
+        {
             return Err(VerifyError::Mismatch {
                 hash_type: entry.hash_type,
                 target: entry.target.clone(),
@@ -439,10 +439,7 @@ pub fn reverify_immediately_before_spawn(
                 }
             })?;
         }
-        let held = match verified
-            .as_deref_mut()
-            .and_then(|w| w.take_pin(i))
-        {
+        let held = match verified.as_deref_mut().and_then(|w| w.take_pin(i)) {
             // The pin was minted on the manifest target; the child's
             // spawn opens the argv spelling — it must still name the
             // verified object (strict — the historical gate does not
@@ -475,12 +472,10 @@ pub fn reverify_immediately_before_spawn(
                         actual: "argv payload path resolves to a different object".to_string(),
                     });
                 }
-                let digest = hash_open_file(&mut file).map_err(|error| {
-                    VerifyError::FileError {
-                        hash_type: HashType::Entrypoint,
-                        target: entry.target.clone(),
-                        error,
-                    }
+                let digest = hash_open_file(&mut file).map_err(|error| VerifyError::FileError {
+                    hash_type: HashType::Entrypoint,
+                    target: entry.target.clone(),
+                    error,
                 })?;
                 if digest != entry.hash_value {
                     return Err(VerifyError::Mismatch {

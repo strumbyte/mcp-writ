@@ -197,9 +197,10 @@ fn immutable_snapshot(
 
 /// Copy `source`'s bytes into `dest`, hashing the stream as it passes —
 /// one traversal produces both the staged object and the digest proving
-/// the bytes copied are the pinned ones. `source` is a clone of the
-/// held pin rewound to offset zero, so the held handle's own position
-/// stays intact.
+/// the bytes copied are the pinned ones. `source` is a `try_clone` of
+/// the held pin: the dup shares the held handle's file offset, so the
+/// rewind moves both — every later read re-seeks, so nothing depends on
+/// preserving it.
 fn copy_and_hash(source: &mut std::fs::File, dest: &mut std::fs::File) -> io::Result<String> {
     use std::io::{Read, Write};
 
@@ -225,10 +226,7 @@ type SnapshotObject = (std::fs::File, Option<(PathBuf, PathBuf)>, String);
 /// The Linux snapshot: a private `memfd` sealed against every write —
 /// the object `/proc/self/fd/N` execs cannot change afterwards.
 #[cfg(target_os = "linux")]
-fn snapshot_object(
-    file: &std::fs::File,
-    label: &str,
-) -> io::Result<SnapshotObject> {
+fn snapshot_object(file: &std::fs::File, label: &str) -> io::Result<SnapshotObject> {
     use std::io::{Seek, Write};
     use std::os::unix::io::FromRawFd;
 
