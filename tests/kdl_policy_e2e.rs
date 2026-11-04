@@ -1756,8 +1756,8 @@ fn example_policies_tool_network_allows_are_reachable() {
             // `unix=` denies are a separate transport and never
             // explain a dead allow side, while a surviving `unix=`
             // allow keeps the side live.
-            let dead_allow_side = !reachable_allow
-                && (!net.denied_hosts.is_empty() || !net.denied_cidrs.is_empty());
+            let dead_allow_side =
+                !reachable_allow && (!net.denied_hosts.is_empty() || !net.denied_cidrs.is_empty());
             // `deny cidr="0.0.0.0/0"` / `"::/0"` covers every IP-literal
             // destination of its family; a name-spelled allow still
             // passes the name layer, so the shadow is total only when
@@ -1788,9 +1788,7 @@ fn example_policies_tool_network_allows_are_reachable() {
                     .iter()
                     .filter(|r| r.allow)
                     .all(|r| match &r.dest {
-                        EgressDest::Host(h) => {
-                            h.parse::<std::net::IpAddr>().is_ok_and(covered)
-                        }
+                        EgressDest::Host(h) => h.parse::<std::net::IpAddr>().is_ok_and(covered),
                         EgressDest::Cidr(c) => cidr_addr(c).is_some_and(covered),
                         EgressDest::Unix(_) => false,
                     });

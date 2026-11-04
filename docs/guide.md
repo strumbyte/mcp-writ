@@ -1802,7 +1802,11 @@ mcp-writ check --policy policy.kdl
 # tools-list-hash + launch binding: `-- <command>` is the server's
 # launch argv — spawned exactly like `generate-policy` live discovery
 # (inside the Warden sandbox: restricted environment, deny-all egress,
-# private TMPDIR) for a fresh tools/list, and the argv also
+# private TMPDIR; `MCP_WRIT_SKIP_SANDBOX=1` takes the same documented
+# downgrade here — the OS sandbox and descendant teardown step aside
+# while the restricted environment and private TMPDIR stay — so an
+# unreviewed server still belongs inside a throwaway VM or container)
+# for a fresh tools/list, and the argv also
 # re-checks that binary-hash/entrypoint-hash targets still bind the launch
 mcp-writ check --policy policy.kdl -- python server.py
 
@@ -3446,11 +3450,14 @@ file owned by root or the effective user with no group/other write, and
 every ancestor directory — on both the spelled and the canonical path —
 must refuse replacement or write by a lower-trust principal (no foreign
 owner, no non-sticky group/world-writable directory). A launch that
-cannot prove this fails closed: pinning a script under a user-writable
-or shared tree (`/tmp`, a group-shared checkout, a world-writable
-install) is refused outright, so keep the entrypoint under an
-owner-restricted tree — `MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1` is the
-explicit, audited opt-out for intentionally shared paths. The namespaced
+cannot prove this fails closed: a foreign-owned file or ancestor, or a
+group/world-writable directory without the sticky bit (a group-shared
+checkout, a world-writable install), is refused outright. A location
+the current user owns and can write qualifies on the same contract —
+a script under user- or root-controlled ancestors, including a sticky
+shared one such as `/tmp`, needs no opt-out —
+`MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1` is the explicit, audited opt-out
+for intentionally shared trees. The namespaced
 route is the one exception: init bind-mounts the re-verified bytes over
 the path inside the namespace, so the interpreter opens an object the
 host side can no longer swap. On Windows the share-mode pin held for the

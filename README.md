@@ -430,8 +430,10 @@ container), never a silent substitute.
   write, and its ancestors must not be replaceable or writable by
   lower-trust principals — a launch that cannot prove this fails closed
   (`MCP_WRIT_ALLOW_REPLACEABLE_PATHS` is the explicit, audited opt-out),
-  so keep pinned scripts under an owner-restricted tree rather than a
-  user-writable or shared directory. The namespaced route's verified
+  so keep pinned scripts on an owner-controlled path — a user-owned
+  script under user- or root-controlled ancestors, sticky `/tmp`
+  included, qualifies — rather than a group/other-shared directory.
+  The namespaced route's verified
   init bind-mount is the one exception to that gate; on Windows the
   share-mode pin held for the session blocks modification, rename, and
   replacement. With such pins declared, a hash mismatch or an

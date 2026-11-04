@@ -896,8 +896,12 @@ impl FdExecPlan {
     /// its resolved real path — the script launches through the object
     /// `verify_spawn_path` re-checked, never a snapshot spelling an
     /// interpreter could not resolve from. `argv[0]` is untouched — the
-    /// child still reads the caller's spelling (a venv `bin/python`
-    /// keeps locating `pyvenv.cfg`).
+    /// child still reads the spelling the expanded argv heads with (the
+    /// caller's `argv[0]`, or the interpreter token a `#!` expansion
+    /// puts there; a venv `bin/python` keeps locating `pyvenv.cfg`). The
+    /// caller's script spelling is preserved at the payload position
+    /// only when no entrypoint pin binds it — a pinned script's own
+    /// argument is the resolved real path, not the caller's spelling.
     pub fn exec_argv(&self, argv: &[String]) -> Vec<String> {
         let mut out = argv.to_vec();
         if let Some((index, path)) = &self.entrypoint

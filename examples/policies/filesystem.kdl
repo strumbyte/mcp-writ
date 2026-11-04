@@ -42,15 +42,18 @@ defaults {
         deny host="*"
     }
     // Restrict the child's environment to the launch contract's base
-    // set (PATH, temp dirs, Windows system vars). Omitting this node
-    // applies the same restriction — the launch contract is
-    // restricted-by-default — so the empty node only makes the intent
-    // explicit. The parent environment returns only when the policy
-    // declares `inherit-parent #true`, an explicit downgrade a dry-run
-    // or SKIP_SANDBOX launch still applies: ambient credentials
-    // included, and this file denies all network at the OS layer only
-    // when the sandbox runs. An extending policy adds `allow "NAME"`
-    // entries for the variables its server demonstrably needs.
+    // set (PATH, Windows system vars — TMPDIR, TMP, and TEMP are not
+    // inherited; a launch that supplies a private temp directory sets
+    // them itself, otherwise a policy `allow` entry must name them).
+    // Omitting this node applies the same restriction — the launch
+    // contract is restricted-by-default — so the empty node only makes
+    // the intent explicit. The parent environment returns only when
+    // the policy declares `inherit-parent #true`, an explicit downgrade
+    // a dry-run or SKIP_SANDBOX launch still applies: ambient
+    // credentials included, and this file denies all network at the OS
+    // layer only when the sandbox runs. An extending policy adds
+    // `allow "NAME"` entries for the variables its server demonstrably
+    // needs.
     environment {
     }
 }

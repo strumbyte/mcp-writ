@@ -31,7 +31,10 @@ pub struct LaunchConfig {
     /// verified here. The child keeps its spelling as `argv[0]` — except
     /// under a pinned Unix `#!` expansion, which heads argv with the
     /// interpreter instead — while the resolved path is exec'd as the
-    /// process image. Must be non-empty.
+    /// process image. That expansion's script argument holds the
+    /// caller's spelling only while the script stays unpinned; a
+    /// payload-bound entrypoint is re-spelled to its resolved real
+    /// path. Must be non-empty.
     pub argv: Vec<String>,
     pub policy: Policy,
     pub fail_on: FailOn,
@@ -180,7 +183,9 @@ pub enum LaunchError {
 /// non-expanded launch keeps the caller's `argv[0]`; a pinned Unix `#!`
 /// launch expands to the interpreter launch the kernel would perform, so
 /// the child's `argv[0]` is the interpreter and the caller's spelling
-/// moves to the script argument.
+/// moves to the script argument — preserved there only while the script
+/// stays unpinned; a payload-bound entrypoint is re-spelled to its
+/// resolved real path instead.
 ///
 /// What the spawn execs splits three ways: a pinned executable image
 /// runs the pinned object itself — an inherited `/proc/self/fd`

@@ -59,13 +59,16 @@ defaults {
         deny host="*"
     }
     // Restrict the child's environment to the launch contract's base set
-    // (PATH, temp dirs, Windows system vars); omitting this node applies
-    // the same restriction — the launch contract is restricted-by-default
-    // — so the empty node only makes the intent explicit. The parent
-    // environment returns only under `inherit-parent #true`. An extending
-    // policy adds `allow "NAME"` entries for the variables it needs —
-    // e.g. proxy settings (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) when
-    // fetches must transit a corporate proxy.
+    // (PATH, Windows system vars — TMPDIR, TMP, and TEMP are not
+    // inherited; a launch that supplies a private temp directory sets
+    // them itself, otherwise a policy `allow` entry must name them);
+    // omitting this node applies the same restriction — the launch
+    // contract is restricted-by-default — so the empty node only makes
+    // the intent explicit. The parent environment returns only under
+    // `inherit-parent #true`. An extending policy adds `allow "NAME"`
+    // entries for the variables it needs — e.g. proxy settings
+    // (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) when fetches must transit
+    // a corporate proxy.
     environment {
     }
 }

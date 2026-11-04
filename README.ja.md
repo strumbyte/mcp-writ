@@ -402,8 +402,10 @@ server "my-mcp-server" {
   group/other の書き込みがなく、すべての祖先が下位の主体による置換・
   書き込みを拒否すること — これを証明できない起動は fail-closed で
   拒否します（`MCP_WRIT_ALLOW_REPLACEABLE_PATHS` が監査される明示的な
-  opt-out）。pin するスクリプトはユーザー書き込み可能・共有の
-  ディレクトリではなく所有者制限のツリーに置いてください。
+  opt-out）。pin するスクリプトは他者所有や group/other 共有の
+  ディレクトリではなく所有者制御のツリーに置いてください —
+  ユーザーまたは root の制御する祖先（sticky な `/tmp` を含む）の
+  下にあるユーザー所有のスクリプトは受理されます。
   namespaced 経路で init が検証して bind-mount した場合だけがこの
   ゲートの例外で、Windows ではセッション中保持される share-mode ピンが
   変更・リネーム・置換を拒否します。これらのピンを宣言したポリシーでは、

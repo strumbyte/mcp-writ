@@ -985,7 +985,11 @@ mcp-writ check --policy policy.kdl
 
 # tools-list-hash + 起動束縛: `-- <command>` はサーバーの起動 argv —
 # `generate-policy` の live discovery と同じ要領（Warden サンドボックス
-# 内: 制限環境・deny-all egress・private TMPDIR）で spawn
+# 内: 制限環境・deny-all egress・private TMPDIR。ここでも
+# `MCP_WRIT_SKIP_SANDBOX=1` は同じダウングレードを取り、OS
+# サンドボックスと子孫プロセスの寿命管理が外れて制限環境と専用
+# TMPDIR は残る — 未レビューのサーバーは使い捨ての VM やコンテナ
+# の中で扱うこと）で spawn
 # して新しい tools/list を pin と照合し、さらに binary-hash /
 # entrypoint-hash の target がその起動を束縛するかも再検査する
 mcp-writ check --policy policy.kdl -- python server.py
@@ -1907,7 +1911,7 @@ server "acme" {
 
 この組み合わせは助言ではなく強制される: ペイロード引数に束縛される `entrypoint-hash` は、解決済みインタプリタを束縛する `binary-hash` が無ければ起動を失敗させ、解決済み実行ファイルにモデル化済みオプション文法が無い場合（リネーム・未認識のインタプリタではペイロード境界を証明できない）も同様に失敗する — pin 済みスクリプトが pin なしインタプリタで走ることはない。`lockfile-hash` は依存マニフェスト自身の内容を検証するがプロセスは束縛しない — レビュー済み依存集合の記録として保持する。ダイジェストはデプロイ先ホストで再計算し、パッケージやインタプリタの更新時に再生成する — [`check`](#415-check--ポリシードリフト再検証) が同じ pin を CI で再検証する。
 
-native Unix では、pin 済みスクリプトは実パスで起動するため、そのパスが信頼できるソースであることが起動の条件になる（`fspriv::require_trusted_source_file`）。スクリプトは通常ファイルで root または実効ユーザーの所有、group/other の書き込みが無いこと、さらにすべての祖先ディレクトリ — 表記パスと正規化パスの両方について — が下位の信頼主体による置換・書き込みを拒否すること（他者所有や、sticky でない group/world 書き込み可ディレクトリを含まない）が求められる。これを証明できない起動は fail-closed で拒否される — ユーザー書き込み可能・共有のツリー（`/tmp`、グループ共有のチェックアウト、world-writable なインストール先）のスクリプトを pin しても起動しないため、entrypoint は所有者制限のツリーに置く。意図的に共有するパス向けに `MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1` が監査される明示的な opt-out としてある。namespaced 経路だけが例外で、init が検証済みバイトを名前空間の内側でそのパスへ bind-mount するため、インタプリタが開く対象はホスト側から差し替えられない。Windows ではセッション中保持される share-mode ピンが同じ役割を果たし、pin 済みファイルはサーバー実行中に変更・リネーム・置換できない。
+native Unix では、pin 済みスクリプトは実パスで起動するため、そのパスが信頼できるソースであることが起動の条件になる（`fspriv::require_trusted_source_file`）。スクリプトは通常ファイルで root または実効ユーザーの所有、group/other の書き込みが無いこと、さらにすべての祖先ディレクトリ — 表記パスと正規化パスの両方について — が下位の信頼主体による置換・書き込みを拒否すること（他者所有や、sticky でない group/world 書き込み可ディレクトリを含まない）が求められる。これを証明できない起動は fail-closed で拒否される — 拒否されるのは他者所有のファイルや祖先、あるいは sticky でない group/world 書き込み可ディレクトリ（グループ共有のチェックアウト、world-writable なインストール先）の下にある配置である。呼び出しユーザー自身が所有し書き込める場所は同じ条件を満たす — ユーザーまたは root だけが制御する祖先（`/tmp` のような sticky な共有祖先を含む）の下にあるユーザー所有のスクリプトは opt-out なしで受理される。意図的に共有するツリー向けに `MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1` が監査される明示的な opt-out としてある。namespaced 経路だけが例外で、init が検証済みバイトを名前空間の内側でそのパスへ bind-mount するため、インタプリタが開く対象はホスト側から差し替えられない。Windows ではセッション中保持される share-mode ピンが同じ役割を果たし、pin 済みファイルはサーバー実行中に変更・リネーム・置換できない。
 
 どちらの形でも pin されずに残るもの: インタプリタが実行時にロードするモジュール（import、`--require`/`--import` ペイロード、プラグイン、ダウンロード）、およびスクリプトを直接起動したとき `#!` 行が選ぶインタプリタ — 後者は `generate-policy` が `// REVIEW:` で指摘し、これらの残存はすべて起動レポートの `code_identity.mutable` で列挙できる。
 

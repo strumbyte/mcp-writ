@@ -518,11 +518,11 @@ fn rel_label(root: &Path, p: &Path) -> String {
 
 /// Stale sentences that contradicted the implementation and must not
 /// return to the docs (PR-01, 2026-11). Each entry is
-/// `(phrase, exempt_marker)`: a hit is not an error when the same line
-/// also carries the marker — `inherit-parent #true` descriptions
-/// legitimately discuss the ambient-inheritance option the env phrases
-/// used to misstate. The list is limited to sentences fixed in that PR;
-/// generic wording is not registered.
+/// `(phrase, exempt_marker)`: a hit is not an error when the same
+/// paragraph also carries the marker — `inherit-parent #true`
+/// descriptions legitimately discuss the ambient-inheritance option
+/// the env phrases used to misstate. The list is limited to sentences
+/// fixed in that PR; generic wording is not registered.
 const FORBIDDEN_PHRASES: &[(&str, Option<&str>)] = &[
     (
         "inherits the full parent environment",
@@ -566,16 +566,65 @@ fn collect_kdl_examples(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Line-wise scan for `FORBIDDEN_PHRASES`, so a line's own
-/// `exempt_marker` can tell an option description from the stale claim.
+/// Paragraph-aware scan for `FORBIDDEN_PHRASES`: prose hard-wraps a
+/// sentence across source lines, and `//` comments in the `*.kdl`
+/// examples wrap the same way, so each paragraph's lines are trimmed —
+/// a leading `//` dropped — and joined with one space before matching;
+/// a stale claim split at the wrap would otherwise slip through. An
+/// ATX heading is its own block even without a blank line, so it ends
+/// the paragraph too and is scanned alone — a marker in the heading
+/// cannot exempt the next paragraph's claims. Errors name the source
+/// line the match begins on, and a paragraph carrying the phrase's
+/// `exempt_marker` is skipped as an option description, the same role
+/// the per-line marker played before.
 fn check_forbidden_phrases(label: &str, text: &str, errors: &mut Vec<String>) {
-    for (i, line) in py_lines(text).iter().enumerate() {
+    let mut paragraphs: Vec<Vec<(usize, &str)>> = Vec::new();
+    let mut paragraph: Vec<(usize, &str)> = Vec::new();
+    for (i, raw) in py_lines(text).iter().enumerate() {
+        let line = raw.trim();
+        let content = line.strip_prefix("//").map(str::trim_start).unwrap_or(line);
+        if content.is_empty() || content.starts_with('#') {
+            if !paragraph.is_empty() {
+                paragraphs.push(std::mem::take(&mut paragraph));
+            }
+            if !content.is_empty() {
+                paragraphs.push(vec![(i + 1, content)]);
+            }
+        } else {
+            paragraph.push((i + 1, content));
+        }
+    }
+    if !paragraph.is_empty() {
+        paragraphs.push(paragraph);
+    }
+    for paragraph in paragraphs {
+        let joined = paragraph
+            .iter()
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join(" ");
         for &(phrase, exempt) in FORBIDDEN_PHRASES {
-            if line.contains(phrase) && exempt.is_none_or(|m| !line.contains(m)) {
-                errors.push(format!(
-                    "{label}:{}: forbidden stale wording `{phrase}`",
-                    i + 1
-                ));
+            if exempt.is_some_and(|m| joined.contains(m)) {
+                continue;
+            }
+            let mut at = 0;
+            while let Some(hit) = joined[at..].find(phrase) {
+                let pos = at + hit;
+                at = pos + phrase.len();
+                // Map the normalized offset back to its source line:
+                // line `k` covers `len + 1` joined bytes (content plus
+                // the join space), so the match's first byte lands on
+                // the line whose cumulative window reaches `pos`.
+                let mut end = 0;
+                for &(line, content) in &paragraph {
+                    end += content.len() + 1;
+                    if pos < end {
+                        errors.push(format!(
+                            "{label}:{line}: forbidden stale wording `{phrase}`"
+                        ));
+                        break;
+                    }
+                }
             }
         }
     }
@@ -680,6 +729,55 @@ fn prose_drops_fenced_blocks() {
     let text =
         "pre\n```rust\n[x](a.md)\n```\nmid\n~~~\n[y](b.md)\n~~~~\n````\n[z](c.md)\n```\nend\n";
     assert_eq!(prose(text), "pre\nmid");
+}
+
+#[test]
+fn forbidden_phrases_match_across_wraps() {
+    let mut errors = Vec::new();
+    // A stale claim wrapped at a paragraph line break still matches,
+    // and the error names the source line the match begins on.
+    check_forbidden_phrases(
+        "x.md",
+        "the child still\ninherits the full parent\nenvironment here\n",
+        &mut errors,
+    );
+    assert_eq!(
+        errors,
+        ["x.md:2: forbidden stale wording `inherits the full parent environment`"]
+    );
+    // `//` comment wraps (the `*.kdl` examples) join the same way.
+    errors.clear();
+    check_forbidden_phrases(
+        "x.kdl",
+        "// the child still\n// inherits the full parent\n// environment\n",
+        &mut errors,
+    );
+    assert_eq!(errors.len(), 1);
+    // A paragraph carrying the exempt marker is an option description;
+    // a blank line splits the scan, so the second paragraph matches.
+    errors.clear();
+    check_forbidden_phrases(
+        "x.md",
+        "only under `inherit-parent #true` does the child\ninherit the full parent \
+         environment\n\ninherits the full parent\nenvironment\n",
+        &mut errors,
+    );
+    assert_eq!(
+        errors,
+        ["x.md:4: forbidden stale wording `inherits the full parent environment`"]
+    );
+    // An ATX heading ends the paragraph without a blank line, so a
+    // marker in the heading cannot exempt the next paragraph's claim.
+    errors.clear();
+    check_forbidden_phrases(
+        "x.md",
+        "## `inherit-parent` semantics\ninherits the full parent environment\n",
+        &mut errors,
+    );
+    assert_eq!(
+        errors,
+        ["x.md:2: forbidden stale wording `inherits the full parent environment`"]
+    );
 }
 
 #[test]

@@ -64,7 +64,7 @@
 - [PR-06 草案の `policy version=3` 出力と、ツール単位 deny ワイルドカードの警告](#pr-06)
 - [PR-07 CI の定期実行と検証記録の件数](#pr-07)
 - [PR-08 運用文書 — ドライバ配置、版の追加手順、直列構成、SECURITY.md](#pr-08)
-- [PR-09 探索の OS サンドボックス適用 — 実装済み（残件は文書と結論記録）](#pr-09)
+- [PR-09 探索の OS サンドボックス適用 — 実装済み・結論記録済み（残件は文書のみ、PR-01 内）](#pr-09)
 - [PR-10 ファジング基盤と PoC 昇格基準](#pr-10)
 - [PR-11 後継機構・新 ABI の評価（調査のみ）](#pr-11)
 - [リリース: 次版（v0.6 想定）— PR-01 の完了後（PR-02〜05・07 は含める範囲を判断）](#release-next)
@@ -85,7 +85,7 @@
 | PR-10 | P2 | なし | `fuzz/`（新規）、`src/framing.rs`・`src/warden/namespaced` の入力境界、guide 英日、`docs/test-matrix.md` |
 | PR-11 | P2 | なし。調査のみでコード変更を含まない | `docs/validation/`（調査記録）、改善計画 |
 
-PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が分かれているので並行できます。PR-04 は PR-03 の後、PR-06 は PR-04 の後、PR-08 は PR-01 の後に着手します。PR-10・PR-11 は他と重なりません。PR-09 は実装済みのため着手対象外です（D-2 の結論記録のみ）。
+PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が分かれているので並行できます。PR-04 は PR-03 の後、PR-06 は PR-04 の後、PR-08 は PR-01 の後に着手します。PR-10・PR-11 は他と重なりません。PR-09 は実装・D-2 の結論記録とも済みのため着手対象外です（残る文書追従は PR-01）。
 
 <a id="pr-01"></a>
 
@@ -110,7 +110,7 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 - [x] E-06: guide.md L429・L3358–3373、guide.ja.md L354・L1882、policy-authoring.md L168（および ja 対応箇所）の Windows 実行ファイル側の表記を「share-mode pin を保持したまま実パスで起動」に改める。スクリプト側の実パス起動と `exe_exec=fd|staged|path` の記述は更新済みなので触らない。差し替え防止の効果の記述は変えない — **済**: 計 6 箇所を「share-mode ピンを保持した実パス」表記に修正。スクリプト側記述と差し替え防止の効果説明は未変更
 - [x] E-07: `runtime/launch.rs` L176–184 の関数コメントを、pin あり実行ファイル／pin なし実行ファイル／entrypoint スクリプトの 3 通りで書き分ける（レポート §4.3 の置き換え案を基にし、`548-559`・`649-657`・`955-972` の既存コメントと矛盾しないようにする） — **済**: 「splits three ways」で 3 通りに書き分け（pin なし実行ファイルは `resolved_exe` 実パス — `fd_exec_plan` の `None` 分岐と照合済み）
 - [x] E-09: guide.md L72・guide.ja.md L72 の構成図 Layer 3 のラベルを「Confused Deputy (deputy role + extraction rules)」相当に改める。本文の攻撃表（L87 付近）は更新済みなので触らない — **済**: 英 `deputy role + extraction rules`・日 `deputy ロール + 抽出規則` に変更。攻撃表は未変更
-- [x] E-10（新規、実装先行の未記載）: payload-bound entrypoint の native Unix 起動が `fspriv::require_trusted_source_file`（pin.rs `1172-1181`）を要求することを guide 英日 §8.2・policy-authoring 英日・README 英日の pin の節に書く — 要件（スクリプトとその祖先が低い信頼の主体による置換を拒否すること）、満たさない場合の fail-closed 拒否、namespaced 経路が init の verified mount で例外になること、を明記する。利用者がユーザー書き込み可能な場所にスクリプトを置くと起動できないため、配置の指針も添える。ポリシー読込側の同ゲート（policy/loader.rs）は別経路の要件であり、本項目の文書化対象には含めない — **済**: 6 ファイル（guide 英日 §8.2・policy-authoring 英日・README 英日）に要件・fail-closed・namespaced 例外・配置指針（所有者制限ツリー、`MCP_WRIT_ALLOW_REPLACEABLE_PATHS` opt-out）を記述。ポリシー読込側のゲートは未記述のまま
+- [x] E-10（新規、実装先行の未記載）: payload-bound entrypoint の native Unix 起動が `fspriv::require_trusted_source_file`（pin.rs `1172-1181`）を要求することを guide 英日 §8.2・policy-authoring 英日・README 英日の pin の節に書く — 要件（スクリプトとその祖先が低い信頼の主体による置換を拒否すること）、満たさない場合の fail-closed 拒否、namespaced 経路が init の verified mount で例外になること、を明記する。低い信頼の別主体が置換・書込できる場所にスクリプトを置くと起動できないため、配置の指針も添える。ポリシー読込側の同ゲート（policy/loader.rs）は別経路の要件であり、本項目の文書化対象には含めない — **済**: 6 ファイル（guide 英日 §8.2・policy-authoring 英日・README 英日）に要件・fail-closed・namespaced 例外・配置指針（所有者制限ツリー、`MCP_WRIT_ALLOW_REPLACEABLE_PATHS` opt-out）を記述。ポリシー読込側のゲートは未記述のまま
 - [x] 再発防止: `tests/docs_check.rs` に「実装と矛盾する既知の文」の不在を固定する否定語句の一覧を足す。最低限、`inherits the full parent environment`／`inherits the whole parent environment`（E-01・E-02。ただし `inherit-parent #true` の説明文は除外できる書き方にする）、`share-mode-held handle on Windows`（E-06）、`in a restricted environment, and records`（E-04）、`does not run discovery inside an OS sandbox` と `OS サンドボックス内での探索では`（E-04 新規乖離）を登録する。一覧は本PRで直した文に限り、一般的な語句は登録しない — **済**: `FORBIDDEN_PHRASES` に指定語句＋`OS サンドボックス内での検出では` 変体を登録。行単位の `inherit-parent` 免除、`improvement-`/`security_report` パス免除、`examples/**/*.kdl` 走査も追加。`cargo test --locked --test docs_check` 11/11 PASS
 
 **検証:** T-DOC、T-POLICY（例ファイルの読込試験）、T-BASE（`launch.rs` のコメント変更があるため）。警告文を固定する既存試験は無い（`tests/` 内に該当文字列の固定は存在しない — `f00e28a` 照合）。
@@ -311,7 +311,7 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 **実装済みの内容（HEAD `f00e28a` 照合）:**
 
 - 探索の子プロセスは既定で Warden 経由（`tools_list.rs` `spawn_server_sandboxed` `1345-1459`・`discovery_policy` `243-263`・`528-566`）。組み込みプロファイル: deny-all egress、fs は解決済み実行ファイルの prefix／コマンドツリー／インタプリタprefix（`node_modules`・PATH helper・引数の親を含む実行時導出）、書込は専用 TMPDIR のみ、制限環境、secret overlay 有効
-- ポリシー構築は blocking pool 上で失敗時 fail-closed、子プロセスは `RunningChild` で子孫まで所有。`MCP_WRIT_SKIP_SANDBOX` は OS サンドボックスだけ外し制限環境は維持、`--unsafe-unsandboxed-discovery` が ambient 継承のフルダウングレード
+- ポリシー構築は blocking pool 上で失敗時 fail-closed、子プロセスは `RunningChild` で子孫まで所有。`MCP_WRIT_SKIP_SANDBOX` は OS サンドボックスと子孫プロセスの寿命管理を外し、制限環境と専用 TMPDIR は維持、`--unsafe-unsandboxed-discovery` が ambient 継承のフルダウングレード
 - 警告文・static-only 案内は実態どおりに更新済み（E-08 解消）
 - 層の規則: 実装は `tools_list.rs` が `Warden::spawn_child_async_exe_with` を直接呼ぶ形。計画の「commands 層から stdio を渡す」分離は取らなかった — T-LAYER で許容されていることを確認し、判断を記録する
 

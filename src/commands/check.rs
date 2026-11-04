@@ -20,8 +20,10 @@
 //! - `tools-list-hash` — only when `-- <command>` names the server's
 //!   launch argv: the server is spawned exactly like
 //!   `generate-policy` live discovery (inside the Warden sandbox:
-//!   restricted environment, deny-all egress, private TMPDIR) and the
-//!   fresh `tools/list` is canonicalized through
+//!   restricted environment, deny-all egress, private TMPDIR;
+//!   `MCP_WRIT_SKIP_SANDBOX` drops the OS sandbox and descendant
+//!   teardown while the restricted environment and private TMPDIR
+//!   stay) and the fresh `tools/list` is canonicalized through
 //!   [`crate::verifier::tools_diff::hash_tools_list`]. Without a
 //!   command the pin is `unverified`, never skipped.
 //! - launch binding — `-- <command>` also re-runs the path
