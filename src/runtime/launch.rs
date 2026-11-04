@@ -174,8 +174,19 @@ pub enum LaunchError {
 }
 
 /// Shared sequence: resolve argv0 → verify hashes → bind → reverify →
-/// Warden spawn (exec'ing the verified path while the child keeps the
-/// caller's `argv[0]`) → `take_io` → `Auditor` relay on a spawned task.
+/// Warden spawn → `take_io` → `Auditor` relay on a spawned task. The
+/// child keeps the caller's `argv[0]` in every case.
+///
+/// What the spawn execs splits three ways: a pinned executable image
+/// runs the pinned object itself — an inherited `/proc/self/fd`
+/// descriptor on Linux, an owner-only staged copy on other Unixes, the
+/// real path under the share-mode pin held for the session on Windows;
+/// an unpinned executable launches through its resolved path; and a
+/// payload-bound entrypoint script launches through its real path so
+/// the interpreter can resolve sibling/relative imports (and Node's
+/// `node_modules` ancestor walk), protected on native Unix by the
+/// `fspriv` trusted-source gate and on the namespaced route by init's
+/// verified bind mount.
 ///
 /// Ordering is fixed: verify → bind → reverify reruns the binding —
 /// including the content re-hash — immediately before spawn, narrowing

@@ -26,7 +26,7 @@ fn invalid_args(mut args: CheckArgs, msg: String) -> CliOutput {
 /// The trailing `-- <command>` is the server's launch argv: it is both
 /// the tools-list source (when the policy carries `tools-list-hash`
 /// pins, `check` spawns the server exactly like `generate-policy` live
-/// discovery — restricted environment — and re-verifies the pin against
+/// discovery — inside the Warden sandbox — and re-verifies the pin against
 /// the fresh `tools/list`) and the launch the identity pins re-bind
 /// against (`binary-hash`/`entrypoint-hash` targets must canonicalize
 /// to the resolved executable or its payload, the correspondence

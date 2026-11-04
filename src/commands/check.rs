@@ -19,8 +19,9 @@
 //!   an image reference by this rule);
 //! - `tools-list-hash` — only when `-- <command>` names the server's
 //!   launch argv: the server is spawned exactly like
-//!   `generate-policy` live discovery (restricted environment, no OS
-//!   sandbox) and the fresh `tools/list` is canonicalized through
+//!   `generate-policy` live discovery (inside the Warden sandbox:
+//!   restricted environment, deny-all egress, private TMPDIR) and the
+//!   fresh `tools/list` is canonicalized through
 //!   [`crate::verifier::tools_diff::hash_tools_list`]. Without a
 //!   command the pin is `unverified`, never skipped.
 //! - launch binding — `-- <command>` also re-runs the path

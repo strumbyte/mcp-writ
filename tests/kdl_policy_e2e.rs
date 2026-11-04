@@ -1677,3 +1677,72 @@ fn test_policy_resolve_version_diff_kdl_comments() {
         "the composed document still follows: {stdout}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Example policies: tool-network deny coverage
+// ═══════════════════════════════════════════════════════════════════
+
+/// Every `examples/policies/*.kdl` must load, and no tool-level `network`
+/// block may pair `deny host="*"` with allow rules: at tool level `*` is
+/// an ordinary wildcard rule evaluated before the block's allows
+/// (deny-first), so the combination denies every destination. Loading
+/// runs under a fixed Linux-native target — the examples carry Linux
+/// syscall baselines — so the check is host-OS independent.
+#[test]
+fn example_policies_tool_network_allows_are_reachable() {
+    use mcp_writ::execution::{ExecutionTarget, TargetArch, TargetOs};
+
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/policies");
+    let dir = make_test_dir("example_policies");
+    let dst = dir.path().join("policies");
+    std::fs::create_dir_all(dst.join("runtime")).unwrap();
+    // Copy each policy into a scratch tree so the `<FETCH_HOST>`
+    // placeholder is substituted without touching the checked-in file;
+    // `extends "runtime/<rt>.kdl"` resolves relative to the policy's dir.
+    for entry in std::fs::read_dir(&src).unwrap().flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("kdl") {
+            let text = std::fs::read_to_string(&p)
+                .unwrap()
+                .replace("<FETCH_HOST>", "fetch.example.com");
+            std::fs::write(dst.join(p.file_name().unwrap()), text).unwrap();
+        }
+    }
+    for entry in std::fs::read_dir(src.join("runtime")).unwrap().flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("kdl") {
+            std::fs::copy(&p, dst.join("runtime").join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    let target = ExecutionTarget {
+        host_os: TargetOs::Linux,
+        substrate_os: TargetOs::Linux,
+        workload_os: TargetOs::Linux,
+        workload_arch: TargetArch::X86_64,
+        ..ExecutionTarget::native()
+    };
+    for entry in std::fs::read_dir(&dst).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("kdl") {
+            continue;
+        }
+        let policy = mcp_writ::policy::kdl_loader::load_kdl_policy_for_target(&path, "", &target)
+            .unwrap_or_else(|e| panic!("{} must load: {e}", path.display()));
+        for tool in &policy.tools {
+            let Some(net) = &tool.network else { continue };
+            if net.denied_hosts.iter().any(|d| d == "*")
+                && !(net.allowed_hosts.is_empty()
+                    && net.allowed_cidrs.is_empty()
+                    && net.egress_rules.is_empty())
+            {
+                panic!(
+                    "{}: tool '{}' pairs `deny host=\"*\"` with allow rules in the \
+                     same tool-level network block — deny-first makes the allows \
+                     unreachable (tool-level `*` is an ordinary rule, not a posture)",
+                    path.display(),
+                    tool.name
+                );
+            }
+        }
+    }
+}

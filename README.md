@@ -131,8 +131,11 @@ mcp-writ generate-policy --live-discovery --output draft.kdl \
 ```
 
 `generate-policy` resolves the npm shim to the package's `dist/index.js`,
-runs `tools/list` in a restricted environment, and records what it
-verified — an excerpt of the draft:
+runs `tools/list` inside the Warden sandbox (restricted environment,
+deny-all egress, private TMPDIR, command-tree filesystem grants, secret
+overlay — `--unsafe-unsandboxed-discovery` is the ambient-environment
+opt-out, where unreviewed servers belong inside a throwaway VM or
+container), and records what it verified — an excerpt of the draft:
 
 ```kdl
 server "auto-generated" {
@@ -414,10 +417,24 @@ container), never a silent substitute.
   argument, and re-verified immediately before `exec` — the executable
   and a matched entrypoint script are both re-hashed there, so a script
   swapped in after the first check fails closed instead of passing on
-  path correspondence alone, and `exec` then maps the pinned object
-  itself (an inherited `/proc/self/fd` snapshot on Linux, a staged copy
-  on other Unix, a share-mode-held handle on Windows) rather than the
-  pathname. With such pins declared, a hash mismatch or an
+  path correspondence alone. The executable then execs the pinned
+  object itself — an inherited `/proc/self/fd` snapshot on Linux, an
+  owner-only staged copy on other Unix, the real path under the held
+  share-mode pin on Windows — so a swap after the last check cannot
+  substitute unverified bytes. A payload-bound entrypoint script
+  launches through its real path instead: the interpreter re-opens it
+  to resolve relative and sibling imports (and Node's `node_modules`
+  ancestor walk), which a snapshot path cannot carry. On native Unix
+  that real-path open is gated by `fspriv`'s trusted-source check: the
+  script must be owned by root or the current user with no group/other
+  write, and its ancestors must not be replaceable or writable by
+  lower-trust principals — a launch that cannot prove this fails closed
+  (`MCP_WRIT_ALLOW_REPLACEABLE_PATHS` is the explicit, audited opt-out),
+  so keep pinned scripts under an owner-restricted tree rather than a
+  user-writable or shared directory. The namespaced route's verified
+  init bind-mount is the one exception to that gate; on Windows the
+  share-mode pin held for the session blocks modification, rename, and
+  replacement. With such pins declared, a hash mismatch or an
   inline-eval launch fails closed.
   Payloads that cannot be bound from argv (`python -m`, `npx`) are not
   pinned; `generate-policy` records the gap as a `// REVIEW:` comment

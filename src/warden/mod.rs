@@ -23,8 +23,10 @@ pub type SpawnFd = std::os::fd::RawFd;
 pub type SpawnFd = i32;
 
 /// Options for child spawn. `run` builds them from the policy's
-/// `defaults.environment` (restriction + allow list); without an
-/// `environment` node the child inherits the ambient env unchanged.
+/// `defaults.environment` (restriction + allow list); `EnvironmentPolicy`
+/// defaults to `restrict: true`, so the child gets the restricted base
+/// set even when the policy has no `environment` node — ambient
+/// inheritance requires the explicit `inherit-parent #true` opt-in.
 ///
 /// Self-test (`generate-policy --self-test`) sets `restrict_environment` and a
 /// private `tmpdir` so the short-lived child matches live-discovery's restricted

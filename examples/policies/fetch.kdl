@@ -37,8 +37,7 @@
 //   server "fetch" {
 //       tool "fetch" {
 //           network {
-//               deny host="*"
-//               allow host="docs.example.com"   // RPC-layer destination allow-list
+//               allow host="docs.example.com"   // closed RPC-layer destination allow-list
 //           }
 //       }
 //   }
@@ -60,11 +59,13 @@ defaults {
         deny host="*"
     }
     // Restrict the child's environment to the launch contract's base set
-    // (PATH, temp dirs, Windows system vars); without this node the server
-    // inherits the whole parent environment. An extending policy adds
-    // `allow "NAME"` entries for the variables it needs — e.g. proxy
-    // settings (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) when fetches must
-    // transit a corporate proxy.
+    // (PATH, temp dirs, Windows system vars); omitting this node applies
+    // the same restriction — the launch contract is restricted-by-default
+    // — so the empty node only makes the intent explicit. The parent
+    // environment returns only under `inherit-parent #true`. An extending
+    // policy adds `allow "NAME"` entries for the variables it needs —
+    // e.g. proxy settings (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) when
+    // fetches must transit a corporate proxy.
     environment {
     }
 }
@@ -91,8 +92,12 @@ server "fetch" {
         // Linux namespaced TUN proxy, the macOS CONNECT proxy, or
         // Windows PSEC) evaluates every connect against
         // `defaults.network`.
+        // At tool level `host="*"` is an ordinary wildcard rule, not a
+        // posture — a `deny host="*"` in this block is evaluated before
+        // its `allow` entries and would cover them all. The `allow`
+        // list below is already closed: a destination it does not name
+        // is denied by the same contract.
         network {
-            deny host="*"
             allow host="<FETCH_HOST>"
         }
     }

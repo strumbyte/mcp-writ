@@ -516,6 +516,71 @@ fn rel_label(root: &Path, p: &Path) -> String {
         .join("/")
 }
 
+/// Stale sentences that contradicted the implementation and must not
+/// return to the docs (PR-01, 2026-11). Each entry is
+/// `(phrase, exempt_marker)`: a hit is not an error when the same line
+/// also carries the marker — `inherit-parent #true` descriptions
+/// legitimately discuss the ambient-inheritance option the env phrases
+/// used to misstate. The list is limited to sentences fixed in that PR;
+/// generic wording is not registered.
+const FORBIDDEN_PHRASES: &[(&str, Option<&str>)] = &[
+    (
+        "inherits the full parent environment",
+        Some("inherit-parent"),
+    ),
+    (
+        "inherits the whole parent environment",
+        Some("inherit-parent"),
+    ),
+    ("share-mode-held handle on Windows", None),
+    ("in a restricted environment, and records", None),
+    ("does not run discovery inside an OS sandbox", None),
+    ("OS サンドボックス内での探索では", None),
+    ("OS サンドボックス内での検出では", None),
+];
+
+/// Meta-documents that quote the stale text on purpose — improvement
+/// plans record the divergence they fix, security reports quote the
+/// evidence they rejected — exempt from `FORBIDDEN_PHRASES` by path
+/// substring (matched against the `/`-joined repo-relative label).
+const PHRASE_CHECK_EXEMPT_PATHS: &[&str] = &["improvement-", "security_report"];
+
+/// `*.kdl` under `examples/`, recursively — the example policies carry
+/// the same prose claims the forbidden list guards.
+fn collect_kdl_examples(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "kdl") {
+                out.push(p.clone());
+            }
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                walk(&p, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root.join("examples"), &mut out);
+    out.sort();
+    out
+}
+
+/// Line-wise scan for `FORBIDDEN_PHRASES`, so a line's own
+/// `exempt_marker` can tell an option description from the stale claim.
+fn check_forbidden_phrases(label: &str, text: &str, errors: &mut Vec<String>) {
+    for (i, line) in py_lines(text).iter().enumerate() {
+        for &(phrase, exempt) in FORBIDDEN_PHRASES {
+            if line.contains(phrase) && exempt.is_none_or(|m| !line.contains(m)) {
+                errors.push(format!(
+                    "{label}:{}: forbidden stale wording `{phrase}`",
+                    i + 1
+                ));
+            }
+        }
+    }
+}
+
 /// The full check; error lines are identical to the Python script's.
 fn check_all(root: &Path) -> (usize, Vec<String>) {
     let link_re = Regex::new(&format!(
@@ -576,6 +641,17 @@ fn check_all(root: &Path) -> (usize, Vec<String>) {
                 errors.push(format!("{label}: missing heading anchor {value}"));
             }
         }
+    }
+    for (path, text) in &documents {
+        let label = rel_label(root, path);
+        if !PHRASE_CHECK_EXEMPT_PATHS.iter().any(|x| label.contains(x)) {
+            check_forbidden_phrases(&label, text, &mut errors);
+        }
+    }
+    for path in collect_kdl_examples(root) {
+        let label = rel_label(root, &path);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{label}: {e}"));
+        check_forbidden_phrases(&label, &text, &mut errors);
     }
     (documents.len(), errors)
 }
