@@ -413,7 +413,7 @@ pub async fn start_gate(
                 }
                 assert!(
                     tokio::time::Instant::now() < probe_deadline,
-                    "dns gate did not bind within 5s"
+                    "dns gate did not bind within 15s"
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }

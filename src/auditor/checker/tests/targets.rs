@@ -167,14 +167,7 @@ fn pr03_classification_matches_reference_composite() {
         ),
         // Selector-looking values under declared payload keys still hit
         // the overlay; duplicates across slots share dedup state.
-        format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\
-             \"name\":\"t\",\"arguments\":{{\
-             \"content\":\"/etc/passwd\",\"text\":\"/etc/passwd\",\
-             \"path\":\".env\",\"prompt\":\".env\",\
-             \"url\":\"https://example.com\",\"host\":\"https://example.com\"\
-             }}}}}}"
-        ),
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"content":"/etc/passwd","text":"/etc/passwd","path":".env","prompt":".env","url":"https://example.com","host":"https://example.com"}}}"#.to_string(),
         // A bare-name spelling under a suffixed path key, beside
         // JSONPath-expression values that must not classify as paths.
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"jsonPath":"$.items[0]","outputJsonPath":"/data/out","repo_path":"build-output","xPath":"a/b"}}}"#.to_string(),

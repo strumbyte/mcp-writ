@@ -510,12 +510,7 @@ pub(crate) mod reference {
         out
     }
 
-    fn walk(
-        val: nojson::RawJsonValue<'_, '_>,
-        key: &str,
-        depth: u32,
-        out: &mut ExtractedTargets,
-    ) {
+    fn walk(val: nojson::RawJsonValue<'_, '_>, key: &str, depth: u32, out: &mut ExtractedTargets) {
         if depth > MAX_JSON_NESTING || out.truncated {
             return;
         }

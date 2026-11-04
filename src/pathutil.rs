@@ -933,8 +933,8 @@ pub fn normalize_fs_argument(raw: &str) -> Result<String, String> {
     let compacted = decoded
         .contains(':')
         .then(|| compact_uri_for_scheme_sniff(&decoded));
-    if let Some(from_uri) = file_uri_to_fs_path(&decoded)
-        .or_else(|| compacted.as_deref().and_then(file_uri_to_fs_path))
+    if let Some(from_uri) =
+        file_uri_to_fs_path(&decoded).or_else(|| compacted.as_deref().and_then(file_uri_to_fs_path))
     {
         return Ok(nfkc(&percent_decode_bounded(&from_uri)?).into_owned());
     }

@@ -289,10 +289,16 @@ pub fn is_secret_path(path: &str) -> bool {
 /// Reserved-secret test for `raw`, where `normalized` is the caller's
 /// already-computed [`pathutil::normalize_fs_argument`] output — the same
 /// two-phase check as [`is_secret_path`] without repeating normalization.
-/// A caller holding only the normalized form passes it as `raw` too;
-/// that still owes the value's own second normalization pass, which is
-/// *not* the identity when NFKC introduced a `%` escape after the first
-/// decode ran (fullwidth `％` → `%`).
+///
+/// A caller holding only the normalized form may pass it as `raw` too
+/// — `(n, n)` then stands in for `is_secret_path(n)`. That shorthand is
+/// valid **only** because `n` is already normalized: the second pass is
+/// then the identity *except* when NFKC introduced a `%` escape after
+/// the first decode ran (fullwidth `％` → `%`), which this function
+/// still runs. Passing an *unnormalized* value as `raw` skips a pass
+/// the value may still owe — `file:/etc/passwd`, `ﬁle://…`, or a
+/// control-embedded spelling carries no `%` yet still normalizes — so
+/// `(v, v)` on raw input under-reports reserved spellings.
 pub fn is_secret_path_normalized(raw: &str, normalized: &str) -> bool {
     if raw.is_empty() || raw.contains('\0') {
         return false;
@@ -444,10 +450,12 @@ mod tests {
         // Fullwidth spellings reach the reserved set through NFKC —
         // asserted by both the predicate and the overlay verdict.
         assert!(is_secret_path("\u{ff0f}etc\u{ff0f}passwd"));
-        assert!(overlay_denies(
-            "\u{ff45}\u{ff54}\u{ff43}\u{ff0f}\u{ff50}\u{ff41}\u{ff53}\u{ff53}\u{ff57}\u{ff44}"
-        )
-        .is_err());
+        assert!(
+            overlay_denies(
+                "\u{ff45}\u{ff54}\u{ff43}\u{ff0f}\u{ff50}\u{ff41}\u{ff53}\u{ff53}\u{ff57}\u{ff44}"
+            )
+            .is_err()
+        );
         // A combining format mark embedded in a reserved spelling is
         // invisible Unicode — the overlay still refuses it.
         assert!(overlay_denies("/etc/passwd\u{034F}").is_err());
