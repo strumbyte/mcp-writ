@@ -202,6 +202,94 @@ fn args_schema_parts(tools: &[ToolDefinition], tool_name: &str) -> (String, Stri
     )
 }
 
+/// `true` when a schema `type` keyword names `name` — either as a bare
+/// string (`"type": "string"`) or inside a type array.
+fn schema_type_includes(ty: nojson::RawJsonValue<'_, '_>, name: &str) -> bool {
+    match ty.kind() {
+        nojson::JsonValueKind::String => crate::schema_spec::str_val(ty)
+            .map(|s| s == name)
+            .unwrap_or(false),
+        nojson::JsonValueKind::Array => ty.to_array().into_iter().flatten().any(|t| {
+            t.kind() == nojson::JsonValueKind::String
+                && crate::schema_spec::str_val(t)
+                    .map(|s| s == name)
+                    .unwrap_or(false)
+        }),
+        _ => false,
+    }
+}
+
+/// Top-level `inputSchema` properties whose values may be free-form
+/// text — `type: string` (type arrays and `items` of arrays included)
+/// with no `format` carrying stronger resource semantics. These are the
+/// fields `arguments { opaque }` could legitimately cover; the draft
+/// only *comments* the candidate out, never enables it (PR-04).
+fn opaque_candidate_fields(schema_str: &str) -> Vec<String> {
+    let Ok(json) = nojson::RawJson::parse(schema_str) else {
+        return Vec::new();
+    };
+    let schema = json.value();
+    let Some(props) = crate::schema_spec::member_opt(schema, "properties") else {
+        return Vec::new();
+    };
+    let Ok(members) = props.to_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (k, sub) in members {
+        let Ok(name) = crate::schema_spec::str_val(k) else {
+            continue;
+        };
+        if crate::schema_spec::member_opt(sub, "format").is_some() {
+            continue;
+        }
+        let Some(ty) = crate::schema_spec::member_opt(sub, "type") else {
+            continue;
+        };
+        let string_field = schema_type_includes(ty, "string");
+        let string_array = schema_type_includes(ty, "array")
+            && crate::schema_spec::member_opt(sub, "items").is_some_and(|items| {
+                crate::schema_spec::member_opt(items, "format").is_none()
+                    && crate::schema_spec::member_opt(items, "type")
+                        .is_some_and(|t| schema_type_includes(t, "string"))
+            });
+        if string_field || string_array {
+            out.push(name.into_owned());
+        }
+    }
+    out
+}
+
+/// The commented-out `arguments { opaque }` candidate under a tool that
+/// declares string arguments with no resource semantics — emitted as
+/// comments only, with the review marker explaining the gate. Returns
+/// the tool-entry suffix (leading newline, no trailing one); empty when
+/// the tool's schema offers no candidates.
+fn opaque_candidate_lines(tools: &[ToolDefinition], tool_name: &str) -> String {
+    let Some(schema) = tools
+        .iter()
+        .find(|t| t.name == tool_name)
+        .and_then(|t| t.input_schema.as_deref())
+    else {
+        return String::new();
+    };
+    let fields = opaque_candidate_fields(schema);
+    if fields.is_empty() {
+        return String::new();
+    }
+    let quoted = fields
+        .iter()
+        .map(|f| format!("\"{}\"", escape_kdl_string(f)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "\n    // inside tool \"{}\" {{ ... }}:\n    // arguments {{ opaque {quoted} }}\n    {}",
+        escape_kdl_string(tool_name),
+        MarkerKind::OpaqueCandidate
+            .comment("enable only for fields that never carry a path, host or URL"),
+    )
+}
+
 fn findings_by_tool(findings: &[ManifestFinding]) -> HashMap<String, Vec<ManifestFinding>> {
     let mut map: HashMap<String, Vec<ManifestFinding>> = HashMap::new();
     for finding in findings {
@@ -361,10 +449,11 @@ fn build_tools_section(
                 .collect();
 
             tools.push(format!(
-                "{comments}{warnings}{schema_comment}    // Matched: {}\n    tool \"{}\" side_effect=\"{}\"{schema_prop}",
+                "{comments}{warnings}{schema_comment}    // Matched: {}\n    tool \"{}\" side_effect=\"{}\"{schema_prop}{}",
                 perms.join(", "),
                 escape_kdl_string(tool_name),
                 side_effect,
+                opaque_candidate_lines(discovered, tool_name),
             ));
         }
     }
@@ -394,9 +483,10 @@ fn build_tools_section(
             }
             ungrounded += 1;
             tools.push(format!(
-                "{comments}{warnings}{schema_comment}    {}\n    tool \"{}\" deny=#true{schema_prop}",
+                "{comments}{warnings}{schema_comment}    {}\n    tool \"{}\" deny=#true{schema_prop}{}",
                 MarkerKind::UnboundTool.comment(&escape_kdl_comment(&verdict.reason)),
                 escape_kdl_string(tool_name),
+                opaque_candidate_lines(discovered, tool_name),
             ));
         }
     }
@@ -426,9 +516,10 @@ fn build_tools_section(
             // tool before it can be called.
             ungrounded += 1;
             tools.push(format!(
-                "{comments}{schema_comment}    {}\n    tool \"{}\" deny=#true{schema_prop}",
+                "{comments}{schema_comment}    {}\n    tool \"{}\" deny=#true{schema_prop}{}",
                 MarkerKind::UnboundTool.comment("manifest findings without a capability verdict"),
                 escape_kdl_string(&live.name),
+                opaque_candidate_lines(discovered, &live.name),
             ));
         }
     }

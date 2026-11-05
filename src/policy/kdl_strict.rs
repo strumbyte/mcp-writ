@@ -85,6 +85,7 @@ const TOOL_CHILD_NODES: &[&str] = &[
     "profile",
     "profiles",
     "deputy",
+    "arguments",
 ];
 
 /// Properties a `tool` may carry.

@@ -140,6 +140,7 @@ fn test_fs_denied_takes_priority_over_allowed() {
             process_exec_allowed: false,
             process_explicit: false,
             deputy: None,
+            opaque_fields: Vec::new(),
         }],
         ..Default::default()
     };
@@ -182,6 +183,7 @@ fn test_network_wildcard_denied_host() {
             process_exec_allowed: false,
             process_explicit: false,
             deputy: None,
+            opaque_fields: Vec::new(),
         }],
         ..Default::default()
     };

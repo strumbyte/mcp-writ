@@ -20,7 +20,7 @@ mod servers;
 pub(crate) use deputy::{parse_deputy_node, reject_misplaced_deputy};
 pub(crate) use leaves::{
     parse_fs_allows, parse_network_rules, parse_process_exec_allowed, parse_syscall_allows,
-    parse_tool_fs, parse_tool_network, parse_tool_syscalls,
+    parse_tool_arguments_node, parse_tool_fs, parse_tool_network, parse_tool_syscalls,
 };
 pub(crate) use mcp_rules::parse_server_mcp_rules;
 pub(crate) use servers::{
@@ -838,12 +838,12 @@ pub(crate) fn validate_tool_shape_v2(
                     }
                 }
                 "filesystem" | "syscalls" | "network" | "process" | "environment" | "profile"
-                | "profiles" => {}
+                | "profiles" | "arguments" => {}
                 other => {
                     return Err(PolicyError::KdlParse(format!(
                         "unexpected node '{other}' in tool '{tool_name}'; version 2 tool entries \
                          accept only filesystem, syscalls, network, process, environment, \
-                         profile, profiles, deputy"
+                         profile, profiles, deputy, arguments"
                     )));
                 }
             }

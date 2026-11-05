@@ -3,10 +3,11 @@
 //! applied to extracted argument targets.
 
 use crate::policy::host::extract_host_from_url;
+use crate::policy::opaque::OpaqueMatcher;
 use crate::policy::{EgressDest, EgressProto, Policy, ToolPolicy};
 
 use super::PolicyViolation;
-use super::targets::{ExtractedTargets, collect_argument_targets};
+use super::targets::{ExtractedTargets, collect_argument_targets_opaque};
 
 /// A request-side network destination: the canonical host plus the
 /// `port=`/`proto=` qualifiers the argument spelling pinned. Bare host
@@ -100,6 +101,16 @@ fn secret_overlay_applies_to_url(url: &str) -> bool {
         || !crate::pathutil::looks_like_network_target(url)
 }
 
+/// The pieces of a `check_tool_sub_policy` pass the caller reports on:
+/// `sub_policy` is the "any sub-policy ran" bit; `opaque_fields` counts
+/// the argument leaves the tool's `arguments { opaque }` declarations
+/// exempted from the unrecognized-argument refusal — the audit detail
+/// that shows the declaration actually carried a value.
+pub(super) struct SubPolicyOutcome {
+    pub(super) sub_policy: bool,
+    pub(super) opaque_fields: usize,
+}
+
 /// Check tool-specific sub-policies (fs paths, network hosts) against request arguments,
 /// and enforce global network denials.
 /// Returns `true` if any sub-policy was evaluated.
@@ -107,9 +118,14 @@ pub(super) fn check_tool_sub_policy(
     json: &nojson::RawJson<'_>,
     tool: &ToolPolicy,
     policy: &Policy,
-) -> Result<bool, PolicyViolation> {
+) -> Result<SubPolicyOutcome, PolicyViolation> {
     let mut has_sub = false;
-    let extracted = collect_argument_targets(json);
+    // The tool's `arguments { opaque }` declarations: leaves under the
+    // named members stay out of the unrecognized-argument refusal —
+    // every other classification (path, URL, host, secret path) still
+    // applies to the same values.
+    let opaque = OpaqueMatcher::build(&tool.opaque_fields);
+    let extracted = collect_argument_targets_opaque(json, opaque.as_ref());
     let fs_restricted = tool.fs.as_ref().is_some_and(|fs_policy| {
         fs_policy.allow_specified
             || fs_policy.require_path.is_some()
@@ -439,7 +455,10 @@ pub(super) fn check_tool_sub_policy(
         has_sub = true;
     }
 
-    Ok(has_sub)
+    Ok(SubPolicyOutcome {
+        sub_policy: has_sub,
+        opaque_fields: extracted.opaque_fields,
+    })
 }
 
 /// Tool fs allow/deny patterns resolved once per request — the policy

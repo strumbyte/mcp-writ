@@ -63,7 +63,7 @@ pub(crate) async fn spawn_namespaced_attempt(
     // The DNS gate exists only when an upstream resolver was resolved —
     // the control is planned as NotApplicable rather than promised.
     controls.extend(plan::os_controls_namespaced(policy, ctx.upstream.is_some()));
-    let mut limitations = plan::base_limitations();
+    let mut limitations = plan::base_limitations(policy);
     if policy.environment.inherit_parent {
         limitations.push(
             "Ambient environment inheritance is enabled (`environment { inherit-parent \

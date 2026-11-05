@@ -933,6 +933,7 @@ pub(super) async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                     server: t.server.clone(),
                     allowed: t.allowed,
                     side_effect: t.side_effect.clone(),
+                    opaque: t.opaque_fields.iter().map(|f| f.source.clone()).collect(),
                 })
                 .collect()
         })

@@ -83,7 +83,47 @@ fn validate_policy_inner(
     validate_side_effect_consistency(policy)?;
     validate_trajectory_requires_side_effect(policy)?;
     validate_deputy_contracts(policy)?;
+    validate_opaque_declarations(policy)?;
     validate_args_schemas(policy)?;
+    Ok(())
+}
+
+/// `arguments { opaque ... }` is a schema-v2 declaration: a v1 document
+/// has no closed tool shape to carry it (the parser already refuses),
+/// and a programmatically built policy that sets `opaque_fields` under
+/// `version < 2` must hit the same contract. `OpaqueField::parse` is
+/// the only constructor, so per-entry shape is already enforced; the
+/// set-level bounds are re-applied here for merges that accumulated
+/// entries across documents.
+fn validate_opaque_declarations(policy: &Policy) -> Result<(), PolicyError> {
+    use crate::policy::opaque::MAX_OPAQUE_FIELDS;
+    use std::collections::HashSet;
+    for tool in &policy.tools {
+        if tool.opaque_fields.is_empty() {
+            continue;
+        }
+        if policy.version < 2 {
+            return Err(PolicyError::Validation(format!(
+                "'arguments' on tool '{}' requires 'policy version=2'",
+                tool.name
+            )));
+        }
+        if tool.opaque_fields.len() > MAX_OPAQUE_FIELDS {
+            return Err(PolicyError::Validation(format!(
+                "tool '{}' declares more than {MAX_OPAQUE_FIELDS} opaque fields",
+                tool.name
+            )));
+        }
+        let mut seen = HashSet::new();
+        for field in &tool.opaque_fields {
+            if !seen.insert(field.segments()) {
+                return Err(PolicyError::Validation(format!(
+                    "tool '{}' declares duplicate opaque field '{}'",
+                    tool.name, field.source
+                )));
+            }
+        }
+    }
     Ok(())
 }
 

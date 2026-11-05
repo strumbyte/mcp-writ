@@ -531,6 +531,33 @@ pub(in crate::policy::kdl_inherit) fn merge_into_policy(
                 existing.deputy = tool.deputy.clone();
                 prov.set(format!("{key}.deputy"), f, l);
             }
+            // `arguments { opaque ... }` unions — a declaration set has
+            // no way to remove a field, so an overlay can only add to
+            // the free-form list a base tool declared.
+            if !tool.opaque_fields.is_empty() {
+                prov.set(format!("{key}.arguments"), f, l);
+                let added: Vec<String> = tool
+                    .opaque_fields
+                    .iter()
+                    .filter(|field| {
+                        !existing
+                            .opaque_fields
+                            .iter()
+                            .any(|e| e.segments() == field.segments())
+                    })
+                    .map(|field| field.source.clone())
+                    .collect();
+                prov.union(format!("{key}.arguments.opaque"), f, l, added);
+                for field in &tool.opaque_fields {
+                    if !existing
+                        .opaque_fields
+                        .iter()
+                        .any(|e| e.segments() == field.segments())
+                    {
+                        existing.opaque_fields.push(field.clone());
+                    }
+                }
+            }
             existing.fs_explicit |= tool.fs_explicit;
             existing.network_explicit |= tool.network_explicit;
             existing.syscalls_explicit |= tool.syscalls_explicit;

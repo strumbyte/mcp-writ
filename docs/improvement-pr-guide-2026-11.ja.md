@@ -187,17 +187,19 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **タスク**
 
-- [ ] 修正前に失敗する再現試験を書く: 制限契約のあるツールに `{"name": "Acme Corp.", "observations": ["Joined in 2021.", "contact alice@example.com"]}` を渡すと拒否され、同じ入力で `.ssh/id_rsa` や `https://evil.example/` を含む値は宣言後も拒否されることを対で固定する
-- [ ] ツール単位の宣言を追加する（名称は担当PRで確定。候補: `tool "x" { arguments { opaque "name" "observations" } }`）。`policy version=2` 以上の未知属性拒否に正規登録し、v1 では読込エラーにする。欄名は `params.arguments` の最上位キーと、JSON Pointer（`deputy extract` と同じ記法）の両方を受ける。継承は和集合（v3 の規則と同じ）、v2 でも和集合とする（狭める意味の属性ではないため）
-- [ ] 分類側: 宣言された欄の文字列は `TargetSlot::Unclassified` に入れない。ただし `is_secret_path` が真の値、`starts_with_file_scheme`・`looks_like_network_target`・`looks_like_host_or_socket` が真の値は従来どおり分類する（宣言は語彙外の拒否だけを免除する）。`read_only` の URL 拒否も従来どおり
-- [ ] `check`／`plan` の表示: 宣言された欄の一覧をツールごとに出し、「この欄は資源らしい文字列でも転送される」ことを運用者に見せる。監査の `tool_call.allowed` の details に宣言で通した欄の件数を残す（値は残さない）。details の追加は監査スキーマ `"2.0"`（`session_id` 全レコード付与・`policy.loaded` `source=` percent-encode 済み）の規約に従い、schema の変更が要る形なら版を上げる判断を記録する
-- [ ] `generate-policy`: `args_schema` で `type: string`（配列要素を含む）かつ `format` の無い欄を、コメントアウトした候補（`// arguments { opaque "name" }` と `// REVIEW: opaque: enable only for fields that never carry a path, host or URL`）として出す。有効な KDL としては投入しない。REVIEW の種別台帳（前身の PR-31 の `MarkerKind`）に `opaque-candidate` を足す
-- [ ] 文書: policy-authoring 英日の冒頭近く（ポリシーを書き始める前の節）に「引数はどう分類され、何が拒否されるか」と「自由記述の欄の宣言」「`deputy extract` との違い」を移す。guide §4 の該当段落（`guide.md:2311`）から参照する
-- [ ] `tests/real_servers_e2e.rs` の memory 系サーバーの試験に、点・`@`・空白を含む正当な値（"Acme Corp."、"contact alice@example.com"）を宣言ありで通し、宣言なしで拒否される対を足す
+- [x] 修正前に失敗する再現試験を書く: 制限契約のあるツールに `{"name": "Acme Corp.", "observations": ["Joined in 2021.", "contact alice@example.com"]}` を渡すと拒否され、同じ入力で `.ssh/id_rsa` や `https://evil.example/` を含む値は宣言後も拒否されることを対で固定する — `auditor::checker::tests::opaque`（拒否/受理/秘密綴り/資源形の各対）と `tests/real_servers_e2e.rs` の memory 対試験で固定
+- [x] ツール単位の宣言を追加する（確定形: `tool "x" { arguments { opaque "name" "observations" } }`）。`policy version=2` 以上の未知属性拒否に正規登録（`kdl_strict.rs` の `TOOL_CHILD_NODES` と `validate_tool_shape_v2`）し、v1 ではパーサと validator の両段で読込エラーにする。欄名は `params.arguments` の最上位キーと `/params/arguments/…` JSON Pointer（`~0`/`~1` デコード、`*`・未 rooted・誤 root を拒否）の両方を受ける。コンテナを指す宣言はそのサブツリー全体をカバーし、配列は透過に辿る。継承は v2・v3 とも `extends`/`include`/`when` 経由で和集合（デコード済みパスで重複排除・1 ツール最大 64 欄）
+- [x] 分類側: 宣言された欄の文字列は `TargetSlot::Unclassified` に入れない（`policy/opaque.rs` の `OpaqueMatcher` trie を `targets.rs` の walk に通し、宣言葉を除外して件数をカウント）。`is_secret_path`、`starts_with_file_scheme`・`looks_like_network_target`・`looks_like_host_or_socket` が真の値は従来どおり分類される（宣言は語彙外の拒否だけを免除する）。`read_only` の URL 拒否・`args_schema`・`deputy` 抽出も従来どおり
+- [x] `check`／`plan` の表示: `check` は JSON `opaque_arguments`（ツールごとの宣言欄一覧）と stderr 一覧、`plan` は `tools[].opaque` と limitations に「資源らしい文字列でも転送される」旨の警告を出す。監査の `tool_call.allowed` の details に `opaque_fields=N`（件数のみ、値は残さない）。details 文字列内の追加でスキーマ形状の変更はないため版上げは不要と判断
+- [x] `generate-policy`: `args_schema` で `type: string`（配列要素を含む）かつ `format` の無い欄を、コメントアウトした候補（`// arguments { opaque "name" }` と `// REVIEW: opaque-candidate: enable only for fields that never carry a path, host or URL`）として出す。配置指示は別コメント行に分離し、有効な KDL としては投入しない。`MarkerKind::OpaqueCandidate` を種別台帳に登録し why/how 文言を追加
+- [x] 文書: policy-authoring 英日の冒頭（`## 1` の前）に「引数の分類と拒否」「自由記述の欄の宣言（`arguments { opaque }`）」「`deputy extract` との違い」を新設し、パス分類の詳述を移動。guide 英日 §4 の fail-closed 段落から参照し、フィールド参照表に `tool` `arguments` 行を追加
+- [x] `tests/real_servers_e2e.rs` の memory 系サーバーの試験に、点・`@`・空白を含む正当な値（"Acme Corp."、"contact alice@example.com"）を `opaque "entities"` 宣言ありで通し、宣言なしで拒否される対を足す（秘密綴り・未宣言キーの拒否も対で固定）
 
-**検証:** T-BASE、T-POLICY（`kdl_policy_e2e` に新属性の v1 拒否・v2 受理・継承の和集合）、T-PROTOCOL（`tool_enforcement_e2e`）、`tests/real_servers_e2e.rs`。
+**検証:** T-BASE（`cargo fmt --check` / `clippy -D warnings` / `cargo test --lib`: 2486 pass）、T-POLICY（`kdl_policy_e2e`: 46 pass — v1 拒否・v2 受理・v2/v3 継承の和集合・wire 転送の対）、T-PROTOCOL（`tool_enforcement_e2e`: 41 pass）、`tests/real_servers_e2e.rs` の memory 対試験 pass — いずれも実施済み。
 
-**完了条件:** 宣言した欄で正当な自由記述が通り、宣言した欄でも秘密パスと明確な資源形は拒否される。宣言の無いポリシーの判定は不変。
+**完了条件:** 宣言した欄で正当な自由記述が通り、宣言した欄でも秘密パスと明確な資源形は拒否される。宣言の無いポリシーの判定は不変。— 全て確認済み。
+
+**実施結果メモ:** 宣言の形は `arguments { opaque }` で確定。仕様照合ループで、コンテナ（オブジェクト・配列）を指す宣言がその配下の葉に伝播しない問題を検出し、terminal ノードがサブツリー全体をカバーするセマンティクスに修正した（`entities` のような配列フィールドを裸名で宣言できる）。REVIEW マーカーのトークンは台帳分類と一致させるため `opaque-candidate` を採用した。
 
 **移行・戻し方:** 属性の追加のみ。宣言を書かなければ従来の判定と同じ。旧版バイナリは未知属性として読込を拒否する（黙って無視しない）。
 

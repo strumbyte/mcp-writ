@@ -204,6 +204,19 @@ pub struct PolicyWarningRecord {
     pub message: String,
 }
 
+/// One tool's `arguments { opaque }` declarations in a [`CheckReport`]
+/// — the `params.arguments` members the unrecognized-argument refusal
+/// waives for that tool. Surfaced so the check output names every
+/// free-form carve-out the policy carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueArgumentsRecord {
+    /// The tool the declarations belong to.
+    pub tool: String,
+    /// Declared spellings — top-level member names or
+    /// `/params/arguments/…` pointers, in policy order.
+    pub fields: Vec<String>,
+}
+
 /// The `check` command's machine-readable result.
 ///
 /// `status` + `reason` are the machine contract; `pins`,
@@ -235,6 +248,9 @@ pub struct CheckReport {
     pub pins: Vec<PinResult>,
     /// Unresolved `// REVIEW` markers from the loaded file set.
     pub review_markers: Vec<ReviewMarkerRecord>,
+    /// Per-tool `arguments { opaque }` declarations — one record per
+    /// tool that declares any. Informational like `warnings`.
+    pub opaque_arguments: Vec<OpaqueArgumentsRecord>,
     /// Non-fatal findings the policy load produced — schema laxity,
     /// replacements that dropped inherited entries, weakened
     /// postures. Informational: they never move `status`.

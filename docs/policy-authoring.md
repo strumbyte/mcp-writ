@@ -11,6 +11,104 @@ incomplete, so saving it does not mean the policy is ready to use.
 
 If you already have a draft, start with [editing permissions](#editing). You can also jump to [recipes](#recipes), [verification](#verification), or [troubleshooting](#troubleshooting).
 
+## How the Auditor reads tool arguments
+
+Before writing clauses it helps to know how the Auditor classifies
+`params.arguments` at `tools/call` time — every string value is
+classified, not just the well-known keys, and on a restricted tool an
+unrecognized field is refused only when its value could name a
+resource — a bare word that names nothing forwards as data.
+
+<a id="argument-classification"></a>
+
+### What is classified, and what is refused
+
+- **Path targets**: a value that looks like a path (`/abs`, `../rel`,
+  `file:///x`), or any value under a path field name — the well-known
+  `path`, `paths`, `file`, `filename`, `filepath`, `directory`, `dir`,
+  `dest`, `destination`, `source`, `output`, `target`, `root`, `cwd`,
+  plus `*_path`/`*_paths` snake-case and `*Path`/`*Paths` camel-case
+  keys. A `*Path` key whose stem spells `xpath` (`XPath`, `xPath`,
+  `nodeXPath`, …) carries an XPath expression and is excluded by name;
+  every other suffix-style key — including the `json` stem (`jsonPath`,
+  `JSONPath`, `json_path`, …) — is decided by its value: a JSONPath
+  expression with no `/` or `\` (`$`, `$.items[0]`, `$[0]`) is a query
+  argument and exempt, while any other value is still checked.
+- **Network targets**: `scheme://` URLs, IP literals, `host:port`,
+  `[v6]:port`, and bare hosts under network field names (`url`, `host`,
+  `uri`, `endpoint`, `origin`, and the aliases `addr`, `peer`, `server`,
+  `socket`, `proxy`, …). A URL-shaped value counts as a network target
+  even on a path-named key.
+- **Reserved secrets**: a value spelling a reserved secret path
+  (`.env`, `.ssh`, `.gnupg`, `.aws/credentials`) under any key stays
+  classified as a secret path that no allow glob can open.
+- **Known payload fields**: `content`, `text`, `data`, `note`,
+  `prompt`, `value`, … carry data, not selectors.
+- **Everything else is unclassified**: on a tool carrying a restricted
+  contract — an fs `allow`/`deny`/`require` rule, a tool `network`
+  block (including `allow none`), `side_effect="read_only"`, or a
+  global outbound rule — an unclassified value that could still name a
+  resource (separators, `~`/`$`/`%`/`@` sigils, or a dot) is refused.
+  Identity- and credential-shaped keys (`id`, `user`, `username`,
+  `token`, `secret`, `password`, `auth`) are not payload; their values
+  classify like any unrecognized field.
+
+That last refusal is what rejects a legitimate free-form string such as
+`"Acme Corp."` or `"contact alice@example.com"` on a memory or
+issue-tracking server.
+
+<a id="declaring-opaque-argument-fields"></a>
+
+### Declaring opaque argument fields
+
+When a field is documented to carry prose — a display name, a note, a
+free-form list — declare it opaque so the unrecognized-field refusal no
+longer applies to its values:
+
+```kdl
+policy version=2
+server "memory" {
+    tool "create_entities" {
+        arguments {
+            opaque "name" "observations"
+        }
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+}
+```
+
+- A bare name covers a top-level key of `params.arguments` — when its
+  value is an object or array, the whole subtree below it is opaque, so
+  `opaque "entities"` covers `entities[*].name` and every other member
+  inside the elements. The JSON Pointer form
+  `/params/arguments/entities/name` reaches a single member inside
+  objects and array elements instead (`~0`/`~1` escapes decode; `*`
+  wildcards are not accepted). A tool may declare up to 64 fields.
+- `arguments` requires `policy version=2` and merges as a union through
+  `extends`, `include`, and matching `when` blocks — declarations only
+  ever add coverage.
+- The declaration exempts **only** the unrecognized-field refusal.
+  Secret-path spellings and resource-shaped values (`scheme://` URLs,
+  IP literals, `host:port`, path-like values) are still classified and
+  checked on a declared field, and `read_only` still refuses hosts and
+  URLs. Declare a field opaque only when it never carries a path, host,
+  or URL. `check` and `plan` list the declared fields per tool, and the
+  audit `tool_call.allowed` record notes how many declared fields a
+  call exercised — never the values.
+
+### `arguments { opaque }` vs `deputy extract`
+
+The two mechanisms answer different questions. `deputy role="use"`
+`extract` *binds* resource arguments: every path the pointer pulls from
+the request must already sit in `known_paths` — it narrows which
+resource values a field may carry. `arguments { opaque }` asserts the
+opposite — the field never carries a resource, so nothing is bound.
+Use `deputy` for fields that carry paths the policy must check; use
+`opaque` for fields that carry free-form text.
+
 ## 1. Identify the server and the operations to allow
 
 Start with one policy file per server so that its permissions are easy to follow. Record the following information.
@@ -581,7 +679,7 @@ tool "echo" side_effect="read_only" {
 
 This allows path-free arguments such as `{"message":"hello"}` while rejecting supplied paths. `require-path #false` is valid only with an empty allowlist.
 
-An argument counts as a path target when its value looks like a path (`/abs`, `../rel`, `file:///x`) or when its key names a path field: the well-known names `path`, `paths`, `file`, `filename`, `filepath`, `directory`, `dir`, `dest`, `destination`, `source`, `output`, `target`, `root`, `cwd`, plus any `*_path`/`*_paths` snake-case or `*Path`/`*Paths` camelCase key. A `*Path` key whose stem spells `xpath` (`XPath`, `xPath`, `nodeXPath`, …) carries an XPath expression and is excluded by name. Every other suffix-style key — including the `json` stem (`jsonPath`, `JSONPath`, `json_path`, …) — is decided by its *value*: a value that is a JSONPath expression with no `/` or `\` (`$`, `$.items[0]`, `$[0]`) is a query argument and exempt, while any other value on `jsonPath` and related keys — including filesystem paths — is still checked, so check the tool's argument names when a call is denied for a path you did not intend to send. A URL-shaped value counts as a network target even on a path-named key.
+An argument counts as a path target when its value looks like a path (`/abs`, `../rel`, `file:///x`) or when its key names a path field — the full classification rules, including the `xpath`/`jsonPath` edge cases, are in [What is classified, and what is refused](#argument-classification). Check the tool's argument names when a call is denied for a path you did not intend to send; if a field that carries only free-form text keeps tripping the unrecognized-field refusal, see [Declaring opaque argument fields](#declaring-opaque-argument-fields).
 Network grants are inherited too, so review `tool.network` if moving this example into a policy with open network access.
 
 ### Constraining argument structure

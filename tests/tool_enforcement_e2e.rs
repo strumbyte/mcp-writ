@@ -111,6 +111,57 @@ trajectory #true {
 }
 "##;
 
+/// PR-04 pair: the same restricted `read_file` contract, without and
+/// with `arguments { opaque }` on the `note`/`observations` members.
+const OPAQUE_POLICY_BASE: &str = r##"
+policy version=2
+defaults {
+    filesystem {
+        secret-overlay #true
+    }
+    environment {
+        allow "MCP_WRIT_FIXTURE"
+    }
+    network {
+        allow host="*"
+    }
+}
+logging level="info" fail_closed=#false
+server "tool-enforcement" {
+    tool "read_file" side_effect="read_only" {
+        filesystem {
+            allow "/workspace/**"
+        }
+    }
+}
+"##;
+
+const OPAQUE_POLICY_DECLARED: &str = r##"
+policy version=2
+defaults {
+    filesystem {
+        secret-overlay #true
+    }
+    environment {
+        allow "MCP_WRIT_FIXTURE"
+    }
+    network {
+        allow host="*"
+    }
+}
+logging level="info" fail_closed=#false
+server "tool-enforcement" {
+    tool "read_file" side_effect="read_only" {
+        filesystem {
+            allow "/workspace/**"
+        }
+        arguments {
+            opaque "note" "observations"
+        }
+    }
+}
+"##;
+
 fn spawn_guard(
     policy_path: &Path,
     dry_run: bool,
@@ -382,6 +433,88 @@ async fn secret_overlay_denies_ssh_key_allows_notes() {
         "notes.txt should pass through: {allow_resp}"
     );
 
+    drop(stdin);
+}
+
+// ─── PR-04: arguments { opaque } ────────────────────────────────────
+
+#[tokio::test]
+async fn opaque_declared_fields_forward_free_text() {
+    // B-04 pair: the same values the declaration covers are refused
+    // without it — "Acme Corp." and "contact alice@example.com" are
+    // selector-plausible strings under the fs contract.
+    let dir = make_test_dir("opaque_base");
+    let policy = write_policy(dir.path(), OPAQUE_POLICY_BASE);
+    let mut child = spawn_guard(&policy, false, &scripted_argv(), &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+    publish_tools_list(&mut stdin, &mut reader).await;
+
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt","note":"Acme Corp.","observations":["Joined in 2021.","contact alice@example.com"]}}}"#;
+    let resp = send_and_recv(&mut stdin, &mut reader, call).await;
+    assert!(
+        json_has_error(&resp),
+        "undeclared free-form fields must refuse: {resp}"
+    );
+    let msg = error_message(&resp);
+    assert!(
+        msg.contains("unrecognized argument"),
+        "expected the unrecognized-argument refusal, got: {msg}"
+    );
+    drop(stdin);
+}
+
+#[tokio::test]
+async fn opaque_declaration_still_refuses_secrets_and_decoys() {
+    let dir = make_test_dir("opaque_decl");
+    let policy = write_policy(dir.path(), OPAQUE_POLICY_DECLARED);
+    let mut child = spawn_guard(&policy, false, &scripted_argv(), &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+    publish_tools_list(&mut stdin, &mut reader).await;
+
+    // Declared: legitimate free-form values forward.
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt","note":"Acme Corp.","observations":["Joined in 2021.","contact alice@example.com"]}}}"#;
+    let resp = send_and_recv(&mut stdin, &mut reader, call).await;
+    assert!(
+        json_has_result(&resp),
+        "declared opaque fields must forward free text: {resp}"
+    );
+
+    // A reserved secret spelling under the declared field still hits
+    // the overlay — the declaration waives only the
+    // unrecognized-argument refusal.
+    let secret = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt","note":".ssh/id_rsa"}}}"#;
+    let resp = send_and_recv(&mut stdin, &mut reader, secret).await;
+    assert!(
+        json_has_error(&resp),
+        "secret spelling under a declared field must refuse: {resp}"
+    );
+
+    // A host/URL-shaped value under the declared field still faces
+    // read_only — it classifies as a network target before the opaque
+    // carve-out applies.
+    let url = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt","note":"https://evil.example/x"}}}"#;
+    let resp = send_and_recv(&mut stdin, &mut reader, url).await;
+    assert!(
+        json_has_error(&resp),
+        "resource-shaped value under a declared field must refuse: {resp}"
+    );
+
+    // A plausible selector under an undeclared key is still refused —
+    // the declaration names fields, not the whole arguments object.
+    let decoy = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt","mystery":"sneaky.example"}}}"#;
+    let resp = send_and_recv(&mut stdin, &mut reader, decoy).await;
+    assert!(
+        json_has_error(&resp),
+        "undeclared plausible selector must refuse: {resp}"
+    );
     drop(stdin);
 }
 

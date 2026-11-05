@@ -5,8 +5,8 @@ use kdl::KdlDocument;
 
 use super::{
     check_none_needs_replace, parse_deputy_node, parse_layer_children, parse_process_exec_allowed,
-    parse_replace_flag, parse_tool_fs, parse_tool_network, parse_tool_syscalls,
-    resolve_tool_args_schema, unique_child, validate_tool_shape_v2,
+    parse_replace_flag, parse_tool_arguments_node, parse_tool_fs, parse_tool_network,
+    parse_tool_syscalls, resolve_tool_args_schema, unique_child, validate_tool_shape_v2,
 };
 use crate::error::PolicyError;
 use crate::policy::merge::{PolicyLayer, merge_policy, validate_merged};
@@ -267,6 +267,19 @@ pub(crate) fn parse_servers(
                 None => None,
             };
 
+            // `arguments { opaque ... }` declares the free-form argument
+            // fields the unrecognized-argument refusal waives. Same
+            // v1 reasoning as `deputy`: under the permissive grammar it
+            // would be silently ignored, so it is rejected outright.
+            let opaque_fields = match tool_children
+                .map(|tc| unique_child(tc, "arguments", &tool_ctx))
+                .transpose()?
+                .flatten()
+            {
+                Some(node) => parse_tool_arguments_node(node, &tool_name, version)?,
+                None => Vec::new(),
+            };
+
             let has_tool_fs = tool_fs.is_some();
             let has_tool_syscalls = tool_syscalls.is_some();
             let has_tool_network = tool_network.is_some();
@@ -375,6 +388,7 @@ pub(crate) fn parse_servers(
                 process_exec_allowed,
                 process_explicit,
                 deputy,
+                opaque_fields,
             });
         }
     }

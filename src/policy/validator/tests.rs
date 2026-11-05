@@ -90,6 +90,7 @@ fn test_empty_tool_name() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     let err = validate_policy(&policy).unwrap_err();
     assert!(err.to_string().contains("empty 'name'"));
@@ -119,6 +120,7 @@ fn test_whitespace_tool_name() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     let err = validate_policy(&policy).unwrap_err();
     assert!(err.to_string().contains("empty 'name'"));
@@ -150,6 +152,7 @@ fn test_duplicate_tool_names() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     policy.tools.push(ToolPolicy {
         name: "read_file".to_string(),
@@ -172,6 +175,7 @@ fn test_duplicate_tool_names() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     let err = validate_policy(&policy).unwrap_err();
     assert!(err.to_string().contains("duplicate tool name 'read_file'"));
@@ -201,6 +205,7 @@ fn test_duplicate_tool_names_after_trimming() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     policy.tools.push(ToolPolicy {
         name: " read_file ".to_string(),
@@ -223,6 +228,7 @@ fn test_duplicate_tool_names_after_trimming() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     let err = validate_policy(&policy).unwrap_err();
     assert!(err.to_string().contains("duplicate tool name 'read_file'"));
@@ -252,6 +258,7 @@ fn test_unique_tool_names_pass() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     policy.tools.push(ToolPolicy {
         name: "write_file".to_string(),
@@ -274,6 +281,7 @@ fn test_unique_tool_names_pass() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     assert!(validate_policy(&policy).is_ok());
 }
@@ -304,6 +312,7 @@ fn test_empty_allowed_path_in_tool() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     let err = validate_policy(&policy).unwrap_err();
     let msg = err.to_string();
@@ -338,6 +347,7 @@ fn test_whitespace_denied_path_in_tool() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     let err = validate_policy(&policy).unwrap_err();
     let msg = err.to_string();
@@ -392,6 +402,7 @@ fn test_valid_paths_pass() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     policy.fs.read_only = vec!["/usr/lib/**".to_string()];
     policy.fs.read_write = vec!["/workspace/**".to_string()];
@@ -943,6 +954,7 @@ fn test_r06_parent_allow_child_deny_rejected() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     let err = validate_policy(&policy).unwrap_err();
     assert!(
@@ -978,6 +990,7 @@ fn test_per_tool_syscalls_are_rejected() {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     let err = validate_policy(&policy).unwrap_err();
     assert!(err.to_string().contains("per-tool syscalls"), "got: {err}");
@@ -1219,6 +1232,7 @@ fn policy_with_schema(version: u32, schema: &str) -> Policy {
         process_exec_allowed: false,
         process_explicit: false,
         deputy: None,
+        opaque_fields: Vec::new(),
     });
     policy
 }
@@ -1323,6 +1337,46 @@ server "s" {
     let err = crate::policy::kdl_loader::load_kdl_policy(&kdl_path).unwrap_err();
     assert!(
         err.to_string().contains("unsupported schema keyword 'if'"),
+        "got: {err}"
+    );
+}
+
+// --- arguments { opaque } (PR-04) ---
+
+#[test]
+fn test_opaque_declarations_require_v2_programmatic() {
+    // The parser refuses `arguments` under v1; a policy assembled
+    // without parsing must hit the same gate in the validator.
+    let mut tool = ToolPolicy::named("memory_add", true);
+    tool.opaque_fields = vec![crate::policy::opaque::OpaqueField::parse("name").unwrap()];
+    let mut policy = default_policy();
+    policy.version = 1;
+    policy.tools = vec![tool];
+    let err = validate_policy(&policy).unwrap_err();
+    assert!(
+        err.to_string().contains("requires 'policy version=2'"),
+        "got: {err}"
+    );
+
+    policy.version = 2;
+    validate_policy(&policy).expect("v2 accepts the declaration");
+}
+
+#[test]
+fn test_opaque_declarations_reject_duplicate_member_paths() {
+    // Merges dedup by segments; a programmatically built set that
+    // carries the same member twice must still fail validation.
+    let mut tool = ToolPolicy::named("memory_add", true);
+    tool.opaque_fields = vec![
+        crate::policy::opaque::OpaqueField::parse("name").unwrap(),
+        crate::policy::opaque::OpaqueField::parse("/params/arguments/name").unwrap(),
+    ];
+    let mut policy = default_policy();
+    policy.version = 2;
+    policy.tools = vec![tool];
+    let err = validate_policy(&policy).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate opaque field"),
         "got: {err}"
     );
 }

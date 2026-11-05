@@ -8,9 +8,10 @@ use crate::policy::kdl_parse::{
     Defaults, check_none_needs_replace, defaults_to_layer, parse_deputy_node,
     parse_environment_node, parse_fs_allows, parse_logging_fail_closed, parse_network_rules,
     parse_process_exec_allowed, parse_replace_flag, parse_server_hashes, parse_server_mcp_rules,
-    parse_servers, parse_syscall_allows, parse_tool_fs, parse_tool_network, parse_tool_syscalls,
-    parse_tools_list_hashes, parse_trajectory, resolve_tool_args_schema,
-    resolve_tool_profile_names, unique_child, validate_logging_level, validate_tool_shape_v2,
+    parse_servers, parse_syscall_allows, parse_tool_arguments_node, parse_tool_fs,
+    parse_tool_network, parse_tool_syscalls, parse_tools_list_hashes, parse_trajectory,
+    resolve_tool_args_schema, resolve_tool_profile_names, unique_child, validate_logging_level,
+    validate_tool_shape_v2,
 };
 use crate::policy::merge::PolicyLayer;
 use crate::policy::provenance::Provenance;
@@ -792,6 +793,36 @@ fn apply_overrides_from_doc(
                         }
                         existing.deputy = Some(parse_deputy_node(dep_node, &tool_name)?);
                         prov.set(format!("{tkey}.deputy"), path, tline);
+                    }
+                    // `arguments { opaque ... }` unions the declared
+                    // free-form fields onto the existing tool's — the
+                    // same include/extends semantics (a declaration set
+                    // has no way to remove a field). Under v1 it would
+                    // be dropped silently, so it is rejected outright.
+                    if let Some(args_node) = unique_child(tc, "arguments", &tool_ctx)? {
+                        let declared =
+                            parse_tool_arguments_node(args_node, &tool_name, policy.version)?;
+                        prov.set(format!("{tkey}.arguments"), path, tline);
+                        let added: Vec<String> = declared
+                            .iter()
+                            .filter(|f| {
+                                !existing
+                                    .opaque_fields
+                                    .iter()
+                                    .any(|e| e.segments() == f.segments())
+                            })
+                            .map(|f| f.source.clone())
+                            .collect();
+                        prov.union(format!("{tkey}.arguments.opaque"), path, tline, added);
+                        for f in declared {
+                            if !existing
+                                .opaque_fields
+                                .iter()
+                                .any(|e| e.segments() == f.segments())
+                            {
+                                existing.opaque_fields.push(f);
+                            }
+                        }
                     }
                 }
             } else {

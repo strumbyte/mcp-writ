@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::policy::deputy::{DeputyRule, KnownShape};
+use crate::policy::opaque::{OpaqueField, OpaqueMatcher};
 
 use super::{MAX_JSON_NESTING, params_member};
 
@@ -59,6 +60,13 @@ pub(super) struct ExtractedTargets<S = Rc<str>> {
     /// select, so restricted callers refuse them rather than forward
     /// an unchecked target.
     pub(super) unclassified: Vec<S>,
+    /// Count of scalar leaves the tool's `arguments { opaque }`
+    /// declarations exempted from the `unclassified` bucket — the
+    /// values that *would* have landed there had the field not been
+    /// declared. Resource-shaped and secret-path values still classify
+    /// normally, so a declared field that carried one contributes a
+    /// `paths`/`urls`/`hosts` entry, not this count.
+    pub(super) opaque_fields: usize,
     /// The leaf/target budget was exceeded — the collected vectors are a
     /// strict prefix of the real targets. Restricted callers must treat
     /// this as unknowable (fail closed); discovery-side callers narrow.
@@ -121,6 +129,7 @@ impl<S: TargetString> ExtractedTargets<S> {
             hosts: Vec::new(),
             noncanonical: Vec::new(),
             unclassified: Vec::new(),
+            opaque_fields: 0,
             truncated: false,
             #[cfg(test)]
             leaves: 0,
@@ -195,7 +204,7 @@ pub fn extract_fs_targets(line: &str) -> Vec<String> {
     let Ok(json) = nojson::RawJson::parse(line) else {
         return Vec::new();
     };
-    collect_argument_targets_as(&json).paths
+    collect_argument_targets_as(&json, None).paths
 }
 
 /// Resolve a `use`-role tool's configured deputy extraction rules against
@@ -210,8 +219,17 @@ pub fn extract_fs_targets(line: &str) -> Vec<String> {
 /// may consume as paths. `Err` is an extraction failure — the caller must deny:
 /// a `use`-role call never passes on an unverifiable path set, and a
 /// pointer evaluation that hit its value bound is unknowable.
-pub fn extract_deputy_use_targets(line: &str, rules: &[DeputyRule]) -> Result<Vec<String>, String> {
-    extract_deputy_use_targets_as(line, rules)
+///
+/// `opaque_fields` is the tool's effective `arguments { opaque }`
+/// declaration set: the closed-contract check at the end exempts those
+/// members from the unrecognized-argument refusal, identical to the
+/// tool's own sub-policy evaluation.
+pub fn extract_deputy_use_targets(
+    line: &str,
+    rules: &[DeputyRule],
+    opaque_fields: &[OpaqueField],
+) -> Result<Vec<String>, String> {
+    extract_deputy_use_targets_as(line, rules, opaque_fields)
 }
 
 /// [`extract_deputy_use_targets`] returning shared `Rc<str>` targets for
@@ -221,13 +239,15 @@ pub fn extract_deputy_use_targets(line: &str, rules: &[DeputyRule]) -> Result<Ve
 pub(crate) fn extract_deputy_use_targets_rc(
     line: &str,
     rules: &[DeputyRule],
+    opaque_fields: &[OpaqueField],
 ) -> Result<Vec<Rc<str>>, String> {
-    extract_deputy_use_targets_as(line, rules)
+    extract_deputy_use_targets_as(line, rules, opaque_fields)
 }
 
 fn extract_deputy_use_targets_as<S: TargetString>(
     line: &str,
     rules: &[DeputyRule],
+    opaque_fields: &[OpaqueField],
 ) -> Result<Vec<S>, String> {
     let json =
         nojson::RawJson::parse(line).map_err(|e| format!("request is not valid JSON: {e}"))?;
@@ -248,11 +268,15 @@ fn extract_deputy_use_targets_as<S: TargetString>(
     // resolutions happen the same number of times and in the same
     // order as the independent walks this replaces.
     let mut combined: Option<CollectedLeaves> = None;
+    // The tool's declared free-form members — built once here so every
+    // combined classify applies the same exemption set.
+    let opaque = OpaqueMatcher::build(opaque_fields);
     for rule in rules {
         match rule {
             DeputyRule::Shape(KnownShape::FsTargets) => {
                 input_responses_covered = true;
-                let targets: ExtractedTargets<S> = combined_classify(&json, &mut combined);
+                let targets: ExtractedTargets<S> =
+                    combined_classify(&json, &mut combined, opaque.as_ref());
                 // A truncated classified walk leaves unchecked targets —
                 // a `use`-role call never passes on a partial path set.
                 if targets.truncated {
@@ -317,7 +341,7 @@ fn extract_deputy_use_targets_as<S: TargetString>(
     // fields they cover, and the raw request is forwarded whole — a
     // plausible selector under an undeclared field is refused like an
     // extraction failure rather than reaching the child unchecked.
-    let classified: ExtractedTargets<S> = combined_classify(&json, &mut combined);
+    let classified: ExtractedTargets<S> = combined_classify(&json, &mut combined, opaque.as_ref());
     if classified.truncated {
         return Err("argument target extraction exceeded the work budget".to_string());
     }
@@ -357,10 +381,25 @@ pub fn request_has_host_or_url(line: &str) -> bool {
 }
 
 pub(super) fn collect_argument_targets(json: &nojson::RawJson<'_>) -> ExtractedTargets<Rc<str>> {
-    collect_argument_targets_as(json)
+    collect_argument_targets_as(json, None)
 }
 
-fn collect_argument_targets_as<S: TargetString>(json: &nojson::RawJson<'_>) -> ExtractedTargets<S> {
+/// [`collect_argument_targets`] with the tool's declared
+/// `arguments { opaque }` matcher — `params.arguments` members under a
+/// declared field are exempted from the `unclassified` bucket (their
+/// other classifications still run). `params.inputResponses` is never
+/// opaque: the declaration names `arguments` members only.
+pub(super) fn collect_argument_targets_opaque(
+    json: &nojson::RawJson<'_>,
+    opaque: Option<&OpaqueMatcher>,
+) -> ExtractedTargets<Rc<str>> {
+    collect_argument_targets_as(json, opaque)
+}
+
+fn collect_argument_targets_as<S: TargetString>(
+    json: &nojson::RawJson<'_>,
+    opaque: Option<&OpaqueMatcher>,
+) -> ExtractedTargets<S> {
     // Single consumer — classify inline as the walk emits each scalar;
     // multi-consumer checks use `walk_combined_classified` instead.
     let mut out = ExtractedTargets::new();
@@ -372,40 +411,56 @@ fn collect_argument_targets_as<S: TargetString>(json: &nojson::RawJson<'_>) -> E
         .and_then(|m| m.optional())
         .and_then(|p| p.to_member("arguments").ok()?.optional())
     {
-        walk_json_scalars(args, &KeyAttrs::NONE, 0, &mut walk, &mut |attrs, s| {
-            // The fused walk stopped classifying once the target budget
-            // tripped — abort traversal so a truncated frame costs no
-            // extra resolutions.
-            if out.truncated {
-                return false;
-            }
-            classify_target_string(attrs, &s, &mut out);
-            !out.truncated
-        });
+        walk_json_scalars(
+            args,
+            &KeyAttrs::NONE,
+            opaque,
+            0,
+            &mut walk,
+            &mut |attrs, s, leaf_opaque| {
+                // The fused walk stopped classifying once the target budget
+                // tripped — abort traversal so a truncated frame costs no
+                // extra resolutions.
+                if out.truncated {
+                    return false;
+                }
+                classify_target_string(attrs, &s, leaf_opaque, &mut out);
+                !out.truncated
+            },
+        );
     }
     if let Some(responses) = params_member(json, "inputResponses") {
-        walk_json_scalars(responses, &KeyAttrs::NONE, 0, &mut walk, &mut |attrs, s| {
-            if out.truncated {
-                return false;
-            }
-            classify_target_string(attrs, &s, &mut out);
-            !out.truncated
-        });
+        walk_json_scalars(
+            responses,
+            &KeyAttrs::NONE,
+            None,
+            0,
+            &mut walk,
+            &mut |attrs, s, leaf_opaque| {
+                if out.truncated {
+                    return false;
+                }
+                classify_target_string(attrs, &s, leaf_opaque, &mut out);
+                !out.truncated
+            },
+        );
     }
     out.truncated |= walk.truncated;
     out
 }
 
 /// First combined classify pays for the walk; later consumers replay
-/// the collected leaf prefix.
+/// the collected leaf prefix. `opaque` matters only on the collect —
+/// the stored leaves already carry the flag it produced.
 fn combined_classify<'a, S: TargetString>(
     json: &'a nojson::RawJson<'a>,
     shared: &mut Option<CollectedLeaves<'a>>,
+    opaque: Option<&OpaqueMatcher>,
 ) -> ExtractedTargets<S> {
     match shared {
         Some(leaves) => leaves.classify(),
         None => {
-            let (targets, leaves) = walk_combined_classified(json);
+            let (targets, leaves) = walk_combined_classified(json, opaque);
             *shared = Some(leaves);
             targets
         }
@@ -419,13 +474,20 @@ fn input_response_targets_as<S: TargetString>(json: &nojson::RawJson<'_>) -> Ext
     let mut out = ExtractedTargets::new();
     let mut walk = LeafWalk::default();
     if let Some(responses) = params_member(json, "inputResponses") {
-        walk_json_scalars(responses, &KeyAttrs::NONE, 0, &mut walk, &mut |attrs, s| {
-            if out.truncated {
-                return false;
-            }
-            classify_target_string(attrs, &s, &mut out);
-            !out.truncated
-        });
+        walk_json_scalars(
+            responses,
+            &KeyAttrs::NONE,
+            None,
+            0,
+            &mut walk,
+            &mut |attrs, s, leaf_opaque| {
+                if out.truncated {
+                    return false;
+                }
+                classify_target_string(attrs, &s, leaf_opaque, &mut out);
+                !out.truncated
+            },
+        );
     }
     out.truncated |= walk.truncated;
     out
@@ -439,6 +501,9 @@ struct ScalarLeaf<'a> {
     attrs: KeyAttrs,
     raw: Cow<'a, str>,
     norm: LeafNorm<'a>,
+    /// The tool's `arguments { opaque }` declaration covered this leaf —
+    /// the `unclassified` fallback does not apply to it.
+    opaque: bool,
 }
 
 enum LeafNorm<'a> {
@@ -453,12 +518,13 @@ enum LeafNorm<'a> {
 }
 
 impl ScalarLeaf<'_> {
-    fn of<'a>(attrs: &KeyAttrs, raw: Cow<'a, str>) -> ScalarLeaf<'a> {
+    fn of<'a>(attrs: &KeyAttrs, raw: Cow<'a, str>, opaque: bool) -> ScalarLeaf<'a> {
         if is_plain_ascii_token(&raw) {
             return ScalarLeaf {
                 attrs: *attrs,
                 raw,
                 norm: LeafNorm::Plain,
+                opaque,
             };
         }
         match raw {
@@ -469,6 +535,7 @@ impl ScalarLeaf<'_> {
                     Ok(n) => LeafNorm::Normalized(n),
                     Err(_) => LeafNorm::Failed,
                 },
+                opaque,
             },
             Cow::Owned(raw) => {
                 // The normalization must not borrow `raw` — both live
@@ -482,6 +549,7 @@ impl ScalarLeaf<'_> {
                     attrs: *attrs,
                     raw: Cow::Owned(raw),
                     norm,
+                    opaque,
                 }
             }
         }
@@ -545,19 +613,24 @@ impl CollectedLeaves<'_> {
 /// budget — the fused combined traversal — classifying each reached
 /// scalar inline and collecting it for replay. Later combined
 /// consumers use [`CollectedLeaves::classify`] on the same prefix.
+///
+/// `opaque` descends the `arguments` tree only — the declaration names
+/// `params.arguments` members, so `inputResponses` values classify
+/// under their own vocabulary as before.
 pub(super) fn walk_combined_classified<'a, S: TargetString>(
     json: &'a nojson::RawJson<'a>,
+    opaque: Option<&OpaqueMatcher>,
 ) -> (ExtractedTargets<S>, CollectedLeaves<'a>) {
     let mut out = ExtractedTargets::new();
     let mut leaves = Vec::new();
     let mut walk = LeafWalk::default();
-    let mut sink = |attrs: &KeyAttrs, s: Cow<'a, str>| -> bool {
+    let mut sink = |attrs: &KeyAttrs, s: Cow<'a, str>, leaf_opaque: bool| -> bool {
         // The fused walk stopped once the classify's own budget tripped
         // — stop emitting (and stop collecting) the same way.
         if out.truncated {
             return false;
         }
-        let leaf = ScalarLeaf::of(attrs, s);
+        let leaf = ScalarLeaf::of(attrs, s, leaf_opaque);
         classify_leaf(&leaf, &mut out);
         leaves.push(leaf);
         !out.truncated
@@ -569,10 +642,10 @@ pub(super) fn walk_combined_classified<'a, S: TargetString>(
         .and_then(|m| m.optional())
         .and_then(|p| p.to_member("arguments").ok()?.optional())
     {
-        walk_json_scalars(args, &KeyAttrs::NONE, 0, &mut walk, &mut sink);
+        walk_json_scalars(args, &KeyAttrs::NONE, opaque, 0, &mut walk, &mut sink);
     }
     if let Some(responses) = params_member(json, "inputResponses") {
-        walk_json_scalars(responses, &KeyAttrs::NONE, 0, &mut walk, &mut sink);
+        walk_json_scalars(responses, &KeyAttrs::NONE, None, 0, &mut walk, &mut sink);
     }
     if walk.truncated {
         out.truncated = true;
@@ -590,12 +663,20 @@ pub(super) fn walk_combined_classified<'a, S: TargetString>(
 /// depth cap, and the leaf budget — emitting every string scalar in
 /// visit order to `sink`, which returns `false` to abort traversal
 /// early (e.g. its classify tripped the target budget).
+///
+/// `opaque` is the tool's `arguments { opaque }` matcher cursor,
+/// descending member by member alongside `val`: a member name consumes
+/// one declared segment, arrays stay transparent, and a scalar emits
+/// `leaf_opaque = true` when its position reached a declared
+/// (terminal) field. `None` disables the tracking entirely — the walk
+/// then costs exactly what it did before the feature existed.
 fn walk_json_scalars<'a>(
     val: nojson::RawJsonValue<'a, '_>,
     key_attrs: &KeyAttrs,
+    opaque: Option<&OpaqueMatcher>,
     depth: u32,
     walk: &mut LeafWalk,
-    sink: &mut impl FnMut(&KeyAttrs, Cow<'a, str>) -> bool,
+    sink: &mut impl FnMut(&KeyAttrs, Cow<'a, str>, bool) -> bool,
 ) {
     if depth > MAX_JSON_NESTING || walk.truncated || walk.done {
         return;
@@ -610,12 +691,23 @@ fn walk_json_scalars<'a>(
                     // Object members carry their own key vocabulary —
                     // the parent's attributes are inherited only
                     // through arrays and scalar leaves.
+                    let member_name = k.to_unquoted_string_str().unwrap_or_default();
                     let member_attrs = if v.kind() == nojson::JsonValueKind::Object {
                         KeyAttrs::NONE
                     } else {
-                        KeyAttrs::of(&k.to_unquoted_string_str().unwrap_or_default())
+                        KeyAttrs::of(&member_name)
                     };
-                    walk_json_scalars(v, &member_attrs, depth + 1, walk, sink);
+                    // The opaque cursor descends on the member name
+                    // regardless of value kind — a declared path's
+                    // intermediate members continue it. A terminal node
+                    // marks its whole subtree: once reached, the cursor
+                    // stays instead of consuming further segments.
+                    let member_opaque = match opaque {
+                        Some(c) if c.terminal() => Some(c),
+                        Some(c) => c.child(member_name.as_ref()),
+                        None => None,
+                    };
+                    walk_json_scalars(v, &member_attrs, member_opaque, depth + 1, walk, sink);
                 }
             }
         }
@@ -625,7 +717,10 @@ fn walk_json_scalars<'a>(
                     if walk.truncated || walk.done {
                         return;
                     }
-                    walk_json_scalars(elem, key_attrs, depth + 1, walk, sink);
+                    // Array elements carry the parent's opaque cursor —
+                    // indices are not member names, so a declared path
+                    // covers every element.
+                    walk_json_scalars(elem, key_attrs, opaque, depth + 1, walk, sink);
                 }
             }
         }
@@ -636,7 +731,7 @@ fn walk_json_scalars<'a>(
                 return;
             }
             if let Ok(s) = val.to_unquoted_string_str()
-                && !sink(key_attrs, s)
+                && !sink(key_attrs, s, opaque.is_some_and(|c| c.terminal()))
             {
                 walk.done = true;
             }
@@ -704,19 +799,23 @@ impl KeyAttrs {
 /// (`collect_argument_targets`, `extract_fs_targets`, host/URL
 /// presence). Multi-consumer checks replay collected leaves through
 /// [`classify_leaf`] instead; both reach the same predicate bodies.
+/// `opaque` marks a leaf under a declared `arguments { opaque }` field
+/// — only the `unclassified` fallback waives; every target-shaped or
+/// secret-path classification still applies.
 fn classify_target_string<S: TargetString>(
     key_attrs: &KeyAttrs,
     value: &str,
+    opaque: bool,
     out: &mut ExtractedTargets<S>,
 ) {
     // A plain ASCII token carries no encoding the normalizer could
     // rewrite and no punctuation the shape tests could key on — skip
     // straight to the key-driven and overlay checks.
     if is_plain_ascii_token(value) {
-        return classify_plain_token(key_attrs, value, out);
+        return classify_plain_token(key_attrs, value, opaque, out);
     }
     match crate::pathutil::normalize_fs_argument_cow(value) {
-        Ok(normalized) => classify_normalized_value(key_attrs, value, &normalized, out),
+        Ok(normalized) => classify_normalized_value(key_attrs, value, &normalized, opaque, out),
         Err(_) => out.push(TargetSlot::Path, value),
     }
 }
@@ -728,10 +827,10 @@ fn classify_target_string<S: TargetString>(
 /// resolutions as an independent classified walk.
 fn classify_leaf<S: TargetString>(leaf: &ScalarLeaf<'_>, out: &mut ExtractedTargets<S>) {
     match &leaf.norm {
-        LeafNorm::Plain => classify_plain_token(&leaf.attrs, &leaf.raw, out),
+        LeafNorm::Plain => classify_plain_token(&leaf.attrs, &leaf.raw, leaf.opaque, out),
         LeafNorm::Failed => out.push(TargetSlot::Path, &leaf.raw),
         LeafNorm::Normalized(normalized) => {
-            classify_normalized_value(&leaf.attrs, &leaf.raw, normalized, out)
+            classify_normalized_value(&leaf.attrs, &leaf.raw, normalized, leaf.opaque, out)
         }
     }
 }
@@ -761,6 +860,7 @@ fn is_plain_ascii_token(value: &str) -> bool {
 fn classify_plain_token<S: TargetString>(
     key_attrs: &KeyAttrs,
     value: &str,
+    opaque: bool,
     out: &mut ExtractedTargets<S>,
 ) {
     if key_attrs.is_path_value(value) {
@@ -793,6 +893,10 @@ fn classify_plain_token<S: TargetString>(
     if key_attrs.payload {
         return;
     }
+    if opaque {
+        out.opaque_fields += 1;
+        return;
+    }
     out.push(TargetSlot::Unclassified, value);
 }
 
@@ -805,6 +909,7 @@ fn classify_normalized_value<S: TargetString>(
     key_attrs: &KeyAttrs,
     value: &str,
     normalized: &str,
+    opaque: bool,
     out: &mut ExtractedTargets<S>,
 ) {
     if crate::pathutil::starts_with_file_scheme(normalized)
@@ -881,6 +986,14 @@ fn classify_normalized_value<S: TargetString>(
     }
     // Declared non-selector payload fields carry opaque content.
     if key_attrs.payload {
+        return;
+    }
+    // A member declared `opaque` for this tool carries free-form text —
+    // the declaration is what proves the value is not a selector, so it
+    // stays out of the unclassified bucket. Every earlier branch still
+    // ran: a resource-shaped or secret-path value classified above.
+    if opaque {
+        out.opaque_fields += 1;
         return;
     }
     // A string under no recognized vocabulary cannot be proven a

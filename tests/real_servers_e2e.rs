@@ -1521,6 +1521,93 @@ async fn memory_stages() {
     .await;
 }
 
+/// PR-04 (B-04): `arguments { opaque }` against the real memory server —
+/// the same free-form `create_entities` call refuses without the
+/// declaration and forwards with it, while a secret spelling under the
+/// declared member and a plausible selector under an undeclared key
+/// stay refused either way.
+#[tokio::test]
+async fn memory_opaque_arguments_pair() {
+    let _stage_lock = STAGE_LOCK.lock().await;
+    let spec = &MEMORY;
+    let (_t, root) = temp_root("mcp_writ_rs_mem_opaque_");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).expect("mkdir");
+    let mem_file = data.join("memory.json");
+
+    let argv = match server_argv(spec, &[]) {
+        Some(a) => a,
+        None => return,
+    };
+    let reviewed = stage1_discover_and_review(spec, &argv, &root, &["create_entities"]);
+
+    // The B-04 values — '.', '@', and spaces the unrecognized-argument
+    // refusal reads as plausible selectors under the tool's fs contract.
+    let freeform = "{\"entities\":[{\"name\":\"Acme Corp.\",\"entityType\":\"org\",\"observations\":[\"Joined in 2021.\",\"contact alice@example.com\"]}]}";
+    let env = [("MEMORY_FILE_PATH", mem_file.to_string_lossy().into_owned())];
+    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mem_grants: &[(&Path, &str)] = &[(&data, "write")];
+
+    let server_extra = |opaque: &str| {
+        format!(
+            "server \"memory\" {{\n    tool \"create_entities\" {{\n        filesystem {{\n            allow none=#true\n            require-path #false\n        }}\n{opaque}    }}\n}}\n"
+        )
+    };
+    let host = |server_extra: &str, name: &str| {
+        let mut kdl = draft_host_policy(&reviewed, &argv[0], server_extra);
+        inject_fs_grants(&mut kdl, mem_grants);
+        inject_environment(&mut kdl, &["MEMORY_FILE_PATH"]);
+        write_policy(&root, name, &kdl)
+    };
+
+    // Without the declaration the plausible strings refuse at the
+    // Auditor — the call never reaches the server.
+    let no_decl = host(&server_extra(""), "host-mem-noop.kdl");
+    let (mut s, _audit) = stage3_spawn(spec, &no_decl, &argv, &env_refs, Some(&data)).await;
+    let resp = s.call("create_entities", freeform).await;
+    assert!(
+        resp.as_deref().is_some_and(json_has_error),
+        "undeclared free-form strings must refuse: {resp:?}"
+    );
+    drop(s);
+
+    // With `arguments { opaque "entities" }` the same call forwards —
+    // the array stays transparent, so every element's members are the
+    // declared subtree.
+    let with_decl = host(
+        &server_extra("        arguments {\n            opaque \"entities\"\n        }\n"),
+        "host-mem-opaque.kdl",
+    );
+    let (mut s, _audit) = stage3_spawn(spec, &with_decl, &argv, &env_refs, Some(&data)).await;
+    let resp = s.call("create_entities", freeform).await;
+    assert!(
+        resp.as_deref()
+            .is_some_and(|r| !json_has_error(r) && !is_error_result(r)),
+        "declared opaque fields must forward free-form values: {resp:?}"
+    );
+
+    // A secret spelling under the declared member still classifies and
+    // refuses — the declaration waives only the
+    // unrecognized-argument refusal.
+    let secret = "{\"entities\":[{\"name\":\".ssh/id_rsa\",\"entityType\":\"org\",\"observations\":[\"ok\"]}]}";
+    let resp = s.call("create_entities", secret).await;
+    assert!(
+        resp.as_deref().is_some_and(json_has_error),
+        "secret spelling under a declared member must refuse: {resp:?}"
+    );
+
+    // A plausible selector under an undeclared key is still refused —
+    // the declaration names fields, not the whole arguments object.
+    let decoy =
+        "{\"entities\":[{\"name\":\"ok\",\"entityType\":\"org\"}],\"mystery\":\"sneaky.example\"}";
+    let resp = s.call("create_entities", decoy).await;
+    assert!(
+        resp.as_deref().is_some_and(json_has_error),
+        "undeclared plausible selector must refuse: {resp:?}"
+    );
+    drop(s);
+}
+
 /// PR6: `defaults.environment` controls which parent variables reach the
 /// real server. MEMORY_FILE_PATH is the observable lever: listed, the
 /// server writes to the granted path; unlisted, the variable never reaches

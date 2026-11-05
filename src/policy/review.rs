@@ -344,6 +344,9 @@ pub enum MarkerKind {
     /// Runtime defaults seeded into the draft — argv-resolved read
     /// grants and commented-out `environment` candidates.
     RuntimeSeed,
+    /// A string argument with no `format` may be free-form — the draft
+    /// carries a commented-out `arguments { opaque }` candidate.
+    OpaqueCandidate,
     /// Marker text matched no known kind — hand-written or edited.
     Custom,
 }
@@ -367,6 +370,7 @@ impl MarkerKind {
         Self::NetworkOutbound,
         Self::Datagram,
         Self::RuntimeSeed,
+        Self::OpaqueCandidate,
     ];
 
     /// The kind's stable name — the `kind` member in `check`'s JSON
@@ -388,6 +392,7 @@ impl MarkerKind {
             Self::NetworkOutbound => "network-outbound",
             Self::Datagram => "datagram",
             Self::RuntimeSeed => "runtime-seed",
+            Self::OpaqueCandidate => "opaque-candidate",
             Self::Custom => "custom",
         }
     }
@@ -465,6 +470,12 @@ impl MarkerKind {
                 "the entry was seeded from launch-time facts — the resolved \
                  interpreter layout or a fixed per-runtime candidate list — \
                  and generation cannot prove this server needs it"
+            }
+            Self::OpaqueCandidate => {
+                "the tool's inputSchema declares a string argument with no \
+                 format — if the field never carries a path, host, or URL, \
+                 an `arguments { opaque }` declaration keeps its free-form \
+                 values out of the unrecognized-argument refusal"
             }
             Self::Custom => {
                 "a marker matching no known generator kind — a hand-written \
@@ -553,6 +564,13 @@ impl MarkerKind {
                  names the server reads — an enabled `allow` copies the \
                  parent's value into the restricted child environment \
                  (guide §4.3)"
+            }
+            Self::OpaqueCandidate => {
+                "verify the field never carries a path, host, or URL, then \
+                 uncomment the `arguments { opaque \"…\" }` line inside the \
+                 tool block — secret-path and resource-shaped values are \
+                 checked either way (policy-authoring, \"Declaring opaque \
+                 argument fields\")"
             }
             Self::Custom => {
                 "read the note and decide what it asks; delete the comment \
@@ -844,6 +862,7 @@ mod tests {
                 "network-outbound",
                 "datagram",
                 "runtime-seed",
+                "opaque-candidate",
                 "custom",
             ]
         );

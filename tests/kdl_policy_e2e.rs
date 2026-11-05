@@ -887,6 +887,271 @@ fn test_circular_include_detected_e2e() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// 5c. `arguments { opaque }` declarations (PR-04)
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_arguments_opaque_rejected_under_v1_e2e() {
+    let dir = make_test_dir("opaque_v1");
+    let policy = write_policy(
+        dir.path(),
+        "policy.kdl",
+        r#"
+            policy version=1
+            server "test" {
+                tool "fetch_url" {
+                    arguments {
+                        opaque "note"
+                    }
+                }
+            }
+        "#,
+    );
+    let err = mcp_writ::policy::kdl_loader::load_kdl_policy(&policy).unwrap_err();
+    assert!(
+        err.to_string().contains("requires 'policy version=2'"),
+        "v1 must reject 'arguments': {err}"
+    );
+}
+
+#[test]
+fn test_arguments_opaque_loads_under_v2_e2e() {
+    let dir = make_test_dir("opaque_v2");
+    let policy = write_policy(
+        dir.path(),
+        "policy.kdl",
+        r#"
+            policy version=2
+            server "test" {
+                tool "fetch_url" {
+                    arguments {
+                        opaque "note" "observations"
+                        opaque "/params/arguments/entities/name"
+                    }
+                }
+            }
+        "#,
+    );
+    let loaded = mcp_writ::policy::kdl_loader::load_kdl_policy(&policy).unwrap();
+    let tool = loaded
+        .tools
+        .iter()
+        .find(|t| t.name == "fetch_url")
+        .expect("tool declared");
+    let segments: Vec<&[String]> = tool.opaque_fields.iter().map(|f| f.segments()).collect();
+    assert_eq!(
+        segments,
+        vec![
+            &["note".to_string()][..],
+            &["observations".to_string()][..],
+            &["entities".to_string(), "name".to_string()][..],
+        ]
+    );
+}
+
+#[test]
+fn test_arguments_opaque_shape_errors_e2e() {
+    let dir = make_test_dir("opaque_shape");
+    for (body, needle) in [
+        // Unknown child inside `arguments`.
+        ("bogus \"x\"", "unexpected node 'bogus'"),
+        // An empty block declares nothing.
+        ("", "declares no 'opaque' fields"),
+        // `opaque` with no field names.
+        ("opaque", "requires a field-name argument"),
+        // Wildcard spellings.
+        ("opaque \"*\"", "wildcard"),
+        ("opaque \"/params/arguments/*/name\"", "wildcard"),
+        // Pointer not rooted at /params/arguments/.
+        ("opaque \"/params/inputResponses/x\"", "/params/arguments/"),
+        // Same member path under two spellings is a duplicate.
+        (
+            "opaque \"name\" \"/params/arguments/name\"",
+            "duplicate opaque field",
+        ),
+    ] {
+        let kdl = format!(
+            "policy version=2\nserver \"test\" {{\n    tool \"fetch_url\" {{\n        arguments {{\n            {body}\n        }}\n    }}\n}}\n"
+        );
+        let policy = write_policy(dir.path(), "policy.kdl", &kdl);
+        let err = mcp_writ::policy::kdl_loader::load_kdl_policy(&policy).unwrap_err();
+        assert!(
+            err.to_string().contains(needle),
+            "case {body:?}: expected {needle:?} in: {err}"
+        );
+    }
+    // Entries/properties on `arguments` itself.
+    let policy = write_policy(
+        dir.path(),
+        "policy.kdl",
+        r#"
+            policy version=2
+            server "test" {
+                tool "fetch_url" {
+                    arguments "x" {
+                        opaque "note"
+                    }
+                }
+            }
+        "#,
+    );
+    let err = mcp_writ::policy::kdl_loader::load_kdl_policy(&policy).unwrap_err();
+    assert!(
+        err.to_string().contains("takes no arguments or properties"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_arguments_opaque_unions_through_extends_e2e() {
+    let dir = make_test_dir("opaque_extends");
+    write_policy(
+        dir.path(),
+        "base.kdl",
+        r#"
+            policy version=2
+            server "test" {
+                tool "fetch_url" {
+                    arguments {
+                        opaque "name"
+                    }
+                }
+            }
+        "#,
+    );
+    let child = write_policy(
+        dir.path(),
+        "child.kdl",
+        r#"
+            extends "base.kdl"
+            policy version=2
+            server "test" {
+                tool "fetch_url" {
+                    arguments {
+                        opaque "observations"
+                    }
+                }
+            }
+        "#,
+    );
+    let loaded = mcp_writ::policy::kdl_loader::load_kdl_policy(&child).unwrap();
+    let tool = loaded
+        .tools
+        .iter()
+        .find(|t| t.name == "fetch_url")
+        .expect("tool declared");
+    let mut names: Vec<&[String]> = tool.opaque_fields.iter().map(|f| f.segments()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![&["name".to_string()][..], &["observations".to_string()][..]],
+        "extends must union opaque declarations"
+    );
+}
+
+#[test]
+fn test_arguments_opaque_unions_through_when_e2e() {
+    let dir = make_test_dir("opaque_when");
+    let policy = write_policy(
+        dir.path(),
+        "policy.kdl",
+        r#"
+            policy version=2
+            server "test" {
+                tool "fetch_url" {
+                    arguments {
+                        opaque "name"
+                    }
+                }
+            }
+            when environment="production" {
+                server "test" {
+                    tool "fetch_url" {
+                        arguments {
+                            opaque "observations"
+                        }
+                    }
+                }
+            }
+        "#,
+    );
+    // Non-matching `when` keeps the base set.
+    let loaded =
+        mcp_writ::policy::kdl_loader::load_kdl_policy_with_env(&policy, "staging").unwrap();
+    let tool = loaded
+        .tools
+        .iter()
+        .find(|t| t.name == "fetch_url")
+        .expect("tool declared");
+    assert_eq!(tool.opaque_fields.len(), 1);
+    // Matching `when` unions the extra declaration onto the base's.
+    let loaded =
+        mcp_writ::policy::kdl_loader::load_kdl_policy_with_env(&policy, "production").unwrap();
+    let tool = loaded
+        .tools
+        .iter()
+        .find(|t| t.name == "fetch_url")
+        .expect("tool declared");
+    let mut names: Vec<&[String]> = tool.opaque_fields.iter().map(|f| f.segments()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![&["name".to_string()][..], &["observations".to_string()][..]],
+        "matching `when` must union opaque declarations"
+    );
+}
+
+/// Wire-level: the declared field forwards free-form text under a
+/// restricted contract while an undeclared lookalike still refuses.
+#[tokio::test]
+async fn test_opaque_declared_field_forwards_free_text_e2e() {
+    let dir = make_test_dir("opaque_wire");
+    let policy = write_policy(
+        dir.path(),
+        "policy.kdl",
+        r#"
+            policy version=2
+            server "test" {
+                tool "fetch_url" {
+                    filesystem {
+                        allow none=#true
+                        require-path #false
+                    }
+                    arguments {
+                        opaque "note"
+                    }
+                }
+            }
+        "#,
+    );
+    let mut child = spawn_guard_with_policy(&policy, false);
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    // "Acme Corp." is selector-plausible under the restricted contract —
+    // the declaration is what lets it forward.
+    let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch_url","arguments":{"note":"Acme Corp."}}}"#;
+    let resp1 = send_and_recv(&mut stdin, &mut reader, req1).await;
+    assert!(
+        has_result(&resp1),
+        "declared opaque field must forward free text: {resp1}"
+    );
+
+    // The same value under an undeclared key still refuses.
+    let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fetch_url","arguments":{"mystery":"Acme Corp."}}}"#;
+    let resp2 = send_and_recv(&mut stdin, &mut reader, req2).await;
+    assert!(
+        !has_result(&resp2),
+        "undeclared plausible selector must still refuse: {resp2}"
+    );
+
+    drop(stdin);
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // 6. Dry-run mode compatibility
 // ═══════════════════════════════════════════════════════════════════
 

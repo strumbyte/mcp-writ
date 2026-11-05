@@ -1976,3 +1976,82 @@ fn test_secret_overlay_can_be_disabled() {
     let policy = parse_kdl_policy(kdl).unwrap();
     assert!(!policy.fs.secret_overlay);
 }
+
+// --- arguments { opaque } (PR-04) ---
+
+#[test]
+fn test_arguments_opaque_rejected_under_v1() {
+    let kdl = r#"
+        policy version=1
+        server "svc" {
+            tool "memory_add" {
+                arguments {
+                    opaque "name"
+                }
+            }
+        }
+    "#;
+    let err = parse_kdl_policy(kdl).unwrap_err();
+    assert!(
+        err.to_string().contains("requires 'policy version=2'"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_arguments_opaque_parses_under_v2() {
+    let kdl = r#"
+        policy version=2
+        server "svc" {
+            tool "memory_add" {
+                arguments {
+                    opaque "name" "observations"
+                    opaque "/params/arguments/entities/name"
+                }
+            }
+        }
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    let tool = &policy.tools[0];
+    let segments: Vec<&[String]> = tool.opaque_fields.iter().map(|f| f.segments()).collect();
+    assert_eq!(
+        segments,
+        vec![
+            &["name".to_string()][..],
+            &["observations".to_string()][..],
+            &["entities".to_string(), "name".to_string()][..],
+        ]
+    );
+}
+
+#[test]
+fn test_arguments_opaque_under_v3_accepted() {
+    let kdl = r#"
+        policy version=3
+        server "svc" {
+            tool "memory_add" {
+                arguments {
+                    opaque "name"
+                }
+            }
+        }
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    assert_eq!(policy.tools[0].opaque_fields.len(), 1);
+}
+
+#[test]
+fn test_arguments_opaque_non_string_entry_rejected() {
+    let kdl = r#"
+        policy version=2
+        server "svc" {
+            tool "memory_add" {
+                arguments {
+                    opaque 42
+                }
+            }
+        }
+    "#;
+    let err = parse_kdl_policy(kdl).unwrap_err();
+    assert!(err.to_string().contains("must be a string"), "got: {err}");
+}
