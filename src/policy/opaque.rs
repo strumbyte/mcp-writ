@@ -21,7 +21,9 @@
 //!     rooted at `/params/arguments/` so a pointer can only name
 //!     members below it; `~0`/`~1` decode inside segments. The `*`
 //!     wildcard is not accepted: an opaque declaration names concrete
-//!     fields, never whole shapes.
+//!     fields, never whole shapes. Empty member names are rejected —
+//!     a trailing `/` reads like "everything below" but would only
+//!     declare a member named `""`, silently narrowing the intent.
 //!
 //! A terminal path marks the declared member itself; arrays stay
 //! transparent (a declared `entities/name` covers every element's
@@ -98,13 +100,17 @@ impl OpaqueField {
                 "opaque field pointer exceeds {MAX_POINTER_SEGMENTS} segments"
             ));
         }
-        if segments.len() < 3
-            || segments[0] != "params"
-            || segments[1] != "arguments"
-            || segments[2].is_empty()
-        {
+        if segments.len() < 3 || segments[0] != "params" || segments[1] != "arguments" {
             return Err(format!(
                 "opaque field pointer \"{source}\" must start with \"/params/arguments/\" and name a member"
+            ));
+        }
+        // An empty member name is never the declaration the operator
+        // meant — a trailing `/` reads like "everything below" but
+        // would only cover a member named `""`.
+        if segments[2..].iter().any(|s| s.is_empty()) {
+            return Err(format!(
+                "opaque field pointer \"{source}\" contains an empty member name"
             ));
         }
         Ok(segments.split_off(2))
@@ -123,7 +129,10 @@ impl OpaqueField {
 /// segment.
 #[derive(Debug, Default)]
 pub struct OpaqueMatcher {
-    terminal: bool,
+    /// Index of the declaration that terminated here — `Some` marks the
+    /// member path reaching this node (and its whole subtree) as
+    /// free-form for this tool.
+    terminal: Option<u32>,
     children: HashMap<String, OpaqueMatcher>,
 }
 
@@ -135,12 +144,12 @@ impl OpaqueMatcher {
             return Option::None;
         }
         let mut root = Self::default();
-        for field in fields {
+        for (index, field) in fields.iter().enumerate() {
             let mut node = &mut root;
             for seg in &field.segments {
                 node = node.children.entry(seg.clone()).or_default();
             }
-            node.terminal = true;
+            node.terminal = Some(index as u32);
         }
         Some(root)
     }
@@ -151,9 +160,10 @@ impl OpaqueMatcher {
         self.children.get(member)
     }
 
-    /// Whether the member path reaching this node was itself declared —
-    /// every scalar under it is free-form for this tool.
-    pub fn terminal(&self) -> bool {
+    /// The index of the declaration that made the member path reaching
+    /// this node terminal — `Some` when the path was itself declared,
+    /// so every scalar under it is free-form for this tool.
+    pub fn declaration(&self) -> Option<u32> {
         self.terminal
     }
 }
@@ -188,6 +198,9 @@ mod tests {
             "entities/name",               // un-rooted pointer spelling
             "/params/arguments",           // no member below arguments
             "/params/arguments/",          // empty member name
+            "/params/arguments/a/",        // trailing slash — empty member
+            "/params/arguments//b",        // empty member mid-path
+            "/params/arguments/a//b",      // empty member mid-path
             "/params/inputResponses/text", // wrong scope
             "/result/content/text",        // wrong root
             "/params/arguments/*/name",    // wildcard segment
@@ -214,11 +227,11 @@ mod tests {
         let m = OpaqueMatcher::build(&fields).unwrap();
         // Top-level member prefix.
         let obs = m.child("observations").unwrap();
-        assert!(obs.terminal());
+        assert_eq!(obs.declaration(), Some(0));
         // Nested path: intermediate nodes are non-terminal prefixes.
         let ent = m.child("entities").unwrap();
-        assert!(!ent.terminal());
-        assert!(ent.child("name").unwrap().terminal());
+        assert_eq!(ent.declaration(), None);
+        assert_eq!(ent.child("name").unwrap().declaration(), Some(1));
         assert!(ent.child("type").is_none());
         // Undeclared members have no matcher node.
         assert!(m.child("content").is_none());

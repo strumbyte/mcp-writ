@@ -962,6 +962,11 @@ fn test_arguments_opaque_shape_errors_e2e() {
         // Wildcard spellings.
         ("opaque \"*\"", "wildcard"),
         ("opaque \"/params/arguments/*/name\"", "wildcard"),
+        // Trailing slash — an empty member name is a load error.
+        (
+            "opaque \"/params/arguments/entities/\"",
+            "empty member name",
+        ),
         // Pointer not rooted at /params/arguments/.
         ("opaque \"/params/inputResponses/x\"", "/params/arguments/"),
         // Same member path under two spellings is a duplicate.

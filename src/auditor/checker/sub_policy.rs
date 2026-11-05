@@ -103,9 +103,10 @@ fn secret_overlay_applies_to_url(url: &str) -> bool {
 
 /// The pieces of a `check_tool_sub_policy` pass the caller reports on:
 /// `sub_policy` is the "any sub-policy ran" bit; `opaque_fields` counts
-/// the argument leaves the tool's `arguments { opaque }` declarations
-/// exempted from the unrecognized-argument refusal — the audit detail
-/// that shows the declaration actually carried a value.
+/// the tool's `arguments { opaque }` declared fields that exempted at
+/// least one argument leaf from the unrecognized-argument refusal —
+/// the audit detail that shows the declaration actually carried a
+/// value.
 pub(super) struct SubPolicyOutcome {
     pub(super) sub_policy: bool,
     pub(super) opaque_fields: usize,
@@ -457,7 +458,7 @@ pub(super) fn check_tool_sub_policy(
 
     Ok(SubPolicyOutcome {
         sub_policy: has_sub,
-        opaque_fields: extracted.opaque_fields,
+        opaque_fields: extracted.opaque_fields(),
     })
 }
 

@@ -316,8 +316,8 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
     // Step 6: Tool-specific sub-policy checks (fs, network)
     let outcome = sub_policy::check_tool_sub_policy(&json, tool, policy)?;
     if outcome.opaque_fields > 0 {
-        // How many argument values the tool's `arguments { opaque }`
-        // declarations carried past the unrecognized-argument refusal —
+        // How many of the tool's `arguments { opaque }` declared fields
+        // carried a value past the unrecognized-argument refusal —
         // a `0` stays silent so ordinary calls see no new detail.
         audit_notes.push(format!("opaque_fields={}", outcome.opaque_fields));
     }

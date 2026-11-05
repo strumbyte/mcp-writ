@@ -58,9 +58,11 @@ fn test_opaque_free_form_values_pass_with_declaration() {
     );
     let result = check_request(&tools_call(1, "memory_add", &args), &policy).unwrap();
     assert_eq!(result.sub_policy, Some("tool:memory_add".to_string()));
-    // The declaration count lands in the audit details.
+    // The count lands in the audit details — declared fields exercised,
+    // not leaves exempted: `name` plus `observations` (two elements) is
+    // two fields.
     assert!(
-        result.audit_notes.iter().any(|n| n == "opaque_fields=3"),
+        result.audit_notes.iter().any(|n| n == "opaque_fields=2"),
         "got: {:?}",
         result.audit_notes
     );

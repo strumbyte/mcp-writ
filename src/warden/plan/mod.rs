@@ -390,7 +390,11 @@ pub(super) fn base_limitations(policy: &Policy) -> Vec<String> {
          never as an access grant."
             .to_string(),
     ];
-    if policy.tools.iter().any(|t| !t.opaque_fields.is_empty()) {
+    if policy
+        .tools
+        .iter()
+        .any(|t| t.allowed && !t.opaque_fields.is_empty())
+    {
         // The declared fields forward even strings that *look*
         // selector-plausible — the operator must see that the
         // unrecognized-argument refusal is waived for exactly those

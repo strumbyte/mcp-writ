@@ -60,13 +60,14 @@ pub(super) struct ExtractedTargets<S = Rc<str>> {
     /// select, so restricted callers refuse them rather than forward
     /// an unchecked target.
     pub(super) unclassified: Vec<S>,
-    /// Count of scalar leaves the tool's `arguments { opaque }`
-    /// declarations exempted from the `unclassified` bucket — the
-    /// values that *would* have landed there had the field not been
-    /// declared. Resource-shaped and secret-path values still classify
-    /// normally, so a declared field that carried one contributes a
-    /// `paths`/`urls`/`hosts` entry, not this count.
-    pub(super) opaque_fields: usize,
+    /// Bitmask of the tool's `arguments { opaque }` declarations that
+    /// exempted at least one scalar leaf from the `unclassified`
+    /// bucket — bit *i* is the *i*-th declared field, so the count is
+    /// fields exercised, not leaves exempted. Resource-shaped and
+    /// secret-path values still classify normally, so a declared field
+    /// that carried one contributes a `paths`/`urls`/`hosts` entry and
+    /// no bit here.
+    pub(super) opaque_mask: u64,
     /// The leaf/target budget was exceeded — the collected vectors are a
     /// strict prefix of the real targets. Restricted callers must treat
     /// this as unknowable (fail closed); discovery-side callers narrow.
@@ -129,7 +130,7 @@ impl<S: TargetString> ExtractedTargets<S> {
             hosts: Vec::new(),
             noncanonical: Vec::new(),
             unclassified: Vec::new(),
-            opaque_fields: 0,
+            opaque_mask: 0,
             truncated: false,
             #[cfg(test)]
             leaves: 0,
@@ -169,6 +170,22 @@ impl<S: TargetString> ExtractedTargets<S> {
             TargetSlot::Host => self.hosts.push(stored),
             TargetSlot::Unclassified => self.unclassified.push(stored),
         }
+    }
+
+    /// Record that a scalar leaf stayed opaque under a declared field —
+    /// bit `decl` marks the declaration that carried it. `decl` is
+    /// bounded by `MAX_OPAQUE_FIELDS` on the load path; an unvalidated
+    /// programmatically built policy could index past the mask, so a
+    /// field beyond bit 63 is dropped rather than panicking.
+    fn push_opaque(&mut self, decl: u32) {
+        self.opaque_mask |= 1u64.checked_shl(decl).unwrap_or(0);
+    }
+
+    /// Count of the declared `arguments { opaque }` fields that carried
+    /// at least one exempted value — the `opaque_fields=N` audit
+    /// detail's N.
+    pub(super) fn opaque_fields(&self) -> usize {
+        self.opaque_mask.count_ones() as usize
     }
 
     /// Record a raw/normalized divergence — only the first matters; the
@@ -501,9 +518,10 @@ struct ScalarLeaf<'a> {
     attrs: KeyAttrs,
     raw: Cow<'a, str>,
     norm: LeafNorm<'a>,
-    /// The tool's `arguments { opaque }` declaration covered this leaf —
-    /// the `unclassified` fallback does not apply to it.
-    opaque: bool,
+    /// Index of the tool's `arguments { opaque }` declaration covering
+    /// this leaf — `Some` exempts it from the `unclassified` fallback
+    /// and names which declaration did so.
+    opaque: Option<u32>,
 }
 
 enum LeafNorm<'a> {
@@ -518,7 +536,7 @@ enum LeafNorm<'a> {
 }
 
 impl ScalarLeaf<'_> {
-    fn of<'a>(attrs: &KeyAttrs, raw: Cow<'a, str>, opaque: bool) -> ScalarLeaf<'a> {
+    fn of<'a>(attrs: &KeyAttrs, raw: Cow<'a, str>, opaque: Option<u32>) -> ScalarLeaf<'a> {
         if is_plain_ascii_token(&raw) {
             return ScalarLeaf {
                 attrs: *attrs,
@@ -624,7 +642,7 @@ pub(super) fn walk_combined_classified<'a, S: TargetString>(
     let mut out = ExtractedTargets::new();
     let mut leaves = Vec::new();
     let mut walk = LeafWalk::default();
-    let mut sink = |attrs: &KeyAttrs, s: Cow<'a, str>, leaf_opaque: bool| -> bool {
+    let mut sink = |attrs: &KeyAttrs, s: Cow<'a, str>, leaf_opaque: Option<u32>| -> bool {
         // The fused walk stopped once the classify's own budget tripped
         // — stop emitting (and stop collecting) the same way.
         if out.truncated {
@@ -667,7 +685,7 @@ pub(super) fn walk_combined_classified<'a, S: TargetString>(
 /// `opaque` is the tool's `arguments { opaque }` matcher cursor,
 /// descending member by member alongside `val`: a member name consumes
 /// one declared segment, arrays stay transparent, and a scalar emits
-/// `leaf_opaque = true` when its position reached a declared
+/// `leaf_opaque = Some(index)` when its position reached a declared
 /// (terminal) field. `None` disables the tracking entirely — the walk
 /// then costs exactly what it did before the feature existed.
 fn walk_json_scalars<'a>(
@@ -676,7 +694,7 @@ fn walk_json_scalars<'a>(
     opaque: Option<&OpaqueMatcher>,
     depth: u32,
     walk: &mut LeafWalk,
-    sink: &mut impl FnMut(&KeyAttrs, Cow<'a, str>, bool) -> bool,
+    sink: &mut impl FnMut(&KeyAttrs, Cow<'a, str>, Option<u32>) -> bool,
 ) {
     if depth > MAX_JSON_NESTING || walk.truncated || walk.done {
         return;
@@ -703,7 +721,7 @@ fn walk_json_scalars<'a>(
                     // marks its whole subtree: once reached, the cursor
                     // stays instead of consuming further segments.
                     let member_opaque = match opaque {
-                        Some(c) if c.terminal() => Some(c),
+                        Some(c) if c.declaration().is_some() => Some(c),
                         Some(c) => c.child(member_name.as_ref()),
                         None => None,
                     };
@@ -731,7 +749,7 @@ fn walk_json_scalars<'a>(
                 return;
             }
             if let Ok(s) = val.to_unquoted_string_str()
-                && !sink(key_attrs, s, opaque.is_some_and(|c| c.terminal()))
+                && !sink(key_attrs, s, opaque.and_then(|c| c.declaration()))
             {
                 walk.done = true;
             }
@@ -799,13 +817,13 @@ impl KeyAttrs {
 /// (`collect_argument_targets`, `extract_fs_targets`, host/URL
 /// presence). Multi-consumer checks replay collected leaves through
 /// [`classify_leaf`] instead; both reach the same predicate bodies.
-/// `opaque` marks a leaf under a declared `arguments { opaque }` field
-/// — only the `unclassified` fallback waives; every target-shaped or
-/// secret-path classification still applies.
+/// `opaque` carries the index of the `arguments { opaque }` declaration
+/// covering this leaf — only the `unclassified` fallback waives; every
+/// target-shaped or secret-path classification still applies.
 fn classify_target_string<S: TargetString>(
     key_attrs: &KeyAttrs,
     value: &str,
-    opaque: bool,
+    opaque: Option<u32>,
     out: &mut ExtractedTargets<S>,
 ) {
     // A plain ASCII token carries no encoding the normalizer could
@@ -860,7 +878,7 @@ fn is_plain_ascii_token(value: &str) -> bool {
 fn classify_plain_token<S: TargetString>(
     key_attrs: &KeyAttrs,
     value: &str,
-    opaque: bool,
+    opaque: Option<u32>,
     out: &mut ExtractedTargets<S>,
 ) {
     if key_attrs.is_path_value(value) {
@@ -893,8 +911,8 @@ fn classify_plain_token<S: TargetString>(
     if key_attrs.payload {
         return;
     }
-    if opaque {
-        out.opaque_fields += 1;
+    if let Some(decl) = opaque {
+        out.push_opaque(decl);
         return;
     }
     out.push(TargetSlot::Unclassified, value);
@@ -909,7 +927,7 @@ fn classify_normalized_value<S: TargetString>(
     key_attrs: &KeyAttrs,
     value: &str,
     normalized: &str,
-    opaque: bool,
+    opaque: Option<u32>,
     out: &mut ExtractedTargets<S>,
 ) {
     if crate::pathutil::starts_with_file_scheme(normalized)
@@ -992,8 +1010,8 @@ fn classify_normalized_value<S: TargetString>(
     // the declaration is what proves the value is not a selector, so it
     // stays out of the unclassified bucket. Every earlier branch still
     // ran: a resource-shaped or secret-path value classified above.
-    if opaque {
-        out.opaque_fields += 1;
+    if let Some(decl) = opaque {
+        out.push_opaque(decl);
         return;
     }
     // A string under no recognized vocabulary cannot be proven a

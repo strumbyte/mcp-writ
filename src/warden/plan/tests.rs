@@ -76,6 +76,31 @@ fn tools_table_keeps_read_write_and_denied_tools() {
 }
 
 #[test]
+fn opaque_limitation_counts_allowed_tools_only() {
+    let field = || crate::policy::opaque::OpaqueField::parse("note").unwrap();
+    let mut policy = policy_with_tools();
+    // A denied tool's declaration never forwards anything — it alone
+    // must not raise the carve-out limitation.
+    let mut denied = ToolPolicy::named("denied_memo", false);
+    denied.opaque_fields = vec![field()];
+    policy.tools.push(denied);
+    assert!(
+        !base_limitations(&policy)
+            .iter()
+            .any(|l| l.contains("opaque")),
+        "a denied tool's declarations must not trigger the limitation"
+    );
+    // An allowed tool's declaration does.
+    policy.tools[0].opaque_fields = vec![field()];
+    assert!(
+        base_limitations(&policy)
+            .iter()
+            .any(|l| l.contains("opaque")),
+        "an allowed tool's declaration must trigger the limitation"
+    );
+}
+
+#[test]
 fn shared_controls_distinguish_optional_features() {
     let policy = policy_with_tools();
     let opts = SpawnOptions {
