@@ -251,6 +251,12 @@ pub(crate) fn argument_classification_corpus() -> Vec<String> {
         "::1",
         "1.2.3.4",
         "hostname",
+        // Non-dotted IPv4 spellings (`inet_aton` accepts them, Rust's
+        // `IpAddr` does not) — plain tokens that still route through
+        // the key vocabulary's host-vs-URL call, not the value-shape
+        // host/socket test.
+        "2130706433",
+        "0x7f000001",
         // Payload-ish.
         "read ./report.txt",
         "hello world",

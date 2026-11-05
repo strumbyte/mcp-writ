@@ -10,12 +10,12 @@ fn test_target_dedup_is_per_slot() {
     let json = nojson::RawJson::parse(line).unwrap();
     let out = super::super::targets::collect_argument_targets(&json);
     assert!(
-        out.urls.iter().any(|u| u == "http://10.0.0.2/"),
+        out.urls.iter().any(|u| u.as_ref() == "http://10.0.0.2/"),
         "the path-key occurrence stays a URL target: {out:?}",
         out = out.urls
     );
     assert!(
-        out.hosts.iter().any(|h| h == "http://10.0.0.2/"),
+        out.hosts.iter().any(|h| h.as_ref() == "http://10.0.0.2/"),
         "the host-key occurrence must still reach host checks: {:?}",
         out.hosts
     );
@@ -29,8 +29,17 @@ fn test_target_dedup_keeps_unclassified_copy() {
     let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"path":"not-a-selector","frobnicate":"not-a-selector"}}}"#;
     let json = nojson::RawJson::parse(line).unwrap();
     let out = super::super::targets::collect_argument_targets(&json);
-    assert_eq!(out.paths, vec!["not-a-selector".to_string()]);
-    assert_eq!(out.unclassified, vec!["not-a-selector".to_string()]);
+    assert_eq!(
+        out.paths.iter().map(|s| s.as_ref()).collect::<Vec<_>>(),
+        vec!["not-a-selector"]
+    );
+    assert_eq!(
+        out.unclassified
+            .iter()
+            .map(|s| s.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["not-a-selector"]
+    );
 }
 
 #[test]
@@ -40,7 +49,46 @@ fn test_target_dedup_same_slot_still_collapses() {
     let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"host":["10.0.0.2:443","10.0.0.2:443"],"extra":{"host":"10.0.0.2:443"}}}}"#;
     let json = nojson::RawJson::parse(line).unwrap();
     let out = super::super::targets::collect_argument_targets(&json);
-    assert_eq!(out.hosts, vec!["10.0.0.2:443".to_string()]);
+    assert_eq!(
+        out.hosts.iter().map(|s| s.as_ref()).collect::<Vec<_>>(),
+        vec!["10.0.0.2:443"]
+    );
+}
+
+#[test]
+fn test_public_extraction_api_keeps_string_vecs() {
+    // API compatibility: the public extractors return `Vec<String>` —
+    // owned, `Send`/`Sync`. The `Rc`-shared dedup storage and the
+    // `_rc` deputy variant are crate-internal; these bindings pin the
+    // signatures so a future refactor cannot leak `Rc` into the public
+    // API without failing to compile.
+    let fs: fn(&str) -> Vec<String> = super::super::targets::extract_fs_targets;
+    let dep: fn(&str, &[crate::policy::deputy::DeputyRule]) -> Result<Vec<String>, String> =
+        super::super::targets::extract_deputy_use_targets;
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    assert_send_sync(&fs(r#"{"params":{"arguments":{"path":"/tmp/a"}}}"#));
+    assert_send_sync(&dep(r#"{"params":{}}"#, &[]));
+}
+
+#[test]
+fn test_combined_collection_stops_at_target_cap() {
+    // Lazy collection: the first combined classify collects only the
+    // leaves it actually reached — the target-budget abort happens
+    // before the tail scalar is normalized or retained. The earlier
+    // eager implementation stored up to 4096 leaves and normalized the
+    // whole tail before the verdict; `collected_len` would have been
+    // 514+ there. A rejection-reason-only check cannot catch that
+    // regression — both shapes deny the frame.
+    let paths = (0..513)
+        .map(|i| format!("\"/p{i}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let tail = "Ａ".repeat(300_000); // fullwidth — NFKC-expensive
+    let line = format!(r#"{{"params":{{"arguments":{{"paths":[{paths}],"tail":"{tail}"}}}}}}"#);
+    let json = nojson::RawJson::parse(&line).unwrap();
+    let (targets, leaves) = super::super::targets::walk_combined_classified::<String>(&json);
+    assert!(targets.truncated);
+    assert_eq!(leaves.collected_len(), 513);
 }
 
 // ── PR-03 differential: current vs frozen HEAD classification ─────
@@ -91,6 +139,7 @@ const DIFF_KEYS: &[&str] = &[
     "source",
     "output",
     "dir",
+    "dest",
     "target",
     "repo_path",
     "outputPath",

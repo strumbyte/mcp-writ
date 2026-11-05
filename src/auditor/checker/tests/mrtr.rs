@@ -172,6 +172,158 @@ fn test_extract_deputy_use_targets_pointer_shape_and_truncate() {
 }
 
 #[test]
+fn test_extract_deputy_use_targets_repeated_fs_targets_rule() {
+    use crate::policy::deputy::{DeputyRule, KnownShape};
+
+    // A repeated `shape "fs_targets"` contributes its path set per rule
+    // occurrence — the shared scalar leaves are not a dedup gate on
+    // the collected target list; each rule classifies fresh.
+    let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt"}}}"#;
+    let rules = [
+        DeputyRule::Shape(KnownShape::FsTargets),
+        DeputyRule::Shape(KnownShape::FsTargets),
+    ];
+    let out = extract_deputy_use_targets(line, &rules).unwrap();
+    assert_eq!(
+        out,
+        vec![
+            "/workspace/a.txt".to_string(),
+            "/workspace/a.txt".to_string()
+        ]
+    );
+}
+
+#[test]
+fn test_deputy_leaf_budget_counts_non_string_scalars() {
+    use crate::policy::deputy::{DeputyRule, KnownShape};
+
+    // Every scalar — not just the classified strings — consumes the
+    // shared leaf budget: 4096 numbers under `arguments` leave no
+    // budget for `inputResponses`, so a path there is unknowable and
+    // the use-side call fails closed. The fused walk agrees: no
+    // filesystem target ever reached extraction.
+    let nums = (0..4096)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let line = format!(
+        r#"{{"params":{{"arguments":{{"n":[{nums}]}},"inputResponses":{{"p":"/tmp/a"}}}}}}"#
+    );
+    let err =
+        extract_deputy_use_targets(&line, &[DeputyRule::Shape(KnownShape::FsTargets)]).unwrap_err();
+    assert!(err.contains("work budget"), "got: {err}");
+    assert_eq!(extract_fs_targets(&line), Vec::<String>::new());
+}
+
+#[test]
+fn test_deputy_leaf_budget_counts_repeated_ir_scalars() {
+    use crate::policy::deputy::{DeputyRule, KnownShape};
+
+    // The budget counts visited scalars, not retained targets: 4097
+    // identical strings under `inputResponses` overflow the combined
+    // budget even though dedup would collapse them to one.
+    let paths = std::iter::repeat_n("\"/tmp/a\"", 4097)
+        .collect::<Vec<_>>()
+        .join(",");
+    let line = format!(r#"{{"params":{{"arguments":{{}},"inputResponses":{{"p":[{paths}]}}}}}}"#);
+    let err =
+        extract_deputy_use_targets(&line, &[DeputyRule::Shape(KnownShape::FsTargets)]).unwrap_err();
+    assert!(err.contains("work budget"), "got: {err}");
+}
+
+#[test]
+fn test_deputy_input_responses_own_budget() {
+    use crate::policy::deputy::{DeputyRule, ExtractPointer};
+
+    // The standalone retry-channel walk keeps its own budget under a
+    // pointer-only contract — repeated strings still count as scalars.
+    let paths = std::iter::repeat_n("\"/tmp/a\"", 4097)
+        .collect::<Vec<_>>()
+        .join(",");
+    let line = format!(
+        r#"{{"params":{{"arguments":{{"path":"/tmp/a"}},"inputResponses":{{"p":[{paths}]}}}}}}"#
+    );
+    let p = ExtractPointer::parse("/params/arguments/path", "params").unwrap();
+    let err = extract_deputy_use_targets(&line, &[DeputyRule::Pointer(p)]).unwrap_err();
+    assert!(err.contains("work budget"), "got: {err}");
+}
+
+#[test]
+fn test_deputy_combined_budget_boundary_counts_scalars() {
+    use crate::policy::deputy::{DeputyRule, KnownShape};
+
+    // The shared budget boundary falls on a scalar count, not a
+    // retained-string count: 4090 scalars under `arguments` (1 string
+    // + 4089 numbers) leave 6 for `inputResponses` — the 7th scalar
+    // trips the cap mid-channel and the call fails closed.
+    let nums = (0..4089)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let over = format!(
+        r#"{{"params":{{"arguments":{{"path":"/tmp/one","n":[{nums}]}},"inputResponses":{{"mix":[0,1,2,3,4,"/tmp/ir0","/tmp/ir1"]}}}}}}"#
+    );
+    let err =
+        extract_deputy_use_targets(&over, &[DeputyRule::Shape(KnownShape::FsTargets)]).unwrap_err();
+    assert!(err.contains("work budget"), "got: {err}");
+    // The fused walk agrees on the classified prefix: the strings
+    // reached before the cap were classified, the rest were not.
+    assert_eq!(
+        extract_fs_targets(&over),
+        vec!["/tmp/one".to_string(), "/tmp/ir0".to_string()]
+    );
+
+    // Exactly at the bound is fine — one scalar fewer clears it.
+    let at = format!(
+        r#"{{"params":{{"arguments":{{"path":"/tmp/one","n":[{nums}]}},"inputResponses":{{"mix":[0,1,2,3,4,"/tmp/ir0"]}}}}}}"#
+    );
+    let out = extract_deputy_use_targets(&at, &[DeputyRule::Shape(KnownShape::FsTargets)]).unwrap();
+    assert_eq!(out, vec!["/tmp/one".to_string(), "/tmp/ir0".to_string()]);
+}
+
+#[test]
+fn test_deputy_fs_targets_matches_fused_walk() {
+    use crate::policy::deputy::{DeputyRule, KnownShape};
+
+    // The deputy `fs_targets` shape extracts the same path list as the
+    // fused classified walk — the shared leaf collection is the
+    // memoized prefix of that same traversal, not a second opinion.
+    for line in [
+        r#"{"params":{"arguments":{"path":"/workspace/a.txt","n":[1,2,"/p",3],"note":"hi"}}}"#,
+        r#"{"params":{"arguments":{"path":"/workspace/a.txt"},"inputResponses":{"e":{"f":"/workspace/r.txt","n":42}}}}"#,
+    ] {
+        let got = extract_deputy_use_targets(line, &[DeputyRule::Shape(KnownShape::FsTargets)]);
+        assert_eq!(
+            got.as_deref().ok(),
+            Some(extract_fs_targets(line).as_slice()),
+            "line: {line}"
+        );
+    }
+}
+
+#[test]
+fn test_deputy_target_cap_stops_before_tail() {
+    use crate::policy::deputy::{DeputyRule, KnownShape};
+
+    // The target budget denies before the trailing scalar is
+    // classified — a huge tail must not change the verdict or the
+    // failure reason.
+    let paths = (0..513)
+        .map(|i| format!("\"/p{i}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let tail = "a".repeat(300_000);
+    for line in [
+        format!(r#"{{"params":{{"arguments":{{"paths":[{paths}]}}}}}}"#),
+        format!(r#"{{"params":{{"arguments":{{"paths":[{paths}],"tail":"{tail}"}}}}}}"#),
+    ] {
+        let err = extract_deputy_use_targets(&line, &[DeputyRule::Shape(KnownShape::FsTargets)])
+            .unwrap_err();
+        assert!(err.contains("work budget"), "got: {err}");
+    }
+}
+
+#[test]
 fn test_extract_deputy_use_targets_covers_input_responses() {
     use crate::policy::deputy::{DeputyRule, ExtractPointer};
 

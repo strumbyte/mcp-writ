@@ -1066,7 +1066,7 @@ pub(super) fn apply_confused_deputy_c2s(
             Ok(())
         }
         crate::policy::deputy::DeputyBinding::Use(rules) => {
-            let paths = checker::extract_deputy_use_targets(line, rules).map_err(|reason| {
+            let paths = checker::extract_deputy_use_targets_rc(line, rules).map_err(|reason| {
                 checker::PolicyViolation {
                     tool_name: tool_name.to_string(),
                     reason: format!("confused deputy: {reason}"),

@@ -483,13 +483,17 @@ pub fn ensure_base_pulled() -> Option<()> {
 /// `require_lifetime_boundary` then has no route and the runner refuses
 /// every launch, which is the substrate's recorded answer rather than
 /// something the runner legs can assert on. Measured directly on the
-/// base image, mirroring the two mechanisms `linux_spawn` offers the
-/// flag: a writable cgroup subtree, or `unshare(CLONE_NEWPID)`. The
-/// check never consults the runner's own verdict, so a product-side
-/// regression still fails the legs on a substrate that can arm the
-/// boundary. Fail-closed under `MCP_WRIT_REQUIRE_WSLC_TESTS=1` like
-/// every `skip_wslc_test` gate — a gated run on a host that cannot arm
-/// the boundary still records the failure, with this reason.
+/// base image, mirroring the two mechanisms the warden offers the
+/// flag: a writable cgroup subtree, or the namespaced route's
+/// `unshare(CLONE_NEWUSER|CLONE_NEWNET|CLONE_NEWNS|CLONE_NEWPID)`
+/// (`namespaced::init` — the user namespace is what grants the
+/// capabilities the PID-namespace arm needs, so a bare
+/// `unshare(CLONE_NEWPID)` under-measures the route). The check never
+/// consults the runner's own verdict, so a product-side regression
+/// still fails the legs on a substrate that can arm the boundary.
+/// Fail-closed under `MCP_WRIT_REQUIRE_WSLC_TESTS=1` like every
+/// `skip_wslc_test` gate — a gated run on a host that cannot arm the
+/// boundary still records the failure, with this reason.
 pub fn substrate_boundary_gap() -> Option<String> {
     static GAP: OnceLock<Option<String>> = OnceLock::new();
     GAP.get_or_init(|| {
@@ -498,10 +502,20 @@ pub fn substrate_boundary_gap() -> Option<String> {
         // ran to completion *without* an OK proves both routes closed.
         // A wedged spawn, a launch failure, or a timeout leaves no
         // marker: that is a broken probe — a test failure, not a skip.
+        // The namespace route is probed through the same combined
+        // unshare the runner performs (CLI flags mirror the CLONE
+        // mask); a missing `unshare` tool means the route was never
+        // measured — inconclusive, not a gap. No `--map-root-user`:
+        // the id-map is a separate `uid_gid_map` stage written from
+        // the init parent, and self-map is the path that is EPERM on
+        // WSL2 — probing it here would measure the wrong mechanism.
         let probe = "mkdir /sys/fs/cgroup/.wslc-boundary-probe 2>/dev/null \
                      && rmdir /sys/fs/cgroup/.wslc-boundary-probe 2>/dev/null \
                      && echo BOUNDARY_OK; \
-                     unshare --pid --fork true 2>/dev/null && echo BOUNDARY_OK; \
+                     command -v unshare >/dev/null 2>&1 \
+                     || echo UNSHARE_TOOL_MISSING; \
+                     unshare --user --net --mount --pid --fork true \
+                     2>/dev/null && echo BOUNDARY_OK; \
                      echo BOUNDARY_PROBE_DONE";
         let out = run_command(
             wslc_cmd(),
@@ -516,15 +530,20 @@ pub fn substrate_boundary_gap() -> Option<String> {
             out.status.code()
         );
         if stdout.contains("BOUNDARY_OK") {
-            None
-        } else {
-            Some(
-                "wslc mounts the container cgroupfs read-only with no delegated \
-                 subtree and grants no PID-namespace route — \
-                 require_lifetime_boundary cannot arm on this substrate"
-                    .into(),
-            )
+            return None;
         }
+        assert!(
+            !stdout.contains("UNSHARE_TOOL_MISSING"),
+            "boundary probe could not measure the PID-namespace route — \
+             the base image ships no `unshare` tool, so 'no route armed' \
+             is unproven rather than measured: {stdout}"
+        );
+        Some(
+            "wslc mounts the container cgroupfs read-only with no delegated \
+             subtree and grants no user/PID-namespace route — \
+             require_lifetime_boundary cannot arm on this substrate"
+                .into(),
+        )
     })
     .clone()
 }

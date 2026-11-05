@@ -381,8 +381,15 @@ pub fn resolve_policy_pattern(pattern: &str) -> Result<String, String> {
 /// at the authorization boundary.
 pub fn path_matches_lexical(path: &str, pattern: &str) -> bool {
     let normalized = lexical_normalize_str(path);
+    path_matches_lexical_normalized(&normalized, pattern)
+}
+
+/// [`path_matches_lexical`] for a caller holding the
+/// [`lexical_normalize_str`] output already — the normalized form is
+/// reused across every pattern instead of rebuilt per call.
+pub(crate) fn path_matches_lexical_normalized(normalized: &str, pattern: &str) -> bool {
     let match_pattern = normalize_pattern(pattern);
-    segment_prefix_match(&normalized, &match_pattern)
+    segment_prefix_match(normalized, &match_pattern)
 }
 
 fn normalize_pattern(pattern: &str) -> String {
@@ -567,6 +574,23 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 /// Decode one layer of `%XX`. Malformed sequences are left unchanged.
+///
+/// [`percent_decode_once`] that borrows the input when nothing decoded
+/// — no `%` at all, or only malformed sequences that decode to the same
+/// bytes.
+fn percent_decode_once_cow(input: &str) -> Cow<'_, str> {
+    if !input.contains('%') {
+        return Cow::Borrowed(input);
+    }
+    let decoded = percent_decode_once(input);
+    if decoded == input {
+        Cow::Borrowed(input)
+    } else {
+        Cow::Owned(decoded)
+    }
+}
+
+/// Decode one layer of `%XX`. Malformed sequences are left unchanged.
 pub fn percent_decode_once(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -628,6 +652,17 @@ pub fn strip_scheme_splitting_controls(input: &str) -> String {
         .collect()
 }
 
+/// [`strip_scheme_splitting_controls`] through a [`Cow`]: a string with
+/// no stripping controls is passed through unallocated — borrowed
+/// stays borrowed, owned keeps its buffer.
+fn strip_scheme_splitting_controls_keep(input: Cow<'_, str>) -> Cow<'_, str> {
+    if input.chars().any(is_scheme_splitting_control) {
+        Cow::Owned(strip_scheme_splitting_controls(&input))
+    } else {
+        input
+    }
+}
+
 /// Compact a URI for `file:` sniffing: drop splitting controls, Unicode
 /// whitespace (`char::is_whitespace`: space, NBSP, EN/EM/THIN/HAIR, …), and
 /// format noise so `file` + NBSP/space + `://` still becomes a filesystem path.
@@ -669,15 +704,17 @@ fn uri_scheme_slot(sniff: &str) -> Option<&str> {
 /// clean ASCII scheme is fail-closed for secret-overlay (confusables,
 /// variation selectors, Braille blank, Hangul filler, …). Not a denylist.
 pub fn uri_scheme_slot_is_dirty(raw: &str) -> bool {
-    let decoded = match percent_decode_bounded(raw) {
-        Ok(d) => nfkc(&d).into_owned(),
+    let decoded: Cow<'_, str> = match percent_decode_bounded_cow(raw) {
+        // ASCII: NFKC is the identity — keep the decoded buffer.
+        Ok(d) if d.is_ascii() => d,
+        Ok(d) => Cow::Owned(nfkc(&d).into_owned()),
         Err(_) => return true,
     };
     let compacted = compact_uri_for_scheme_sniff(&decoded);
     let sniff = if compacted.contains("://") {
         compacted.as_str()
     } else if decoded.contains("://") {
-        decoded.as_str()
+        decoded.as_ref()
     } else {
         return false;
     };
@@ -687,6 +724,18 @@ pub fn uri_scheme_slot_is_dirty(raw: &str) -> bool {
     }
 }
 
+/// [`decode_then_strip_c0`] through a [`Cow`]: a round that changes
+/// nothing returns the input borrowed — NUL check and control strip
+/// still run exactly as the owned variant.
+fn decode_then_strip_c0_cow(input: &str) -> Result<Cow<'_, str>, String> {
+    let decoded = percent_decode_once_cow(input);
+    if decoded.contains('\0') {
+        return Err("empty or NUL-containing path".to_string());
+    }
+    Ok(strip_scheme_splitting_controls_keep(decoded))
+}
+
+#[cfg(test)]
 fn decode_then_strip_c0(input: &str) -> Result<String, String> {
     let decoded = percent_decode_once(input);
     if decoded.contains('\0') {
@@ -702,6 +751,13 @@ fn decode_then_strip_c0(input: &str) -> Result<String, String> {
 /// [`PERCENT_DECODE_MAX_ROUNDS`]. NUL or a still-changing input after the cap
 /// is an error. Auditor argument normalization only.
 pub fn percent_decode_bounded(input: &str) -> Result<String, String> {
+    percent_decode_bounded_cow(input).map(Cow::into_owned)
+}
+
+/// [`percent_decode_bounded`] through a [`Cow`]: an input that reaches
+/// the fixed point unchanged stays borrowed — the owned copy is only
+/// built by a round that actually rewrites the string.
+pub(crate) fn percent_decode_bounded_cow(input: &str) -> Result<Cow<'_, str>, String> {
     if input.contains('\0') {
         return Err("empty or NUL-containing path".to_string());
     }
@@ -712,17 +768,20 @@ pub fn percent_decode_bounded(input: &str) -> Result<String, String> {
         .bytes()
         .all(|b| (0x20..=0x7E).contains(&b) && b != b'%')
     {
-        return Ok(input.to_string());
+        return Ok(Cow::Borrowed(input));
     }
-    let mut current = strip_scheme_splitting_controls(input);
+    let mut current: Cow<'_, str> = strip_scheme_splitting_controls_keep(Cow::Borrowed(input));
     for _ in 0..PERCENT_DECODE_MAX_ROUNDS {
-        let next = decode_then_strip_c0(&current)?;
+        // `next` borrows `current` only while the round was the
+        // identity — a changed output arrives owned, so the borrow
+        // ends before `current` is replaced.
+        let next = decode_then_strip_c0_cow(&current)?;
         if next == current {
             return Ok(current);
         }
-        current = next;
+        current = Cow::Owned(next.into_owned());
     }
-    let next = decode_then_strip_c0(&current)?;
+    let next = decode_then_strip_c0_cow(&current)?;
     if next != current {
         return Err("percent-encoding did not stabilize within decode cap".to_string());
     }
@@ -888,12 +947,14 @@ pub(crate) fn parse_ipv4_whatwg(host: &str) -> Option<Ipv4Addr> {
 
 /// `file:` with no `//` authority and a non-absolute remainder (`file:etc/passwd`).
 pub fn is_opaque_file_uri(raw: &str) -> bool {
-    let decoded = match percent_decode_bounded(raw) {
-        Ok(d) => nfkc(&d).into_owned(),
+    let decoded: Cow<'_, str> = match percent_decode_bounded_cow(raw) {
+        // ASCII: NFKC is the identity — keep the decoded buffer.
+        Ok(d) if d.is_ascii() => d,
+        Ok(d) => Cow::Owned(nfkc(&d).into_owned()),
         Err(_) => return false,
     };
     let compacted = compact_uri_for_scheme_sniff(&decoded);
-    for candidate in [&decoded, &compacted] {
+    for candidate in [decoded.as_ref(), compacted.as_str()] {
         if !starts_with_file_scheme(candidate) {
             continue;
         }
@@ -918,14 +979,23 @@ pub fn is_opaque_file_uri(raw: &str) -> bool {
 /// sniff only. Ordinary path arguments keep spaces (`/workspace/my file.txt`).
 /// Does **not** close TOCTOU after `open`.
 pub fn normalize_fs_argument(raw: &str) -> Result<String, String> {
+    normalize_fs_argument_cow(raw).map(Cow::into_owned)
+}
+
+/// [`normalize_fs_argument`] returning a `Cow` — an input unchanged by
+/// normalization (no escapes, no controls, no `file:` rewrite) stays
+/// borrowed, so a caller that normalizes every scalar leaf avoids the
+/// destination copy on the common path.
+pub(crate) fn normalize_fs_argument_cow(raw: &str) -> Result<Cow<'_, str>, String> {
     if raw.is_empty() {
         return Err("empty or NUL-containing path".to_string());
     }
-    let decoded_raw = percent_decode_bounded(raw)?;
-    let decoded = match nfkc(&decoded_raw) {
+    let decoded_raw = percent_decode_bounded_cow(raw)?;
+    let decoded: Cow<'_, str> = if decoded_raw.is_ascii() {
         // ASCII: NFKC is the identity — keep the decoded buffer.
-        Cow::Borrowed(_) => decoded_raw,
-        Cow::Owned(s) => s,
+        decoded_raw
+    } else {
+        Cow::Owned(nfkc(&decoded_raw).into_owned())
     };
     // `file:` needs a literal `:` — without one no amount of whitespace
     // or format-noise compaction can form the scheme, so the compacted
@@ -936,7 +1006,9 @@ pub fn normalize_fs_argument(raw: &str) -> Result<String, String> {
     if let Some(from_uri) =
         file_uri_to_fs_path(&decoded).or_else(|| compacted.as_deref().and_then(file_uri_to_fs_path))
     {
-        return Ok(nfkc(&percent_decode_bounded(&from_uri)?).into_owned());
+        return Ok(Cow::Owned(
+            nfkc(&percent_decode_bounded_cow(&from_uri)?).into_owned(),
+        ));
     }
     if starts_with_file_scheme(&decoded)
         || compacted.as_deref().is_some_and(starts_with_file_scheme)
@@ -965,8 +1037,14 @@ pub fn is_path_field_name(key: &str) -> bool {
 /// Exact-name argument keys that carry filesystem targets
 /// (case-insensitive).
 fn is_exact_path_field_name(key: &str) -> bool {
+    is_exact_path_field_name_lowered(&key.to_ascii_lowercase())
+}
+
+/// [`is_exact_path_field_name`] for a caller holding the already-
+/// lowercased key — one lowercase serves every vocabulary test.
+pub(crate) fn is_exact_path_field_name_lowered(key_l: &str) -> bool {
     matches!(
-        key.to_ascii_lowercase().as_str(),
+        key_l,
         "path"
             | "paths"
             | "file"
@@ -996,9 +1074,15 @@ fn is_exact_path_field_name(key: &str) -> bool {
 /// values instead: `jsonPath = "$.items"` is a query argument while
 /// `jsonPath = "/data/out"` still checks as a filesystem path.
 fn is_suffixed_path_field_name(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    lower.ends_with("_path")
-        || lower.ends_with("_paths")
+    is_suffixed_path_field_name_lowered(key, &key.to_ascii_lowercase())
+}
+
+/// [`is_suffixed_path_field_name`] for a caller holding the already-
+/// lowercased key — the `Path`/`Paths` stem test still consults the
+/// original spelling (the `X` in `XPath`/`xPath` is case-significant).
+pub(crate) fn is_suffixed_path_field_name_lowered(key: &str, key_l: &str) -> bool {
+    key_l.ends_with("_path")
+        || key_l.ends_with("_paths")
         || (key.ends_with("Path") && !(key.ends_with("XPath") || key == "xPath"))
         || (key.ends_with("Paths") && !(key.ends_with("XPaths") || key == "xPaths"))
 }
@@ -1021,7 +1105,7 @@ pub fn is_path_field_value(key: &str, value: &str) -> bool {
 /// A value containing `/` or `\` is path-like — JSONPath members and
 /// indices use `.`/`[..]`, so slashes mark a filesystem value that must
 /// still reach inspection.
-fn looks_like_jsonpath_expression(value: &str) -> bool {
+pub(crate) fn looks_like_jsonpath_expression(value: &str) -> bool {
     let v = value.trim_start();
     if v.contains('/') || v.contains('\\') {
         return false;
@@ -1036,8 +1120,14 @@ fn looks_like_jsonpath_expression(value: &str) -> bool {
 /// so a bare host under any of these names still reaches the network
 /// policy instead of falling through unrecognized.
 pub fn is_network_field_name(key: &str) -> bool {
+    is_network_field_name_lowered(&key.to_ascii_lowercase())
+}
+
+/// [`is_network_field_name`] for a caller holding the already-
+/// lowercased key — one lowercase serves every vocabulary test.
+pub(crate) fn is_network_field_name_lowered(key_l: &str) -> bool {
     matches!(
-        key.to_ascii_lowercase().as_str(),
+        key_l,
         "url"
             | "urls"
             | "host"
@@ -1183,8 +1273,14 @@ pub(crate) fn dns_name_shape(host: &str) -> bool {
 /// mediates), and a credential field the contract never declared must
 /// not pass a restricted tool unchecked.
 pub fn is_known_payload_field_name(key: &str) -> bool {
+    is_known_payload_field_name_lowered(&key.to_ascii_lowercase())
+}
+
+/// [`is_known_payload_field_name`] for a caller holding the already-
+/// lowercased key — one lowercase serves every vocabulary test.
+pub(crate) fn is_known_payload_field_name_lowered(key_l: &str) -> bool {
     matches!(
-        key.to_ascii_lowercase().as_str(),
+        key_l,
         "content"
             | "contents"
             | "text"
@@ -1307,7 +1403,10 @@ pub fn selector_plausible(value: &str) -> bool {
 /// frozen for the differential tests that prove the complexity work
 /// changed no verdict (`tests.rs` runs the shared corpus against both).
 /// Bodies are verbatim HEAD except for the old owned-`String` `nfkc`
-/// spelled `nfkc_string`.
+/// spelled `nfkc_string`. The frozen bodies are the contract under
+/// test — an intentional verdict change must re-baseline them (or
+/// retire the differential tests), never edit them to track the new
+/// behavior.
 #[cfg(test)]
 pub(crate) mod reference {
     use super::*;

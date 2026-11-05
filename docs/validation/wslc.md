@@ -327,8 +327,10 @@ regression; the other 20 legs pass. Whether this is a 3.0.1→3.0.3
 mount-policy change or host configuration is unproven; a gated re-run
 on the reference host settles it. Following this observation the five
 legs were re-gated on `substrate_boundary_gap`, which probes the same
-mechanisms the runner needs (cgroup mkdir, `unshare --pid`) directly on
-the base image — on a substrate that cannot arm either, the legs skip
+mechanisms the runner needs (cgroup mkdir, the namespaced route's
+combined `unshare(CLONE_NEWUSER|CLONE_NEWNET|CLONE_NEWNS|CLONE_NEWPID)`)
+directly on the base image — on a substrate that cannot arm either, the
+legs skip
 (or fail closed under `MCP_WRIT_REQUIRE_WSLC_TESTS=1`) instead of
 re-launching a refused runner; on a substrate that can arm one, they
 still launch and a runner-side refusal keeps failing them.

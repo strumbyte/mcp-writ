@@ -128,10 +128,10 @@ fn reserved_eq(a: &str, b: &str) -> bool {
 /// canonicalization error on a path that exists) is retried on the next
 /// call rather than cached. HOME/USERPROFILE-derived prefixes stay out
 /// of this cache so tests that adjust those variables still take effect.
-fn resolved_reserved_files() -> Vec<Option<String>> {
+fn resolved_reserved_files() -> Cow<'static, [Option<String>]> {
     static CACHE: OnceLock<Vec<Option<String>>> = OnceLock::new();
     if let Some(cached) = CACHE.get() {
-        return cached.clone();
+        return Cow::Borrowed(cached.as_slice());
     }
     let resolved: Vec<Option<String>> = RESERVED_ABS_FILES
         .iter()
@@ -142,9 +142,18 @@ fn resolved_reserved_files() -> Vec<Option<String>> {
         })
         .collect();
     if resolved.iter().all(Option::is_some) {
-        let _ = CACHE.set(resolved.clone());
+        // A raced `set` keeps the winner's slice — equivalent content.
+        return Cow::Borrowed(CACHE.get_or_init(|| resolved).as_slice());
     }
-    resolved
+    Cow::Owned(resolved)
+}
+
+/// `seg.to_ascii_lowercase().starts_with(".env.")` without the per-
+/// segment lowercase copy — the prefix is ASCII, so a boundary-checked
+/// head compare is the same test.
+fn starts_with_dot_env_marker(seg: &str) -> bool {
+    seg.get(..".env.".len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(".env."))
 }
 
 fn matches_reserved_form(normalized: &str) -> bool {
@@ -164,18 +173,32 @@ fn matches_reserved_form(normalized: &str) -> bool {
     } else {
         Cow::Borrowed(&*unified)
     };
+    // `lexical_normalize_str` once — `path_matches_lexical` would rebuild
+    // the input-side normalized form per reserved spelling, resolved
+    // alias, and home prefix. The pattern side still normalizes per
+    // call; those inputs are short literals.
+    let unified_lex = pathutil::lexical_normalize_str(&unified);
+    // When the lowered form equals the unified one their lexical
+    // normalizations coincide — borrow rather than clone the string.
+    let unified_l_lex_store;
+    let unified_l_lex: &str = if unified_l == unified {
+        &unified_lex
+    } else {
+        unified_l_lex_store = pathutil::lexical_normalize_str(&unified_l);
+        &unified_l_lex_store
+    };
     let resolved = resolved_reserved_files();
-    for (reserved, resolved_reserved) in RESERVED_ABS_FILES.iter().zip(&resolved) {
+    for (reserved, resolved_reserved) in RESERVED_ABS_FILES.iter().zip(resolved.iter()) {
         if reserved_eq(&unified, reserved)
-            || pathutil::path_matches_lexical(&unified, reserved)
-            || pathutil::path_matches_lexical(&unified_l, reserved)
+            || pathutil::path_matches_lexical_normalized(&unified_lex, reserved)
+            || pathutil::path_matches_lexical_normalized(unified_l_lex, reserved)
         {
             return true;
         }
         // macOS resolves /etc to /private/etc. Follow the reserved path
         // too, so reaching the same object through an alias stays denied.
         if let Some(resolved_reserved) = resolved_reserved
-            && pathutil::path_matches_lexical(&unified_l, resolved_reserved)
+            && pathutil::path_matches_lexical_normalized(unified_l_lex, resolved_reserved)
         {
             return true;
         }
@@ -200,8 +223,7 @@ fn matches_reserved_form(normalized: &str) -> bool {
         if reserved_eq(seg, RESERVED_ENV) {
             return true;
         }
-        let seg_l = seg.to_ascii_lowercase();
-        if seg_l.starts_with(".env.") && !reserved_eq(seg, ENV_EXAMPLE) {
+        if starts_with_dot_env_marker(seg) && !reserved_eq(seg, ENV_EXAMPLE) {
             return true;
         }
     }
@@ -210,8 +232,7 @@ fn matches_reserved_form(normalized: &str) -> bool {
         if reserved_eq(last, RESERVED_ENV) {
             return true;
         }
-        let last_l = last.to_ascii_lowercase();
-        if last_l.starts_with(".env.") && !reserved_eq(last, ENV_EXAMPLE) {
+        if starts_with_dot_env_marker(last) && !reserved_eq(last, ENV_EXAMPLE) {
             return true;
         }
     }
@@ -219,8 +240,11 @@ fn matches_reserved_form(normalized: &str) -> bool {
     for home in reserved_windows_homes() {
         for name in RESERVED_DIR_NAMES {
             let prefix = format!("{home}/{name}");
-            if pathutil::path_matches_lexical(&unified, &prefix)
-                || pathutil::path_matches_lexical(&unified_l, &prefix.to_ascii_lowercase())
+            if pathutil::path_matches_lexical_normalized(&unified_lex, &prefix)
+                || pathutil::path_matches_lexical_normalized(
+                    unified_l_lex,
+                    &prefix.to_ascii_lowercase(),
+                )
                 || reserved_eq(&unified, &prefix)
             {
                 return true;
@@ -290,13 +314,15 @@ pub fn is_secret_path(path: &str) -> bool {
 /// already-computed [`pathutil::normalize_fs_argument`] output — the same
 /// two-phase check as [`is_secret_path`] without repeating normalization.
 ///
-/// A caller holding only the normalized form may pass it as `raw` too
-/// — `(n, n)` then stands in for `is_secret_path(n)`. That shorthand is
-/// valid **only** because `n` is already normalized: the second pass is
-/// then the identity *except* when NFKC introduced a `%` escape after
-/// the first decode ran (fullwidth `％` → `%`), which this function
-/// still runs. Passing an *unnormalized* value as `raw` skips a pass
-/// the value may still owe — `file:/etc/passwd`, `ﬁle://…`, or a
+/// A caller holding only the normalized form should reach for
+/// [`is_secret_path_pre_normalized`] instead — the signature itself
+/// carries the `(n, n)` contract that the shorthand here only
+/// documents: `raw == normalized` is valid **only** when `raw` is
+/// already a normalization fixed point, since the second pass is then
+/// the identity *except* when NFKC introduced a `%` escape after the
+/// first decode ran (fullwidth `％` → `%`), which this function still
+/// runs. Passing an *unnormalized* value as `raw` skips a pass the
+/// value may still owe — `file:/etc/passwd`, `ﬁle://…`, or a
 /// control-embedded spelling carries no `%` yet still normalizes — so
 /// `(v, v)` on raw input under-reports reserved spellings.
 pub fn is_secret_path_normalized(raw: &str, normalized: &str) -> bool {
@@ -323,6 +349,18 @@ pub fn is_secret_path_normalized(raw: &str, normalized: &str) -> bool {
         // the same `Err(_) => true` `is_secret_path` applies.
         Err(_) => true,
     }
+}
+
+/// [`is_secret_path_normalized`] for a caller that holds *only* the
+/// [`pathutil::normalize_fs_argument`] output — `is_secret_path(n)`
+/// without repeating normalization. The signature carries the `(n, n)`
+/// contract in the type, so an unnormalized value cannot fill the
+/// `raw` slot by accident. `normalized` must already be a
+/// normalization fixed point — a *raw* argument may still owe a pass
+/// (`file:/etc/passwd` carries no `%` yet still normalizes), so raw
+/// input goes through [`is_secret_path`], not here.
+pub fn is_secret_path_pre_normalized(normalized: &str) -> bool {
+    is_secret_path_normalized(normalized, normalized)
 }
 
 /// Overlay evaluation for one extracted filesystem argument.
@@ -638,17 +676,38 @@ mod tests {
                     "unstable normalization must stay reserved: {value:?}"
                 ),
             }
-            // Callers holding only the normalized form pass it as both
-            // phases — that must still equal the HEAD verdict.
+            // Callers holding only the normalized form use the
+            // pre-normalized entry — that must still equal the HEAD
+            // verdict.
             if let Ok(normalized) = pathutil::normalize_fs_argument(&value) {
                 assert_eq!(
-                    is_secret_path_normalized(&normalized, &normalized),
+                    is_secret_path_pre_normalized(&normalized),
                     reference::is_secret_path(&normalized),
-                    "is_secret_path_normalized(n, n) diverged on \
+                    "is_secret_path_pre_normalized diverged on \
                      normalized {normalized:?} (raw {value:?})"
                 );
             }
         }
+    }
+}
+
+/// `matches_reserved_form` exits early on an input with no `/`, `.`,
+/// or `\`, so every spelling the reserved set can match as a lone
+/// segment must carry one — a bare-name addition without a dot would
+/// silently never fire. `RESERVED_AWS_FILE` is exempt: it only matches
+/// paired after `.aws`, which forces a separator into the input.
+#[test]
+fn reserved_spellings_keep_the_lexical_gate_invariant() {
+    for name in RESERVED_ABS_FILES.iter().chain(RESERVED_DIR_NAMES).chain([
+        &RESERVED_AWS_DIR,
+        &RESERVED_ENV,
+        &ENV_EXAMPLE,
+    ]) {
+        assert!(
+            name.contains(['/', '.', '\\']),
+            "reserved spelling {name:?} carries no '/' '.' or '\\' — \
+             the matches_reserved_form early-out would suppress it"
+        );
     }
 }
 
@@ -657,7 +716,10 @@ mod tests {
 /// changed no verdict (`tests::` runs the shared corpus against both;
 /// `auditor::checker::targets::reference` reuses `is_secret_path` for
 /// its own baseline). Bodies are verbatim HEAD except for the old
-/// owned-`String` `nfkc` spelled `nfkc_string`.
+/// owned-`String` `nfkc` spelled `nfkc_string`. The frozen bodies are
+/// the contract under test — an intentional verdict change must
+/// re-baseline them (or retire the differential tests), never edit
+/// them to track the new behavior.
 #[cfg(test)]
 pub(crate) mod reference {
     use super::*;
@@ -672,7 +734,7 @@ pub(crate) mod reference {
         let unified = normalized.replace('\\', "/");
         let unified_l = unified.to_ascii_lowercase();
         let resolved = resolved_reserved_files();
-        for (reserved, resolved_reserved) in RESERVED_ABS_FILES.iter().zip(&resolved) {
+        for (reserved, resolved_reserved) in RESERVED_ABS_FILES.iter().zip(resolved.iter()) {
             if reserved_eq(&unified, reserved)
                 || pathutil::path_matches_lexical(&unified, reserved)
                 || pathutil::path_matches_lexical(&unified_l, reserved)
