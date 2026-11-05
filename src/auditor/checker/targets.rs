@@ -413,6 +413,12 @@ pub(super) fn collect_argument_targets_opaque(
     collect_argument_targets_as(json, opaque)
 }
 
+/// [`collect_argument_targets`] generic over the target-string type
+/// and carrying the tool's `arguments { opaque }` matcher. Single
+/// consumer — each scalar classifies inline as the walk emits it;
+/// multi-consumer checks use `walk_combined_classified` instead.
+/// `params.inputResponses` always walks without the matcher: opaque
+/// declarations name `arguments` members only.
 fn collect_argument_targets_as<S: TargetString>(
     json: &nojson::RawJson<'_>,
     opaque: Option<&OpaqueMatcher>,
@@ -536,6 +542,12 @@ enum LeafNorm<'a> {
 }
 
 impl ScalarLeaf<'_> {
+    /// Build a leaf's pure parse/normalize outcome: a plain ASCII
+    /// token stays [`LeafNorm::Plain`]; anything else runs
+    /// `normalize_fs_argument_cow` once here so every consumer replays
+    /// the result instead of re-normalizing. `opaque` is the index of
+    /// the `arguments { opaque }` declaration covering this leaf, when
+    /// the walk found one.
     fn of<'a>(attrs: &KeyAttrs, raw: Cow<'a, str>, opaque: Option<u32>) -> ScalarLeaf<'a> {
         if is_plain_ascii_token(&raw) {
             return ScalarLeaf {

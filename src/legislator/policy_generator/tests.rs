@@ -854,8 +854,12 @@ fn test_opaque_candidates_emitted_as_comments_only() {
     }];
 
     let kdl_str = generate_policy(&result, &cap, None, &discovered, &WorkloadHashes::default());
+    // Members are spelled as `/params/arguments/…` pointers — the same
+    // declaration, unambiguous for any member name.
     assert!(
-        kdl_str.contains("// arguments { opaque \"name\" \"observations\" }"),
+        kdl_str.contains(
+            "// arguments { opaque \"/params/arguments/name\" \"/params/arguments/observations\" }"
+        ),
         "candidate line missing: {kdl_str}"
     );
     assert!(
@@ -884,6 +888,51 @@ fn test_opaque_candidates_emitted_as_comments_only() {
         marker_kinds_in(&kdl_str).contains(&crate::policy::review::MarkerKind::OpaqueCandidate),
         "opaque-candidate marker must classify: {kdl_str}"
     );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("draft.kdl");
+    std::fs::write(&path, &kdl_str).unwrap();
+    crate::policy::loader::load_policy(&path).expect("generated KDL should load");
+}
+
+#[test]
+fn test_opaque_candidates_pointer_spell_member_names() {
+    // A member name containing '/' or '~' — or itself looking like a
+    // pointer — must declare itself, so candidates are emitted in the
+    // `/params/arguments/…` pointer spelling with `~0`/`~1` escapes.
+    // `*` and the empty name have no safe spelling and are omitted.
+    let cap = make_capability(RiskFlags::default(), &["read"], vec![], vec![]);
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::FileRead,
+            Some("memory_add"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+    let discovered = [ToolDefinition {
+        name: "memory_add".to_string(),
+        description: "Add a memory".to_string(),
+        input_schema: Some(
+            r#"{"type":"object","properties":{"a/b":{"type":"string"},"~x":{"type":"string"},"/params/arguments/y":{"type":"string"},"*":{"type":"string"},"":{"type":"string"},"ok":{"type":"string"}}}"#
+                .to_string(),
+        ),
+        ..Default::default()
+    }];
+
+    let kdl_str = generate_policy(&result, &cap, None, &discovered, &WorkloadHashes::default());
+    assert!(
+        kdl_str.contains(
+            "// arguments { opaque \"/params/arguments/a~1b\" \"/params/arguments/~0x\" \"/params/arguments/~1params~1arguments~1y\" \"/params/arguments/ok\" }"
+        ),
+        "escaped pointer candidates missing: {kdl_str}"
+    );
+    // `*` and "" were omitted — no wildcard or bare spelling leaks.
+    assert!(
+        !kdl_str.contains("\"*\"") && !kdl_str.contains("\"\""),
+        "names with no safe spelling must be omitted: {kdl_str}"
+    );
+    // Every emitted candidate parses back to its own member name.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("draft.kdl");
     std::fs::write(&path, &kdl_str).unwrap();

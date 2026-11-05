@@ -5,6 +5,7 @@ use crate::inspector::profile::CapabilityProfile;
 use crate::legislator::cross_validator::CrossValidationResult;
 use crate::legislator::heuristics::Permission;
 use crate::legislator::source_bind::{InterpreterKind, WorkloadHashes};
+use crate::policy::opaque::OpaqueField;
 use crate::policy::review::MarkerKind;
 use crate::termutil::{escape_kdl_comment, escape_kdl_string};
 use crate::tool_def::ToolDefinition;
@@ -224,6 +225,12 @@ fn schema_type_includes(ty: nojson::RawJsonValue<'_, '_>, name: &str) -> bool {
 /// with no `format` carrying stronger resource semantics. These are the
 /// fields `arguments { opaque }` could legitimately cover; the draft
 /// only *comments* the candidate out, never enables it (PR-04).
+///
+/// Each member is returned as its `/params/arguments/…` declaration
+/// pointer with `~0`/`~1`-escaped segments, so a property literally
+/// named `a/b` or `/x` declares itself instead of reading as an
+/// existing path. Names with no safe spelling (empty, `*`, or past
+/// the pointer byte budget) are omitted.
 fn opaque_candidate_fields(schema_str: &str) -> Vec<String> {
     let Ok(json) = nojson::RawJson::parse(schema_str) else {
         return Vec::new();
@@ -254,7 +261,22 @@ fn opaque_candidate_fields(schema_str: &str) -> Vec<String> {
                         .is_some_and(|t| schema_type_includes(t, "string"))
             });
         if string_field || string_array {
-            out.push(name.into_owned());
+            // Spell the member as its declaration pointer — the bare
+            // form cannot express a name containing '/' and a name
+            // that looks like a pointer would silently declare a
+            // different member.
+            let pointer = format!(
+                "/params/arguments/{}",
+                name.replace('~', "~0").replace('/', "~1")
+            );
+            // Round-trip through the load path: an empty name, a `*`
+            // name, or a pointer past the byte budget is omitted
+            // rather than suggested in a spelling that fails to load.
+            if let Ok(field) = OpaqueField::parse(&pointer)
+                && field.segments() == [name.as_ref()]
+            {
+                out.push(pointer);
+            }
         }
     }
     out
