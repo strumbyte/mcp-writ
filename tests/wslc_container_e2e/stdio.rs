@@ -145,7 +145,12 @@ async fn wslc_last_code(args: &[&str]) -> Option<i32> {
 /// sessions, so enforcement evidence attributes identically. A session
 /// VM whose kernel cannot fully apply Landlock/seccomp makes the
 /// runner refuse the launch — that refusal IS the adoption-relevant
-/// finding and fails this test (fail-closed, evidence kept).
+/// finding and fails this test (fail-closed, evidence kept). A
+/// substrate that cannot arm a descendant-lifetime boundary at all
+/// (read-only cgroupfs, no PID-namespace route — measured directly by
+/// [`substrate_boundary_gap`], never inferred from the runner's
+/// verdict) is reported through the prerequisite gate instead, which
+/// still fails closed under `MCP_WRIT_REQUIRE_WSLC_TESTS=1`.
 #[tokio::test]
 async fn wslc_stdio_session() {
     if let Some(reason) = blocking(check_prereqs).await {
@@ -160,6 +165,10 @@ async fn wslc_stdio_session() {
         return;
     };
     if blocking(ensure_base_pulled).await.is_none() {
+        return;
+    }
+    if let Some(gap) = blocking(substrate_boundary_gap).await {
+        common::skip_wslc_test(&gap);
         return;
     }
     let (image, secure) = match shared_images(&runner, &probe).await {
@@ -444,6 +453,10 @@ async fn wslc_mrtr_and_wire_stress() {
         return;
     };
     if blocking(ensure_base_pulled).await.is_none() {
+        return;
+    }
+    if let Some(gap) = blocking(substrate_boundary_gap).await {
+        common::skip_wslc_test(&gap);
         return;
     }
     let (_image, secure) = match shared_images(&runner, &probe).await {

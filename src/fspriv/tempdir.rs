@@ -8,19 +8,30 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Process-unique suffix for sibling temp names: pid + epoch nanos +
+/// a process-local counter. `SystemTime` granularity is ~15.6 ms on
+/// some platforms — two callers inside one tick get the same nanos —
+/// so the counter carries the same-pid same-tick uniqueness the
+/// timestamp cannot promise.
+pub(crate) fn unique_suffix() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 /// Create a new directory under the system temp dir with owner-only access.
 ///
 /// Fails closed if the directory already exists or permissions cannot be set.
 pub fn create_private_tempdir(label: &str) -> io::Result<PathBuf> {
     let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
-        .join(format!(
-            "mcp-writ-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        .join(format!("mcp-writ-{label}-{}", unique_suffix()));
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;

@@ -32,6 +32,10 @@ async fn wslc_stop_terminates_and_cleans_up() {
     if blocking(ensure_base_pulled).await.is_none() {
         return;
     }
+    if let Some(gap) = blocking(substrate_boundary_gap).await {
+        common::skip_wslc_test(&gap);
+        return;
+    }
     let (image, secure) = match shared_images(&runner, &probe).await {
         Ok(t) => t,
         Err(e) => {

@@ -251,8 +251,11 @@ async fn tcp_connection_capacity_refuses_overflow() {
         );
     }
     // Let the accept loop drain the backlog so every held connection
-    // actually occupies its slot before the overflow attempt.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // actually occupies its slot before the overflow attempt. Under
+    // full-suite parallel load 64 accepts take longer than a light
+    // run — give the loop generous room or the overflow connection
+    // is measured before the slots are actually full.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let mut extra = TcpStream::connect(gate.listen)
         .await
         .expect("overflow connection still completes the handshake");

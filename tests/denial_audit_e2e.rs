@@ -31,8 +31,15 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-#[cfg(target_os = "linux")]
+/// Load-tolerant external wait — sized well above the gate's 5s
+/// upstream budget and 10s teardown so full-suite parallel load cannot
+/// read a slow-but-healthy response as a failure.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-probe budget inside the gate readiness loop — short enough
+/// that `child.try_wait()` is re-polled between probes; the outer
+/// `TEST_TIMEOUT` deadline still bounds total readiness time.
+const PROBE_BUDGET: Duration = Duration::from_millis(500);
 
 // ─── shared helpers ──────────────────────────────────────────────────
 
@@ -593,26 +600,55 @@ fn spawn_mock_upstream() -> std::net::SocketAddr {
 }
 
 /// One UDP query with id matching — a connected socket so a recycled
-/// datagram cannot be mistaken for the answer.
+/// datagram cannot be mistaken for the answer. Sized above the gate's
+/// whole-exchange upstream budget (5s): a SERVFAIL after upstream
+/// timeout must still fit the read window, and parallel-suite
+/// scheduling adds seconds on top.
 fn udp_query(listen: std::net::SocketAddr, pkt: &[u8]) -> Option<Vec<u8>> {
+    udp_query_budgeted(listen, pkt, TEST_TIMEOUT)
+}
+
+/// `udp_query` bounded by `budget` rather than the full `TEST_TIMEOUT`
+/// — the readiness probe loops on `PROBE_BUDGET` so a gate that died
+/// before serving is caught by `try_wait` on the next pass instead of
+/// after a whole-timeout query. Retransmit on every recv timeout — a
+/// datagram sent before the gate finished binding is simply lost, and
+/// a send-once loop would burn the whole deadline waiting for an
+/// answer that never comes.
+fn udp_query_budgeted(
+    listen: std::net::SocketAddr,
+    pkt: &[u8],
+    budget: Duration,
+) -> Option<Vec<u8>> {
     let sock = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
     sock.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
     sock.connect(listen).ok()?;
-    sock.send(pkt).ok()?;
     let want_id = u16::from_be_bytes([pkt[0], pkt[1]]);
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + budget;
     let mut buf = [0u8; 4096];
-    loop {
+    while Instant::now() < deadline {
+        sock.send(pkt).ok()?;
         match sock.recv(&mut buf) {
             Ok(n) if n >= 2 && u16::from_be_bytes([buf[0], buf[1]]) == want_id => {
                 return Some(buf[..n].to_vec());
             }
+            // A read timeout already paced this round — but an
+            // immediate error (a ConnectionReset for an ICMP
+            // port-unreachable while the gate is still unbound)
+            // returns at once, and without a pause the loop would
+            // spin retransmitting as fast as the socket allows.
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             _ => {}
         }
-        if Instant::now() >= deadline {
-            return None;
-        }
     }
+    None
 }
 
 /// The gate binds *both* UDP and TCP on its listen port
@@ -714,7 +750,7 @@ fn spawn_dns_gate(
         let _stdout_rx = drain(child.stdout.take().unwrap());
         let stderr_rx = drain(child.stderr.take().unwrap());
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + TEST_TIMEOUT;
         let serving = loop {
             if let Some(status) = child.try_wait().expect("try_wait") {
                 let stderr = stderr_rx
@@ -726,19 +762,22 @@ fn spawn_dns_gate(
                 }
                 panic!("dns-gate exited before serving ({status}): {stderr}");
             }
-            // Readiness probe: the gate answers even a header-only packet.
+            // Readiness probe: the gate answers even a header-only
+            // packet. A short budget keeps the loop returning to
+            // `try_wait` — a dead gate must fail on its exit status,
+            // not ride out a full-timeout probe as "did not answer".
             let mut pkt = Vec::new();
             pkt.extend_from_slice(&0xEEu16.to_be_bytes());
             pkt.extend_from_slice(&0x0100u16.to_be_bytes());
             pkt.extend_from_slice(&[0u8; 8]);
-            if let Some(resp) = udp_query(listen, &pkt)
+            if let Some(resp) = udp_query_budgeted(listen, &pkt, PROBE_BUDGET)
                 && resp.len() >= 4
             {
                 break true;
             }
             assert!(
                 Instant::now() < deadline,
-                "dns-gate did not answer within 10s"
+                "dns-gate did not answer within {TEST_TIMEOUT:?}"
             );
         };
         if serving {
@@ -814,7 +853,7 @@ fn dns_gate_denial_leg(refuse_rcode: Option<&str>, want_rcode: u8, rcode_name: &
     // it, but the emit→dequeue hop races the kill below. Wait for the
     // record to land before stopping the gate — the assertion is about
     // the record existing, not about a lucky drain order.
-    let resolve_deadline = Instant::now() + Duration::from_secs(10);
+    let resolve_deadline = Instant::now() + TEST_TIMEOUT;
     loop {
         let body = read_audit(&audit);
         if audit_lines(&body, "sandbox.network_resolved")

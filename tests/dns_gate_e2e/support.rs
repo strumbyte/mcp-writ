@@ -20,7 +20,12 @@ use mcp_writ::policy::{OutboundPolicy, Policy};
 
 use crate::common;
 
-pub const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Client-side wire budget. Sized well above the gate's own
+/// `UPSTREAM_TIMEOUT` (5s) plus `TASK_DRAIN_TIMEOUT` (10s) teardown —
+/// a full-suite run with dozens of parallel binaries can starve the
+/// gate's tasks for seconds at a time, and a budget only marginally
+/// above the upstream timeout flakes under that load.
+pub const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ─── Wire helpers (test-local; the crate's codec is crate-internal) ──
 
@@ -392,8 +397,10 @@ pub async fn start_gate(
             });
             // Wait until the gate's UDP listener is actually bound: a
             // header-only packet earns a FORMERR once the socket
-            // answers.
-            let probe_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            // answers. The deadline is generous — under full-suite
+            // parallel load the freshly spawned task may not reach
+            // `bind` for seconds.
+            let probe_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             loop {
                 if task.is_finished() {
                     break; // bind lost the race — retry on a new port
@@ -406,7 +413,7 @@ pub async fn start_gate(
                 }
                 assert!(
                     tokio::time::Instant::now() < probe_deadline,
-                    "dns gate did not bind within 5s"
+                    "dns gate did not bind within 15s"
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -444,7 +451,10 @@ pub async fn udp_probe(listen: SocketAddr) -> bool {
         return false;
     }
     let mut buf = [0u8; 64];
-    match timeout(Duration::from_millis(100), sock.recv(&mut buf)).await {
+    // A bound-but-starved gate answers slowly under parallel load —
+    // a short recv window would read a live listener as unbound and
+    // burn the caller's bind deadline on false negatives.
+    match timeout(Duration::from_millis(500), sock.recv(&mut buf)).await {
         Ok(Ok(n)) => n >= 2 && buf[0] == 0 && buf[1] == 0xEE,
         _ => false,
     }

@@ -126,6 +126,197 @@ pub(crate) fn restricted_tempdir() -> Option<tempfile::TempDir> {
     None
 }
 
+/// Argument-string corpus shared by the PR-03 differential tests —
+/// exercises every branch the classification fast paths must preserve:
+/// opaque tokens (the fast path's domain), single-punctuation boundary
+/// variants, encodings, Unicode confusables, controls, NUL, and
+/// selector spellings for each key vocabulary.
+pub(crate) fn argument_classification_corpus() -> Vec<String> {
+    let mut v: Vec<String> = [
+        // Opaque ASCII tokens — the fast path's domain.
+        "hello",
+        "prod-server",
+        "a1_-+=,;x",
+        "UPPER",
+        "  padded  ",
+        "x y",
+        "[bracket]",
+        "{opaque}",
+        "tok#frag",
+        "tok?query",
+        "*wild*",
+        "line1'quote",
+        "say\"hi",
+        // One selector-significant byte inside an opaque token.
+        "a.b",
+        "..",
+        ".",
+        ".env",
+        ".ENV",
+        ".env.local",
+        ".env.example",
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        "credentials",
+        "id_rsa",
+        "a..b",
+        "10.0.0.1",
+        "256.1.1.1",
+        "1.2.3.4.5",
+        "v1.2",
+        "a/b",
+        "./rel",
+        "../up",
+        "/etc/passwd",
+        "/etc/shadow",
+        "/etc/sudoers",
+        "/private/etc/passwd",
+        "etc/passwd",
+        "a\\b",
+        "C:\\x",
+        "C:/x",
+        "\\\\server\\share",
+        "/workspace/notes.txt",
+        "/workspace/.env",
+        "/home/user/.aws/credentials",
+        "/home/u/.aws/config",
+        "/w/.ssh/id_rsa",
+        "x:y",
+        "h:80",
+        "C:x",
+        "a:b:c",
+        ":8080",
+        "[::1]",
+        "[::1]:443",
+        "[::g]",
+        "[]:80",
+        "~",
+        "~/x",
+        "~root/x",
+        "$V",
+        "$V/x",
+        "u@h",
+        "@scope",
+        "a%b",
+        "%41",
+        "%GG",
+        "%",
+        "%%",
+        "%00",
+        "a%0Ab",
+        "%252e",
+        "%2e%2e/x",
+        "%66ile:///etc/passwd",
+        "file:///etc/passwd",
+        "FILE:///ETC/PASSWD",
+        "file://localhost/etc/passwd",
+        "file://127.0.0.1/etc/passwd",
+        "file://[::1]/etc/passwd",
+        "file://evil.com/etc/passwd",
+        "file:etc/passwd",
+        "file:./etc/passwd",
+        "file:../etc/passwd",
+        "file:////host/share",
+        "file://localhost//host/share",
+        "file://localhost/etc/passwd?x=1",
+        "file:///etc/passwd#frag",
+        "file \t://localhost/etc/passwd",
+        "file%0A://localhost/etc/passwd",
+        "file%250B://localhost/etc/passwd",
+        "file\u{00A0}://localhost/etc/passwd",
+        "\u{FB01}le:///etc/passwd",
+        "f\u{0456}le:///etc/passwd",
+        "%EF%BD%86ile:///etc/passwd",
+        "%66ile%0A://localhost/etc/passwd",
+        // NFKC introduces the `%` escape *after* the bounded decode ran
+        // (fullwidth `％` → `%`) — only a second normalization pass
+        // reveals the `file:` URI / `..` path underneath.
+        "\u{ff05}66ile://localhost/etc/passwd",
+        "\u{ff05}2e\u{ff05}2e/x",
+        "https://example.com",
+        "http://h/x",
+        "ftp://h",
+        "a://b",
+        "//host/share",
+        "//a",
+        "://",
+        "x://y",
+        // Network shapes.
+        "localhost",
+        "example.com",
+        "sub.example.com",
+        "a-b.example.com",
+        "127.0.0.1",
+        "::1",
+        "1.2.3.4",
+        "hostname",
+        // Non-dotted IPv4 spellings (`inet_aton` accepts them, Rust's
+        // `IpAddr` does not) — plain tokens that still route through
+        // the key vocabulary's host-vs-URL call, not the value-shape
+        // host/socket test.
+        "2130706433",
+        "0x7f000001",
+        // Payload-ish.
+        "read ./report.txt",
+        "hello world",
+        "line\nbreak",
+        "tab\tsep",
+        "{\"j\":1}",
+        "[1,2]",
+        // Controls / edge bytes.
+        "",
+        " ",
+        "   ",
+        "\t",
+        "\n",
+        "a\u{0001}b",
+        "a\u{007f}b",
+        "a\u{0085}b",
+        "a\u{2028}b",
+        "a\u{2029}b",
+        "a\0b",
+        "\0",
+        // Unicode.
+        "caf\u{00e9}",
+        "\u{ff21}\u{ff22}",
+        "\u{200b}x",
+        "x\u{00a0}y",
+        "\u{ff0f}etc\u{ff0f}passwd",
+        "\u{ff45}\u{ff54}\u{ff43}\u{ff0f}\u{ff50}\u{ff41}\u{ff53}\u{ff53}\u{ff57}\u{ff44}",
+        "n\u{0303}ame",
+        "e\u{0301}",
+        "\u{034f}x",
+        "\u{feff}x",
+        "\u{180e}x",
+        "$.items[0]",
+        "$[0]",
+        "$",
+        "$.x",
+        "x$",
+        "$x",
+        "$[",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // Size-scaled boundary variants — the byte-scan fast path must not
+    // change the verdict at any length.
+    for prefix in ["A", "A B", "-", "_", "[", "x"] {
+        for tail in [
+            "", ".", "/", "\\", ":", "~", "$", "%", "@", "..", "x", "\u{ff41}",
+        ] {
+            v.push(format!("{}{}{}", prefix.repeat(700), tail, "z".repeat(9)));
+        }
+    }
+    v.push("A".repeat(4096));
+    v.push(format!("{}.env", "A".repeat(500)));
+    v.push(format!("{}/x", "A".repeat(500)));
+    v.push(format!("file://localhost/{}", "A".repeat(500)));
+    v.push(format!("{}.env{}", "%".repeat(30), "A".repeat(500)));
+    v
+}
+
 /// Set `dir`'s DACL from an SDDL string as a protected DACL, so the
 /// fixture's trust state is exactly the spelled one regardless of the
 /// ACEs the parent would otherwise hand down. Applying it propagates

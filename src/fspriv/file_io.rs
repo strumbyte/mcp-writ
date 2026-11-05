@@ -102,13 +102,9 @@ fn write_file_atomic_pinned(path: &Path, contents: &[u8]) -> io::Result<()> {
         super::pinned::require_parent_write_restricted(parent)?;
     }
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
     let mut tmp_os = std::ffi::OsString::from(".");
     tmp_os.push(name);
-    tmp_os.push(format!(".tmp-{}-{nanos}", std::process::id()));
+    tmp_os.push(format!(".tmp-{}", super::tempdir::unique_suffix()));
     let c_tmp = CString::new(tmp_os.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "temp name contains NUL"))?;
     let c_name = CString::new(name.as_bytes()).map_err(|_| {
@@ -201,12 +197,8 @@ fn write_file_atomic_rename(path: &Path, contents: &[u8]) -> io::Result<()> {
     {
         super::winsec::require_no_reparse_ancestors(path)?;
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
     let mut tmp_os = path.as_os_str().to_os_string();
-    tmp_os.push(format!(".tmp-{}-{nanos}", std::process::id()));
+    tmp_os.push(format!(".tmp-{}", super::tempdir::unique_suffix()));
     let tmp = PathBuf::from(tmp_os);
     // `create_new` failing means the temp name is already taken (e.g.
     // planted) — that file is not ours to delete, so the cleanup below

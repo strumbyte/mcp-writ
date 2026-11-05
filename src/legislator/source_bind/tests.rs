@@ -228,12 +228,8 @@ fn shebang_script_binds_interpreter_and_payload() {
     }
     let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
         .join(format!(
-            "mcp_writ_envshebang_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "mcp_writ_envshebang_{}",
+            crate::fspriv::unique_suffix()
         ));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("server.py");
@@ -298,13 +294,9 @@ fn unmodeled_shebang_marks_payload_unbound() {
             continue;
         }
         let dir = std::env::temp_dir().join(format!(
-            "mcp_writ_native_shebang_{}_{}_{}",
+            "mcp_writ_native_shebang_{}_{}",
             interp,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            crate::fspriv::unique_suffix()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         // Extensionless + unrecognized interpreter → Native discovery.
@@ -329,12 +321,8 @@ fn unmodeled_shebang_marks_payload_unbound() {
 
     // No shebang → a plain file is exec'd verbatim — no caveat.
     let dir = std::env::temp_dir().join(format!(
-        "mcp_writ_native_shebang_plain_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "mcp_writ_native_shebang_plain_{}",
+        crate::fspriv::unique_suffix()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("entrypoint");
@@ -352,12 +340,8 @@ fn unmodeled_shebang_marks_payload_unbound() {
 #[test]
 fn shebang_interpreter_parses_command_token() {
     let dir = std::env::temp_dir().join(format!(
-        "mcp_writ_shebang_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "mcp_writ_shebang_{}",
+        crate::fspriv::unique_suffix()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     // Extensionless so only the shebang can identify the language.
@@ -431,12 +415,8 @@ fn shebang_interpreter_parses_command_token() {
 #[test]
 fn shebang_line_uses_only_the_first_line() {
     let dir = std::env::temp_dir().join(format!(
-        "mcp_writ_shebang_bytes_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "mcp_writ_shebang_bytes_{}",
+        crate::fspriv::unique_suffix()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("entrypoint");
@@ -468,12 +448,8 @@ fn shebang_line_uses_only_the_first_line() {
 #[test]
 fn extensionless_shebang_script_is_a_source_payload() {
     let dir = std::env::temp_dir().join(format!(
-        "mcp_writ_extless_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "mcp_writ_extless_{}",
+        crate::fspriv::unique_suffix()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     // PATH-installed entry scripts (`mcp-server-git`, …) are commonly
@@ -691,12 +667,8 @@ fn payload_flag_after_script_is_not_inline_eval() {
 #[test]
 fn node_preload_flags_get_unbound_reason() {
     let dir = std::env::temp_dir().join(format!(
-        "mcp_writ_preload_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "mcp_writ_preload_{}",
+        crate::fspriv::unique_suffix()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("index.js");
@@ -737,12 +709,8 @@ fn native_binary_stays_native() {
 #[test]
 fn shebang_script_inspect() {
     let dir = std::env::temp_dir().join(format!(
-        "mcp_writ_shebang_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "mcp_writ_shebang_{}",
+        crate::fspriv::unique_suffix()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("mcp-server");
@@ -802,12 +770,8 @@ fn direct_script_argv0() {
 fn analyzed_digest_pins_analyzed_bytes_not_a_second_read() {
     let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
         .join(format!(
-            "mcp_writ_toctou_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "mcp_writ_toctou_{}",
+            crate::fspriv::unique_suffix()
         ));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("server.py");
@@ -858,12 +822,8 @@ fn analyzed_digest_pins_analyzed_bytes_not_a_second_read() {
 fn analyzed_digest_refused_when_payload_resolution_drifted() {
     let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
         .join(format!(
-            "mcp_writ_toctou_drift_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "mcp_writ_toctou_drift_{}",
+            crate::fspriv::unique_suffix()
         ));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("server.py");
@@ -908,12 +868,8 @@ fn analyzed_digest_refused_when_payload_resolution_drifted() {
 fn analyzed_launch_image_binds_the_binary_pin() {
     let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
         .join(format!(
-            "mcp_writ_toctou_bin_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "mcp_writ_toctou_bin_{}",
+            crate::fspriv::unique_suffix()
         ));
     std::fs::create_dir_all(&dir).unwrap();
     let exe = dir.join("server.bin");
@@ -946,12 +902,8 @@ fn workload_hashes_carry_resolved_and_spelled_paths() {
     }
     let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
         .join(format!(
-            "mcp_writ_seedpaths_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "mcp_writ_seedpaths_{}",
+            crate::fspriv::unique_suffix()
         ));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("server.py");
@@ -1012,12 +964,8 @@ fn spelled_path_keeps_the_venv_symlink_location() {
     };
     let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
         .join(format!(
-            "mcp_writ_venvspell_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "mcp_writ_venvspell_{}",
+            crate::fspriv::unique_suffix()
         ));
     let venv_bin = dir.join(".venv/bin");
     std::fs::create_dir_all(&venv_bin).unwrap();

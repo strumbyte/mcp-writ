@@ -24,6 +24,7 @@
 //! `fileURLToPath` and must hit this overlay; leftover opaque `file:` that
 //! is not already `/…` or a drive form is fail-closed DENY, not ALLOW.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -80,8 +81,15 @@ fn path_has_invisible_unicode(path: &str) -> bool {
     })
 }
 
-fn nfkc(input: &str) -> String {
-    input.nfkc().collect()
+/// NFKC is the identity on pure ASCII — borrow the input instead of
+/// walking every char through the compatibility tables. Non-ASCII
+/// values still get the full normalization.
+fn nfkc(input: &str) -> Cow<'_, str> {
+    if input.is_ascii() {
+        Cow::Borrowed(input)
+    } else {
+        Cow::Owned(input.nfkc().collect())
+    }
 }
 
 fn last_segment(path: &str) -> Option<&str> {
@@ -120,10 +128,10 @@ fn reserved_eq(a: &str, b: &str) -> bool {
 /// canonicalization error on a path that exists) is retried on the next
 /// call rather than cached. HOME/USERPROFILE-derived prefixes stay out
 /// of this cache so tests that adjust those variables still take effect.
-fn resolved_reserved_files() -> Vec<Option<String>> {
+fn resolved_reserved_files() -> Cow<'static, [Option<String>]> {
     static CACHE: OnceLock<Vec<Option<String>>> = OnceLock::new();
     if let Some(cached) = CACHE.get() {
-        return cached.clone();
+        return Cow::Borrowed(cached.as_slice());
     }
     let resolved: Vec<Option<String>> = RESERVED_ABS_FILES
         .iter()
@@ -134,26 +142,63 @@ fn resolved_reserved_files() -> Vec<Option<String>> {
         })
         .collect();
     if resolved.iter().all(Option::is_some) {
-        let _ = CACHE.set(resolved.clone());
+        // A raced `set` keeps the winner's slice — equivalent content.
+        return Cow::Borrowed(CACHE.get_or_init(|| resolved).as_slice());
     }
-    resolved
+    Cow::Owned(resolved)
+}
+
+/// `seg.to_ascii_lowercase().starts_with(".env.")` without the per-
+/// segment lowercase copy — the prefix is ASCII, so a boundary-checked
+/// head compare is the same test.
+fn starts_with_dot_env_marker(seg: &str) -> bool {
+    seg.get(..".env.".len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(".env."))
 }
 
 fn matches_reserved_form(normalized: &str) -> bool {
-    let unified = normalized.replace('\\', "/");
-    let unified_l = unified.to_ascii_lowercase();
+    // Every reserved spelling carries a '.' or a separator — a single
+    // unbroken name can match none of them. Checked before the
+    // separator-unifying copy so an opaque token costs one scan.
+    if !normalized.contains(['/', '.', '\\']) {
+        return false;
+    }
+    let unified: Cow<'_, str> = if normalized.contains('\\') {
+        Cow::Owned(normalized.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(normalized)
+    };
+    let unified_l: Cow<'_, str> = if unified.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(unified.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(&*unified)
+    };
+    // `lexical_normalize_str` once — `path_matches_lexical` would rebuild
+    // the input-side normalized form per reserved spelling, resolved
+    // alias, and home prefix. The pattern side still normalizes per
+    // call; those inputs are short literals.
+    let unified_lex = pathutil::lexical_normalize_str(&unified);
+    // When the lowered form equals the unified one their lexical
+    // normalizations coincide — borrow rather than clone the string.
+    let unified_l_lex_store;
+    let unified_l_lex: &str = if unified_l == unified {
+        &unified_lex
+    } else {
+        unified_l_lex_store = pathutil::lexical_normalize_str(&unified_l);
+        &unified_l_lex_store
+    };
     let resolved = resolved_reserved_files();
-    for (reserved, resolved_reserved) in RESERVED_ABS_FILES.iter().zip(&resolved) {
+    for (reserved, resolved_reserved) in RESERVED_ABS_FILES.iter().zip(resolved.iter()) {
         if reserved_eq(&unified, reserved)
-            || pathutil::path_matches_lexical(&unified, reserved)
-            || pathutil::path_matches_lexical(&unified_l, reserved)
+            || pathutil::path_matches_lexical_normalized(&unified_lex, reserved)
+            || pathutil::path_matches_lexical_normalized(unified_l_lex, reserved)
         {
             return true;
         }
         // macOS resolves /etc to /private/etc. Follow the reserved path
         // too, so reaching the same object through an alias stays denied.
         if let Some(resolved_reserved) = resolved_reserved
-            && pathutil::path_matches_lexical(&unified_l, resolved_reserved)
+            && pathutil::path_matches_lexical_normalized(unified_l_lex, resolved_reserved)
         {
             return true;
         }
@@ -178,8 +223,7 @@ fn matches_reserved_form(normalized: &str) -> bool {
         if reserved_eq(seg, RESERVED_ENV) {
             return true;
         }
-        let seg_l = seg.to_ascii_lowercase();
-        if seg_l.starts_with(".env.") && !reserved_eq(seg, ENV_EXAMPLE) {
+        if starts_with_dot_env_marker(seg) && !reserved_eq(seg, ENV_EXAMPLE) {
             return true;
         }
     }
@@ -188,8 +232,7 @@ fn matches_reserved_form(normalized: &str) -> bool {
         if reserved_eq(last, RESERVED_ENV) {
             return true;
         }
-        let last_l = last.to_ascii_lowercase();
-        if last_l.starts_with(".env.") && !reserved_eq(last, ENV_EXAMPLE) {
+        if starts_with_dot_env_marker(last) && !reserved_eq(last, ENV_EXAMPLE) {
             return true;
         }
     }
@@ -197,8 +240,11 @@ fn matches_reserved_form(normalized: &str) -> bool {
     for home in reserved_windows_homes() {
         for name in RESERVED_DIR_NAMES {
             let prefix = format!("{home}/{name}");
-            if pathutil::path_matches_lexical(&unified, &prefix)
-                || pathutil::path_matches_lexical(&unified_l, &prefix.to_ascii_lowercase())
+            if pathutil::path_matches_lexical_normalized(&unified_lex, &prefix)
+                || pathutil::path_matches_lexical_normalized(
+                    unified_l_lex,
+                    &prefix.to_ascii_lowercase(),
+                )
                 || reserved_eq(&unified, &prefix)
             {
                 return true;
@@ -222,7 +268,15 @@ fn reserved_after_normalize(path: &str) -> bool {
         return false;
     }
     let nfkc_raw = nfkc(path);
-    let lexical = pathutil::lexical_normalize_str(&nfkc_raw);
+    // No separator or dot: no `.`/`..` segment to fold and no drive
+    // prefix to rebuild, so lexical normalization is the identity and
+    // its copy is skipped (an opaque token then fails the
+    // `matches_reserved_form` early-out on a single scan).
+    let lexical: Cow<'_, str> = if nfkc_raw.contains(['/', '\\', '.']) {
+        Cow::Owned(pathutil::lexical_normalize_str(&nfkc_raw))
+    } else {
+        Cow::Borrowed(&*nfkc_raw)
+    };
     if matches_reserved_form(&lexical) {
         return true;
     }
@@ -247,11 +301,66 @@ pub fn is_secret_path(path: &str) -> bool {
         return true;
     }
     match pathutil::normalize_fs_argument(path) {
-        Ok(normalized) => reserved_after_normalize(&normalized),
+        // An unchanged spelling needs no second pass — phase one just
+        // evaluated this same string.
+        Ok(normalized) => normalized != path && reserved_after_normalize(&normalized),
         // Unstable percent-encoding / NUL after decode: treat as reserved
         // so overlay fails closed rather than allowing a bypass.
         Err(_) => true,
     }
+}
+
+/// Reserved-secret test for `raw`, where `normalized` is the caller's
+/// already-computed [`pathutil::normalize_fs_argument`] output — the same
+/// two-phase check as [`is_secret_path`] without repeating normalization.
+///
+/// A caller holding only the normalized form should reach for
+/// [`is_secret_path_pre_normalized`] instead — the signature itself
+/// carries the `(n, n)` contract that the shorthand here only
+/// documents: `raw == normalized` is valid **only** when `raw` is
+/// already a normalization fixed point, since the second pass is then
+/// the identity *except* when NFKC introduced a `%` escape after the
+/// first decode ran (fullwidth `％` → `%`), which this function still
+/// runs. Passing an *unnormalized* value as `raw` skips a pass the
+/// value may still owe — `file:/etc/passwd`, `ﬁle://…`, or a
+/// control-embedded spelling carries no `%` yet still normalizes — so
+/// `(v, v)` on raw input under-reports reserved spellings.
+pub fn is_secret_path_normalized(raw: &str, normalized: &str) -> bool {
+    if raw.is_empty() || raw.contains('\0') {
+        return false;
+    }
+    if reserved_after_normalize(raw) {
+        return true;
+    }
+    if raw != normalized {
+        return reserved_after_normalize(normalized);
+    }
+    // `(n, n)` stands in for `is_secret_path(n)`: its second phase
+    // normalizes `n` itself, and that pass is only a fixed point while
+    // `n` carries no decodable escape.
+    if !normalized.contains('%') {
+        return false;
+    }
+    match pathutil::normalize_fs_argument(normalized) {
+        // An unchanged spelling needs no second pass — phase one just
+        // evaluated this same string.
+        Ok(second) => second != normalized && reserved_after_normalize(&second),
+        // Unstable encoding on re-normalization: fail closed reserved,
+        // the same `Err(_) => true` `is_secret_path` applies.
+        Err(_) => true,
+    }
+}
+
+/// [`is_secret_path_normalized`] for a caller that holds *only* the
+/// [`pathutil::normalize_fs_argument`] output — `is_secret_path(n)`
+/// without repeating normalization. The signature carries the `(n, n)`
+/// contract in the type, so an unnormalized value cannot fill the
+/// `raw` slot by accident. `normalized` must already be a
+/// normalization fixed point — a *raw* argument may still owe a pass
+/// (`file:/etc/passwd` carries no `%` yet still normalizes), so raw
+/// input goes through [`is_secret_path`], not here.
+pub fn is_secret_path_pre_normalized(normalized: &str) -> bool {
+    is_secret_path_normalized(normalized, normalized)
 }
 
 /// Overlay evaluation for one extracted filesystem argument.
@@ -274,7 +383,7 @@ pub fn overlay_denies(path: &str) -> Result<(), String> {
             "path '{path}' contains invisible Unicode and is rejected by secret-overlay"
         ));
     }
-    if reserved_after_normalize(path) || reserved_after_normalize(&normalized) {
+    if is_secret_path_normalized(path, &normalized) {
         return Err(format!(
             "path '{path}' matches the secret-path overlay (beats explicit allow)"
         ));
@@ -372,6 +481,27 @@ mod tests {
         // U+FF0F FULLWIDTH SOLIDUS → `/` under NFKC
         let sneaky = "\u{ff0f}etc\u{ff0f}passwd";
         assert!(is_secret_path(sneaky));
+    }
+
+    #[test]
+    fn nonascii_secret_forms_stay_denied() {
+        // Fullwidth spellings reach the reserved set through NFKC —
+        // asserted by both the predicate and the overlay verdict.
+        assert!(is_secret_path("\u{ff0f}etc\u{ff0f}passwd"));
+        assert!(
+            overlay_denies(
+                "\u{ff45}\u{ff54}\u{ff43}\u{ff0f}\u{ff50}\u{ff41}\u{ff53}\u{ff53}\u{ff57}\u{ff44}"
+            )
+            .is_err()
+        );
+        // A combining format mark embedded in a reserved spelling is
+        // invisible Unicode — the overlay still refuses it.
+        assert!(overlay_denies("/etc/passwd\u{034F}").is_err());
+        assert!(overlay_denies("/workspace/.env\u{034F}").is_err());
+        // A non-ASCII letter whose NFKC fold lands on the reserved
+        // name (modifier small-a → 'a') still matches the overlay.
+        assert!(is_secret_path("/etc/p\u{1D43}sswd"));
+        assert!(overlay_denies("/etc/p\u{1D43}sswd").is_err());
     }
 
     #[test]
@@ -506,5 +636,254 @@ mod tests {
                 ));
             }
         }
+    }
+
+    // ── PR-03 differential: current vs frozen HEAD implementations ──
+
+    /// The overlay verdicts must match the frozen HEAD implementations
+    /// on the shared argument corpus — the PR-03 changes remove
+    /// repeated normalization, not checks.
+    #[test]
+    fn pr03_corpus_matches_reference() {
+        for value in crate::testutil::argument_classification_corpus() {
+            assert_eq!(
+                is_secret_path(&value),
+                reference::is_secret_path(&value),
+                "is_secret_path diverged: {value:?}"
+            );
+            assert_eq!(
+                overlay_denies(&value).is_err(),
+                reference::overlay_denies(&value).is_err(),
+                "overlay_denies diverged: {value:?}"
+            );
+            // The normalized-input entry must agree with the HEAD
+            // two-phase check on the same strings.
+            match pathutil::normalize_fs_argument(&value) {
+                Ok(normalized) => assert_eq!(
+                    is_secret_path_normalized(&value, &normalized),
+                    reference::is_secret_path(&value),
+                    "is_secret_path_normalized diverged: {value:?}"
+                ),
+                // A normalize failure never reaches
+                // `is_secret_path_normalized` — classification has
+                // already fail-closed the value as a path. The overlay
+                // still treats the spelling as reserved unless it is
+                // empty or carries a literal NUL (those fail on the
+                // NUL/empty reason instead).
+                Err(_) => assert_eq!(
+                    reference::is_secret_path(&value),
+                    !(value.is_empty() || value.contains('\0')),
+                    "unstable normalization must stay reserved: {value:?}"
+                ),
+            }
+            // Callers holding only the normalized form use the
+            // pre-normalized entry — that must still equal the HEAD
+            // verdict.
+            if let Ok(normalized) = pathutil::normalize_fs_argument(&value) {
+                assert_eq!(
+                    is_secret_path_pre_normalized(&normalized),
+                    reference::is_secret_path(&normalized),
+                    "is_secret_path_pre_normalized diverged on \
+                     normalized {normalized:?} (raw {value:?})"
+                );
+            }
+        }
+    }
+}
+
+/// `matches_reserved_form` exits early on an input with no `/`, `.`,
+/// or `\`, so every spelling the reserved set can match as a lone
+/// segment must carry one — a bare-name addition without a dot would
+/// silently never fire. `RESERVED_AWS_FILE` is exempt: it only matches
+/// paired after `.aws`, which forces a separator into the input.
+#[test]
+fn reserved_spellings_keep_the_lexical_gate_invariant() {
+    for name in RESERVED_ABS_FILES.iter().chain(RESERVED_DIR_NAMES).chain([
+        &RESERVED_AWS_DIR,
+        &RESERVED_ENV,
+        &ENV_EXAMPLE,
+    ]) {
+        assert!(
+            name.contains(['/', '.', '\\']),
+            "reserved spelling {name:?} carries no '/' '.' or '\\' — \
+             the matches_reserved_form early-out would suppress it"
+        );
+    }
+}
+
+/// Pre-PR-03 implementations of the overlay entry points, frozen for
+/// the differential tests that prove the shared-normalization plumbing
+/// changed no verdict (`tests::` runs the shared corpus against both;
+/// `auditor::checker::targets::reference` reuses `is_secret_path` for
+/// its own baseline). Bodies are verbatim HEAD except for the old
+/// owned-`String` `nfkc` spelled `nfkc_string`. The frozen bodies are
+/// the contract under test — an intentional verdict change must
+/// re-baseline them (or retire the differential tests), never edit
+/// them to track the new behavior.
+#[cfg(test)]
+pub(crate) mod reference {
+    use super::*;
+
+    /// HEAD `nfkc` — always walks the compatibility tables.
+    fn nfkc_string(input: &str) -> String {
+        input.nfkc().collect()
+    }
+
+    /// HEAD `matches_reserved_form` — no unbroken-name early-out.
+    fn matches_reserved_form(normalized: &str) -> bool {
+        let unified = normalized.replace('\\', "/");
+        let unified_l = unified.to_ascii_lowercase();
+        let resolved = resolved_reserved_files();
+        for (reserved, resolved_reserved) in RESERVED_ABS_FILES.iter().zip(resolved.iter()) {
+            if reserved_eq(&unified, reserved)
+                || pathutil::path_matches_lexical(&unified, reserved)
+                || pathutil::path_matches_lexical(&unified_l, reserved)
+            {
+                return true;
+            }
+            // macOS resolves /etc to /private/etc. Follow the reserved
+            // path too, so reaching the same object through an alias
+            // stays denied.
+            if let Some(resolved_reserved) = resolved_reserved
+                && pathutil::path_matches_lexical(&unified_l, resolved_reserved)
+            {
+                return true;
+            }
+            let trimmed = reserved.trim_start_matches('/');
+            if reserved_eq(&unified, trimmed) || reserved_eq(&unified_l, trimmed) {
+                return true;
+            }
+        }
+
+        let segs = segments(&unified);
+        for (i, seg) in segs.iter().enumerate() {
+            if RESERVED_DIR_NAMES.iter().any(|n| reserved_eq(seg, n)) {
+                return true;
+            }
+            if reserved_eq(seg, RESERVED_AWS_DIR)
+                && segs
+                    .get(i + 1)
+                    .is_some_and(|next| reserved_eq(next, RESERVED_AWS_FILE))
+            {
+                return true;
+            }
+            if reserved_eq(seg, RESERVED_ENV) {
+                return true;
+            }
+            let seg_l = seg.to_ascii_lowercase();
+            if seg_l.starts_with(".env.") && !reserved_eq(seg, ENV_EXAMPLE) {
+                return true;
+            }
+        }
+
+        if let Some(last) = last_segment(&unified) {
+            if reserved_eq(last, RESERVED_ENV) {
+                return true;
+            }
+            let last_l = last.to_ascii_lowercase();
+            if last_l.starts_with(".env.") && !reserved_eq(last, ENV_EXAMPLE) {
+                return true;
+            }
+        }
+
+        for home in reserved_windows_homes() {
+            for name in RESERVED_DIR_NAMES {
+                let prefix = format!("{home}/{name}");
+                if pathutil::path_matches_lexical(&unified, &prefix)
+                    || pathutil::path_matches_lexical(&unified_l, &prefix.to_ascii_lowercase())
+                    || reserved_eq(&unified, &prefix)
+                {
+                    return true;
+                }
+            }
+            let aws = format!("{home}/{RESERVED_AWS_DIR}/{RESERVED_AWS_FILE}");
+            if reserved_eq(&unified, &aws) || reserved_eq(&unified_l, &aws.to_ascii_lowercase()) {
+                return true;
+            }
+            let env = format!("{home}/{RESERVED_ENV}");
+            if reserved_eq(&unified, &env) || reserved_eq(&unified_l, &env.to_ascii_lowercase()) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// HEAD `reserved_after_normalize`.
+    fn reserved_after_normalize(path: &str) -> bool {
+        if path.is_empty() || path.contains('\0') {
+            return false;
+        }
+        let nfkc_raw = nfkc_string(path);
+        let lexical = pathutil::lexical_normalize_str(&nfkc_raw);
+        if matches_reserved_form(&lexical) {
+            return true;
+        }
+        if let Ok(resolved) = pathutil::resolve_for_authorization(&nfkc_raw) {
+            let resolved_nfkc = nfkc_string(&resolved);
+            if matches_reserved_form(&resolved_nfkc)
+                || matches_reserved_form(&pathutil::lexical_normalize_str(&resolved_nfkc))
+                || matches_reserved_form(&pathutil::strip_drive_prefix(&resolved_nfkc))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// HEAD `is_secret_path` — normalizes internally a second time.
+    pub(crate) fn is_secret_path(path: &str) -> bool {
+        if path.is_empty() || path.contains('\0') {
+            return false;
+        }
+        if reserved_after_normalize(path) {
+            return true;
+        }
+        match crate::pathutil::reference::normalize_fs_argument(path) {
+            Ok(normalized) => reserved_after_normalize(&normalized),
+            // Unstable percent-encoding / NUL after decode: treat as
+            // reserved so overlay fails closed rather than allowing a
+            // bypass.
+            Err(_) => true,
+        }
+    }
+
+    /// HEAD `overlay_denies` — per-phase normalization and reserved
+    /// checks.
+    pub(crate) fn overlay_denies(path: &str) -> Result<(), String> {
+        if path.is_empty() || path.contains('\0') {
+            return Err("empty or NUL-containing path".to_string());
+        }
+        let normalized = match crate::pathutil::reference::normalize_fs_argument(path) {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(format!("path '{path}' rejected by secret-overlay ({e})"));
+            }
+        };
+        if path_has_invisible_unicode(path) || path_has_invisible_unicode(&normalized) {
+            return Err(format!(
+                "path '{path}' contains invisible Unicode and is rejected by secret-overlay"
+            ));
+        }
+        if reserved_after_normalize(path) || reserved_after_normalize(&normalized) {
+            return Err(format!(
+                "path '{path}' matches the secret-path overlay (beats explicit allow)"
+            ));
+        }
+        if crate::pathutil::reference::uri_scheme_slot_is_dirty(path)
+            || crate::pathutil::reference::uri_scheme_slot_is_dirty(&normalized)
+        {
+            return Err(format!(
+                "path '{path}' has a non-ASCII or invalid URI scheme and is rejected by secret-overlay"
+            ));
+        }
+        if crate::pathutil::reference::is_opaque_file_uri(path)
+            || crate::pathutil::reference::is_opaque_file_uri(&normalized)
+        {
+            return Err(format!(
+                "path '{path}' is an opaque file: URI and is rejected by the secret-path overlay"
+            ));
+        }
+        Ok(())
     }
 }

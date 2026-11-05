@@ -138,7 +138,7 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 - [x] `bind_launched_workload` と `reverify_immediately_before_spawn` は、パス名から開き直してハッシュする代わりに、保持ハンドルの同一性（`same_open_object`）と stamp の不変を確認する。stamp が変わっていれば内容を再ハッシュして判定する（stamp だけで内容検証を代替しない — D-6）。保持ハンドルを持たない経路（`run-image` など）は従来どおり。`require_trusted_source_file` ゲート（E-10 の対象）は読み直しの対象外として残し、順序（信頼判定 → ハッシュ）を変えない
 - [x] スナップショット（`snapshot_object`）は保持ハンドルから複製しながらダイジェストを計算し、複製後の別読みをなくす。複製したバイト列のダイジェストが pin と一致しなければ fail-closed
 - [x] `code_identity` の報告（どの検査点を通ったか）は従来どおりの項目を出す。読取回数が減っても「検証した検査点」の表現は変えない
-- [ ] 修正後の計測を同じ条件で取り、guide 英日 §8.2 に「起動コストの目安（ファイルサイズ・CPU・回数）」として載せる。目標は読取回数 6 → 2、Node.js 119 MiB で 3.3 s → 1.2 s 以下（SHA 拡張命令なし） — **未了**: 現行の §8.2 記載値は `sha_ni` あり・112 MiB イメージ・0.57 s → 0.33 s の別基準で計測したもので、要求基準（Node.js 119 MiB・SHA 拡張命令なし）の修正前後計測（読取回数・起動時間）は未取得
+- [x] 修正後の計測を同じ条件で取り、guide 英日 §8.2 に「起動コストの目安（ファイルサイズ・CPU・回数）」として載せる。目標は読取回数 6 → 2、Node.js 119 MiB で 3.3 s → 1.2 s 以下（SHA 拡張命令なし） — **計測済み**: WSL2・カーネル 6.18.54.1・x86-64（`sha_ni` ありのホストで `sha2_backend="soft"` 指定ビルドにより非 SHA 拡張 CPU と同一の圧縮経路を強制）、`node` v22.20.0（117.5 MiB）+ `server-filesystem` entrypoint（5.4 KiB）。実行ファイルへの guard 側 `read` は 469.9 MiB → 235.0 MiB（6 → 2 パス相当）、traced `read` 総量 589.3 → 236.8 MiB、spawn→`initialize` 中央値（7 回）1.149 s → 0.561 s。`python3.12`（7.6 MiB）binary-only は 30.6 → 15.3 MiB・0.394 → 0.351 s。strace 7.3 で `read`/`pread64` を `-y` 付きで収集（本カーネルは `rchar` 非公開）。デバッグビルドの `interpreted_entrypoint_hash_*` 3 試験は実 node で単独実行 6.70 s（旧レポートの >30 s から短縮）
 
 **検証:** T-BASE、T-IDENTITY（`workload_hash_e2e` の既存試験 — 差し替え検出・inline eval 拒否・`python -m` 非固定 — が全て通ること）。加えて、hash 中の書き換えを `stamp_unchanged` が検出する既存試験と、保持ハンドルを持たない経路の回帰を対で固定する。デバッグビルドで 30 秒を超えていた Node.js の試験（レポート「評価の前提」）が単独実行で短縮されることを記録する。
 
@@ -160,12 +160,12 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **タスク**
 
-- [ ] 修正前の計測を記録する: レポートと同じ形（64 B／64 KiB／1 MiB の引数、直結との差分、`MCP_WRIT_SKIP_SANDBOX=1`）で Linux 実機の値を取り、`callgrind` または `perf` で内訳を残す
-- [ ] ASCII のみの値では NFKC を省く（NFKC は ASCII に対して恒等。`is_ascii()` の判定は線形 1 回で済む）。非 ASCII を含む値は従来どおり NFKC を 2 回とも行う
-- [ ] `classify_target_string` が計算した `normalized` を `is_secret_path` に渡す入口（例: `is_secret_path_normalized(raw, normalized)`）を設け、二重の `normalize_fs_argument` をなくす。`Err(_) => true`（不安定なパーセントエンコードは予約扱い）の fail-closed は維持する
-- [ ] `selector_plausible` が偽になる値（区切り・sigil・ドットを含まない）について、正規化の前に判定できる条件を特定し、該当する値では正規化と秘密パス判定を省けるかを検討する。省けるのは「`looks_like_path`・`looks_like_network_target`・`looks_like_host_or_socket`・`is_secret_path` のいずれも真になり得ない」ことを証明できる場合に限る。証明できなければ省かない（D-4）
-- [ ] 1 MiB 級の単一文字列で `resolve_for_authorization`（`secret_paths.rs` `229`）がファイルシステムに触れる回数を測り、`matches_reserved_form` の字句判定が偽のときに解決を省けるかを確認する（既存の順序が「字句で真なら即 true、偽なら解決して再判定」なので、解決は省けない可能性が高い — 結果を記録する）
-- [ ] 修正後の計測を同じ条件で取り、guide 英日の性能の節（§8 付近）に「引数サイズ別の増分の目安」として載せる。目標は 1 MiB で増分を半減
+- [x] 修正前の計測を記録する: レポートと同じ形（64 B／64 KiB／1 MiB の引数、直結との差分、`MCP_WRIT_SKIP_SANDBOX=1`）で Linux 実機の値を取り、`callgrind` または `perf` で内訳を残す — **計測済み**: WSL2・カーネル 6.18.54.1・x86-64。`check_request` 1 MiB 約 96–99 ms（`is_secret_path` 約 72 ms・`normalize_fs_argument` 約 15 ms・`looks_like_network_target` 約 16 ms）、`perf stat` 約 344 G 命令、proxy 増分（直結差分）約 111 ms。`perf` 内訳: NFKC 系約 46 %・UTF-8 lossy 約 9 %
+- [x] ASCII のみの値では NFKC を省く（NFKC は ASCII に対して恒等。`is_ascii()` の判定は線形 1 回で済む）。非 ASCII を含む値は従来どおり NFKC を 2 回とも行う — `nfkc` を `Cow` 化し ASCII は借用（`pathutil.rs`・`secret_paths.rs`）
+- [x] `classify_target_string` が計算した `normalized` を `is_secret_path` に渡す入口（例: `is_secret_path_normalized(raw, normalized)`）を設け、二重の `normalize_fs_argument` をなくす。`Err(_) => true`（不安定なパーセントエンコードは予約扱い）の fail-closed は維持する — `is_secret_path_normalized` を新設し二重正規化を解消。`looks_like_network_target_normalized` も同様に正規化済み入力を受ける版を追加
+- [x] `selector_plausible` が偽になる値（区切り・sigil・ドットを含まない）について、正規化の前に判定できる条件を特定し、該当する値では正規化と秘密パス判定を省けるかを検討する。省けるのは「`looks_like_path`・`looks_like_network_target`・`looks_like_host_or_socket`・`is_secret_path` のいずれも真になり得ない」ことを証明できる場合に限る。証明できなければ省かない（D-4） — **結果**: セレクタ区切り（`/` `\` `:` `~` `$` `%` `@` `.`）を持たない印字 ASCII トークンは `normalize_fs_argument` が恒等（`%` 無し・制御 byte 無し・`:` 無し・ASCII）かつ 4 つの shape 判定が全て偽と証明できるため、正規化と shape 判定を省略する `classify_plain_token` 経路を設けた。**`is_secret_path` は省略しない** — bare トークンでも cwd やシンボリックリンク祖先経由で予約綴りに解決し得る（cwd=`/etc` + `passwd`）ため証明できず、代わりに字句ゲートでミスを安くした
+- [x] 1 MiB 級の単一文字列で `resolve_for_authorization`（`secret_paths.rs` `229`）がファイルシステムに触れる回数を測り、`matches_reserved_form` の字句判定が偽のときに解決を省けるかを確認する（既存の順序が「字句で真なら即 true、偽なら解決して再判定」なので、解決は省けない可能性が高い — 結果を記録する） — **結果**: 省けない。ptrace トレーサで測定（strace・tracing イベントは本 WSL2 カーネルで不可）: 1 MiB 単一トークンで path-lookup syscall 約 9 回/呼出（`getcwd`×1・`statx`×4・`readlink`×4）、引数サイズ非依存の有界コスト。字句で偽でも解決が予約綴りを生み得る（同上）ため解決は維持
+- [x] 修正後の計測を同じ条件で取り、guide 英日の性能の節（§8 付近）に「引数サイズ別の増分の目安」として載せる。目標は 1 MiB で増分を半減 — **計測済み**: 同条件で `check_request` 1 MiB 約 5.6–7.7 ms・命令数約 18 G（約 95 % 削減）、proxy 増分約 111 ms → 約 11 ms（約 90 % 削減、半減目標を上回る）。guide 英日 §8.2 の起動コスト計測段落に続けて記載
 
 **検証:** T-BASE（`targets.rs`・`secret_paths.rs`・`pathutil.rs` の既存単体試験 — 特に `%66ile:///`・NUL・不可視 Unicode・NFKC 同形の秘密パスを検出する試験 — が全て通ること）、T-PROTOCOL（`tool_enforcement_e2e`）。非 ASCII の秘密パス（全角・結合文字）が引き続き拒否されることを対で固定する。
 

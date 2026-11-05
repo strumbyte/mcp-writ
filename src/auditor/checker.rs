@@ -6,6 +6,7 @@ use crate::protocol::{MCP_VERSION_2025_11_25, MCP_VERSION_2026_07_28, META_PROTO
 mod sub_policy;
 mod targets;
 
+pub(crate) use targets::extract_deputy_use_targets_rc;
 pub use targets::{extract_deputy_use_targets, extract_fs_targets, request_has_host_or_url};
 
 /// Maximum accepted `params.requestState` UTF-8 byte length.

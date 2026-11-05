@@ -392,12 +392,8 @@ impl DynamicAllowList {
 }
 
 fn export_temp_path(path: &Path) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
     let mut tmp_os = path.as_os_str().to_os_string();
-    tmp_os.push(format!(".tmp-{}-{nanos}", std::process::id()));
+    tmp_os.push(format!(".tmp-{}", crate::fspriv::unique_suffix()));
     PathBuf::from(tmp_os)
 }
 

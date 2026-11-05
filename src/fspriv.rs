@@ -30,6 +30,7 @@ pub use pinned::{
 pub(crate) use pinned::{path_under_share_root, replaceable_permitted_for};
 #[cfg(windows)]
 pub use tempdir::restrict_handle_owner_only;
+pub(crate) use tempdir::unique_suffix;
 pub use tempdir::{create_private_tempdir, restrict_owner_only};
 #[cfg(windows)]
 pub(crate) use winsec::{

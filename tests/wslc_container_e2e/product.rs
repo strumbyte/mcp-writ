@@ -92,6 +92,10 @@ async fn wslc_product_run_image() {
     if blocking(ensure_base_pulled).await.is_none() {
         return;
     }
+    if let Some(gap) = blocking(substrate_boundary_gap).await {
+        common::skip_wslc_test(&gap);
+        return;
+    }
     let (_image, secure) = match shared_images(&runner, &probe).await {
         Ok(t) => t,
         Err(e) => {
@@ -257,6 +261,10 @@ async fn wslc_product_external_sigint_ends_session() {
         return;
     };
     if blocking(ensure_base_pulled).await.is_none() {
+        return;
+    }
+    if let Some(gap) = blocking(substrate_boundary_gap).await {
+        common::skip_wslc_test(&gap);
         return;
     }
     let (_image, secure) = match shared_images(&runner, &probe).await {

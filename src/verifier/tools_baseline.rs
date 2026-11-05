@@ -123,13 +123,10 @@ mod tests {
     use super::*;
 
     fn make_test_dir(label: &str) -> std::path::PathBuf {
-        let id = std::process::id();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir =
-            crate::testutil::real_temp_base().join(format!("mcp_writ_baseline_{label}_{id}_{ts}"));
+        let dir = crate::testutil::real_temp_base().join(format!(
+            "mcp_writ_baseline_{label}_{}",
+            crate::fspriv::unique_suffix()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
