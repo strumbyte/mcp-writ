@@ -255,6 +255,10 @@ pub struct ToolDisposition {
     pub server: Option<String>,
     pub allowed: bool,
     pub side_effect: Option<String>,
+    /// The tool's `arguments { opaque }` declared spellings — the
+    /// `params.arguments` members the unrecognized-argument refusal
+    /// waives for this tool. Empty unless the policy declares them.
+    pub opaque: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

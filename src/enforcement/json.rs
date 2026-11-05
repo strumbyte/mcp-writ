@@ -198,7 +198,16 @@ fn write_tool(
     match &t.side_effect {
         Some(s) => f.member("side_effect", s.as_str()),
         None => f.member("side_effect", JsonNull),
-    }
+    }?;
+    f.member(
+        "opaque",
+        nojson::array(|f| {
+            for field in &t.opaque {
+                f.element(field.as_str())?;
+            }
+            Ok(())
+        }),
+    )
 }
 
 fn write_egress_rule(
@@ -857,6 +866,26 @@ impl CheckReport {
                 nojson::array(|f| {
                     for m in &report.review_markers {
                         f.element(nojson::object(|o| write_review_marker(o, m)))?;
+                    }
+                    Ok(())
+                }),
+            )?;
+            f.member(
+                "opaque_arguments",
+                nojson::array(|f| {
+                    for r in &report.opaque_arguments {
+                        f.element(nojson::object(|o| {
+                            o.member("tool", r.tool.as_str())?;
+                            o.member(
+                                "fields",
+                                nojson::array(|f| {
+                                    for field in &r.fields {
+                                        f.element(field.as_str())?;
+                                    }
+                                    Ok(())
+                                }),
+                            )
+                        }))?;
                     }
                     Ok(())
                 }),

@@ -26,6 +26,7 @@ fn test_policy() -> Policy {
                 process_exec_allowed: false,
                 process_explicit: false,
                 deputy: None,
+                opaque_fields: Vec::new(),
             },
             ToolPolicy {
                 name: "exec_shell".to_string(),
@@ -48,6 +49,7 @@ fn test_policy() -> Policy {
                 process_exec_allowed: false,
                 process_explicit: false,
                 deputy: None,
+                opaque_fields: Vec::new(),
             },
         ],
         ..Default::default()
@@ -208,6 +210,7 @@ fn sub_policy_policy() -> Policy {
                 process_exec_allowed: false,
                 process_explicit: false,
                 deputy: None,
+                opaque_fields: Vec::new(),
             },
             // Tool with network sub-policy
             ToolPolicy {
@@ -238,6 +241,7 @@ fn sub_policy_policy() -> Policy {
                 process_exec_allowed: false,
                 process_explicit: false,
                 deputy: None,
+                opaque_fields: Vec::new(),
             },
             // Tool with no sub-policy (global defaults only)
             ToolPolicy {
@@ -261,6 +265,7 @@ fn sub_policy_policy() -> Policy {
                 process_exec_allowed: false,
                 process_explicit: false,
                 deputy: None,
+                opaque_fields: Vec::new(),
             },
             // Tool with syscall sub-policy (metadata only, no request-level check)
             ToolPolicy {
@@ -287,6 +292,7 @@ fn sub_policy_policy() -> Policy {
                 process_exec_allowed: false,
                 process_explicit: false,
                 deputy: None,
+                opaque_fields: Vec::new(),
             },
         ],
         // The global default is `deny_all_others` — these tests exercise
@@ -339,6 +345,7 @@ fn schema_policy() -> Policy {
                 process_exec_allowed: false,
                 process_explicit: false,
                 deputy: None,
+                opaque_fields: Vec::new(),
             },
             ToolPolicy {
                 name: "optional_args".to_string(),
@@ -363,6 +370,7 @@ fn schema_policy() -> Policy {
                 process_exec_allowed: false,
                 process_explicit: false,
                 deputy: None,
+                opaque_fields: Vec::new(),
             },
             ToolPolicy {
                 name: "no_schema".to_string(),
@@ -385,6 +393,7 @@ fn schema_policy() -> Policy {
                 process_exec_allowed: false,
                 process_explicit: false,
                 deputy: None,
+                opaque_fields: Vec::new(),
             },
         ],
         ..Default::default()
@@ -394,6 +403,7 @@ fn schema_policy() -> Policy {
 mod decoy;
 mod helpers;
 mod mrtr;
+mod opaque;
 mod schema;
 mod targets;
 mod tool_sub_policy;

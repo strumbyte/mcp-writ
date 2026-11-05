@@ -372,7 +372,8 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
                 || emit_syscalls
                 || emit_net
                 || tool.process_explicit
-                || tool.deputy.is_some();
+                || tool.deputy.is_some()
+                || !tool.opaque_fields.is_empty();
             if has_children {
                 tool_line.push_str(" {\n");
                 if emit_fs && let Some(ref fs) = tool.fs {
@@ -492,6 +493,19 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
                         }
                         tool_line.push_str("        }\n");
                     }
+                }
+                if !tool.opaque_fields.is_empty() {
+                    // One `opaque` node per declared field — the parse
+                    // accepts several names on a node, but one per line
+                    // keeps the exported diff readable.
+                    tool_line.push_str("        arguments {\n");
+                    for field in &tool.opaque_fields {
+                        tool_line.push_str(&format!(
+                            "            opaque \"{}\"\n",
+                            escape_kdl(&field.source)
+                        ));
+                    }
+                    tool_line.push_str("        }\n");
                 }
                 tool_line.push_str("    }\n");
             } else {
@@ -689,6 +703,10 @@ fn normalized_for_export(policy: &Policy) -> Policy {
         {
             tool.syscalls = None;
         }
+        // The declaration order of `opaque` fields carries no semantic
+        // weight — the field set is the contract.
+        tool.opaque_fields
+            .sort_by(|a, b| a.segments().cmp(b.segments()));
     }
     // `to_kdl` groups tools and hash entries by server, so declaration
     // order is not preserved; compare them as sets.
@@ -842,6 +860,36 @@ mod to_kdl_tests {
             .expect("allowed_exec");
         assert!(allowed.process_explicit);
         assert!(allowed.process_exec_allowed);
+    }
+
+    #[test]
+    fn opaque_fields_emit_and_round_trip() {
+        let kdl = r#"
+            policy version=2
+            server "svc" {
+                tool "memory_add" {
+                    arguments {
+                        opaque "name" "observations"
+                        opaque "/params/arguments/entities/name"
+                    }
+                }
+            }
+        "#;
+        let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
+        let emitted = policy.to_kdl();
+        assert!(emitted.contains("arguments {"), "got:\n{emitted}");
+        assert!(emitted.contains("opaque \"name\""), "got:\n{emitted}");
+        assert!(
+            emitted.contains("opaque \"/params/arguments/entities/name\""),
+            "got:\n{emitted}"
+        );
+        let reparsed =
+            crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
+        assert!(
+            policies_equivalent_for_export(&policy, &reparsed),
+            "opaque declarations must survive the export round-trip"
+        );
+        crate::policy::validator::validate_policy(&reparsed).expect("to_kdl output validates");
     }
 
     #[test]

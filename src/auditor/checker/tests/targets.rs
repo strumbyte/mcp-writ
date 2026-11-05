@@ -62,12 +62,16 @@ fn test_public_extraction_api_keeps_string_vecs() {
     // `_rc` deputy variant are crate-internal; these bindings pin the
     // signatures so a future refactor cannot leak `Rc` into the public
     // API without failing to compile.
+    type DeputyExtractor = fn(
+        &str,
+        &[crate::policy::deputy::DeputyRule],
+        &[crate::policy::opaque::OpaqueField],
+    ) -> Result<Vec<String>, String>;
     let fs: fn(&str) -> Vec<String> = super::super::targets::extract_fs_targets;
-    let dep: fn(&str, &[crate::policy::deputy::DeputyRule]) -> Result<Vec<String>, String> =
-        super::super::targets::extract_deputy_use_targets;
+    let dep: DeputyExtractor = super::super::targets::extract_deputy_use_targets;
     fn assert_send_sync<T: Send + Sync>(_: &T) {}
     assert_send_sync(&fs(r#"{"params":{"arguments":{"path":"/tmp/a"}}}"#));
-    assert_send_sync(&dep(r#"{"params":{}}"#, &[]));
+    assert_send_sync(&dep(r#"{"params":{}}"#, &[], &[]));
 }
 
 #[test]
@@ -86,7 +90,7 @@ fn test_combined_collection_stops_at_target_cap() {
     let tail = "Ａ".repeat(300_000); // fullwidth — NFKC-expensive
     let line = format!(r#"{{"params":{{"arguments":{{"paths":[{paths}],"tail":"{tail}"}}}}}}"#);
     let json = nojson::RawJson::parse(&line).unwrap();
-    let (targets, leaves) = super::super::targets::walk_combined_classified::<String>(&json);
+    let (targets, leaves) = super::super::targets::walk_combined_classified::<String>(&json, None);
     assert!(targets.truncated);
     assert_eq!(leaves.collected_len(), 513);
 }

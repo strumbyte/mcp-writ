@@ -148,6 +148,20 @@ pub(super) fn seed_tool_fields(
             |_| false,
         );
     }
+    // `arguments { opaque ... }` has no defaults source — declared
+    // fields attribute to the declaration site.
+    if !tool.opaque_fields.is_empty() {
+        prov.reproject(
+            format!("{key}.arguments.opaque"),
+            origin,
+            tool.opaque_fields
+                .iter()
+                .map(|f| f.source.clone())
+                .collect(),
+            &[],
+            |_| false,
+        );
+    }
 }
 
 /// Merge an overlay tool's declared `filesystem` block onto the base

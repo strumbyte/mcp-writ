@@ -366,6 +366,7 @@ pub(super) fn tools_table(policy: &Policy) -> Vec<ToolDisposition> {
             server: t.server.clone(),
             allowed: t.allowed,
             side_effect: t.side_effect.clone(),
+            opaque: t.opaque_fields.iter().map(|f| f.source.clone()).collect(),
         })
         .collect()
 }
@@ -373,8 +374,8 @@ pub(super) fn tools_table(policy: &Policy) -> Vec<ToolDisposition> {
 /// Scope notes every plan carries. These are the load-bearing honest
 /// statements: grants are process-wide, ambient permissions are not
 /// enumerated, and a deny never surfaces as an access grant.
-pub(super) fn base_limitations() -> Vec<String> {
-    vec![
+pub(super) fn base_limitations(policy: &Policy) -> Vec<String> {
+    let mut v = vec![
         "OS grants are process-wide: a path granted for one tool is reachable by \
          every tool at kernel level; per-tool restrictions are enforced at the \
          RPC layer only."
@@ -388,7 +389,25 @@ pub(super) fn base_limitations() -> Vec<String> {
          explicitly (PSEC fs_deny) it appears as a `*_deny` rule record, \
          never as an access grant."
             .to_string(),
-    ]
+    ];
+    if policy
+        .tools
+        .iter()
+        .any(|t| t.allowed && !t.opaque_fields.is_empty())
+    {
+        // The declared fields forward even strings that *look*
+        // selector-plausible — the operator must see that the
+        // unrecognized-argument refusal is waived for exactly those
+        // members, and that the other classification gates still run.
+        v.push(
+            "arguments { opaque } declarations: the named argument members forward \
+             free-form strings for that tool — the unrecognized-argument refusal is \
+             waived for them, while secret-path and resource-shape rules still \
+             evaluate their values."
+                .to_string(),
+        );
+    }
+    v
 }
 
 /// The `launch.env` observation: the env contract is applied as part of
@@ -459,7 +478,7 @@ pub(super) fn build_plan(
     let psec_env = cfg!(target_os = "windows") && mechanism == WindowsNativeMechanism::Psec;
     let mut controls = shared_controls(policy, opts, dry_run, private_tmpdir, psec_env);
     let tools = tools_table(policy);
-    let mut limitations = base_limitations();
+    let mut limitations = base_limitations(policy);
     if policy.environment.inherit_parent {
         limitations.push(
             "Ambient environment inheritance is enabled (`environment { inherit-parent \
@@ -527,7 +546,7 @@ pub(super) fn build_plan_namespaced(
 ) -> EnforcementPlan {
     let mut controls = shared_controls(policy, opts, dry_run, false, false);
     let tools = tools_table(policy);
-    let mut limitations = base_limitations();
+    let mut limitations = base_limitations(policy);
     if policy.environment.inherit_parent {
         limitations.push(
             "Ambient environment inheritance is enabled (`environment { inherit-parent \

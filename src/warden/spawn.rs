@@ -498,7 +498,7 @@ impl Warden {
             let psec_env = self.windows_mechanism == WindowsNativeMechanism::Psec;
             let mut controls = plan::shared_controls(&self.policy, opts, dry_run, false, psec_env);
             controls.extend(plan::os_controls(&self.policy, self.windows_mechanism));
-            let mut limitations = plan::base_limitations();
+            let mut limitations = plan::base_limitations(&self.policy);
             plan::os_limitations(&self.policy, &mut limitations, self.windows_mechanism);
             let mut grants = Vec::new();
             // Observations are taken from the spawn path alone: it owns
@@ -617,7 +617,7 @@ impl Warden {
         {
             let mut controls = plan::shared_controls(&self.policy, opts, dry_run, true, false);
             controls.extend(plan::os_controls(&self.policy, self.windows_mechanism));
-            let mut limitations = plan::base_limitations();
+            let mut limitations = plan::base_limitations(&self.policy);
             plan::os_limitations(&self.policy, &mut limitations, self.windows_mechanism);
             let mut observations = Vec::new();
 
@@ -939,7 +939,7 @@ impl Warden {
 
             let mut controls = plan::shared_controls(&self.policy, opts, dry_run, false, false);
             controls.extend(plan::os_controls(&self.policy, self.windows_mechanism));
-            let mut limitations = plan::base_limitations();
+            let mut limitations = plan::base_limitations(&self.policy);
             plan::os_limitations(&self.policy, &mut limitations, self.windows_mechanism);
 
             let mut sandbox_bits = match linux_spawn::prepare_linux_child_sandbox(&self.policy) {

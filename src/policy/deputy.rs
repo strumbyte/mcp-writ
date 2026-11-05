@@ -266,8 +266,9 @@ impl ExtractPointer {
 }
 
 /// Decode one pointer segment's `~0`/`~1` escapes; any other `~` use is
-/// invalid.
-fn decode_segment(raw: &str) -> Result<String, String> {
+/// invalid. Shared with the `opaque` field declarations — they use the
+/// same restricted-pointer notation.
+pub(crate) fn decode_segment(raw: &str) -> Result<String, String> {
     if !raw.contains('~') {
         return Ok(raw.to_string());
     }

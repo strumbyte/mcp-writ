@@ -312,14 +312,14 @@ fn test_extract_deputy_use_targets_denies_undeclared_selector() {
     // selector under an undeclared key is an extraction failure.
     let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt","mystery":"sneaky.example"}}}"#;
     let p = ExtractPointer::parse("/params/arguments/path", "params").unwrap();
-    let err = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)]).unwrap_err();
+    let err = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)], &[]).unwrap_err();
     assert!(err.contains("unrecognized argument"), "got: {err}");
 
     // Payload-vocabulary values and bare words are not selectors and the
     // declared pointer still resolves.
     let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt","note":"see sneaky.example","mystery":"word"}}}"#;
     let p = ExtractPointer::parse("/params/arguments/path", "params").unwrap();
-    let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)]).unwrap();
+    let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)], &[]).unwrap();
     assert_eq!(out, vec!["/workspace/a.txt".to_string()]);
 }
 

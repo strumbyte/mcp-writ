@@ -9,6 +9,51 @@
 
 既に草案がある場合は[権限の編集](#editing)から進めてください。[用途別の例](#recipes)、[動作確認](#verification)、[問題の切り分け](#troubleshooting)も参照できます。
 
+## Auditor はツールの引数をどう読むか
+
+条項を書き始める前に、`tools/call` の `params.arguments` を Auditor がどう分類するかを押さえておくと判断しやすくなります — 分類されるのは既知キーだけではなく全ての文字列値で、制限付きツール上の未認識フィールドは、その値がリソースを指し得る形の場合にだけ拒否されます。何も指さない裸の単語はデータとして転送されます。
+
+<a id="argument-classification"></a>
+
+### 何が分類され、何が拒否されるか
+
+- **パスターゲット**: 値がパスらしい場合（`/abs`、`../rel`、`file:///x`）、またはパスフィールド名のキーの下にある全ての値 — 既知名の `path`、`paths`、`file`、`filename`、`filepath`、`directory`、`dir`、`dest`、`destination`、`source`、`output`、`target`、`root`、`cwd` に加え、任意の `*_path` / `*_paths`（スネークケース）・`*Path` / `*Paths`（キャメルケース）キー。`*Path` の語幹が `xpath`（`XPath`、`xPath`、`nodeXPath` など）のキーは XPath 式を運ぶため名前で除外されます。その他のサフィックス系キー — `jsonPath`・`JSONPath`・`json_path` といった `json` 語幹の綴りを含む — は値で判定され、`/` も `\` も含まない JSONPath 式（`$`、`$.items[0]`、`$[0]`）はクエリ引数として免除され、それ以外の値は引き続き検査対象です。
+- **ネットワークターゲット**: `scheme://` URL、IP リテラル、`host:port`、`[v6]:port`、およびネットワークフィールド名（`url`、`host`、`uri`、`endpoint`、`origin`、別名 `addr`、`peer`、`server`、`socket`、`proxy` など）の下の裸のホスト名。値が URL 形の場合は、キー名がパス系でもネットワークターゲットとして扱われます。
+- **予約済み秘密パス**: 任意のキーの下で予約済み秘密パス（`.env`、`.ssh`、`.gnupg`、`.aws/credentials`）を綴る値は、どの allow glob でも開けない秘密パスとして分類されたままです。
+- **既知のペイロードフィールド**: `content`、`text`、`data`、`note`、`prompt`、`value` などはセレクタではなくデータを運びます。
+- **その他は未分類**: 制限付き契約を持つツール — fs の `allow`/`deny`/`require` 規則、ツール `network` ブロック（`allow none` を含む）、`side_effect="read_only"`、グローバル outbound 規則 — では、それでもリソースを指し得る形の未分類の値（区切り、`~`/`$`/`%`/`@` のシジル、ドットを含む）は拒否されます。識別・資格情報系のキー（`id`、`user`、`username`、`token`、`secret`、`password`、`auth`）はペイロードではなく、その値は未認識フィールドと同様に分類を経ます。
+
+この最後の拒否が、記憶系や課題管理系のサーバーで `"Acme Corp."` や `"contact alice@example.com"` のような正当な自由記述の文字列を拒否する原因です。
+
+<a id="declaring-opaque-argument-fields"></a>
+
+### 自由記述の欄の宣言（`arguments { opaque }`）
+
+欄が文章を運ぶと分かっている場合 — 表示名、メモ、自由形式のリスト — は opaque として宣言し、その欄の値に未認識フィールド拒否がかからないようにできます。
+
+```kdl
+policy version=2
+server "memory" {
+    tool "create_entities" {
+        arguments {
+            opaque "name" "observations"
+        }
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+}
+```
+
+- 裸の名前は `params.arguments` の最上位キーを指します — 値がオブジェクトや配列の場合、その配下のサブツリー全体が opaque になるため、`opaque "entities"` は `entities[*].name` をはじめ要素内の全メンバーをカバーします。JSON Pointer 形式 `/params/arguments/entities/name` は、オブジェクトや配列要素の中の特定のメンバーだけを指します（`~0`/`~1` エスケープはデコードされ、`*` ワイルドカードは受理されません）。1 ツールあたり最大 64 欄です。
+- `arguments` は `policy version=2` が必要で、`extends`、`include`、条件の合った `when` を通して和集合でマージされます — 宣言は適用範囲を増やすだけです。
+- 宣言が免除するのは**未認識フィールド拒否だけ**です。宣言した欄でも、秘密パスの綴りや資源形の値（`scheme://` URL、IP リテラル、`host:port`、パスらしい値）は従来どおり分類・検査され、`read_only` はホストや URL を拒否し続けます。パス・ホスト・URL を決して運ばない欄にだけ opaque を宣言してください。宣言した欄は `check` と `plan` でツールごとに一覧表示され、監査の `tool_call.allowed` レコードには呼び出しが宣言済み欄をいくつ使ったかが記録されます — 値そのものは記録されません。
+
+### `arguments { opaque }` と `deputy extract` の違い
+
+2 つの仕組みは異なる問いに答えます。`deputy role="use"` の `extract` は資源引数を**束縛**します — ポインタが要求から抽出したパスは全て `known_paths` 済みでなければならず、欄が運べる資源の値を絞ります。`arguments { opaque }` は逆の主張です — その欄は資源を決して運ばないので、束縛するものはありません。ポリシーが検査すべきパスを運ぶ欄には `deputy` を、自由記述のテキストを運ぶ欄には `opaque` を使います。
+
 ## 1. 対象と許可する操作を決める
 
 最初は、1 サーバーにつき 1 ポリシーファイルにすると設定を追いやすくなります。次の情報を確認します。
@@ -548,7 +593,7 @@ tool "echo" side_effect="read_only" {
 
 これで `{"message":"hello"}` のようなパスなし引数を許可し、持ち込まれたパスは拒否します。`require-path #false` は、空の許可リストと組み合わせる場合にだけ使えます。
 
-引数がパスターゲットとして扱われるのは、値がパスらしい場合（`/abs`、`../rel`、`file:///x`）か、キー名がパスフィールドの場合です — 既知名の `path`、`paths`、`file`、`filename`、`filepath`、`directory`、`dir`、`dest`、`destination`、`source`、`output`、`target`、`root`、`cwd` に加え、任意の `*_path` / `*_paths`（スネークケース）・`*Path` / `*Paths`（キャメルケース）キー。`Path` の語幹が `xpath`（`XPath`、`xPath`、`nodeXPath` など）のキーは XPath 式を運ぶため名前で除外されます。その他の `*Path` / `*Paths` キー — `jsonPath`・`JSONPath`・`json_path` といった `json` 語幹の綴りを含む — は値で判定され、値が `/` も `\` も含まない JSONPath 式（`$`、`$.items[0]`、`$[0]`）の場合に限りクエリ引数として免除されます。`jsonPath` 系キーの下でも、`/etc/passwd` のようなパスを含む値はその他の値と同様にパス検査の対象です。意図しないパスで拒否されたときはツールの引数名を確認してください。値が URL 形の場合は、キー名がパス系でもネットワークターゲットとして扱われます。
+引数がパスターゲットとして扱われるのは、値がパスらしい場合（`/abs`、`../rel`、`file:///x`）か、キー名がパスフィールドの場合です — `xpath`・`jsonPath` 系の細かい判定を含む分類規則の全容は[何が分類され、何が拒否されるか](#argument-classification)にあります。意図しないパスで拒否されたときはツールの引数名を確認してください。自由記述しか運ばない欄が未認識フィールド拒否に引っかかり続ける場合は[自由記述の欄の宣言](#declaring-opaque-argument-fields)を参照してください。
 親のネットワーク許可も継承するので、この例をネットワークが開いたポリシーへ移すときは `tool.network` も見直してください。
 
 ### 引数の形式を制限する

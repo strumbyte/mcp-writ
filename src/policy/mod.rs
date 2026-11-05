@@ -16,6 +16,7 @@ pub(crate) const MAX_SCHEMA_FILE_BYTES: u64 = 1024 * 1024;
 pub mod loader;
 pub mod mcp;
 pub mod merge;
+pub mod opaque;
 mod outbound;
 pub mod review;
 pub mod validator;
@@ -354,6 +355,12 @@ pub struct ToolPolicy {
     /// (KDL schema v2). `None` leaves the fixed-name compatibility
     /// mapping in effect — see `deputy::deputy_binding`.
     pub deputy: Option<deputy::DeputyPolicy>,
+    /// `arguments { opaque ... }` declarations (KDL schema v2): the
+    /// named `params.arguments` members hold free-form text for this
+    /// tool, so the unrecognized-argument refusal does not apply to
+    /// them. Secret-path and resource-shape classification still does
+    /// — see `opaque.rs`.
+    pub opaque_fields: Vec<opaque::OpaqueField>,
 }
 
 impl ToolPolicy {
@@ -380,6 +387,7 @@ impl ToolPolicy {
             process_exec_allowed: false,
             process_explicit: false,
             deputy: None,
+            opaque_fields: Vec::new(),
         }
     }
 

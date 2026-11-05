@@ -83,6 +83,7 @@ fn base_report() -> CheckReport {
         policy: None,
         pins: Vec::new(),
         review_markers: Vec::new(),
+        opaque_arguments: Vec::new(),
         warnings: Vec::new(),
         migration: None,
         remediation: Vec::new(),
@@ -185,6 +186,18 @@ async fn evaluate(args: CheckArgs) -> CheckReport {
             file: w.file.display().to_string(),
             line: w.line,
             message: sanitize_for_terminal(&w.message),
+        })
+        .collect();
+    // The opaque-argument carve-outs ride in-band like the warnings —
+    // the report names every member whose unrecognized-argument
+    // refusal is waived.
+    report.opaque_arguments = bound
+        .tools
+        .iter()
+        .filter(|t| !t.opaque_fields.is_empty())
+        .map(|t| crate::enforcement::OpaqueArgumentsRecord {
+            tool: t.name.clone(),
+            fields: t.opaque_fields.iter().map(|f| f.source.clone()).collect(),
         })
         .collect();
 
@@ -873,6 +886,22 @@ fn print_summary(report: &CheckReport) {
             }
         }
     }
+    // Declared free-form members are an operational carve-out — the
+    // operator must see which fields forward strings that merely *look*
+    // like resources, not just read them out of the JSON report.
+    for record in &report.opaque_arguments {
+        eprintln!(
+            "  tool '{}' arguments {{ opaque {} }} — declared members forward \
+             free-form strings (resource shapes still checked)",
+            sanitize_for_terminal(&record.tool),
+            record
+                .fields
+                .iter()
+                .map(|f| format!("\"{}\"", sanitize_for_terminal(f)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     for (i, step) in report.remediation.iter().enumerate() {
         eprintln!("  {}. {}", i + 1, sanitize_for_terminal(step));
     }
@@ -934,6 +963,7 @@ fn emit_and_exit(report: &CheckReport, report_path: Option<&Path>) -> ! {
                 policy: report.policy.clone(),
                 pins: report.pins.clone(),
                 review_markers: report.review_markers.clone(),
+                opaque_arguments: report.opaque_arguments.clone(),
                 warnings: report.warnings.clone(),
                 migration: report.migration.clone(),
                 remediation: vec![format!(

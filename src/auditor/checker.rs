@@ -314,9 +314,15 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
     check_input_responses(&json, tool, &tool_name, &mut audit_notes)?;
 
     // Step 6: Tool-specific sub-policy checks (fs, network)
-    let has_sub_policy = sub_policy::check_tool_sub_policy(&json, tool, policy)?;
+    let outcome = sub_policy::check_tool_sub_policy(&json, tool, policy)?;
+    if outcome.opaque_fields > 0 {
+        // How many of the tool's `arguments { opaque }` declared fields
+        // carried a value past the unrecognized-argument refusal —
+        // a `0` stays silent so ordinary calls see no new detail.
+        audit_notes.push(format!("opaque_fields={}", outcome.opaque_fields));
+    }
 
-    let sub_policy = if has_sub_policy {
+    let sub_policy = if outcome.sub_policy {
         Some(format!("tool:{}", tool_name))
     } else {
         None

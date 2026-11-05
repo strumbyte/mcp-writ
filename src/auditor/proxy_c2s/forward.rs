@@ -1066,12 +1066,21 @@ pub(super) fn apply_confused_deputy_c2s(
             Ok(())
         }
         crate::policy::deputy::DeputyBinding::Use(rules) => {
-            let paths = checker::extract_deputy_use_targets_rc(line, rules).map_err(|reason| {
-                checker::PolicyViolation {
+            // The tool's `arguments { opaque }` declarations apply to the
+            // closed-contract check exactly as they do to the tool's own
+            // sub-policy — the deputy binding lookup already found this
+            // tool by name.
+            let opaque_fields = policy
+                .tools
+                .iter()
+                .find(|t| t.name == tool_name)
+                .map(|t| t.opaque_fields.as_slice())
+                .unwrap_or(&[]);
+            let paths = checker::extract_deputy_use_targets_rc(line, rules, opaque_fields)
+                .map_err(|reason| checker::PolicyViolation {
                     tool_name: tool_name.to_string(),
                     reason: format!("confused deputy: {reason}"),
-                }
-            })?;
+                })?;
             if paths.is_empty() {
                 return Err(checker::PolicyViolation {
                     tool_name: tool_name.to_string(),

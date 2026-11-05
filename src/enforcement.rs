@@ -40,7 +40,8 @@ pub use capability::{
 };
 pub use check::{
     CHECK_REPORT_SCHEMA_VERSION, CheckReport, CheckStatus, MigrationFieldDiff, MigrationRecord,
-    MigrationStatus, PinResult, PinStatus, PolicyWarningRecord, ReviewMarkerRecord,
+    MigrationStatus, OpaqueArgumentsRecord, PinResult, PinStatus, PolicyWarningRecord,
+    ReviewMarkerRecord,
 };
 pub use model::{
     CodeIdentity, ControlLayer, ControlPhase, ControlState, CorrectionCandidates, DeniedTarget,

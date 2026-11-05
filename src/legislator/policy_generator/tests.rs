@@ -827,6 +827,149 @@ fn test_supported_input_schema_still_emitted() {
     );
 }
 
+// --- PR-04: `arguments { opaque }` candidates ---
+
+#[test]
+fn test_opaque_candidates_emitted_as_comments_only() {
+    // String fields (type arrays and string-item arrays included) with
+    // no `format` are opaque candidates — commented out, never live KDL.
+    let cap = make_capability(RiskFlags::default(), &["read"], vec![], vec![]);
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::FileRead,
+            Some("memory_add"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+    let discovered = [ToolDefinition {
+        name: "memory_add".to_string(),
+        description: "Add a memory".to_string(),
+        input_schema: Some(
+            r#"{"type":"object","properties":{"name":{"type":"string"},"observations":{"type":"array","items":{"type":"string"}},"url":{"type":"string","format":"uri"},"count":{"type":"integer"},"home":{"type":"array","items":{"type":"string","format":"uri"}}}}"#
+                .to_string(),
+        ),
+        ..Default::default()
+    }];
+
+    let kdl_str = generate_policy(&result, &cap, None, &discovered, &WorkloadHashes::default());
+    // Members are spelled as `/params/arguments/…` pointers — the same
+    // declaration, unambiguous for any member name.
+    assert!(
+        kdl_str.contains(
+            "// arguments { opaque \"/params/arguments/name\" \"/params/arguments/observations\" }"
+        ),
+        "candidate line missing: {kdl_str}"
+    );
+    assert!(
+        kdl_str.contains(
+            "// REVIEW: opaque-candidate: enable only for fields that never carry a path, host or URL"
+        ),
+        "review marker missing: {kdl_str}"
+    );
+    // `format` carries resource semantics (uri on `url`, on `home`'s
+    // items) and `count` is not a string — none may be nominated.
+    assert!(
+        !kdl_str.contains("opaque \"url\"")
+            && !kdl_str.contains("opaque \"count\"")
+            && !kdl_str.contains("opaque \"home\""),
+        "non-candidate fields must not be nominated: {kdl_str}"
+    );
+    // Candidates stay comments — no live `arguments` node anywhere.
+    assert!(
+        !kdl_str
+            .lines()
+            .any(|l| l.trim_start().starts_with("arguments")),
+        "opaque candidates must be comments only: {kdl_str}"
+    );
+    // The marker reads back to its ledger kind, and the draft loads.
+    assert!(
+        marker_kinds_in(&kdl_str).contains(&crate::policy::review::MarkerKind::OpaqueCandidate),
+        "opaque-candidate marker must classify: {kdl_str}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("draft.kdl");
+    std::fs::write(&path, &kdl_str).unwrap();
+    crate::policy::loader::load_policy(&path).expect("generated KDL should load");
+}
+
+#[test]
+fn test_opaque_candidates_pointer_spell_member_names() {
+    // A member name containing '/' or '~' — or itself looking like a
+    // pointer — must declare itself, so candidates are emitted in the
+    // `/params/arguments/…` pointer spelling with `~0`/`~1` escapes.
+    // `*` and the empty name have no safe spelling and are omitted.
+    let cap = make_capability(RiskFlags::default(), &["read"], vec![], vec![]);
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::FileRead,
+            Some("memory_add"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+    let discovered = [ToolDefinition {
+        name: "memory_add".to_string(),
+        description: "Add a memory".to_string(),
+        input_schema: Some(
+            r#"{"type":"object","properties":{"a/b":{"type":"string"},"~x":{"type":"string"},"/params/arguments/y":{"type":"string"},"*":{"type":"string"},"":{"type":"string"},"ok":{"type":"string"}}}"#
+                .to_string(),
+        ),
+        ..Default::default()
+    }];
+
+    let kdl_str = generate_policy(&result, &cap, None, &discovered, &WorkloadHashes::default());
+    assert!(
+        kdl_str.contains(
+            "// arguments { opaque \"/params/arguments/a~1b\" \"/params/arguments/~0x\" \"/params/arguments/~1params~1arguments~1y\" \"/params/arguments/ok\" }"
+        ),
+        "escaped pointer candidates missing: {kdl_str}"
+    );
+    // `*` and "" were omitted — no wildcard or bare spelling leaks.
+    assert!(
+        !kdl_str.contains("\"*\"") && !kdl_str.contains("\"\""),
+        "names with no safe spelling must be omitted: {kdl_str}"
+    );
+    // Every emitted candidate parses back to its own member name.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("draft.kdl");
+    std::fs::write(&path, &kdl_str).unwrap();
+    crate::policy::loader::load_policy(&path).expect("generated KDL should load");
+}
+
+#[test]
+fn test_no_opaque_candidate_without_string_fields() {
+    // A schema whose string fields all carry `format` offers no
+    // candidates — no marker, no comment.
+    let cap = make_capability(RiskFlags::default(), &["read"], vec![], vec![]);
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::FileRead,
+            Some("fetch_url"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+    let discovered = [ToolDefinition {
+        name: "fetch_url".to_string(),
+        description: "Fetch a URL".to_string(),
+        input_schema: Some(
+            r#"{"type":"object","properties":{"url":{"type":"string","format":"uri"},"timeout":{"type":"integer"}}}"#
+                .to_string(),
+        ),
+        ..Default::default()
+    }];
+
+    let kdl_str = generate_policy(&result, &cap, None, &discovered, &WorkloadHashes::default());
+    assert!(
+        !kdl_str.contains("opaque"),
+        "no opaque output expected: {kdl_str}"
+    );
+}
+
 #[test]
 fn test_all_case_c_draft_gets_header_note() {
     // F-10: a dispatcher-shaped server grounds nothing — every tool

@@ -2,6 +2,7 @@ use kdl::KdlDocument;
 
 use super::unique_child;
 use crate::error::PolicyError;
+use crate::policy::opaque::{MAX_OPAQUE_FIELDS, OpaqueField};
 use crate::policy::{
     FsPolicy, FsToolPolicy, NetworkPolicy, OutboundPolicy, SyscallPolicy, ToolNetworkPolicy,
     ToolSyscallPolicy,
@@ -944,4 +945,112 @@ pub(crate) fn parse_network_rules(doc: &KdlDocument) -> Result<NetworkPolicy, Po
         },
         inbound,
     })
+}
+
+/// Parse the `opaque` children of a tool's `arguments` block into the
+/// declared free-form argument fields.
+///
+/// `opaque` takes one or more string positional arguments — bare member
+/// names or `/params/arguments/…` pointers; properties and children on
+/// it would be silently dropped, so they are load errors. Two
+/// declarations resolving to the same member path are a duplicate, and
+/// the block is bounded at [`MAX_OPAQUE_FIELDS`] entries — a wider
+/// declaration belongs in `args_schema`/`deputy`, not here.
+pub(crate) fn parse_tool_arguments(
+    doc: &KdlDocument,
+    tool_name: &str,
+) -> Result<Vec<OpaqueField>, PolicyError> {
+    fn err(msg: impl Into<String>) -> PolicyError {
+        PolicyError::KdlParse(msg.into())
+    }
+
+    let mut fields: Vec<OpaqueField> = Vec::new();
+    for node in doc.nodes() {
+        let name = node.name().to_string();
+        if name != "opaque" {
+            return Err(err(format!(
+                "unexpected node '{name}' in 'arguments' for tool '{tool_name}'; expected 'opaque'"
+            )));
+        }
+        if node.children().is_some() {
+            return Err(err(format!(
+                "'opaque' in 'arguments' for tool '{tool_name}' takes no child nodes"
+            )));
+        }
+        let mut declared_any = false;
+        for entry in node.entries() {
+            if let Some(prop) = entry.name() {
+                return Err(err(format!(
+                    "unexpected property '{}' on 'opaque' in 'arguments' for tool '{tool_name}'",
+                    prop.value()
+                )));
+            }
+            let source = entry.value().as_string().ok_or_else(|| {
+                err(format!(
+                    "'opaque' entry in 'arguments' for tool '{tool_name}' must be a string, got {:?}",
+                    entry.value()
+                ))
+            })?;
+            let field = OpaqueField::parse(source).map_err(|e| {
+                err(format!(
+                    "'opaque' in 'arguments' for tool '{tool_name}': {e}"
+                ))
+            })?;
+            declared_any = true;
+            if fields.iter().any(|f| f.segments() == field.segments()) {
+                return Err(err(format!(
+                    "duplicate opaque field '{source}' in 'arguments' for tool '{tool_name}'"
+                )));
+            }
+            fields.push(field);
+        }
+        if !declared_any {
+            return Err(err(format!(
+                "'opaque' in 'arguments' for tool '{tool_name}' requires a field-name argument"
+            )));
+        }
+        if fields.len() > MAX_OPAQUE_FIELDS {
+            return Err(err(format!(
+                "'arguments' on tool '{tool_name}' exceeds {MAX_OPAQUE_FIELDS} opaque fields"
+            )));
+        }
+    }
+    Ok(fields)
+}
+
+/// Validate and parse an `arguments { opaque ... }` node on a tool —
+/// the version gate, the no-entries shape, and the nonempty-field
+/// requirement shared by the inline `tool` block and `when` overrides.
+/// Under v1 the block would be silently ignored by the permissive
+/// grammar, so it is rejected outright like `deputy`.
+pub(crate) fn parse_tool_arguments_node(
+    node: &kdl::KdlNode,
+    tool_name: &str,
+    version: u32,
+) -> Result<Vec<OpaqueField>, PolicyError> {
+    fn err(msg: impl Into<String>) -> PolicyError {
+        PolicyError::KdlParse(msg.into())
+    }
+
+    if version < 2 {
+        return Err(err(format!(
+            "'arguments' on tool '{tool_name}' requires 'policy version=2'"
+        )));
+    }
+    if !node.entries().is_empty() {
+        return Err(err(format!(
+            "'arguments' on tool '{tool_name}' takes no arguments or properties; \
+             it holds 'opaque' child nodes"
+        )));
+    }
+    let fields = match node.children() {
+        Some(c) => parse_tool_arguments(c, tool_name)?,
+        None => Vec::new(),
+    };
+    if fields.is_empty() {
+        return Err(err(format!(
+            "'arguments' on tool '{tool_name}' declares no 'opaque' fields"
+        )));
+    }
+    Ok(fields)
 }

@@ -139,7 +139,7 @@ fn test_extract_deputy_use_targets_pointer_shape_and_truncate() {
 
     let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt","note":"hi"}}}"#;
     let p = ExtractPointer::parse("/params/arguments/path", "params").unwrap();
-    let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)]).unwrap();
+    let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)], &[]).unwrap();
     assert_eq!(out, vec!["/workspace/a.txt".to_string()]);
 
     // A `file:` URI normalizes to the fs path, but the use side refuses
@@ -147,13 +147,13 @@ fn test_extract_deputy_use_targets_pointer_shape_and_truncate() {
     // normalized form while the server consumes the forwarded raw one.
     let line = r#"{"params":{"arguments":{"path":"file:///workspace/a.txt"}}}"#;
     let p = ExtractPointer::parse("/params/arguments/path", "params").unwrap();
-    let err = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)]).unwrap_err();
+    let err = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)], &[]).unwrap_err();
     assert!(err.contains("canonical form"), "got: {err}");
 
     // `shape "fs_targets"` reads the well-known path argument keys.
     let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt"}}}"#;
     let out =
-        extract_deputy_use_targets(line, &[DeputyRule::Shape(KnownShape::FsTargets)]).unwrap();
+        extract_deputy_use_targets(line, &[DeputyRule::Shape(KnownShape::FsTargets)], &[]).unwrap();
     assert!(
         out.contains(&"/workspace/a.txt".to_string()),
         "got: {out:?}"
@@ -167,7 +167,7 @@ fn test_extract_deputy_use_targets_pointer_shape_and_truncate() {
         .join(",");
     let line = format!(r#"{{"params":{{"arguments":{{"files":[{big}]}}}}}}"#);
     let p = ExtractPointer::parse("/params/arguments/files/*", "params").unwrap();
-    let err = extract_deputy_use_targets(&line, &[DeputyRule::Pointer(p)]).unwrap_err();
+    let err = extract_deputy_use_targets(&line, &[DeputyRule::Pointer(p)], &[]).unwrap_err();
     assert!(err.contains("value bound"), "got: {err}");
 }
 
@@ -183,7 +183,7 @@ fn test_extract_deputy_use_targets_repeated_fs_targets_rule() {
         DeputyRule::Shape(KnownShape::FsTargets),
         DeputyRule::Shape(KnownShape::FsTargets),
     ];
-    let out = extract_deputy_use_targets(line, &rules).unwrap();
+    let out = extract_deputy_use_targets(line, &rules, &[]).unwrap();
     assert_eq!(
         out,
         vec![
@@ -209,8 +209,8 @@ fn test_deputy_leaf_budget_counts_non_string_scalars() {
     let line = format!(
         r#"{{"params":{{"arguments":{{"n":[{nums}]}},"inputResponses":{{"p":"/tmp/a"}}}}}}"#
     );
-    let err =
-        extract_deputy_use_targets(&line, &[DeputyRule::Shape(KnownShape::FsTargets)]).unwrap_err();
+    let err = extract_deputy_use_targets(&line, &[DeputyRule::Shape(KnownShape::FsTargets)], &[])
+        .unwrap_err();
     assert!(err.contains("work budget"), "got: {err}");
     assert_eq!(extract_fs_targets(&line), Vec::<String>::new());
 }
@@ -226,8 +226,8 @@ fn test_deputy_leaf_budget_counts_repeated_ir_scalars() {
         .collect::<Vec<_>>()
         .join(",");
     let line = format!(r#"{{"params":{{"arguments":{{}},"inputResponses":{{"p":[{paths}]}}}}}}"#);
-    let err =
-        extract_deputy_use_targets(&line, &[DeputyRule::Shape(KnownShape::FsTargets)]).unwrap_err();
+    let err = extract_deputy_use_targets(&line, &[DeputyRule::Shape(KnownShape::FsTargets)], &[])
+        .unwrap_err();
     assert!(err.contains("work budget"), "got: {err}");
 }
 
@@ -244,7 +244,7 @@ fn test_deputy_input_responses_own_budget() {
         r#"{{"params":{{"arguments":{{"path":"/tmp/a"}},"inputResponses":{{"p":[{paths}]}}}}}}"#
     );
     let p = ExtractPointer::parse("/params/arguments/path", "params").unwrap();
-    let err = extract_deputy_use_targets(&line, &[DeputyRule::Pointer(p)]).unwrap_err();
+    let err = extract_deputy_use_targets(&line, &[DeputyRule::Pointer(p)], &[]).unwrap_err();
     assert!(err.contains("work budget"), "got: {err}");
 }
 
@@ -263,8 +263,8 @@ fn test_deputy_combined_budget_boundary_counts_scalars() {
     let over = format!(
         r#"{{"params":{{"arguments":{{"path":"/tmp/one","n":[{nums}]}},"inputResponses":{{"mix":[0,1,2,3,4,"/tmp/ir0","/tmp/ir1"]}}}}}}"#
     );
-    let err =
-        extract_deputy_use_targets(&over, &[DeputyRule::Shape(KnownShape::FsTargets)]).unwrap_err();
+    let err = extract_deputy_use_targets(&over, &[DeputyRule::Shape(KnownShape::FsTargets)], &[])
+        .unwrap_err();
     assert!(err.contains("work budget"), "got: {err}");
     // The fused walk agrees on the classified prefix: the strings
     // reached before the cap were classified, the rest were not.
@@ -277,7 +277,8 @@ fn test_deputy_combined_budget_boundary_counts_scalars() {
     let at = format!(
         r#"{{"params":{{"arguments":{{"path":"/tmp/one","n":[{nums}]}},"inputResponses":{{"mix":[0,1,2,3,4,"/tmp/ir0"]}}}}}}"#
     );
-    let out = extract_deputy_use_targets(&at, &[DeputyRule::Shape(KnownShape::FsTargets)]).unwrap();
+    let out =
+        extract_deputy_use_targets(&at, &[DeputyRule::Shape(KnownShape::FsTargets)], &[]).unwrap();
     assert_eq!(out, vec!["/tmp/one".to_string(), "/tmp/ir0".to_string()]);
 }
 
@@ -292,7 +293,8 @@ fn test_deputy_fs_targets_matches_fused_walk() {
         r#"{"params":{"arguments":{"path":"/workspace/a.txt","n":[1,2,"/p",3],"note":"hi"}}}"#,
         r#"{"params":{"arguments":{"path":"/workspace/a.txt"},"inputResponses":{"e":{"f":"/workspace/r.txt","n":42}}}}"#,
     ] {
-        let got = extract_deputy_use_targets(line, &[DeputyRule::Shape(KnownShape::FsTargets)]);
+        let got =
+            extract_deputy_use_targets(line, &[DeputyRule::Shape(KnownShape::FsTargets)], &[]);
         assert_eq!(
             got.as_deref().ok(),
             Some(extract_fs_targets(line).as_slice()),
@@ -317,8 +319,9 @@ fn test_deputy_target_cap_stops_before_tail() {
         format!(r#"{{"params":{{"arguments":{{"paths":[{paths}]}}}}}}"#),
         format!(r#"{{"params":{{"arguments":{{"paths":[{paths}],"tail":"{tail}"}}}}}}"#),
     ] {
-        let err = extract_deputy_use_targets(&line, &[DeputyRule::Shape(KnownShape::FsTargets)])
-            .unwrap_err();
+        let err =
+            extract_deputy_use_targets(&line, &[DeputyRule::Shape(KnownShape::FsTargets)], &[])
+                .unwrap_err();
         assert!(err.contains("work budget"), "got: {err}");
     }
 }
@@ -332,7 +335,7 @@ fn test_extract_deputy_use_targets_covers_input_responses() {
     // carries request-side input the tool may consume as a path.
     let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt"},"inputResponses":{"e":{"action":"accept","content":{"path":"/workspace/sneaky.txt"}}}}}"#;
     let p = ExtractPointer::parse("/params/arguments/path", "params").unwrap();
-    let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p.clone())]).unwrap();
+    let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p.clone())], &[]).unwrap();
     assert!(
         out.contains(&"/workspace/a.txt".to_string())
             && out.contains(&"/workspace/sneaky.txt".to_string()),
@@ -342,7 +345,7 @@ fn test_extract_deputy_use_targets_covers_input_responses() {
     // Non-path answers are not extracted — the walk is classified,
     // not "every string".
     let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt"},"inputResponses":{"e":{"action":"accept","content":{"name":"octocat"}}}}}"#;
-    let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p.clone())]).unwrap();
+    let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p.clone())], &[]).unwrap();
     assert_eq!(out, vec!["/workspace/a.txt".to_string()]);
 }
 
