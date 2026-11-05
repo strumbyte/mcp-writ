@@ -478,6 +478,57 @@ pub fn ensure_base_pulled() -> Option<()> {
     )
 }
 
+/// `Some(reason)` when this host's `wslc` substrate cannot arm a
+/// kernel-enforced descendant-lifetime boundary inside a container —
+/// `require_lifetime_boundary` then has no route and the runner refuses
+/// every launch, which is the substrate's recorded answer rather than
+/// something the runner legs can assert on. Measured directly on the
+/// base image, mirroring the two mechanisms `linux_spawn` offers the
+/// flag: a writable cgroup subtree, or `unshare(CLONE_NEWPID)`. The
+/// check never consults the runner's own verdict, so a product-side
+/// regression still fails the legs on a substrate that can arm the
+/// boundary. Fail-closed under `MCP_WRIT_REQUIRE_WSLC_TESTS=1` like
+/// every `skip_wslc_test` gate — a gated run on a host that cannot arm
+/// the boundary still records the failure, with this reason.
+pub fn substrate_boundary_gap() -> Option<String> {
+    static GAP: OnceLock<Option<String>> = OnceLock::new();
+    GAP.get_or_init(|| {
+        // The probe marks each armable route with BOUNDARY_OK and ends
+        // with BOUNDARY_PROBE_DONE unconditionally — only output that
+        // ran to completion *without* an OK proves both routes closed.
+        // A wedged spawn, a launch failure, or a timeout leaves no
+        // marker: that is a broken probe — a test failure, not a skip.
+        let probe = "mkdir /sys/fs/cgroup/.wslc-boundary-probe 2>/dev/null \
+                     && rmdir /sys/fs/cgroup/.wslc-boundary-probe 2>/dev/null \
+                     && echo BOUNDARY_OK; \
+                     unshare --pid --fork true 2>/dev/null && echo BOUNDARY_OK; \
+                     echo BOUNDARY_PROBE_DONE";
+        let out = run_command(
+            wslc_cmd(),
+            &["run", "--rm", "--entrypoint", "sh", BASE_IMAGE, "-c", probe],
+            SESSION_TIMEOUT_SECS,
+        )
+        .expect("boundary probe never returned — wslc spawn failed or the session VM wedged");
+        let stdout = decode_cli(&out.stdout);
+        assert!(
+            stdout.contains("BOUNDARY_PROBE_DONE"),
+            "boundary probe did not run to completion (status {:?}): {stdout}",
+            out.status.code()
+        );
+        if stdout.contains("BOUNDARY_OK") {
+            None
+        } else {
+            Some(
+                "wslc mounts the container cgroupfs read-only with no delegated \
+                 subtree and grants no PID-namespace route — \
+                 require_lifetime_boundary cannot arm on this substrate"
+                    .into(),
+            )
+        }
+    })
+    .clone()
+}
+
 /// `wslc build -t <tag> -f <dockerfile> <ctx>` bounded — a wedged build
 /// is killed, never waited on.
 pub fn wslc_build(context: &Path, tag: &str, dockerfile: &Path) -> Result<(), String> {

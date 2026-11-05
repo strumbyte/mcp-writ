@@ -112,6 +112,11 @@ substrate mounts files, its holding dir at `/etc/mcp-secure` otherwise
 fully apply Landlock/seccomp makes the runner refuse launch (no
 `allow_degraded` in the fixture policy) — that refusal is itself the
 adoption-relevant finding, recorded in the session's report evidence.
+A substrate that cannot arm a descendant-lifetime boundary at all —
+the container's cgroupfs is read-only with no delegated subtree and no
+PID-namespace route — is reported through the prerequisite gate
+(`substrate_boundary_gap`, measured directly on the base image), which
+still fails closed under `MCP_WRIT_REQUIRE_WSLC_TESTS=1`.
 
 ## Owned-resource / cleanup contract
 
@@ -307,6 +312,26 @@ call — so a bump check starts from `wslc --version`/`info` drift plus a
 re-run of the gated suite, and each enterprise interaction below (policy
 prohibition, MDE plug-in interference) is its own axis to re-measure on
 the affected host class, not a reason to guess compatibility.
+
+**Re-measured axis (informal spot-check, not a gated run):** on wslc
+**3.0.3** (2026-11-05, same host class) a container's `/sys/fs/cgroup`
+is mounted **read-only** with no delegated subtree and no PID-namespace
+route (`unshare --pid` → EPERM), and `wslc run` exposes no delegation
+flag — `require_lifetime_boundary` therefore refuses the launch inside
+the guest (`cgroup v2 hierarchy unavailable or unwritable`). Exactly the
+five runner-launch legs (`wslc_stdio_session`,
+`wslc_mrtr_and_wire_stress`, `wslc_stop_terminates_and_cleans_up`,
+`wslc_product_run_image`, `wslc_product_external_sigint_ends_session`)
+fail closed on such a substrate — the designed finding, not a product
+regression; the other 20 legs pass. Whether this is a 3.0.1→3.0.3
+mount-policy change or host configuration is unproven; a gated re-run
+on the reference host settles it. Following this observation the five
+legs were re-gated on `substrate_boundary_gap`, which probes the same
+mechanisms the runner needs (cgroup mkdir, `unshare --pid`) directly on
+the base image — on a substrate that cannot arm either, the legs skip
+(or fail closed under `MCP_WRIT_REQUIRE_WSLC_TESTS=1`) instead of
+re-launching a refused runner; on a substrate that can arm one, they
+still launch and a runner-side refusal keeps failing them.
 
 ### Unverified / not-exercised (explicitly, on this host)
 
