@@ -569,19 +569,36 @@ mod imp {
         };
         let _held_fd_exec_plan = fd_exec_plan;
 
-        // A payload pinned under a tree init masks with a private
+        // PR-05 — the workload's own paths get the masked-root screen
+        // the mechanism selection applies: the resolved executable
+        // (unless it execs through the fd pin — a `/proc/self/fd/N`
+        // spelling no masked tree can hide), the first payload
+        // argument (pinned or not), and the pinned entrypoint.
+        // Anything rooted under a tree init masks with a private
         // tmpfs (`/run` always; `/tmp` when the resolv.conf bridge
         // needs it) can never resolve inside the namespace — refuse
-        // now, with the cause named, rather than let init's bind-mount
-        // or the interpreter's open surface it as a bare ENOENT.
-        if let Some(plan) = &_held_fd_exec_plan
-            && let Some((_, target, _)) = plan.entrypoint_bind_pin()
-            && let Some(why) = crate::warden::select::masked_namespace_root(target)
-        {
+        // now, with the cause named, rather than let init's
+        // bind-mount or the interpreter's open surface it as a bare
+        // `ERR exec errno=2`.
+        let visibility = crate::warden::select::workload_visibility(
+            &command_argv,
+            &resolved_exe,
+            _held_fd_exec_plan
+                .as_ref()
+                .and_then(|plan| plan.entrypoint_bind_pin())
+                .map(|(_, target, _)| target.to_path_buf()),
+            // The plan exists iff the exe pinned — init then execs the
+            // sealed memfd via `/proc/self/fd/N`, so the exe's path
+            // under a masked tree is not a launch blocker.
+            _held_fd_exec_plan.is_some(),
+        );
+        if let Some(masked) = visibility.first_masked() {
             let detail = format!(
-                "refusing namespaced launch: pinned entrypoint '{}' is \
-                 rooted under a masked tree — {why}",
-                target.display()
+                "refusing namespaced launch: {} '{}' is rooted under a \
+                 masked tree — {}",
+                masked.what,
+                masked.path.display(),
+                masked.masked.why
             );
             eprintln!("Error: {detail}");
             write_report(

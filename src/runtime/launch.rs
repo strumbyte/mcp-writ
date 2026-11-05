@@ -274,7 +274,39 @@ pub async fn launch(
         None
     } else {
         linux_mechanism.map(|request| {
-            crate::warden::select::select_linux_mechanism(request, &policy, dns_upstream)
+            // PR-05 — the masked-tree screen judges the same paths the
+            // launch resolves below: the resolved executable and the
+            // first payload arg must still resolve inside init's mount
+            // namespace. A payload-bound entrypoint pin needs no
+            // separate input — its path is the same normalized
+            // spelling the payload arg screens, and an exe-bound pin
+            // execs through `/proc/self/fd/N`. Best-effort: an
+            // unresolvable argv[0] carries no visibility and the
+            // launch's own resolve step reports that error instead.
+            let visibility = crate::workload::resolve_launch(argv0, has_hashes)
+                .map(|resolution| {
+                    let eff_argv = resolution.into_argv(&argv);
+                    // An exe a hash entry pins execs the verified
+                    // snapshot through `/proc/self/fd/N` inside the
+                    // namespace — its *path* is never what init opens,
+                    // so the masked screen must not count it.
+                    crate::warden::select::workload_visibility(
+                        &eff_argv,
+                        &resolution.exe,
+                        None,
+                        crate::warden::select::exe_pin_fd_exec(
+                            &policy.hash_entries,
+                            &resolution.exe,
+                        ),
+                    )
+                })
+                .unwrap_or_default();
+            crate::warden::select::select_linux_mechanism(
+                request,
+                &policy,
+                dns_upstream,
+                visibility,
+            )
         })
     };
     // `target` records the bound mechanism — or, on a refused
@@ -998,6 +1030,19 @@ pub async fn launch(
         details.push_str(&format!(" exe_exec={}", plan.exe_exec_mode()));
         if plan.entrypoint_exec_mode().is_some() {
             details.push_str(" entrypoint_exec=path");
+        }
+    }
+    // PR-05 — a selection that fell back to native because the
+    // workload resolves under a tree init masks names the blocked
+    // root on the spawn record too, like the other launch waivers;
+    // the plan/report `mechanism.missing` member carries the full
+    // evidence list.
+    #[cfg(target_os = "linux")]
+    if let Some(sel) = warden.linux_selection() {
+        for token in &sel.missing {
+            if token.starts_with("workload_masked:") {
+                details.push_str(&format!(" {token}"));
+            }
         }
     }
     #[cfg(windows)]

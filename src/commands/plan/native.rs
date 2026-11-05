@@ -303,10 +303,28 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
         ));
         None
     } else {
+        // PR-05 — the same workload visibility `run` screens: the
+        // resolved exe and payload arg rooted under a tree init masks
+        // make the namespaced route unavailable for this workload.
+        // An unresolved command carries no visibility — the
+        // `command.resolve` check already failed above and reports
+        // that cause instead.
+        let visibility = launch
+            .as_ref()
+            .map(|(argv, exe)| {
+                crate::warden::select::workload_visibility(
+                    argv,
+                    exe,
+                    None,
+                    crate::warden::select::exe_pin_fd_exec(&policy.hash_entries, exe),
+                )
+            })
+            .unwrap_or_default();
         Some(crate::warden::select::select_linux_mechanism(
             args.linux_mechanism.unwrap_or_default(),
             &policy,
             args.dns_upstream,
+            visibility,
         ))
     };
     #[cfg(target_os = "linux")]

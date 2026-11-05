@@ -540,3 +540,102 @@ async fn plan_launch_env_diagnoses_allowlist_gaps() {
         );
     }
 }
+
+/// PR-05 — a workload rooted under a tree namespaced init masks is a
+/// *selection* verdict, not an exec-time `ENOENT`: `plan` runs the same
+/// masked-tree screen `run` does, so `plan.mechanism` carries the
+/// `workload_masked:<root>` token — `namespaced` refuses (selected
+/// stays null) while `auto` picks native with the token kept as
+/// evidence. `MCP_WRIT_NS_FORCE_TMP_MASK=1` pins the conditional `/tmp`
+/// mask on hosts whose resolver already lives under `/run` (the
+/// debug-build injection the linux_mechanism e2e legs share).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn plan_mechanism_names_masked_workload_root() {
+    let dir = common::real_tempdir();
+    let policy = write_policy(&dir);
+    // The masked screen only flags objects init's private tmpfs would
+    // actually hide — the exe must exist on the host.
+    let masked =
+        std::path::PathBuf::from(format!("/tmp/mcp-writ-plan-masked-{}", std::process::id()));
+    std::fs::copy("/bin/true", &masked).expect("copy exe under /tmp");
+    let force: &[(&str, &str)] = &[("MCP_WRIT_NS_FORCE_TMP_MASK", "1")];
+
+    fn mechanism<'j>(json: &'j nojson::RawJson<'j>) -> nojson::RawJsonValue<'j, 'j> {
+        member(member(json.value(), "plan"), "mechanism")
+    }
+    fn missing_has(m: nojson::RawJsonValue, token: &str) -> bool {
+        member(m, "missing")
+            .to_array()
+            .unwrap()
+            .any(|t| t.as_string_str().unwrap() == token)
+    }
+
+    // Leg 1 — explicit `namespaced`: refused before spawn, `selected`
+    // stays null, and `missing` names the blocked root.
+    let out = run_plan_env(
+        &[
+            "--policy",
+            policy.to_str().unwrap(),
+            "--linux-mechanism",
+            "namespaced",
+            "--",
+            masked.to_str().unwrap(),
+        ],
+        force,
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(1), "blocked exits 1: {out:?}");
+    let json = plan_json(&out.stdout);
+    assert_eq!(status_of(&json), "blocked");
+    let mech = mechanism(&json);
+    assert_eq!(
+        member(mech, "requested").as_string_str().unwrap(),
+        "namespaced"
+    );
+    assert!(
+        member(mech, "selected").kind().is_null(),
+        "a refused selection binds no mechanism"
+    );
+    assert!(
+        missing_has(mech, "workload_masked:/tmp"),
+        "mechanism.missing must carry the masked-root token"
+    );
+
+    // Leg 2 — `auto`: the same masked workload falls back to native
+    // (the minimal policy is native-satisfiable) and the token stays
+    // on the record as the reason namespaced was out.
+    let out = run_plan_env(
+        &[
+            "--policy",
+            policy.to_str().unwrap(),
+            "--linux-mechanism",
+            "auto",
+            "--",
+            masked.to_str().unwrap(),
+        ],
+        force,
+    )
+    .await;
+    let json = plan_json(&out.stdout);
+    let mech = mechanism(&json);
+    assert_eq!(
+        member(mech, "selected").as_string_str().unwrap(),
+        "linux-native",
+        "auto must fall back to native for a masked workload: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        missing_has(mech, "workload_masked:/tmp"),
+        "the auto→native record must keep the token"
+    );
+    assert!(
+        member(mech, "reason")
+            .as_string_str()
+            .unwrap()
+            .contains("workload_masked:/tmp"),
+        "the reason names why namespaced was out"
+    );
+
+    let _ = std::fs::remove_file(&masked);
+}

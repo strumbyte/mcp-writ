@@ -148,17 +148,21 @@ pub(crate) async fn spawn_namespaced_attempt(
     // (`/run` always; `/tmp` when the resolv.conf bridge needs it) can
     // never resolve inside the namespace — refuse with the cause named
     // rather than let init's bind-mount or the interpreter's open
-    // surface it as a bare ENOENT.
+    // surface it as a bare ENOENT. PR-05 screens the same candidates
+    // at selection time; this point-of-use re-check covers the pin the
+    // selection could not yet see (the screen is re-run, never
+    // trusted stale).
     if let Some((_, target, _)) = &opts.exec_entry_pin
-        && let Some(why) = super::super::select::masked_namespace_root(target)
+        && let Some(masked) = super::super::select::masked_namespace_root(target)
     {
         refuse!(
             controls,
             grants,
             spawn_err_msg(&format!(
                 "pinned entrypoint '{}' is rooted under a masked tree — \
-                 {why}; the namespaced workload could never resolve it",
-                target.display()
+                 {}; the namespaced workload could never resolve it",
+                target.display(),
+                masked.why
             ))
         );
     }

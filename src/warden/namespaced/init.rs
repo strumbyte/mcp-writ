@@ -291,8 +291,30 @@ fn resolv_conf_target(
 /// `/proc/self/fd/N` memfd symlink is EINVAL to `mount(2)`, so the
 /// source lives on a private tmpfs over `/tmp`, which also means
 /// workload scratch under `/tmp` never touches the host filesystem.
+///
+/// The bind source could equally well live under the `/run` tmpfs
+/// mounted moments earlier (`/run/mcp-writ/resolv.conf`) —
+/// `pin_entrypoint_mount` already stages and bind-mounts from that
+/// tree, so `/tmp` is not strictly required for the redirect. What
+/// keeps the default is the cover's second effect: it isolates the
+/// workload's `/tmp` scratch from the host filesystem. Whether that
+/// isolation is wanted *without* the redirect needing it is a
+/// separate decision (PR-05 records it; the default stays).
 fn redirect_resolv_conf(target: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    if target.starts_with("/run") {
+    // Debug-build fixture hook (PR-05): a forwarded
+    // `MCP_WRIT_NS_FORCE_TMP_MASK=1` takes the bind-mount branch even
+    // when the target resolves under `/run`, so e2e legs pin the
+    // `/tmp` mask the parent's `tmp_mask_planned` predicts rather
+    // than depend on how this host's resolv.conf resolves. On such a
+    // host the tmpfs still mounts while the bind onto
+    // `/etc/resolv.conf` may warn-fail (a `/run`-rooted symlink
+    // target does not exist in the fresh `/run`) — the mask is what
+    // the fixtures exercise; they do not need the resolver.
+    #[cfg(debug_assertions)]
+    let force_tmp_mask = std::env::var(super::init_env::FORCE_TMP_MASK).as_deref() == Ok("1");
+    #[cfg(not(debug_assertions))]
+    let force_tmp_mask = false;
+    if target.starts_with("/run") && !force_tmp_mask {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }

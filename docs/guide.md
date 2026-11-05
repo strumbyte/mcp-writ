@@ -1382,6 +1382,17 @@ the launch route:
 | `namespaced`, unavailable or unsatisfiable | launch refused — never falls back to native |
 | `native`, unsatisfiable requirements present | launch refused |
 
+One unavailability is per-workload, not per-host: namespaced init
+covers `/run` — and `/tmp` when the resolv.conf redirect needs its
+bind-mount source — with a private tmpfs, so a resolved executable,
+first payload argument, or pinned entrypoint rooted under either tree
+is invisible inside the namespace. Selection screens those paths up
+front: `auto` treats the route as unavailable *for this workload* and
+records `workload_masked:<root>` in `missing` (the reason names the
+masked path), while explicit `namespaced` refuses with the object
+named — either way the launch never reaches init's `ERR exec
+errno=2`.
+
 Selection is a launch-time decision the report keeps honest:
 `plan.mechanism` in `plan`, `--report`, and the JSONL audit's
 `target.native_linux_mechanism`/`sandbox_mechanism` all derive from the
@@ -3315,7 +3326,8 @@ log — stdout always carries only JSON-RPC frames. Use this table:
 | `Error: failed to spawn MCP server ... Sandbox setup failed during '<stage>' stage on <os>:` | stderr + `server.error` audit event | **Sandbox setup/apply failure** at the named stage (`policy` translation, `prepare` artifacts, `apply` to OS state) |
 | `Error: failed to spawn MCP server ... Process spawn failed:` | stderr + `server.error` audit event | **Generic spawn failure** — the exec itself failed (bad exe, EACCES, fork/pre-exec error). The failing stage is undetermined and is never reported as a sandbox-apply failure |
 | `result.isError` tool result, e.g. `structuredContent.error: "EACCES"` | stdout frame (a normal tool result) | **Server-side (child) access failure** — the Auditor allowed the call and the server's own `open`/`stat` failed. This is never re-labeled as a Warden or policy denial |
-| `init refused: ERR <stage> errno=<n>` or `init post-GO failure: ERR <stage> errno=<n>` on a namespaced launch, with an appended environment hint on the known pairs — `ERR proc-mount errno=1` → a fully-visible `/proc` is required for the remount (masked `/proc` in a container or nested userns refuses `EPERM`; use `--linux-mechanism native` on this host); `ERR unshare errno=1`/`ERR idmap errno=1` → unprivileged userns/sysctl constraints | stderr + launch refusal | **Namespaced environment constraint** — the stage name and errno are verbatim init evidence; the appended hint names the established cause. Pre-launch the same constraint surfaces as `missing: ["proc_mount"]` in `plan.mechanism` |
+| `init refused: ERR <stage> errno=<n>` or `init post-GO failure: ERR <stage> errno=<n>` on a namespaced launch, with an appended environment hint on the known pairs — `ERR proc-mount errno=1` → a fully-visible `/proc` is required for the remount (masked `/proc` in a container or nested userns refuses `EPERM`; use `--linux-mechanism native` on this host); `ERR unshare errno=1`/`ERR idmap errno=1` → unprivileged userns/sysctl constraints; `ERR exec errno=2` → the workload path likely resolves under a tree init masks (`/run`, or `/tmp` when the resolv.conf redirect masks it) — the pre-spawn screen normally refuses these first, so a relative/cwd-dependent spelling slipped past | stderr + launch refusal | **Namespaced environment constraint** — the stage name and errno are verbatim init evidence; the appended hint names the established cause. Pre-launch the same constraint surfaces as `missing: ["proc_mount"]` in `plan.mechanism` |
+| Launch refused naming `workload_masked:/run` or `workload_masked:/tmp` in `plan.mechanism` `missing`, or stderr `... resolves under a masked tree` | stderr + `plan.mechanism`/`--report` + `server.connected` details (auto→native) | **Masked-tree workload screen** — the resolved executable, first payload argument, or pinned entrypoint sits under a tree namespaced init covers with a private tmpfs, so it could never resolve inside the namespace (the historical symptom was `ERR exec errno=2`). `auto` selects native when it satisfies the policy; explicit `namespaced` refuses. Relocate the workload outside the masked tree or use `--linux-mechanism native` |
 | Child exits by signal; `mcp-writ` exits `128 + sig` (Unix) | exit code + stderr `MCP server exited with code N` | **Child signal death** — e.g. 137 for SIGKILL. A seccomp kill surfaces as SIGSYS (159), distinct from an ordinary exit 1 |
 
 Two rules of thumb: a child-side `EPERM`/`EACCES` string — whether in a tool
