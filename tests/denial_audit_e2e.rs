@@ -36,6 +36,11 @@ mod common;
 /// read a slow-but-healthy response as a failure.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-probe budget inside the gate readiness loop — short enough
+/// that `child.try_wait()` is re-polled between probes; the outer
+/// `TEST_TIMEOUT` deadline still bounds total readiness time.
+const PROBE_BUDGET: Duration = Duration::from_millis(500);
+
 // ─── shared helpers ──────────────────────────────────────────────────
 
 /// A workspace-private temp dir that survives a failed run for
@@ -595,19 +600,31 @@ fn spawn_mock_upstream() -> std::net::SocketAddr {
 }
 
 /// One UDP query with id matching — a connected socket so a recycled
-/// datagram cannot be mistaken for the answer.
+/// datagram cannot be mistaken for the answer. Sized above the gate's
+/// whole-exchange upstream budget (5s): a SERVFAIL after upstream
+/// timeout must still fit the read window, and parallel-suite
+/// scheduling adds seconds on top.
 fn udp_query(listen: std::net::SocketAddr, pkt: &[u8]) -> Option<Vec<u8>> {
+    udp_query_budgeted(listen, pkt, TEST_TIMEOUT)
+}
+
+/// `udp_query` bounded by `budget` rather than the full `TEST_TIMEOUT`
+/// — the readiness probe loops on `PROBE_BUDGET` so a gate that died
+/// before serving is caught by `try_wait` on the next pass instead of
+/// after a whole-timeout query. Retransmit on every recv timeout — a
+/// datagram sent before the gate finished binding is simply lost, and
+/// a send-once loop would burn the whole deadline waiting for an
+/// answer that never comes.
+fn udp_query_budgeted(
+    listen: std::net::SocketAddr,
+    pkt: &[u8],
+    budget: Duration,
+) -> Option<Vec<u8>> {
     let sock = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
     sock.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
     sock.connect(listen).ok()?;
     let want_id = u16::from_be_bytes([pkt[0], pkt[1]]);
-    // Sized above the gate's whole-exchange upstream budget (5s): a
-    // SERVFAIL after upstream timeout must still fit the read window,
-    // and parallel-suite scheduling adds seconds on top. Retransmit on
-    // every recv timeout — a datagram sent before the gate finished
-    // binding is simply lost, and a send-once loop would burn the
-    // whole deadline waiting for an answer that never comes.
-    let deadline = Instant::now() + TEST_TIMEOUT;
+    let deadline = Instant::now() + budget;
     let mut buf = [0u8; 4096];
     while Instant::now() < deadline {
         sock.send(pkt).ok()?;
@@ -745,12 +762,15 @@ fn spawn_dns_gate(
                 }
                 panic!("dns-gate exited before serving ({status}): {stderr}");
             }
-            // Readiness probe: the gate answers even a header-only packet.
+            // Readiness probe: the gate answers even a header-only
+            // packet. A short budget keeps the loop returning to
+            // `try_wait` — a dead gate must fail on its exit status,
+            // not ride out a full-timeout probe as "did not answer".
             let mut pkt = Vec::new();
             pkt.extend_from_slice(&0xEEu16.to_be_bytes());
             pkt.extend_from_slice(&0x0100u16.to_be_bytes());
             pkt.extend_from_slice(&[0u8; 8]);
-            if let Some(resp) = udp_query(listen, &pkt)
+            if let Some(resp) = udp_query_budgeted(listen, &pkt, PROBE_BUDGET)
                 && resp.len() >= 4
             {
                 break true;
