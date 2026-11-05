@@ -475,8 +475,11 @@ pub struct MechanismSelection {
     /// One-line rationale: the auto pick's basis, or the refusal's
     /// primary cause.
     pub reason: Option<String>,
-    /// `linux-namespaced` `requires` ids unmet on this host (probe
-    /// evidence — empty when the probe was not consulted or passed).
+    /// `linux-namespaced` `requires` ids unmet on this host — probe
+    /// stage ids, plus `workload_masked:<root>` tokens for each tree
+    /// init masks that a workload path resolves under (PR-05: the
+    /// route is unavailable *for this workload*, not the host).
+    /// Empty when the probe passed and no workload path is masked.
     pub missing: Vec<String>,
     /// Requirements a mechanism could not express or enforce —
     /// policy-shape violations and failed rule builds.

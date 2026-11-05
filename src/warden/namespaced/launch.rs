@@ -144,25 +144,40 @@ pub(crate) async fn spawn_namespaced_attempt(
         }
     };
 
-    // A payload pinned under a tree init masks with a private tmpfs
-    // (`/run` always; `/tmp` when the resolv.conf bridge needs it) can
-    // never resolve inside the namespace — refuse with the cause named
-    // rather than let init's bind-mount or the interpreter's open
-    // surface it as a bare ENOENT. PR-05 screens the same candidates
-    // at selection time; this point-of-use re-check covers the pin the
-    // selection could not yet see (the screen is re-run, never
-    // trusted stale).
-    if let Some((_, target, _)) = &opts.exec_entry_pin
-        && let Some(masked) = super::super::select::masked_namespace_root(target)
-    {
+    // PR-05 — the masked-tree screen re-run at the point of use, on
+    // the exact spellings this spawn hands init: the resolved
+    // executable (the fd pin's `/proc/self/fd/N` when
+    // `exec_uncloak_fds` is non-empty — a spelling no masked tree can
+    // hide), the first payload argument, and the pinned entrypoint's
+    // mount target. The selection screens the same candidates
+    // earlier; re-running here closes the selection→spawn window in
+    // which a workload path could move under a tree init masks
+    // (`/run` always; `/tmp` when the resolv.conf bridge needs it) —
+    // never trusted stale. Anything flagged can never resolve inside
+    // the namespace — refuse with the cause named rather than let
+    // init's bind-mount or the interpreter's open surface it as a
+    // bare ENOENT.
+    let visibility = super::super::select::workload_visibility(
+        argv,
+        program,
+        opts.exec_entry_pin
+            .as_ref()
+            .map(|(_, target, _)| target.clone()),
+        // `exec_uncloak_fds` lists the exe pin's dup'd descriptors —
+        // non-empty exactly when the exe execs through the held
+        // descriptor spelling, so its host path is not evidence.
+        !opts.exec_uncloak_fds.is_empty(),
+    );
+    if let Some(masked) = visibility.first_masked() {
         refuse!(
             controls,
             grants,
             spawn_err_msg(&format!(
-                "pinned entrypoint '{}' is rooted under a masked tree — \
-                 {}; the namespaced workload could never resolve it",
-                target.display(),
-                masked.why
+                "{} '{}' is rooted under a masked tree — {}; the namespaced \
+                 workload could never resolve it",
+                masked.what,
+                masked.path.display(),
+                masked.masked.why
             ))
         );
     }
@@ -436,4 +451,146 @@ fn spawn_err_msg(detail: &str) -> WardenError {
 
 fn eval_err(detail: &str) -> WardenError {
     WardenError::sandbox_setup(crate::error::SandboxStage::Prepare, detail.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::{LinuxMechanismRequest, LinuxNativeMechanism};
+
+    fn namespaced_selection() -> LinuxSelection {
+        LinuxSelection {
+            requested: LinuxMechanismRequest::Namespaced,
+            selected: Some(LinuxNativeMechanism::Namespaced),
+            reason: "test selection".to_string(),
+            missing: Vec::new(),
+            violations: Vec::new(),
+            probe: None,
+            probe_err: None,
+            dns_upstream: None,
+        }
+    }
+
+    fn ctx() -> NamespacedLaunchCtx {
+        NamespacedLaunchCtx {
+            launch_id: uuid::Uuid::new_v4(),
+            upstream: None,
+            audit: crate::audit_log::AuditLogger::to_tracing(),
+            policy_ctx: None,
+        }
+    }
+
+    /// The smallest policy the spawn's own rule builds accept —
+    /// `require_execve_allowance` fails a bare `Policy::default()`
+    /// before the masked screen is ever reached.
+    fn spawnable_policy() -> Policy {
+        let mut p = Policy::default();
+        p.sandbox.allow_degraded = true;
+        p
+    }
+
+    /// PR-05 — the point-of-use rescreen inside the spawn entry point
+    /// itself: a workload whose payload arg sits under `/run` (the root
+    /// init always masks) refuses before init ever spawns, even though
+    /// the selection record presented here carries no mask evidence —
+    /// the window between selection and spawn is not trusted.
+    #[tokio::test]
+    async fn spawn_refuses_a_payload_masked_since_selection() {
+        let policy = spawnable_policy();
+        let selection = namespaced_selection();
+        let opts = SpawnOptions::default();
+        let ctx = ctx();
+        // `/run` exists on every Linux host and is always covered —
+        // as a payload arg it can never resolve inside the namespace.
+        let argv = vec!["true".to_string(), "/run".to_string()];
+        let attempt = spawn_namespaced_attempt(
+            &policy,
+            &selection,
+            Path::new("/bin/true"),
+            &argv,
+            &opts,
+            false,
+            &ctx,
+            None,
+        )
+        .await;
+        let err = match attempt.outcome {
+            Err(err) => err,
+            Ok(_) => panic!("a masked payload refuses the namespaced launch"),
+        };
+        assert!(
+            err.to_string().contains("masked tree"),
+            "the refusal names the masked-tree cause: {err}"
+        );
+        assert!(
+            err.to_string().contains("/run"),
+            "the refusal names the covered root: {err}"
+        );
+    }
+
+    /// The same wiring does not flag an unmasked workload — control
+    /// for the refusal above: the launch proceeds past the screen
+    /// toward the real init spawn. An unprivileged environment fails
+    /// that spawn with its own error, which must not be the
+    /// masked-tree refusal.
+    #[tokio::test]
+    async fn spawn_screen_passes_an_unmasked_workload() {
+        let policy = spawnable_policy();
+        let selection = namespaced_selection();
+        let opts = SpawnOptions::default();
+        let ctx = ctx();
+        let argv = vec!["true".to_string(), "/bin".to_string()];
+        let attempt = spawn_namespaced_attempt(
+            &policy,
+            &selection,
+            Path::new("/bin/true"),
+            &argv,
+            &opts,
+            false,
+            &ctx,
+            None,
+        )
+        .await;
+        if let Err(err) = attempt.outcome {
+            assert!(
+                !err.to_string().contains("masked tree"),
+                "an unmasked workload never hits the masked-tree refusal: {err}"
+            );
+        }
+    }
+
+    /// An exe exec'ing through its fd pin is not evidence — the
+    /// `/proc/self/fd/N` spelling resolves inside the namespace
+    /// whatever the host path looked like. With the pin's fds on
+    /// `exec_uncloak_fds` the fd-spelled exe stays off the screen.
+    #[tokio::test]
+    async fn spawn_screen_skips_the_fd_spelled_exe() {
+        let policy = spawnable_policy();
+        let selection = namespaced_selection();
+        let opts = SpawnOptions {
+            exec_uncloak_fds: vec![42],
+            ..SpawnOptions::default()
+        };
+        let ctx = ctx();
+        // The exe rides `/proc/self/fd/42`; the payload arg `/bin` is
+        // unmasked — nothing on the screen may flag.
+        let argv = vec!["true".to_string(), "/bin".to_string()];
+        let attempt = spawn_namespaced_attempt(
+            &policy,
+            &selection,
+            Path::new("/proc/self/fd/42"),
+            &argv,
+            &opts,
+            false,
+            &ctx,
+            None,
+        )
+        .await;
+        if let Err(err) = attempt.outcome {
+            assert!(
+                !err.to_string().contains("masked tree"),
+                "the fd-spelled exe is not a masked-tree candidate: {err}"
+            );
+        }
+    }
 }

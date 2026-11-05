@@ -229,7 +229,13 @@ impl WorkloadVisibility {
 /// binds it — an unpinned workload resolving under a masked tree
 /// ENOENTs inside the namespace exactly like a pinned one. `-m`
 /// module and inline-eval payloads carry no filesystem object and
-/// are left out. The arg is normalized the same way the pin
+/// are left out. For an executable with no modeled option grammar
+/// the payload position is heuristic — the generic scan's first
+/// non-flag token may be a subcommand word rather than a path; the
+/// host-existence plus masked-root conjunction keeps such
+/// coincidences rare, and the flag direction stays conservative (a
+/// workload that does open the arg as a path would ENOENT inside
+/// the namespace). The arg is normalized the same way the pin
 /// normalizes `PinnedEntry.path`: a relative spelling joins the
 /// launcher's cwd (the child's inherited one) and `.` components
 /// collapse. A relative arg under a masked cwd still flags — the cwd
@@ -302,7 +308,10 @@ pub struct LinuxSelection {
     pub selected: Option<LinuxNativeMechanism>,
     /// One-line rationale (the pick's basis, or the refusal cause).
     pub reason: String,
-    /// `linux-namespaced` `requires` ids unmet on this host (probe).
+    /// `linux-namespaced` `requires` ids unmet on this host — probe
+    /// stage ids, plus `workload_masked:<root>` tokens for each
+    /// masked tree a workload path resolves under (PR-05: a
+    /// workload-level unavailability, deduped by root).
     pub missing: Vec<String>,
     /// Requirements a candidate mechanism could not satisfy — the
     /// strings themselves name the mechanism they belong to.
@@ -429,7 +438,7 @@ fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSe
     // `None` probe = the probe never ran (explicit native request) —
     // no missing evidence and no error is fabricated for it.
     let probe = input.probe.and_then(|r| r.clone().ok());
-    let (mut missing, probe_err) = match &input.probe {
+    let (probe_missing, probe_err) = match &input.probe {
         Some(Ok(p)) => (p.missing().iter().map(|s| s.to_string()).collect(), None),
         Some(Err(e)) => (Vec::new(), Some(e.clone())),
         None => (Vec::new(), None),
@@ -438,7 +447,11 @@ fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSe
     // in `missing` — the same "unmet requirement" surface the probe
     // stage ids use — so the plan/report mechanism member names the
     // launch-level blocker alongside them (deduped: an exe and a
-    // payload under `/tmp` are one blocked tree, not two).
+    // payload under `/tmp` are one blocked tree, not two). The
+    // workload tokens join the *record* only: refusal prose that
+    // attributes findings to the probe reads `probe_missing` so it
+    // never names evidence the probe did not produce.
+    let mut missing = probe_missing.clone();
     for m in &input.workload_masked {
         let token = format!("workload_masked:{}", m.masked.root);
         if !missing.iter().any(|t| t == &token) {
@@ -460,7 +473,7 @@ fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSe
                     None,
                     format!(
                         "namespaced: launch refused — {}",
-                        probe_unavailable_reason(input.probe, &missing)
+                        probe_unavailable_reason(input.probe, &probe_missing)
                     ),
                     // Policy violations are real evidence even when the
                     // probe failed first — a refusal that hides them
@@ -620,15 +633,19 @@ fn ns_unavailable_reason(
     }
 }
 
+/// Why the namespaced route is out for an explicit `namespaced`
+/// request: `probe_missing` is the probe's *own* missing-stage ids —
+/// `workload_masked` tokens stay off this message so a probe
+/// attribution never names evidence the probe did not produce.
 fn probe_unavailable_reason(
     probe: Option<&Result<ProbeReport, String>>,
-    missing: &[String],
+    probe_missing: &[String],
 ) -> String {
     match probe {
         Some(Err(e)) => format!("the capability probe could not run: {e}"),
         Some(Ok(p)) if !p.capable() => format!(
             "the capability probe found missing stages: {}",
-            missing.join(", ")
+            probe_missing.join(", ")
         ),
         // An explicit `namespaced` request always probes — these arms
         // exist so the helper stays total if that ever changes.
@@ -1044,29 +1061,97 @@ fn masked_fs_root(spelling: &str, tmp_masked: bool) -> Option<&'static str> {
 }
 
 /// `Some(MaskedRoot)` when `path` — a concrete workload path, not a
-/// grant spelling — sits under a tree init masks with a private
-/// tmpfs (`/run` always; `/tmp` when the resolv.conf redirect needs
-/// its tmpfs): the namespaced workload could never resolve it.
-/// Unlike `masked_fs_root`'s glob-aware spelling walk this resolves
-/// the path first, so a symlinked path is judged by the object it
-/// reaches — the same object the pin verified. `/var/run` needs no
-/// separate arm: a path spelled through it canonicalizes under `/run`.
+/// grant spelling — cannot resolve inside init's mount namespace:
+/// `/run` is always covered with a private tmpfs, `/tmp` when the
+/// resolv.conf redirect needs its tmpfs. Unlike `masked_fs_root`'s
+/// glob-aware spelling walk this judges the spelled path the way the
+/// in-namespace lookup would: a masked mount point itself resolves
+/// (it is the empty tmpfs root), but nothing beneath it does — so a
+/// component resolved *under* a masked root is hidden even when the
+/// full path's canonical target is not. A whole-path canonicalize
+/// misjudges both directions a symlink can take: a link living under
+/// a masked root and pointing out (the spelled path dies on the
+/// hidden dentry) and a link outside pointing in (the resolution
+/// steps into the covered tree). `/var/run` needs no separate arm: a
+/// path spelled through it resolves under `/run`.
 pub(crate) fn masked_namespace_root(path: &Path) -> Option<MaskedRoot> {
-    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if resolved.starts_with("/run") {
-        return Some(MaskedRoot {
-            root: "/run",
-            why: "the namespaced mount setup covers /run with a private tmpfs",
-        });
+    masked_namespace_root_under(path, tmp_mask_planned())
+}
+
+/// The traversal walk behind [`masked_namespace_root`], with the
+/// `/tmp` mask decision explicit so tests pin it without the
+/// debug-build fixture env (`MCP_WRIT_NS_FORCE_TMP_MASK`).
+fn masked_namespace_root_under(path: &Path, tmp_masked: bool) -> Option<MaskedRoot> {
+    let root_of = |p: &Path| -> Option<MaskedRoot> {
+        if p.starts_with("/run") {
+            Some(MaskedRoot {
+                root: "/run",
+                why: "the namespaced mount setup covers /run with a private tmpfs",
+            })
+        } else if tmp_masked && p.starts_with("/tmp") {
+            Some(MaskedRoot {
+                root: "/tmp",
+                why: "init covers /tmp with a private tmpfs to host the resolv.conf \
+                     bind-mount source",
+            })
+        } else {
+            None
+        }
+    };
+    // The mount root itself resolves inside the namespace (it is the
+    // tmpfs root); only lookups *beneath* it fail, so the equality
+    // check and the rooted-under verdict stay distinct predicates.
+    let is_masked_mount =
+        |p: &Path| p == Path::new("/run") || (tmp_masked && p == Path::new("/tmp"));
+    // A relative spelling resolves against the launcher's cwd — the
+    // child's inherited one — matching the pin's payload-arg join.
+    let spelled = match std::env::current_dir() {
+        Ok(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_path_buf(),
+    };
+    let mut dir = std::path::PathBuf::from("/");
+    for comp in spelled.components() {
+        match comp {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // `..` from the masked tmpfs root escapes to the real
+                // parent — canonicalize tracks either side of the
+                // mount boundary correctly.
+                match std::fs::canonicalize(dir.join("..")) {
+                    Ok(resolved) => dir = resolved,
+                    Err(_) => return None,
+                }
+            }
+            std::path::Component::Normal(name) => {
+                if is_masked_mount(&dir) {
+                    // The mount root resolves but its contents do
+                    // not — any deeper lookup fails in the empty
+                    // private tmpfs.
+                    return root_of(&dir);
+                }
+                match std::fs::canonicalize(dir.join(name)) {
+                    Ok(resolved) => {
+                        if let Some(m) = root_of(&resolved)
+                            && !is_masked_mount(&resolved)
+                        {
+                            // A crossing lookup — a symlink or spelled
+                            // component landing *below* the mount
+                            // root — already fails inside: only the
+                            // mount root's own dentry exists there.
+                            return Some(m);
+                        }
+                        dir = resolved;
+                    }
+                    // A component absent on the host is not a hidden
+                    // object — the in-namespace tmpfs is writable, so
+                    // a tail the workload creates resolves fine.
+                    Err(_) => return None,
+                }
+            }
+            std::path::Component::Prefix(_) => {}
+        }
     }
-    if tmp_mask_planned() && resolved.starts_with("/tmp") {
-        return Some(MaskedRoot {
-            root: "/tmp",
-            why: "init covers /tmp with a private tmpfs to host the resolv.conf \
-                 bind-mount source",
-        });
-    }
-    None
+    root_of(&dir)
 }
 
 /// `Some(<fs name>)` when `spelling`'s grant base sits on a filesystem

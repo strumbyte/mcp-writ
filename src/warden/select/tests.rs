@@ -918,7 +918,8 @@ fn masked_tokens_dedupe_by_root() {
 }
 
 /// Probe-missing and workload-masked coexist in `missing` — an
-/// explicit namespaced refusal keeps both kinds of evidence.
+/// explicit namespaced refusal keeps both kinds of evidence, while
+/// the reason attributes only the probe's own stages to the probe.
 #[test]
 fn masked_workload_coexists_with_probe_missing() {
     let p = bare_port_policy();
@@ -936,6 +937,89 @@ fn masked_workload_coexists_with_probe_missing() {
         sel.missing,
         vec!["tun".to_string(), "workload_masked:/run".to_string()]
     );
+    assert!(
+        sel.reason.contains("tun") && !sel.reason.contains("workload_masked"),
+        "the probe attribution names only evidence the probe produced: {}",
+        sel.reason
+    );
+}
+
+/// `masked_namespace_root` walks the spelled path the way the
+/// in-namespace lookup would — a symlink *living under* a masked
+/// root hides whatever it names (the dentry never reaches the
+/// workload), and a link pointing *into* one hides whatever lies
+/// beneath, while a `..` pop escapes the mask legitimately. `/tmp`
+/// stands in as the masked root so the fixture needs no env.
+#[test]
+fn masked_namespace_root_walks_spelled_traversal() {
+    let tag = std::process::id();
+    // Living under the masked root, pointing out: `/bin` is unmasked
+    // yet the link's own dentry is hidden inside the namespace.
+    let link = std::path::PathBuf::from(format!("/tmp/mcp-writ-pr05-link-{tag}"));
+    std::os::unix::fs::symlink("/bin", &link).unwrap();
+    assert_eq!(
+        masked_namespace_root_under(&link, true).map(|m| m.root),
+        Some("/tmp"),
+        "a symlink under the masked root is hidden whatever it names"
+    );
+    assert_eq!(
+        masked_namespace_root_under(&link.join("sh"), true).map(|m| m.root),
+        Some("/tmp"),
+        "traversal through a hidden symlink fails inside"
+    );
+    std::fs::remove_file(&link).unwrap();
+    // `..` pops out of the covered tree — the escaped spelling
+    // resolves outside the mask and is not flagged.
+    assert_eq!(
+        masked_namespace_root_under(std::path::Path::new("/tmp/../bin/sh"), true).map(|m| m.root),
+        None,
+        "`..` escapes the masked root before the hidden lookup"
+    );
+    // The mount root itself resolves inside (it is the tmpfs root) —
+    // the flag still stands as the verdict for the object it names.
+    assert_eq!(
+        masked_namespace_root_under(std::path::Path::new("/tmp"), true).map(|m| m.root),
+        Some("/tmp")
+    );
+    assert_eq!(
+        masked_namespace_root_under(std::path::Path::new("/bin/sh"), true).map(|m| m.root),
+        None,
+        "an unmasked object is never flagged"
+    );
+    assert_eq!(
+        masked_namespace_root_under(std::path::Path::new("/tmp"), false).map(|m| m.root),
+        None,
+        "the /tmp arm follows the mask decision it is given"
+    );
+
+    // Pointing into the masked root: the link lives outside but its
+    // resolution steps into the covered tree.
+    for outside in ["/dev/shm", "/var/tmp"] {
+        let in_link = std::path::PathBuf::from(format!("{outside}/mcp-writ-pr05-in-{tag}"));
+        if std::os::unix::fs::symlink("/tmp", &in_link).is_err() {
+            continue; // not writable on this host — try the next spot
+        }
+        assert_eq!(
+            masked_namespace_root_under(&in_link, true).map(|m| m.root),
+            Some("/tmp"),
+            "a symlink into the masked root lands on the mask"
+        );
+        std::fs::remove_file(&in_link).unwrap();
+        // Landing *below* the mount root fails the crossing lookup
+        // outright — only the mount root's own dentry exists inside.
+        let sub = std::path::PathBuf::from(format!("/tmp/mcp-writ-pr05-sub-{tag}"));
+        std::fs::create_dir(&sub).unwrap();
+        let deep = std::path::PathBuf::from(format!("{outside}/mcp-writ-pr05-deep-{tag}"));
+        std::os::unix::fs::symlink(&sub, &deep).unwrap();
+        assert_eq!(
+            masked_namespace_root_under(&deep.join("x"), true).map(|m| m.root),
+            Some("/tmp"),
+            "a component landing below the masked root is hidden"
+        );
+        std::fs::remove_file(&deep).unwrap();
+        std::fs::remove_dir(&sub).unwrap();
+        return;
+    }
 }
 
 /// An exe that execs through its fd pin (`/proc/self/fd/N` inside the

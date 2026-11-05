@@ -1036,9 +1036,13 @@ pub async fn launch(
     // workload resolves under a tree init masks names the blocked
     // root on the spawn record too, like the other launch waivers;
     // the plan/report `mechanism.missing` member carries the full
-    // evidence list.
+    // evidence list. An explicit `native` request keeps the token in
+    // `missing` but not here — namespaced was never a candidate for
+    // this launch, so the spawn record has no waiver to describe.
     #[cfg(target_os = "linux")]
-    if let Some(sel) = warden.linux_selection() {
+    if let Some(sel) = warden.linux_selection()
+        && sel.requested != crate::execution::LinuxMechanismRequest::Native
+    {
         for token in &sel.missing {
             if token.starts_with("workload_masked:") {
                 details.push_str(&format!(" {token}"));
