@@ -538,6 +538,7 @@ mcp-writ generate-policy [OPTIONS] -- <mcp-server-command> [args...]
 |--------|-------|---------|-------------|
 | `--binary <path>` | `-b` | *(command[0])* | Path to binary to inspect (defaults to first element of command) |
 | `--output <path>` | `-o` | *(stdout)* | Write generated policy to file |
+| `--policy-version <2\|3>` | | `2` | `policy version=` the draft declares — `3` emits a draft the v3 grammar accepts directly, so `check` reports `migration: null` for it |
 | `--verbose` | `-v` | off | Increase log verbosity |
 | `--live-discovery` | | off | Execute the MCP server inside the Warden sandbox (restricted environment, deny-all egress, private TMPDIR) to discover tools (not the default) |
 | `--unsafe-unsandboxed-discovery` | | off | Live discovery without the OS sandbox, in the ambient environment — the explicit downgrade |

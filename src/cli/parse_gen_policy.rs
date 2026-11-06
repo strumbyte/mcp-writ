@@ -40,9 +40,11 @@ pub(super) fn parse_gen_policy_args(
         None
     };
 
-    // --policy-version <2|3> (optional; default 2 — v3 emits
-    // `policy version=3` and the v3-required spellings, e.g. an
-    // explicit `allow none=#true` beside `require-path #false`)
+    // --policy-version <2|3> (optional; default 2 — 3 declares
+    // `policy version=3`. The generated template carries no
+    // version-sensitive spellings — no `require-path`, no bare
+    // `allow none=#true`, no `replace` — so the declaration alone
+    // makes the draft valid under either grammar)
     let policy_version_taken = noargs::opt("policy-version")
         .doc("Policy schema version to declare in the draft: 2 (default) or 3")
         .take(&mut raw);

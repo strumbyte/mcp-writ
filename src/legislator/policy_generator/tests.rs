@@ -2576,6 +2576,23 @@ fn policy_version_2_is_the_default_and_unchanged() {
     assert_eq!(default, explicit_v2);
 }
 
+/// The v3 draft is byte-identical to the default draft apart from the
+/// declared version line — the compatibility property a snapshot of
+/// the prior output would pin, stated here as the delta between the
+/// two generated outputs (the emitted body carries no
+/// version-sensitive spelling either grammar rejects).
+#[test]
+fn policy_version_3_differs_only_in_the_version_line() {
+    let (cap, result) = b02_capability_and_result();
+    let v2 = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
+    let v3 = generate_policy_with_version(&result, &cap, None, &[], &WorkloadHashes::default(), 3);
+    assert_eq!(
+        v2.replacen("policy version=2\n", "policy version=3\n", 1),
+        v3,
+        "the v3 draft must differ only in the declared version:\n{v3}"
+    );
+}
+
 /// `--policy-version 3` emits a draft that declares `version=3` and
 /// loads under v3 grammar outright — `check` then reports
 /// `migration: null` rather than simulating a v2 draft under v3 rules.

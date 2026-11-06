@@ -90,6 +90,10 @@ pub fn generate_policy_with_version(
     workload: &WorkloadHashes,
     policy_version: u32,
 ) -> String {
+    debug_assert!(
+        matches!(policy_version, 2 | 3),
+        "generate_policy_with_version accepts only validated versions (2 or 3)"
+    );
     // Build the tools section first: when every emitted tool is denied
     // (dispatcher-shaped servers where nothing could be grounded — F-10)
     // the draft head must say so, or the operator reads an all-deny

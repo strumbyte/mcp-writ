@@ -754,6 +754,13 @@ fn check_tool_node(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyError
 /// `proto=`/`port=` is a parse error upstream, and a qualified
 /// `host="*"` cannot appear on `deny`, so the wildcard is always the
 /// bare form here.
+///
+/// Scope is deliberately the single block — the declaration-site
+/// contradiction D-1 names. Cross-layer shadowing (a `deny host="*"`
+/// in `server-defaults` covering an `allow` the tool block adds, and
+/// vice versa) composes at load and is out of scope here; a lone
+/// `deny host="*"` with no sibling allow is "close this tool's
+/// egress", which reads coherently and is not warned.
 fn check_tool_network_entries(
     cx: &mut Check<'_>,
     node: &KdlNode,

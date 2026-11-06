@@ -1,4 +1,4 @@
-# mcp-writ 改善計画 PR別実装手順書（2026-10-27、2026-11-04 更新）
+﻿# mcp-writ 改善計画 PR別実装手順書（2026-10-27、2026-11-04 更新）
 
 作成日: 2026-10-27
 更新日: 2026-11-04（基準コミットを `f00e28a` に更新 — 後述の「基準以降の変化」参照）
@@ -244,13 +244,15 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **タスク**
 
-- [ ] B-02 の原因を特定する: レポートの事象（v2 草案を v3 で読むと「`require-path #false` には明示的に空の許可リストが要る」で失敗）を、生成テンプレートの fixture で再現する試験を書く
-- [ ] `--policy-version 2|3` を `generate-policy` に追加する。既定は 2 で出力不変（前身の PR-32 の snapshot 試験で固定）。3 では `policy version=3` を出し、`require-path #false` のブロックに明示的な空の許可リストを添える（または v3 の検証規則側で「`require-path #false` 単独」を受理すべきかを判断し、受理する場合は検証規則の変更として前身の PR-28 の不変条件 — 子で足した許可が親の許可を含む — に反しないことを確認する）
-- [ ] v3 で出した草案を `check` に掛け、`migration` が `null`（v3 のため対象外）になること、v2 で出した草案の `migration.status` が `fields_differ` または `unchanged` になり `simulation_failed` にならないことを固定する
-- [ ] D-1: ツール単位 `network` に `deny host="*"` と allow（host／cidr／egress rule）が同居するとき、読込時の警告（前身の PR-24 の継承警告と同じ経路）と `check` の `warnings[]` に「tool-level `deny host="*"` is an ordinary wildcard rule evaluated before every allow in this block — the allow list is already closed; remove the deny」を出す。エラーにはしない。既存ポリシーの判定は不変
-- [ ] policy-authoring 英日: `--policy-version` の説明と、ツール単位 `network` の規則（PR-01 で書いた文）への警告の参照を足す
+- [x] B-02 の原因を特定する: レポートの事象（v2 草案を v3 で読むと「`require-path #false` には明示的に空の許可リストが要る」で失敗）を、生成テンプレートの fixture で再現する試験を書く — **済**: `b02_v2_require_path_block_fails_under_v3_rules`（生成テンプレートに tool `filesystem` ブロックを差し込み、v2 規則では読め v3 規則では `require-path #false requires an explicitly empty allow-list` で失敗することを固定）と e2e の `check_v2_require_path_migration_preview_is_simulation_failed`（`simulation_failed` が status・exit code を動かさず in-band に報告されることを固定）
+- [x] `--policy-version 2|3` を `generate-policy` に追加する。既定は 2 で出力不変（前身の PR-32 の snapshot 試験で固定）。3 では `policy version=3` を出し、`require-path #false` のブロックに明示的な空の許可リストを添える（または v3 の検証規則側で「`require-path #false` 単独」を受理すべきかを判断し、受理する場合は検証規則の変更として前身の PR-28 の不変条件 — 子で足した許可が親の許可を含む — に反しないことを確認する） — **済**: `GenPolicyArgs.policy_version` + `generate_policy_with_version` で宣言を出し分け。既定出力は `assert_eq!(default, explicit_v2)` で「既定経路が明示指定の v2 と同一の草案を出す」ことを固定し、v2 草案と v3 草案の差分が宣言行のみであることを `policy_version_3_differs_only_in_the_version_line` で固定（先行出力との一致は fixture との比較ではなく、出力差分が宣言行に限定されることに依る）。`require-path #false`・`allow none`・`replace`・tool 配下ブロックは生成テンプレートが一切出力しないため、明示的な空許可リストを添える対象が存在せず、宣言の反転のみで v3 適合となる（検証規則側の変更も不要と判断 — D-3）
+- [x] v3 で出した草案を `check` に掛け、`migration` が `null`（v3 のため対象外）になること、v2 で出した草案の `migration.status` が `fields_differ` または `unchanged` になり `simulation_failed` にならないことを固定する — **済**: `generate_policy_version_3_draft_reports_null_migration`・`generate_policy_version_2_draft_migration_never_fails`・`check_v3_require_path_spelling_loads_and_skips_preview`（`policy_check_e2e`）と `policy_version_3_draft_declares_v3_and_loads`（単体）で固定
+- [x] D-1: ツール単位 `network` に `deny host="*"` と allow（host／cidr／egress rule）が同居するとき、読込時の警告（前身の PR-24 の継承警告と同じ経路）と `check` の `warnings[]` に「tool-level `deny host="*"` is an ordinary wildcard rule evaluated before every allow in this block — the allow list is already closed; remove the deny」を出す。エラーにはしない。既存ポリシーの判定は不変 — **済**: `LoadWarningKind::ShadowedAllow`（`"shadowed-allow"`）を新設し、`check_tool_network_entries`（kdl_strict のスキーマ検査）が tool・`server-defaults`・`profile` の各 tool 層 `network` で発火 — defaults 層は posture 綴りのため対象外。警告は読込時の `Warning:` stderr（`emit_warnings` 経由 = PR-24 と同じ経路）と `check` の `warnings[]`（`kind.as_str()` で自動伝搬）の双方に出る。`deny` は修飾子不可・tool 層の `allow unix=` は parse エラーなので、ワイルドカードは常に裸形で全 allow を覆うことを確認済み
+- [x] policy-authoring 英日: `--policy-version` の説明と、ツール単位 `network` の規則（PR-01 で書いた文）への警告の参照を足す — **済**: 英 L255・日 L168 付近に `--policy-version` 節を追加、英 L617・日 L531 の tool `network` 段落に警告の説明を追記
 
-**検証:** T-BASE、T-POLICY、`tests/policy_check_e2e.rs`、`tests/self_test.rs`（v3 草案で enforced run が起動すること）。
+**検証:** T-BASE、T-POLICY、`tests/policy_check_e2e.rs`、`tests/self_test.rs`（v3 草案で enforced run が起動すること） — **実施済み**（Windows 実機）: `cargo fmt --check`・`cargo clippy --all-targets -D warnings` クリーン、`cargo test --lib` 2501 pass、`docs_check` 13 pass、`kdl_policy_e2e` 46 pass、`environment_e2e` 16 pass、`go_runtime_policy` 7 pass、`policy_check_e2e` 43 pass、`self_test` 5 pass（非 Linux 経路。Linux 経路の `v3_policy_self_test_still_spawns` は WSL2 実機で要実行）。
+
+**実施結果メモ:** D-3 の判断 — 生成テンプレートが v2 専用の綴りを一切含まないことを全エミッション経路で確認し、「`require-path #false` への注記」と「検証規則の変更」の両方が不要と確定（宣言反転のみで充足）。D-1 の警告検出は計画が挙げた `leaves.rs`/`validator.rs`/`commands/check.rs` ではなく kdl_strict のスキーマ検査に実装 — `LoadWarning` 経路は同一で、tool・server-defaults・profile の 3 層を宣言箇所で捕捉できる。検出は同一ブロック内に限定（層間の遮蔽 — server-defaults の `deny *` が tool の `allow` を覆う等 — は合成後の話でスコープ外、コメントに境界を明記）。tool 単体の `deny host="*"` は「そのツールの egress を閉じる」一貫した意図として警告しない。**追記（レビュー指摘対応）**: `parse_gen_policy.rs` のコメントが「v3 は v3-required の綴りを出す」と実装と逆の記述になっていたため「テンプレートに版依存の綴りが無いため宣言のみで足りる」に修正。guide 英日 §4.3 の Options 表に `--policy-version` 行が未掲載だったため追加。`generate_policy_with_version` に `debug_assert!(matches!(policy_version, 2 | 3))` を追加（CLI 以外の将来の呼出元での誤用防止）。
 
 **完了条件:** v3 の草案が `check` と `run` を通り、v2 草案の移行プレビューが生成テンプレート起因で失敗しない。ツール単位の deny ワイルドカードが警告される。既定の出力と判定は不変。
 

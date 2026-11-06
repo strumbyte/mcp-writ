@@ -467,6 +467,7 @@ mcp-writ generate-policy [OPTIONS] -- <mcp-server-command> [args...]
 |--------|-------|---------|-------------|
 | `--binary <path>` | `-b` | *（command[0]）* | 検査対象のバイナリパス（デフォルトはコマンドの最初の要素） |
 | `--output <path>` | `-o` | *（stdout）* | 生成されたポリシーをファイルに書き込む |
+| `--policy-version <2\|3>` | | `2` | 草案が宣言する `policy version=` — `3` は v3 文法でそのまま読める草案を出すため、`check` は `migration: null` を報告する |
 | `--verbose` | `-v` | off | ログの詳細レベルを上げる |
 | `--live-discovery` | | off | MCP サーバーを Warden サンドボックス内で実行してツールを検出する（制限環境・deny-all egress・private TMPDIR。デフォルトではない） |
 | `--unsafe-unsandboxed-discovery` | | off | OS サンドボックス無し・周囲の環境のままライブ検出する — 明示的なダウングレード |
