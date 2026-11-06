@@ -11,6 +11,13 @@ mod pin;
 
 #[cfg(unix)]
 pub use pin::FdExecPlan;
+/// The payload-path normalization `warden::select` mirrors for its
+/// masked-tree screen (PR-05) — the same spelling the pin's
+/// `PinnedEntry.path` records. `select` is Linux-only, so the
+/// re-export is gated to it: any wider Unix scope would be an unused
+/// import there.
+#[cfg(target_os = "linux")]
+pub(crate) use pin::simplify_verbatim;
 pub use pin::{
     SpawnPin, VerifiedWorkload, bind_launched_workload, reverify_immediately_before_spawn,
 };

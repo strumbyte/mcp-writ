@@ -20,7 +20,10 @@ pub(crate) use anchor::open_pinned;
 pub use bind::bind_launched_workload;
 #[cfg(unix)]
 pub use plan::FdExecPlan;
-#[cfg(all(test, windows))]
+// Linux exports it for `warden::select`'s masked-tree screen (PR-05)
+// — the only production consumer, itself Linux-gated; a wider Unix
+// scope would be an unused import there. Windows keeps it test-only.
+#[cfg(any(target_os = "linux", all(test, windows)))]
 pub(crate) use spawn::simplify_verbatim;
 pub use spawn::{SpawnPin, reverify_immediately_before_spawn};
 #[cfg(all(unix, test))]

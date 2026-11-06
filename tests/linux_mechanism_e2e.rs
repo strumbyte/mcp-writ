@@ -24,6 +24,13 @@
 //! - `namespaced` refuses a policy it cannot satisfy (an fs grant
 //!   rooted under the `/run` private-tmpfs mask) instead of falling
 //!   back to native.
+//! - PR-05: a workload executable under `/tmp` — the tree init masks
+//!   when the resolv.conf redirect needs its bind-mount source — is
+//!   screened before spawn: `namespaced` refuses with a
+//!   `workload_masked:/tmp` token in `mechanism.missing`, `auto`
+//!   falls back to native and runs (never an `ERR exec errno=2`).
+//!   `MCP_WRIT_NS_FORCE_TMP_MASK=1` pins the conditional mask so the
+//!   leg does not depend on the host's resolv.conf layout.
 //! - Forcing the egress proxy to end while UDP traffic is in flight is
 //!   a supervision loss: the workload is killed fail-closed, `run`
 //!   exits nonzero, the report records `proxy_lost`, and the audit
@@ -407,6 +414,32 @@ fn launch(
     dns_upstream: Option<String>,
     workload_args: &[String],
 ) -> Run {
+    launch_env(
+        dir,
+        policy,
+        mechanism,
+        kill_after_ms,
+        dns_upstream,
+        workload_args,
+        fixture().expect("fixture checked"),
+        &[],
+    )
+}
+
+/// `launch` with the workload image and extra supervisor-environment
+/// members spelled out — the PR-05 masked-tree legs need both (a
+/// fixture copy under `/tmp`, `MCP_WRIT_NS_FORCE_TMP_MASK=1`).
+#[expect(clippy::too_many_arguments)]
+fn launch_env(
+    dir: &Path,
+    policy: &Path,
+    mechanism: Option<&str>,
+    kill_after_ms: Option<u64>,
+    dns_upstream: Option<String>,
+    workload_args: &[String],
+    workload_exe: PathBuf,
+    extra_env: &[(&str, &str)],
+) -> Run {
     let audit = dir.join("audit.jsonl");
     let report = dir.join("report.json");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
@@ -423,13 +456,14 @@ fn launch(
     if let Some(u) = dns_upstream {
         cmd.args(["--dns-upstream", &u]);
     }
-    cmd.arg("--")
-        .arg(fixture().expect("fixture checked"))
-        .args(workload_args);
+    cmd.arg("--").arg(&workload_exe).args(workload_args);
     cmd.env_remove("MCP_WRIT_SKIP_SANDBOX")
         .env_remove(PROXY_KILL_ENV);
     if let Some(ms) = kill_after_ms {
         cmd.env(PROXY_KILL_ENV, ms.to_string());
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -521,6 +555,13 @@ struct Report {
     selected: Option<String>,
     status: Option<String>,
     detail: Option<String>,
+    /// `mechanism.reason` — the selection's one-line rationale (the
+    /// pick's basis or the refusal cause).
+    reason: Option<String>,
+    /// `mechanism.missing` — unmet `linux-namespaced` requirements:
+    /// probe stage ids and, since PR-05, `workload_masked:<root>`
+    /// tokens naming a masked tree the launch resolves under.
+    missing: Vec<String>,
     violations: Vec<String>,
     /// `mechanism.probe.proc_mount` — `Some` whenever the pre-launch
     /// capability probe ran (absent only when the probe itself was
@@ -564,12 +605,21 @@ fn read_report(dir: &Path) -> Report {
                 .collect()
         })
         .unwrap_or_default();
+    let missing = member(&mech, "missing")
+        .and_then(|arr| arr.to_array().ok())
+        .map(|els| {
+            els.filter_map(|e| e.to_unquoted_string_str().ok().map(|s| s.into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
     let proc_mount = member(&mech, "probe").and_then(|p| member_bool(&p, "proc_mount"));
     Report {
         requested: member_str(&mech, "requested"),
         selected: member_str(&mech, "selected"),
         status: member_str(&result, "status"),
         detail: member_str(&result, "detail"),
+        reason: member_str(&mech, "reason"),
+        missing,
         violations,
         proc_mount,
         ns,
@@ -896,6 +946,153 @@ fn namespaced_refuses_unsatisfiable_policy_without_fallback() {
             .all(|l| !l.contains("server.connected")),
         "a refused launch must never spawn the workload"
     );
+}
+
+/// PR-05 — an unpinned executable under `/tmp` used to reach
+/// namespaced init and die at `ERR exec errno=2`: init covers `/tmp`
+/// with a private tmpfs to host the resolv.conf bind-mount source,
+/// hiding the image before exec. The selection now screens the
+/// resolved executable (and the first payload argument) against the
+/// masked roots before spawn: `--linux-mechanism namespaced` refuses
+/// with the `workload_masked` token, and `auto` falls back to native —
+/// the launch still runs.
+///
+/// `MCP_WRIT_NS_FORCE_TMP_MASK=1` pins the masking decision regardless
+/// of how this host's `/etc/resolv.conf` resolves — the bind branch is
+/// environment-dependent (a host whose resolver already lives under
+/// `/run` mounts no `/tmp` tmpfs) — and the parent forwards the flag
+/// to init so the real mount sequence takes the same branch. Both
+/// reads are debug-build-only, matching the dev-profile binary this
+/// target drives.
+#[test]
+fn masked_tmp_workload_is_screened_before_spawn() {
+    if !namespaced_capable() {
+        return;
+    }
+    let Some(ip) = host_ipv4() else { return };
+    let Some(srv) = start_echo_servers() else {
+        return;
+    };
+    let Some(bin) = fixture() else { return };
+
+    // Copy the fixture under `/tmp` — the tree init masks when the
+    // resolv.conf redirect takes its bind-mount branch. A per-pid name
+    // keeps parallel runs from colliding; `fs::copy` carries the exec
+    // mode over.
+    let masked_exe = PathBuf::from(format!("/tmp/mcp-writ-e2e-masked-{}", std::process::id()));
+    std::fs::copy(&bin, &masked_exe).expect("copy fixture under /tmp");
+    let force: &[(&str, &str)] = &[("MCP_WRIT_NS_FORCE_TMP_MASK", "1")];
+    let rules = format!(
+        "        allow host=\"*\" proto=\"tcp\" port={}\n        deny host=\"*\"\n",
+        srv.tcp_port
+    );
+
+    // Leg 1 — explicit `namespaced`: refused before spawn, naming the
+    // masked root; the workload never exists and no `server.connected`
+    // audit record is written.
+    let dir = common::real_tempdir();
+    let policy = write_policy(dir.path(), "", &rules);
+    let run = launch_env(
+        dir.path(),
+        &policy,
+        Some("namespaced"),
+        None,
+        None,
+        &["tcp-echo".to_string(), format!("{ip}:{}", srv.tcp_port)],
+        masked_exe.clone(),
+        force,
+    );
+    assert_ne!(
+        run.code, 0,
+        "namespaced must refuse the masked workload; stderr: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("masked tree"),
+        "the refusal must name the masked tree: {}",
+        run.stderr
+    );
+    let report = read_report(dir.path());
+    assert_eq!(report.requested.as_deref(), Some("namespaced"));
+    assert_eq!(report.selected.as_deref(), None);
+    assert_eq!(report.status.as_deref(), Some("failed"));
+    assert!(
+        report.missing.iter().any(|m| m == "workload_masked:/tmp"),
+        "the mechanism record must carry the workload_masked token: {:?}",
+        report.missing
+    );
+    assert!(
+        audit_lines(dir.path())
+            .iter()
+            .all(|l| !l.contains("server.connected")),
+        "a refused launch must never spawn the workload"
+    );
+
+    // Leg 2 — `auto`: the same masked workload falls back to native
+    // (the port-scoped TCP allow is native-satisfiable). The selection
+    // evidence — native pick, masked token on `missing`, reason naming
+    // the blocked root — is the PR-05 contract and holds whether or
+    // not this host can then launch native (a cgroup-less box refuses
+    // the native launch itself, which is a separate environmental
+    // verdict); on a native-capable host the workload also runs and
+    // the spawn record names the masked root.
+    let dir = common::real_tempdir();
+    let policy = write_policy(dir.path(), "", &rules);
+    let run = launch_env(
+        dir.path(),
+        &policy,
+        Some("auto"),
+        None,
+        None,
+        &["tcp-echo".to_string(), format!("{ip}:{}", srv.tcp_port)],
+        masked_exe.clone(),
+        force,
+    );
+    let report = read_report(dir.path());
+    assert_eq!(report.requested.as_deref(), Some("auto"));
+    assert_eq!(
+        report.selected.as_deref(),
+        Some("linux-native"),
+        "auto must fall back to native for a masked workload; stderr: {}",
+        run.stderr
+    );
+    assert!(
+        report.missing.iter().any(|m| m == "workload_masked:/tmp"),
+        "the auto→native record must keep the token: {:?}",
+        report.missing
+    );
+    assert!(
+        report
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("workload_masked:/tmp"),
+        "the reason names why namespaced was out: {:?}",
+        report.reason
+    );
+    if run.code == 0 {
+        assert_eq!(report.status.as_deref(), Some("exited"));
+        assert!(
+            audit_lines(dir.path())
+                .iter()
+                .any(|l| l.contains("server.connected") && l.contains("workload_masked:/tmp")),
+            "the spawn record must name the masked root"
+        );
+    } else {
+        // The fallback decision is already proven — the failure must
+        // be the native launch's own refusal (e.g. no writable cgroup
+        // v2 boundary on this host): the masked workload namespaced
+        // could never exec is visible on the unmasked route, so a
+        // native-side refusal is environmental, not the screen.
+        assert_eq!(report.status.as_deref(), Some("failed"));
+        assert!(
+            run.stderr.contains("failed to spawn"),
+            "the failure is the native launch's own, not selection: {}",
+            run.stderr
+        );
+    }
+
+    let _ = std::fs::remove_file(&masked_exe);
 }
 
 /// The previously unverified leg from

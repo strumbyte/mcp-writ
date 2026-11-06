@@ -185,6 +185,15 @@ fn err_stage_hint(line: &str) -> Option<&'static str> {
              (self-map after unshare(CLONE_NEWUSER) is EPERM on WSL2); \
              check the userns sysctl settings on this host",
         ),
+        ("exec", libc::ENOENT) => Some(
+            "the workload's executable did not resolve inside the namespace — \
+             init covers /run, and /tmp when the resolv.conf redirect needs a \
+             bind-mount source, with a private tmpfs, so a workload path under \
+             either is invisible to exec (the selection's masked-tree screen \
+             normally refuses such a launch before spawn; a relative or \
+             cwd-dependent spelling can still slip past it) — place the \
+             workload outside the masked tree or use --linux-mechanism native",
+        ),
         _ => None,
     }
 }
@@ -394,6 +403,14 @@ fn build_init_command(
             super::init_env::SKIP_SANDBOX
         );
         cmd.env(super::init_env::SKIP_SANDBOX, "1");
+    }
+    // PR-05 fixture hook (debug builds only): forward the forced
+    // `/tmp` mask so init's actual mount sequence and the parent's
+    // `tmp_mask_planned` prediction take the same branch — the masked
+    // tree the e2e legs exercise is real either way.
+    #[cfg(debug_assertions)]
+    if std::env::var(super::init_env::FORCE_TMP_MASK).as_deref() == Ok("1") {
+        cmd.env(super::init_env::FORCE_TMP_MASK, "1");
     }
     // fd handoff: uncloak the pin's dup'd descriptors in this child's
     // pre_exec — never in the parent — so they survive init's re-exec.
@@ -777,11 +794,24 @@ mod tests {
     }
 
     #[test]
+    fn exec_enoent_gets_the_masked_tree_hint() {
+        // PR-05 — the historical masked-tree failure: the line stays
+        // verbatim and the hint names the masked roots plus the two
+        // remediations (relocation, `--linux-mechanism native`).
+        let annotated = annotate_init_err("ERR exec errno=2");
+        assert!(annotated.contains("ERR exec errno=2"), "{annotated}");
+        assert!(annotated.contains("/run"), "{annotated}");
+        assert!(annotated.contains("/tmp"), "{annotated}");
+        assert!(annotated.contains("masked"), "{annotated}");
+        assert!(annotated.contains("linux-mechanism native"), "{annotated}");
+    }
+
+    #[test]
     fn unrecognized_lines_and_pairs_pass_through() {
         // No hint is ever a guessed cause: unknown stages, other
         // errnos, and non-errno ERR forms keep the line verbatim.
         for line in [
-            "ERR exec errno=2",
+            "ERR exec errno=13",
             "ERR unshare errno=0",
             "ERR proc-mount errno=22",
             "ERR sandbox policy-load bad kdl",

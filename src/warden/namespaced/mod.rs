@@ -157,6 +157,17 @@ pub(crate) mod init_env {
     /// the init/workload environment — and its only effect is the
     /// fail-closed direction, never a weakened verdict.
     pub const PROXY_KILL_AFTER_MS: &str = "MCP_WRIT_NS_PROXY_KILL_AFTER_MS";
+    /// Test-only fixture hook for the conditional `/tmp` mask (PR-05):
+    /// `1` on the supervisor's environment makes init take the
+    /// resolv.conf bind-mount branch — covering `/tmp` with the
+    /// private tmpfs — even when the host's resolver already lives
+    /// under `/run`, so e2e legs pin the masking decision
+    /// `tmp_mask_planned` predicts on the supervisor side. Debug
+    /// builds only (`#[cfg(debug_assertions)]` on both the spawn's
+    /// forward and init's read); a release binary carries neither.
+    /// Listing it in `ALL` also keeps ambient values out of the
+    /// workload's environment.
+    pub const FORCE_TMP_MASK: &str = "MCP_WRIT_NS_FORCE_TMP_MASK";
     pub const ALL: &[&str] = &[
         SOCK_FD,
         EXE,
@@ -167,5 +178,6 @@ pub(crate) mod init_env {
         ENTRYPIN_TARGET,
         ENTRYPIN_SHA,
         PROXY_KILL_AFTER_MS,
+        FORCE_TMP_MASK,
     ];
 }

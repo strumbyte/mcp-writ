@@ -11,6 +11,18 @@
 //! | `namespaced`, unavailable or unsatisfiable | **refuse** — never falls back |
 //! | `native`, unsatisfiable policy | **refuse** |
 //!
+//! PR-05 adds the workload itself to "unavailable": the resolved
+//! executable, the first payload argument, and the pinned entrypoint
+//! must still resolve inside init's mount namespace. Init covers
+//! `/run`, and `/tmp` when the resolv.conf redirect needs a
+//! bind-mount source, with a private tmpfs — a workload path rooted
+//! under either is invisible to the exec init performs, so the
+//! namespaced route is unavailable *for this workload*. `auto`
+//! falls back to native when native satisfies the policy; an
+//! explicit `namespaced` refuses with the masked object named — the
+//! `missing` list records a `workload_masked:<root>` token either
+//! way.
+//!
 //! "Satisfies" means every declared requirement lands on an
 //! enforcement point that actually applies — never a silently wider
 //! or narrower mapping:
@@ -84,6 +96,207 @@ struct SelectionInput<'a> {
     /// wildcard v6 rules (`::/0`) whose network address is itself
     /// undialable.
     host_v6_any: bool,
+    /// Workload paths the masked screen flagged (PR-05): each entry
+    /// names what was screened and the `/run`|`/tmp` root init hides
+    /// it under. Empty when every workload path resolves outside the
+    /// masked trees — only then can the namespaced route exec this
+    /// workload at all.
+    workload_masked: Vec<MaskedWorkloadPath>,
+}
+
+/// The tree init masks that a workload path resolves under — the
+/// `workload_masked:<root>` token suffix plus the cause text a
+/// refusal names.
+pub(crate) struct MaskedRoot {
+    /// `"/run"` | `"/tmp"` — the `missing` token's suffix.
+    pub root: &'static str,
+    /// Why init masks that tree — the refusal's cause text.
+    pub why: &'static str,
+}
+
+/// A workload path the masked screen flagged — the evidence one
+/// `workload_masked:<root>` `missing` token records.
+pub(crate) struct MaskedWorkloadPath {
+    /// Which workload component — the diagnostic's subject
+    /// (`"resolved executable"`, `"payload argument"`, `"pinned
+    /// entrypoint"`).
+    pub what: &'static str,
+    /// The path as the workload resolves it.
+    pub path: std::path::PathBuf,
+    /// The masked-root verdict — token suffix plus cause text.
+    pub masked: MaskedRoot,
+}
+
+/// The workload paths the namespaced route must still resolve inside
+/// its mount namespace (PR-05): init covers `/run`, and `/tmp` when
+/// the resolv.conf redirect needs a bind-mount source, with a private
+/// tmpfs — a workload object rooted under either is invisible to the
+/// launch the route would spawn, surfacing today as init's
+/// `ERR exec errno=2`.
+///
+/// Gathered by the caller from the same resolution the launch uses
+/// ([`workload_visibility`]). `Default` describes an unknown workload
+/// — a `run` whose `argv[0]` fails to resolve, or a `plan` whose
+/// `command.resolve` check already failed: the masked screen stays
+/// silent for it and the launch's own resolve step reports that
+/// error.
+#[derive(Debug, Default)]
+pub struct WorkloadVisibility {
+    /// The resolved executable image — `resolve_launch`'s `exe`
+    /// (canonicalized; the shebang-expanded interpreter on a pinned
+    /// `#!` launch). `None` also when the exe execs through an fd
+    /// pin — see `exe_fd_exec` below.
+    pub resolved_exe: Option<std::path::PathBuf>,
+    /// The exe execs through a descriptor spelling
+    /// (`/proc/self/fd/N`) a hash pin handed init — the resolved path
+    /// is never what the workload opens, so its masking is
+    /// irrelevant. When set, `targets()` skips `resolved_exe`: an fd
+    /// spelling canonicalizes to the memfd pseudo-path — outside
+    /// every masked root — and screening the path would refuse a
+    /// launch that genuinely works.
+    pub exe_fd_exec: bool,
+    /// The first payload argument as the workload resolves it —
+    /// `None` when argv carries no path payload (`-m` module and
+    /// inline-eval payloads are not filesystem objects).
+    pub payload_arg: Option<std::path::PathBuf>,
+    /// The pinned entrypoint's real path — `Some` once the launch's
+    /// pin plan names a payload-bound `entrypoint-hash` target. On
+    /// the front-door routes it coincides with `payload_arg` (the
+    /// pin's `PinnedEntry.path` is the same normalized spelling), so
+    /// the field exists for callers that already materialized the
+    /// pin — `namespaced-run`.
+    pub pinned_entrypoint: Option<std::path::PathBuf>,
+}
+
+impl WorkloadVisibility {
+    /// `(role, path)` candidates the masked screen judges, in exec
+    /// order: the image first, then the payload the launched process
+    /// opens, then the pinned entrypoint handoff.
+    fn targets(&self) -> impl Iterator<Item = (&'static str, &Path)> {
+        [
+            (
+                "resolved executable",
+                self.resolved_exe.as_deref().filter(|_| !self.exe_fd_exec),
+            ),
+            ("payload argument", self.payload_arg.as_deref()),
+            ("pinned entrypoint", self.pinned_entrypoint.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(role, p)| p.map(|p| (role, p)))
+    }
+
+    /// Every candidate a masked root hides — the input `decide`
+    /// reads.
+    ///
+    /// Only a path that exists on the host is a hidden object: the
+    /// masked tree's private tmpfs is writable inside the namespace,
+    /// so a spelling for a file the workload *creates* there (a
+    /// socket to bind, a scratch file) resolves fine and must not be
+    /// flagged — screening it would refuse launches that work.
+    fn masked(&self) -> Vec<MaskedWorkloadPath> {
+        self.targets()
+            .filter(|(_, path)| path.exists())
+            .filter_map(|(what, path)| {
+                masked_namespace_root(path).map(|masked| MaskedWorkloadPath {
+                    what,
+                    path: path.to_path_buf(),
+                    masked,
+                })
+            })
+            .collect()
+    }
+
+    /// The first masked candidate — the object a refusal names.
+    /// `namespaced-run` runs this screen directly, having no
+    /// selection record to consult.
+    pub(crate) fn first_masked(&self) -> Option<MaskedWorkloadPath> {
+        self.masked().into_iter().next()
+    }
+}
+
+/// Build the masked-screen input for one launch spelling (PR-05).
+/// `eff_argv` is the post-shebang-expansion argv and `resolved_exe`
+/// its canonicalized image — `resolve_launch`'s pair; a launch that
+/// never resolves carries `WorkloadVisibility::default()` instead.
+/// `pinned_entrypoint` is the entrypoint pin's real-path target when
+/// the caller already holds the pin (`namespaced-run`); the front
+/// door passes `None` because a payload-bound pin's path is the same
+/// normalized spelling `payload_arg` covers, and an exe-bound pin
+/// execs through `/proc/self/fd/N` — not a filesystem path the
+/// screen judges.
+///
+/// The first payload argument joins the screen whether or not a pin
+/// binds it — an unpinned workload resolving under a masked tree
+/// ENOENTs inside the namespace exactly like a pinned one. `-m`
+/// module and inline-eval payloads carry no filesystem object and
+/// are left out. For an executable with no modeled option grammar
+/// the payload position is heuristic — the generic scan's first
+/// non-flag token may be a subcommand word rather than a path; the
+/// host-existence plus masked-root conjunction keeps such
+/// coincidences rare, and the flag direction stays conservative (a
+/// workload that does open the arg as a path would ENOENT inside
+/// the namespace). The arg is normalized the same way the pin
+/// normalizes `PinnedEntry.path`: a relative spelling joins the
+/// launcher's cwd (the child's inherited one) and `.` components
+/// collapse. A relative arg under a masked cwd still flags — the cwd
+/// dentry survives the cover, but the workload's own absolute
+/// re-resolution of the same file (realpath, sibling imports,
+/// `__file__` canonicalization) would hit the covered tree.
+/// `exe_fd_exec` marks the resolved exe as exec'ing through a held
+/// descriptor spelling instead of its path — see [`exe_pin_fd_exec`]
+/// for how callers derive it.
+pub(crate) fn workload_visibility(
+    eff_argv: &[String],
+    resolved_exe: &Path,
+    pinned_entrypoint: Option<std::path::PathBuf>,
+    exe_fd_exec: bool,
+) -> WorkloadVisibility {
+    let payload_arg =
+        if crate::workload::argv_contains_inline_eval_with_exe(eff_argv, Some(resolved_exe))
+            || crate::workload::payload_is_module_with_exe(eff_argv, Some(resolved_exe))
+        {
+            None
+        } else {
+            crate::workload::first_payload_arg_with_exe(eff_argv, Some(resolved_exe)).map(|arg| {
+                let path = Path::new(arg);
+                let joined = match std::env::current_dir() {
+                    Ok(cwd) if path.is_relative() => cwd.join(path),
+                    _ => path.to_path_buf(),
+                };
+                crate::verifier::hash::simplify_verbatim(
+                    joined.components().collect::<std::path::PathBuf>(),
+                )
+            })
+        };
+    WorkloadVisibility {
+        resolved_exe: Some(resolved_exe.to_path_buf()),
+        exe_fd_exec,
+        payload_arg,
+        pinned_entrypoint,
+    }
+}
+
+/// `true` when the launch will exec `resolved_exe` through a held
+/// descriptor spelling rather than its path — on Linux the pin's
+/// sealed memfd read via `/proc/self/fd/N`, which init's mount
+/// namespace resolves regardless of masked trees. That is exactly
+/// `bind_launched_workload`'s outcome gate restated: binding succeeds
+/// only when a binary/entrypoint entry names the launched exe, so a
+/// matching entry means the exe is either fd-exec'd or the launch
+/// refused at verification — in both cases its *path* masking is not
+/// this screen's evidence. Callers that already materialized the
+/// fd-exec plan (`namespaced-run`) pass `plan.is_some()` instead —
+/// the plan exists iff the exe pinned.
+pub(crate) fn exe_pin_fd_exec(
+    hash_entries: &[crate::policy::HashEntry],
+    resolved_exe: &Path,
+) -> bool {
+    hash_entries.iter().any(|e| {
+        matches!(
+            e.hash_type,
+            crate::policy::HashType::Binary | crate::policy::HashType::Entrypoint
+        ) && crate::workload::same_file(Path::new(&e.target), resolved_exe)
+    })
 }
 
 /// The selection outcome `run`/`plan` share. `selected == None` is a
@@ -95,7 +308,10 @@ pub struct LinuxSelection {
     pub selected: Option<LinuxNativeMechanism>,
     /// One-line rationale (the pick's basis, or the refusal cause).
     pub reason: String,
-    /// `linux-namespaced` `requires` ids unmet on this host (probe).
+    /// `linux-namespaced` `requires` ids unmet on this host — probe
+    /// stage ids, plus `workload_masked:<root>` tokens for each
+    /// masked tree a workload path resolves under (PR-05: a
+    /// workload-level unavailability, deduped by root).
     pub missing: Vec<String>,
     /// Requirements a candidate mechanism could not satisfy — the
     /// strings themselves name the mechanism they belong to.
@@ -162,11 +378,15 @@ impl LinuxSelection {
 
 /// Gather the host facts and run the selection — the one entry point
 /// `run` (launch) and `plan` share so the pre-launch diagnosis and the
-/// actual setup check can never diverge.
+/// actual setup check can never diverge. `workload` carries the
+/// launch's resolved paths for the masked-tree screen (PR-05);
+/// `WorkloadVisibility::default()` describes an unresolved workload
+/// the screen stays silent on.
 pub fn select_linux_mechanism(
     request: LinuxMechanismRequest,
     policy: &Policy,
     upstream_flag: Option<SocketAddr>,
+    workload: WorkloadVisibility,
 ) -> LinuxSelection {
     // An explicit `native` request never dispatches the namespaced
     // route — skip the namespaced probe (a re-exec plus a full
@@ -190,6 +410,11 @@ pub fn select_linux_mechanism(
         .map(|_| ())
         .err()
         .map(|e| e.to_string());
+    // PR-05: the resolved exe, payload argument, and pinned
+    // entrypoint must still resolve inside init's mount namespace —
+    // a path rooted under a tree init masks makes the route
+    // unavailable for this workload specifically.
+    let workload_masked = workload.masked();
     decide(
         request,
         &SelectionInput {
@@ -202,6 +427,7 @@ pub fn select_linux_mechanism(
             host_v6_reach: v6_dest_reachable,
             host_v6_range: v6_range_reachable,
             host_v6_any: host_has_v6(),
+            workload_masked,
         },
     )
 }
@@ -212,16 +438,32 @@ fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSe
     // `None` probe = the probe never ran (explicit native request) —
     // no missing evidence and no error is fabricated for it.
     let probe = input.probe.and_then(|r| r.clone().ok());
-    let (missing, probe_err) = match &input.probe {
+    let (probe_missing, probe_err) = match &input.probe {
         Some(Ok(p)) => (p.missing().iter().map(|s| s.to_string()).collect(), None),
         Some(Err(e)) => (Vec::new(), Some(e.clone())),
         None => (Vec::new(), None),
     };
+    // PR-05: each masked workload path lands as `workload_masked:<root>`
+    // in `missing` — the same "unmet requirement" surface the probe
+    // stage ids use — so the plan/report mechanism member names the
+    // launch-level blocker alongside them (deduped: an exe and a
+    // payload under `/tmp` are one blocked tree, not two). The
+    // workload tokens join the *record* only: refusal prose that
+    // attributes findings to the probe reads `probe_missing` so it
+    // never names evidence the probe did not produce.
+    let mut missing = probe_missing.clone();
+    for m in &input.workload_masked {
+        let token = format!("workload_masked:{}", m.masked.root);
+        if !missing.iter().any(|t| t == &token) {
+            missing.push(token);
+        }
+    }
     let probe_capable = matches!(&input.probe, Some(Ok(p)) if p.capable());
 
     let namespaced_violations = namespaced_policy_violations(input);
     let native_violations = native_policy_violations(input);
-    let ns_available = probe_capable && namespaced_violations.is_empty();
+    let ns_available =
+        probe_capable && namespaced_violations.is_empty() && input.workload_masked.is_empty();
     let native_available = native_violations.is_empty();
 
     let (selected, reason, violations) = match request {
@@ -231,11 +473,30 @@ fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSe
                     None,
                     format!(
                         "namespaced: launch refused — {}",
-                        probe_unavailable_reason(input.probe, &missing)
+                        probe_unavailable_reason(input.probe, &probe_missing)
                     ),
                     // Policy violations are real evidence even when the
                     // probe failed first — a refusal that hides them
                     // would misdiagnose "fix the host" over "fix both".
+                    namespaced_violations,
+                )
+            } else if let Some(m) = input.workload_masked.first() {
+                // The workload itself cannot resolve inside the
+                // namespace — refuse with the masked object named
+                // rather than let init surface it as
+                // `ERR exec errno=2`. An explicit `namespaced` never
+                // falls back to native.
+                (
+                    None,
+                    format!(
+                        "namespaced: launch refused — {} '{}' resolves under a \
+                         masked tree — {}; the workload could never resolve it \
+                         inside the namespace, and the route never falls back \
+                         to native",
+                        m.what,
+                        m.path.display(),
+                        m.masked.why
+                    ),
                     namespaced_violations,
                 )
             } else if !namespaced_violations.is_empty() {
@@ -287,7 +548,12 @@ fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSe
                     Some(LinuxNativeMechanism::Native),
                     format!(
                         "auto: native selected — {} and native satisfies the policy",
-                        ns_unavailable_reason(input.probe, &namespaced_violations, &missing)
+                        ns_unavailable_reason(
+                            input.probe,
+                            &namespaced_violations,
+                            &missing,
+                            &input.workload_masked
+                        )
                     ),
                     Vec::new(),
                 )
@@ -300,7 +566,12 @@ fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSe
                 let reason = format!(
                     "auto: launch refused — {} and native cannot satisfy the \
                      policy either; there is no weaker mechanism to fall back to",
-                    ns_unavailable_reason(input.probe, &violations, &missing)
+                    ns_unavailable_reason(
+                        input.probe,
+                        &violations,
+                        &missing,
+                        &input.workload_masked
+                    )
                 );
                 violations.extend(native_violations);
                 (None, reason, violations)
@@ -320,11 +591,14 @@ fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSe
 }
 
 /// Why the namespaced route is out for `auto`: the probe's missing
-/// ids when it is incapable, else the policy's first violation.
+/// ids when it is incapable, else a workload path under init's
+/// masked trees (the launch-level blocker — the workload could not
+/// exec at all), else the policy's first violation.
 fn ns_unavailable_reason(
     probe: Option<&Result<ProbeReport, String>>,
     violations: &[String],
     missing: &[String],
+    workload_masked: &[MaskedWorkloadPath],
 ) -> String {
     match probe {
         Some(Err(e)) => format!("namespaced is unavailable (probe failed: {e})"),
@@ -334,28 +608,44 @@ fn ns_unavailable_reason(
                 missing.join(", ")
             )
         }
-        Some(Ok(_)) => format!(
-            "namespaced cannot satisfy the policy ({})",
-            violations
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "requirement inexpressible".to_string())
-        ),
+        Some(Ok(_)) => {
+            if let Some(m) = workload_masked.first() {
+                format!(
+                    "namespaced is unavailable for this workload — {} '{}' \
+                     resolves under a masked tree (workload_masked:{})",
+                    m.what,
+                    m.path.display(),
+                    m.masked.root
+                )
+            } else {
+                format!(
+                    "namespaced cannot satisfy the policy ({})",
+                    violations
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "requirement inexpressible".to_string())
+                )
+            }
+        }
         // `auto` always probes — kept only so the signature stays
         // honest if a future request mode skips it.
         None => "namespaced is unavailable (capability probe not run)".to_string(),
     }
 }
 
+/// Why the namespaced route is out for an explicit `namespaced`
+/// request: `probe_missing` is the probe's *own* missing-stage ids —
+/// `workload_masked` tokens stay off this message so a probe
+/// attribution never names evidence the probe did not produce.
 fn probe_unavailable_reason(
     probe: Option<&Result<ProbeReport, String>>,
-    missing: &[String],
+    probe_missing: &[String],
 ) -> String {
     match probe {
         Some(Err(e)) => format!("the capability probe could not run: {e}"),
         Some(Ok(p)) if !p.capable() => format!(
             "the capability probe found missing stages: {}",
-            missing.join(", ")
+            probe_missing.join(", ")
         ),
         // An explicit `namespaced` request always probes — these arms
         // exist so the helper stays total if that ever changes.
@@ -677,8 +967,17 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
 /// `true` when init's resolv.conf redirect will cover `/tmp` with a
 /// private tmpfs. Mirrors `init.rs`: the bind-mount path is taken iff
 /// `/etc/resolv.conf`'s real target is outside `/run` (an absent or
-/// unresolvable resolv.conf only warns — nothing is masked).
+/// unresolvable resolv.conf only warns — nothing is masked). Debug
+/// builds also honor `MCP_WRIT_NS_FORCE_TMP_MASK=1` on the
+/// supervisor's environment — the same switch the spawn forwards to
+/// init — so e2e fixtures pin the masking decision on a host whose
+/// resolver already lives under `/run` (a release binary carries
+/// neither the read nor the switch).
 fn tmp_mask_planned() -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var(namespaced::init_env::FORCE_TMP_MASK).as_deref() == Ok("1") {
+        return true;
+    }
     std::fs::canonicalize("/etc/resolv.conf")
         .map(|t| !t.starts_with("/run"))
         .unwrap_or(false)
@@ -761,26 +1060,98 @@ fn masked_fs_root(spelling: &str, tmp_masked: bool) -> Option<&'static str> {
     None
 }
 
-/// `Some(reason)` when `path` — a concrete pinned payload path, not a
-/// grant spelling — sits under a tree init masks with a private
-/// tmpfs (`/run` always; `/tmp` when the resolv.conf redirect needs
-/// its tmpfs): the namespaced workload could never resolve it.
-/// Unlike `masked_fs_root`'s glob-aware spelling walk this resolves
-/// the path first, so a symlinked entrypoint is judged by the object
-/// it reaches — the same object the pin verified. `/var/run` needs no
-/// separate arm: a path spelled through it canonicalizes under `/run`.
-pub(crate) fn masked_namespace_root(path: &Path) -> Option<&'static str> {
-    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if resolved.starts_with("/run") {
-        return Some("the namespaced mount setup covers /run with a private tmpfs");
+/// `Some(MaskedRoot)` when `path` — a concrete workload path, not a
+/// grant spelling — cannot resolve inside init's mount namespace:
+/// `/run` is always covered with a private tmpfs, `/tmp` when the
+/// resolv.conf redirect needs its tmpfs. Unlike `masked_fs_root`'s
+/// glob-aware spelling walk this judges the spelled path the way the
+/// in-namespace lookup would: a masked mount point itself resolves
+/// (it is the empty tmpfs root), but nothing beneath it does — so a
+/// component resolved *under* a masked root is hidden even when the
+/// full path's canonical target is not. A whole-path canonicalize
+/// misjudges both directions a symlink can take: a link living under
+/// a masked root and pointing out (the spelled path dies on the
+/// hidden dentry) and a link outside pointing in (the resolution
+/// steps into the covered tree). `/var/run` needs no separate arm: a
+/// path spelled through it resolves under `/run`.
+pub(crate) fn masked_namespace_root(path: &Path) -> Option<MaskedRoot> {
+    masked_namespace_root_under(path, tmp_mask_planned())
+}
+
+/// The traversal walk behind [`masked_namespace_root`], with the
+/// `/tmp` mask decision explicit so tests pin it without the
+/// debug-build fixture env (`MCP_WRIT_NS_FORCE_TMP_MASK`).
+fn masked_namespace_root_under(path: &Path, tmp_masked: bool) -> Option<MaskedRoot> {
+    let root_of = |p: &Path| -> Option<MaskedRoot> {
+        if p.starts_with("/run") {
+            Some(MaskedRoot {
+                root: "/run",
+                why: "the namespaced mount setup covers /run with a private tmpfs",
+            })
+        } else if tmp_masked && p.starts_with("/tmp") {
+            Some(MaskedRoot {
+                root: "/tmp",
+                why: "init covers /tmp with a private tmpfs to host the resolv.conf \
+                     bind-mount source",
+            })
+        } else {
+            None
+        }
+    };
+    // The mount root itself resolves inside the namespace (it is the
+    // tmpfs root); only lookups *beneath* it fail, so the equality
+    // check and the rooted-under verdict stay distinct predicates.
+    let is_masked_mount =
+        |p: &Path| p == Path::new("/run") || (tmp_masked && p == Path::new("/tmp"));
+    // A relative spelling resolves against the launcher's cwd — the
+    // child's inherited one — matching the pin's payload-arg join.
+    let spelled = match std::env::current_dir() {
+        Ok(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_path_buf(),
+    };
+    let mut dir = std::path::PathBuf::from("/");
+    for comp in spelled.components() {
+        match comp {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // `..` from the masked tmpfs root escapes to the real
+                // parent — canonicalize tracks either side of the
+                // mount boundary correctly.
+                match std::fs::canonicalize(dir.join("..")) {
+                    Ok(resolved) => dir = resolved,
+                    Err(_) => return None,
+                }
+            }
+            std::path::Component::Normal(name) => {
+                if is_masked_mount(&dir) {
+                    // The mount root resolves but its contents do
+                    // not — any deeper lookup fails in the empty
+                    // private tmpfs.
+                    return root_of(&dir);
+                }
+                match std::fs::canonicalize(dir.join(name)) {
+                    Ok(resolved) => {
+                        if let Some(m) = root_of(&resolved)
+                            && !is_masked_mount(&resolved)
+                        {
+                            // A crossing lookup — a symlink or spelled
+                            // component landing *below* the mount
+                            // root — already fails inside: only the
+                            // mount root's own dentry exists there.
+                            return Some(m);
+                        }
+                        dir = resolved;
+                    }
+                    // A component absent on the host is not a hidden
+                    // object — the in-namespace tmpfs is writable, so
+                    // a tail the workload creates resolves fine.
+                    Err(_) => return None,
+                }
+            }
+            std::path::Component::Prefix(_) => {}
+        }
     }
-    if tmp_mask_planned() && resolved.starts_with("/tmp") {
-        return Some(
-            "init covers /tmp with a private tmpfs to host the resolv.conf \
-             bind-mount source",
-        );
-    }
-    None
+    root_of(&dir)
 }
 
 /// `Some(<fs name>)` when `spelling`'s grant base sits on a filesystem

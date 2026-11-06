@@ -47,6 +47,7 @@ fn input_v6<'a>(
         host_v6_reach: if v6_ok { |_| true } else { |_| false },
         host_v6_range: if v6_ok { |_, _| true } else { |_, _| false },
         host_v6_any: v6_ok,
+        workload_masked: Vec::new(),
     }
 }
 
@@ -251,6 +252,7 @@ fn cidr_allow_reachability_asks_the_range_not_the_network_address() {
         host_v6_reach: |_| false,
         host_v6_range: |_, _| true,
         host_v6_any: true,
+        workload_masked: Vec::new(),
     };
     let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
     assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
@@ -290,6 +292,7 @@ fn cidr_masking_to_unspecified_still_needs_a_route() {
         host_v6_reach: |_| true,
         host_v6_range: |_, _| true,
         host_v6_any: false,
+        workload_masked: Vec::new(),
     };
     let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
     assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
@@ -337,6 +340,7 @@ fn wildcard_cidr_still_asks_host_v6_any() {
         host_v6_reach: |_| false,
         host_v6_range: |_, _| false,
         host_v6_any: true,
+        workload_masked: Vec::new(),
     };
     let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
     assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
@@ -769,6 +773,311 @@ fn masked_fs_root_matches_only_rooted_spellings() {
     assert!(masked_fs_root("/tmp/x", true).is_some());
 }
 
+// --- PR-05: masked-workload screen ----------------------------------
+
+/// A `workload_masked` entry as the gather step would report it —
+/// `what`/`path`/`root` are fabricated directly so the decision table
+/// stays host-independent.
+fn masked(what: &'static str, path: &str, root: &'static str) -> MaskedWorkloadPath {
+    MaskedWorkloadPath {
+        what,
+        path: std::path::PathBuf::from(path),
+        masked: MaskedRoot {
+            root,
+            why: "test masked root",
+        },
+    }
+}
+
+fn masked_input<'a>(
+    policy: &'a Policy,
+    probe: &'a Result<ProbeReport, String>,
+    workload_masked: Vec<MaskedWorkloadPath>,
+) -> SelectionInput<'a> {
+    SelectionInput {
+        workload_masked,
+        ..input(policy, probe, upstream(), 8)
+    }
+}
+
+/// `auto`, probe-capable, native satisfiable: a workload path under a
+/// masked tree makes namespaced unavailable *for this workload* — the
+/// selection falls back to native and the `missing` list carries the
+/// `workload_masked:<root>` token.
+#[test]
+fn auto_falls_back_to_native_for_masked_workload() {
+    let p = bare_port_policy();
+    let pr = probe(true);
+    let inp = masked_input(
+        &p,
+        &pr,
+        vec![masked("resolved executable", "/run/srv/bin", "/run")],
+    );
+    let sel = decide(LinuxMechanismRequest::Auto, &inp);
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Native));
+    assert_eq!(sel.missing, vec!["workload_masked:/run".to_string()]);
+    assert!(
+        sel.reason.contains("/run/srv/bin") && sel.reason.contains("workload_masked:/run"),
+        "the auto→native reason names the masked object and token: {}",
+        sel.reason
+    );
+}
+
+/// An explicit `namespaced` request refuses a masked workload with
+/// the object named — it never falls back to native.
+#[test]
+fn explicit_namespaced_refuses_masked_workload() {
+    let p = bare_port_policy();
+    let pr = probe(true);
+    let inp = masked_input(
+        &p,
+        &pr,
+        vec![masked("payload argument", "/tmp/srv.py", "/tmp")],
+    );
+    let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
+    assert_eq!(sel.selected, None);
+    assert_eq!(sel.missing, vec!["workload_masked:/tmp".to_string()]);
+    assert!(
+        sel.reason.contains("/tmp/srv.py"),
+        "the refusal names the masked path: {}",
+        sel.reason
+    );
+    assert!(
+        sel.reason.contains("never falls back"),
+        "the refusal keeps the no-fallback contract: {}",
+        sel.reason
+    );
+}
+
+/// A masked workload plus a policy native cannot satisfy refuses
+/// `auto` outright — the masked screen knocks out namespaced and the
+/// policy knocks out native.
+#[test]
+fn auto_refuses_when_masked_and_native_unsatisfiable() {
+    let p = name_allow_policy(); // dest-scoped allow: native cannot bind
+    let pr = probe(true);
+    let inp = masked_input(
+        &p,
+        &pr,
+        vec![masked("resolved executable", "/run/srv", "/run")],
+    );
+    let sel = decide(LinuxMechanismRequest::Auto, &inp);
+    assert_eq!(sel.selected, None);
+    assert_eq!(sel.missing, vec!["workload_masked:/run".to_string()]);
+    assert!(
+        sel.reason.contains("/run/srv"),
+        "the reason still names the workload blocker: {}",
+        sel.reason
+    );
+    assert!(
+        !sel.violations.is_empty(),
+        "the native violations record why the fallback failed"
+    );
+}
+
+/// The masked screen is route-specific evidence: an explicit `native`
+/// request selects native — the workload resolves there without a
+/// mount namespace — while `missing` still records the token as the
+/// launch's namespaced-unavailability evidence.
+#[test]
+fn explicit_native_ignores_masked_workload() {
+    let p = bare_port_policy();
+    let pr = probe(true);
+    let inp = masked_input(
+        &p,
+        &pr,
+        vec![masked("resolved executable", "/run/srv", "/run")],
+    );
+    let sel = decide(LinuxMechanismRequest::Native, &inp);
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Native));
+    assert_eq!(sel.missing, vec!["workload_masked:/run".to_string()]);
+}
+
+/// Two candidates under the same masked root dedupe to one
+/// `workload_masked:<root>` token.
+#[test]
+fn masked_tokens_dedupe_by_root() {
+    let p = bare_port_policy();
+    let pr = probe(true);
+    let inp = masked_input(
+        &p,
+        &pr,
+        vec![
+            masked("resolved executable", "/tmp/bin/srv", "/tmp"),
+            masked("payload argument", "/tmp/bin/srv.py", "/tmp"),
+        ],
+    );
+    let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
+    assert_eq!(sel.selected, None);
+    assert_eq!(sel.missing, vec!["workload_masked:/tmp".to_string()]);
+    assert!(
+        sel.reason.contains("/tmp/bin/srv"),
+        "the refusal names the first masked candidate: {}",
+        sel.reason
+    );
+}
+
+/// Probe-missing and workload-masked coexist in `missing` — an
+/// explicit namespaced refusal keeps both kinds of evidence, while
+/// the reason attributes only the probe's own stages to the probe.
+#[test]
+fn masked_workload_coexists_with_probe_missing() {
+    let p = bare_port_policy();
+    let mut r = probe(true).unwrap();
+    r.tun = false;
+    let pr = Ok(r);
+    let inp = masked_input(
+        &p,
+        &pr,
+        vec![masked("resolved executable", "/run/srv", "/run")],
+    );
+    let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
+    assert_eq!(sel.selected, None);
+    assert_eq!(
+        sel.missing,
+        vec!["tun".to_string(), "workload_masked:/run".to_string()]
+    );
+    assert!(
+        sel.reason.contains("tun") && !sel.reason.contains("workload_masked"),
+        "the probe attribution names only evidence the probe produced: {}",
+        sel.reason
+    );
+}
+
+/// `masked_namespace_root` walks the spelled path the way the
+/// in-namespace lookup would — a symlink *living under* a masked
+/// root hides whatever it names (the dentry never reaches the
+/// workload), and a link pointing *into* one hides whatever lies
+/// beneath, while a `..` pop escapes the mask legitimately. `/tmp`
+/// stands in as the masked root so the fixture needs no env.
+#[test]
+fn masked_namespace_root_walks_spelled_traversal() {
+    let tag = std::process::id();
+    // Living under the masked root, pointing out: `/bin` is unmasked
+    // yet the link's own dentry is hidden inside the namespace.
+    let link = std::path::PathBuf::from(format!("/tmp/mcp-writ-pr05-link-{tag}"));
+    std::os::unix::fs::symlink("/bin", &link).unwrap();
+    assert_eq!(
+        masked_namespace_root_under(&link, true).map(|m| m.root),
+        Some("/tmp"),
+        "a symlink under the masked root is hidden whatever it names"
+    );
+    assert_eq!(
+        masked_namespace_root_under(&link.join("sh"), true).map(|m| m.root),
+        Some("/tmp"),
+        "traversal through a hidden symlink fails inside"
+    );
+    std::fs::remove_file(&link).unwrap();
+    // `..` pops out of the covered tree — the escaped spelling
+    // resolves outside the mask and is not flagged.
+    assert_eq!(
+        masked_namespace_root_under(std::path::Path::new("/tmp/../bin/sh"), true).map(|m| m.root),
+        None,
+        "`..` escapes the masked root before the hidden lookup"
+    );
+    // The mount root itself resolves inside (it is the tmpfs root) —
+    // the flag still stands as the verdict for the object it names.
+    assert_eq!(
+        masked_namespace_root_under(std::path::Path::new("/tmp"), true).map(|m| m.root),
+        Some("/tmp")
+    );
+    assert_eq!(
+        masked_namespace_root_under(std::path::Path::new("/bin/sh"), true).map(|m| m.root),
+        None,
+        "an unmasked object is never flagged"
+    );
+    assert_eq!(
+        masked_namespace_root_under(std::path::Path::new("/tmp"), false).map(|m| m.root),
+        None,
+        "the /tmp arm follows the mask decision it is given"
+    );
+
+    // Pointing into the masked root: the link lives outside but its
+    // resolution steps into the covered tree.
+    for outside in ["/dev/shm", "/var/tmp"] {
+        let in_link = std::path::PathBuf::from(format!("{outside}/mcp-writ-pr05-in-{tag}"));
+        if std::os::unix::fs::symlink("/tmp", &in_link).is_err() {
+            continue; // not writable on this host — try the next spot
+        }
+        assert_eq!(
+            masked_namespace_root_under(&in_link, true).map(|m| m.root),
+            Some("/tmp"),
+            "a symlink into the masked root lands on the mask"
+        );
+        std::fs::remove_file(&in_link).unwrap();
+        // Landing *below* the mount root fails the crossing lookup
+        // outright — only the mount root's own dentry exists inside.
+        let sub = std::path::PathBuf::from(format!("/tmp/mcp-writ-pr05-sub-{tag}"));
+        std::fs::create_dir(&sub).unwrap();
+        let deep = std::path::PathBuf::from(format!("{outside}/mcp-writ-pr05-deep-{tag}"));
+        std::os::unix::fs::symlink(&sub, &deep).unwrap();
+        assert_eq!(
+            masked_namespace_root_under(&deep.join("x"), true).map(|m| m.root),
+            Some("/tmp"),
+            "a component landing below the masked root is hidden"
+        );
+        std::fs::remove_file(&deep).unwrap();
+        std::fs::remove_dir(&sub).unwrap();
+        return;
+    }
+}
+
+/// An exe that execs through its fd pin (`/proc/self/fd/N` inside the
+/// namespace) is not a hidden object — the masked screen skips it.
+/// The same path unpinned is the B-08 refusal. `/run` exists on every
+/// Linux host, so no fixture file is needed.
+#[test]
+fn fd_exec_exe_is_not_masked_screened() {
+    let unpinned = WorkloadVisibility {
+        resolved_exe: Some(std::path::PathBuf::from("/run")),
+        ..WorkloadVisibility::default()
+    };
+    assert!(
+        unpinned.first_masked().is_some(),
+        "an unpinned exe under /run is the masked-workload blocker"
+    );
+    let pinned = WorkloadVisibility {
+        resolved_exe: Some(std::path::PathBuf::from("/run")),
+        exe_fd_exec: true,
+        ..WorkloadVisibility::default()
+    };
+    assert!(
+        pinned.first_masked().is_none(),
+        "an fd-spelled exe resolves regardless of masked trees"
+    );
+}
+
+/// `exe_pin_fd_exec` mirrors `bind_launched_workload`'s outcome gate:
+/// `true` exactly when a binary/entrypoint entry names the resolved
+/// exe — other entries, other paths, and empty lists all leave the
+/// exe on the screen.
+#[test]
+fn exe_pin_fd_exec_matches_identity_entries_at_the_exe() {
+    use crate::policy::{HashEntry, HashType};
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("srv");
+    let other = dir.path().join("other");
+    std::fs::write(&exe, b"x").unwrap();
+    std::fs::write(&other, b"x").unwrap();
+    let entry = |hash_type: HashType, target: &std::path::Path| HashEntry {
+        server_name: "s".into(),
+        hash_type,
+        hash_value: "sha256:0".into(),
+        target: target.display().to_string(),
+        approved: None,
+    };
+    assert!(exe_pin_fd_exec(&[entry(HashType::Binary, &exe)], &exe));
+    assert!(exe_pin_fd_exec(&[entry(HashType::Entrypoint, &exe)], &exe));
+    // A payload-bound entrypoint names the payload, not the exe.
+    assert!(!exe_pin_fd_exec(
+        &[entry(HashType::Entrypoint, &other)],
+        &exe
+    ));
+    // Non-identity entries never bind the exe.
+    assert!(!exe_pin_fd_exec(&[entry(HashType::Lockfile, &exe)], &exe));
+    assert!(!exe_pin_fd_exec(&[], &exe));
+}
+
 #[test]
 fn native_record_drops_dns_upstream() {
     // dns_upstream is namespaced-route evidence — a native-bound
@@ -816,6 +1125,7 @@ fn skipped_probe_fabricates_no_evidence() {
         host_v6_reach: |_| true,
         host_v6_range: |_, _| true,
         host_v6_any: true,
+        workload_masked: Vec::new(),
     };
     let sel = decide(LinuxMechanismRequest::Native, &inp);
     assert_eq!(sel.selected, Some(LinuxNativeMechanism::Native));
