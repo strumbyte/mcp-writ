@@ -10,25 +10,65 @@ owner, and how execution evidence is recorded. Local commands are in
 All verification workflows are manual (`workflow_dispatch`) or callable
 (`workflow_call`) — except PR checks, the single Linux job that runs on
 every pull request touching code, tests, or docs (D-1, added in PR-17 so
-a guard-rail regression cannot merge untested). Do not convert the
-remaining manual triggers into automatic PR triggers.
+a guard-rail regression cannot merge untested). Three workflows also run
+on a weekly `schedule` against the default branch (PR-07, D-10 — see the
+Schedule column). Do not convert the remaining manual triggers into
+automatic PR triggers.
 
-| Workflow | File | Trigger | Called by Release | Runners | Unexecuted-is-failure gate |
-|---|---|---|---|---|---|
-| PR checks | [pr-checks.yml](../.github/workflows/pr-checks.yml) | `pull_request` (path-filtered) / dispatch | no | `ubuntu-latest` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` |
-| CI | [ci.yml](../.github/workflows/ci.yml) | dispatch / call | yes (`verify` job) | `ubuntu-latest` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` |
-| Platform tests | [platform-tests.yml](../.github/workflows/platform-tests.yml) | dispatch / call | yes | `windows-latest`, `macos-latest` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` |
-| Linux tests | [linux-tests.yml](../.github/workflows/linux-tests.yml) | dispatch / call | no — dispatch on the release commit | `ubuntu-latest`, `ubuntu-24.04-arm` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` |
-| Container tests | [container-tests.yml](../.github/workflows/container-tests.yml) | dispatch / call | yes | `ubuntu-22.04` (requires a Docker daemon) | `MCP_WRIT_REQUIRE_CONTAINER_TESTS=1` |
-| MCP server verification | [mcp-servers.yml](../.github/workflows/mcp-servers.yml) | dispatch | no — dispatch on the release commit | `ubuntu-24.04`, `macos-latest`, `windows-latest` | `MCP_WRIT_REQUIRE_SERVER_TESTS=1` |
-| Go MCP runtime compatibility | [go-runtime.yml](../.github/workflows/go-runtime.yml) | dispatch / call | yes | `ubuntu-24.04`, `windows-latest` | none (fixture build + probe compare always run) |
-| VM tests | [vm-tests.yml](../.github/workflows/vm-tests.yml) | dispatch only (per-method input) | no — self-hosted virtualization hosts only | `[self-hosted, linux, kata]`, `[self-hosted, macos, apple-container]`, `[self-hosted, windows, hyperv]`, `[self-hosted, windows, windows-sandbox]`, `[self-hosted, windows, wslc]`, `[self-hosted, windows, winiso]` | `MCP_WRIT_REQUIRE_{KATA,APPLE,HYPERV,WSB,WSLC,WINISO}_TESTS=1` set inside each `scripts/validate-*` job |
-| Release | [release.yml](../.github/workflows/release.yml) | pushed `v*` tag | — | packaging runners | — |
+| Workflow | File | Trigger | Called by Release | Runners | Unexecuted-is-failure gate | Schedule |
+|---|---|---|---|---|---|---|
+| PR checks | [pr-checks.yml](../.github/workflows/pr-checks.yml) | `pull_request` (path-filtered) / dispatch | no | `ubuntu-latest` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` | — |
+| CI | [ci.yml](../.github/workflows/ci.yml) | dispatch / call | yes (`verify` job) | `ubuntu-latest` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` | weekly, Mon 03:17 UTC |
+| Platform tests | [platform-tests.yml](../.github/workflows/platform-tests.yml) | dispatch / call | yes | `windows-latest`, `macos-latest` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` | — (Release-called) |
+| Linux tests | [linux-tests.yml](../.github/workflows/linux-tests.yml) | dispatch / call | no — dispatch on the release commit | `ubuntu-latest`, `ubuntu-24.04-arm` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` | weekly, Mon 03:17 UTC |
+| Container tests | [container-tests.yml](../.github/workflows/container-tests.yml) | dispatch / call | yes | `ubuntu-22.04` (requires a Docker daemon) | `MCP_WRIT_REQUIRE_CONTAINER_TESTS=1` | — (Release-called) |
+| MCP server verification | [mcp-servers.yml](../.github/workflows/mcp-servers.yml) | dispatch | no — dispatch on the release commit | `ubuntu-24.04`, `macos-latest`, `windows-latest` | `MCP_WRIT_REQUIRE_SERVER_TESTS=1` | weekly, Mon 03:17 UTC |
+| Go MCP runtime compatibility | [go-runtime.yml](../.github/workflows/go-runtime.yml) | dispatch / call | yes | `ubuntu-24.04`, `windows-latest` | none (fixture build + probe compare always run) | — (Release-called) |
+| VM tests | [vm-tests.yml](../.github/workflows/vm-tests.yml) | dispatch only (per-method input) | no — self-hosted virtualization hosts only | `[self-hosted, linux, kata]`, `[self-hosted, macos, apple-container]`, `[self-hosted, windows, hyperv]`, `[self-hosted, windows, windows-sandbox]`, `[self-hosted, windows, wslc]`, `[self-hosted, windows, winiso]` | `MCP_WRIT_REQUIRE_{KATA,APPLE,HYPERV,WSB,WSLC,WINISO}_TESTS=1` set inside each `scripts/validate-*` job | — (self-hosted) |
+| Release | [release.yml](../.github/workflows/release.yml) | pushed `v*` tag | — | packaging runners | — | — |
 
 Release calls CI, Platform tests, Container tests, and Go runtime before
 building artifacts. Linux tests and MCP server verification stay
 manual-dispatch on the release commit (see [Releasing](releasing.md)),
 and the real-server fixture versions stay pinned by their setup scripts.
+
+The weekly `schedule` runs (`cron '17 3 * * 1'`, Monday 03:17 UTC) on
+CI, Linux tests, and MCP server verification target the default branch —
+`schedule` accepts no branch selector, so every run leaves evidence for
+the unreleased `main` tip (R-06: the report found no CI run for
+`66e08c9`). Detect a missing run by looking, not by notification — none
+is sent for a run that never started: each week, confirm the latest
+`schedule`-event run of each of the three workflows is this week's —
+any returned run is only evidence if its `createdAt` matches the
+latest expected Monday 03:17 UTC slot, allowing for scheduling delay
+(`gh run list --workflow <file> --event schedule --limit 1 --json
+createdAt`). GitHub also disables scheduled workflows after 60 days
+of repository inactivity; re-enable a disabled workflow from its
+Actions page or with `gh workflow enable <file>` before the cadence
+lapses. The scheduled
+Linux tests run also carries the real-AArch64 leg, which needs no
+self-hosted runner: `ubuntu-24.04-arm` is a hosted
+image free for public repositories. MCP server verification is
+scheduled at the same cadence by PR-07's call: the pinned servers and
+toolchains still drift against the hosted runner images, and surfacing
+that breakage weekly is the point of B-01 — keeping it manual would
+only defer the same failure to release-preflight. Platform tests,
+Container tests, and Go runtime stay unscheduled because Release
+already calls them through `workflow_call` on every tag — a weekly run
+would duplicate the release path's evidence at double the runner cost;
+manual dispatch still covers them between releases. VM tests stays
+dispatch-only on self-hosted virtualization hosts, and PR checks
+already runs on every PR. Scheduled failures are expected to surface
+through GitHub Actions notifications: a scheduled run's failure
+notifies the user who last edited its cron line — or, once a disabled
+workflow is re-enabled, the user who re-enabled it — and only when
+that recipient has Actions notifications enabled and actually monitors
+failures, so notification is a prerequisite, not a guarantee. Confirm
+the current notification recipient monitors scheduled failures, or
+document a separate reliable alert path (for example, a named reviewer
+checking the scheduled runs each week). No issue is auto-filed (D-10),
+and no README badge is added — the badge would merge scheduled and
+Release-called runs of the same workflow into one status.
 VM tests is dispatch-only on self-hosted virtualization hosts and is
 never invoked by Release — a published archive does not imply VM-method
 acceptance. Each method job runs `scripts/validate-<method>.*`, which

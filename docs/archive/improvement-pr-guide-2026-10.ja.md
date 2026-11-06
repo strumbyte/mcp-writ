@@ -61,6 +61,7 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 - 対象コミット、OS・arch・カーネル／ビルド、実行方式、コマンド、結果を記録する。
 - 成功・失敗・スキップ・環境未確保を分ける。実行していない試験を「通過」と書かない。
+- 実行した試験の件数（pass／fail／skip）を記録する。
 - 追加・変更したテストがどの手動ワークフローに含まれるか確認し、[test-matrix.md](../test-matrix.md) の担当一覧へ登録する。
 - 表示した権限・制御が、実際のルール構築と同じ情報から得られるか確認する。`--report` と JSONL 監査で同じ事実を指すか照合する。
 - UTF-8、BOMなし、LF、リンク、差分を確認する。PowerShellで日本語を書く場合はUTF-8を明示する。
@@ -1195,7 +1196,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 - [x] ディスパッチャ型の冒頭 NOTE（`policy_generator.rs:83-88`）を具体化する: (1) ツール名が文字列リテラルとしてハンドラに結び付いていないため、能力分析（syscall・文字列・マニフェスト）をツール単位に対応付けられず `allowed`/`blocked` の判定を立てられない、(2) そのため許可判断はツール単位で運用者が行う — 必要なツールだけ `deny=#true` を外す、(3) 整合性の拠り所は `tools-list-hash` pin — `--live-discovery` で取得した一覧の digest が pin され、以後 `check`/`run` が一覧の変化を検知する。サーバー更新時は別ファイルに再生成して差分レビュー、(4) guide の該当節（Case C・§8.2）への参照。英日 guide §4.3 にも同じ説明を置く。→ 実施: (1)〜(4) すべてを冒頭 NOTE に記述 — `@server.call_tool()`/`setRequestHandler` による単一入口ディスパッチ、ツール単位の帰属不能、運用者の確認事項（per-tool 許可・`side_effect`・下位ポリシー）、`tools-list-hash` の役割、更新時の別ファイル再生成＋差分レビュー、guide §4.3 "Case C"・§8.2 参照。英日 guide §4.3 に同趣旨の段落を追加
 - [x] 全件 deny でない（部分的に根拠なし）ドラフトでも、根拠なしツールの件数を冒頭に出す（現状は全件のときだけ NOTE）。→ 実施: `build_tools_section` が `(ungrounded, emitted)` の組を返し、全件未根拠のときのみディスパッチャ型 NOTE、部分のときは `K/N tools in this draft carry no capability grounding` の件数 NOTE（全件とは断定しない文面）を出し分け — `policy_generator/tests.rs` で両形を固定
 
-**検証:** T-BASE、T-POLICY（`tests/policy_check_e2e.rs`）、T-DOC。REVIEW 種別ごとの fixture ポリシーで JSON の `kind`/`why`/`how` と stderr を固定し、`check` の `status`・終了コードが変わらないことを既存の `policy_check_e2e` で確認する。
+**検証:** T-BASE、T-POLICY（`tests/policy_check_e2e.rs`）、T-DOC。REVIEW 種別ごとの fixture ポリシーで JSON の `kind`/`why`/`how` と stderr を固定し、`check` の `status`・終了コードが変わらないことを既存の `policy_check_e2e` で確認する。（次にこの検証を実行したとき、件数（pass／fail／skip）を追記する — 遡っての再実行は求めない）
 
 **完了条件:** `check` の出力から、未解決項目ごとに必要な判断と解消方法が読める。全件 deny ドラフトの冒頭だけで、ディスパッチャ型の事情と次の手順が分かる。
 
@@ -1220,7 +1221,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 - [x] `environment` ブロックの雛形を、コメントアウトした候補として出す（例: `// environment { allow "NODE_EXTRA_CA_CERTS" "SSL_CERT_FILE" "HTTPS_PROXY" "NO_PROXY" }` と `// REVIEW: enable only the names this server reads`）。有効な KDL としては投入しない（fail-closed を保つ）。候補はランタイム別の固定リストに限り、親環境を走査して名前を集めることはしない。
 - [x] 雛形を適用しない経路（native バイナリ、分類不能な起動）の出力が現状と同一であることを snapshot 試験で固定する。
 
-**検証:** T-BASE、T-POLICY、`tests/self_test.rs`、`tests/real_servers_e2e.rs`（Node / Python 系サーバーで、生成直後のドラフト＋最小の手編集で enforced run が起動すること）。
+**検証:** T-BASE、T-POLICY、`tests/self_test.rs`、`tests/real_servers_e2e.rs`（Node / Python 系サーバーで、生成直後のドラフト＋最小の手編集で enforced run が起動すること）。（次にこの検証を実行したとき、件数（pass／fail／skip）を追記する — 遡っての再実行は求めない）
 
 **完了条件:** インタプリタ実行のサーバーで、生成ドラフトの syscall・ファイル読み取りが不足して起動拒否にならない。雛形を適用しない経路の出力は不変。
 
@@ -1245,7 +1246,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 - [x] 起動時に stderr へ 1 行の警告を出す（`warning: allowlisted environment variable(s) not set in the parent environment: A, B`）。`--report` と JSONL が同じ事実を指すことを照合する（「PRを閉じるとき」の規則）。→ 実装では `path_missing` にも同形式の警告を追加（ギャップ種別ごとに 1 行）。`run`/`mcp-secure-runner`（runtime/launch.rs）に加え `namespaced-run`/`unotify-run`/`ebpf-run`/`macos-proxy-run` の各起動経路にも `warn_env_allowlist_gaps` で適用。
 - [x] guide 英日に「欠落は観測として残し、起動は止めない。厳格運用が必要なら CI で `plan` の `launch.env` を検査する」と書く（D-8）。
 
-**検証:** T-BASE、T-NATIVE（`environment_e2e`・`diagnostics_e2e`・`plan_report_e2e`）。許可名を意図的に欠いた起動で、plan・report・`server.connected` の 3 面に名前が残り、値が残らないことを fixture で固定する（値に秘密らしい文字列を入れ、report と audit に現れないことを assert する）。
+**検証:** T-BASE、T-NATIVE（`environment_e2e`・`diagnostics_e2e`・`plan_report_e2e`）。許可名を意図的に欠いた起動で、plan・report・`server.connected` の 3 面に名前が残り、値が残らないことを fixture で固定する（値に秘密らしい文字列を入れ、report と audit に現れないことを assert する）。（次にこの検証を実行したとき、件数（pass／fail／skip）を追記する — 遡っての再実行は求めない）
 
 **完了条件:** 許可リストの変数を意図的に欠いた起動で、レポートにその変数が欠けていたことが記録される。変数の値はレポートにも監査にも記録されない。
 
@@ -1269,7 +1270,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 - [x] 既存試験（`proxy_tools_list.rs:1358-1520`、`tool_enforcement_e2e.rs:1360`・`1537`、`real_servers_e2e.rs:1305`）の期待値を更新し、blocked な `tools_list.verified` が `failure` のままであることを対で固定する。→ 3 ファイルとも `outcome":"success"` 期待に更新。blocked `tools_list.verified` は `outcome=failure`/`action=observed`/`details` に `blocked=true` でコミットされることを対で固定（従来 emit の無かった blocked 記録自体も追加）
 - [x] PR-23 の `version=` → `revision=` と同様に、`docs/archive/migration.{md,ja.md}` に「`tools_list.filtered` の outcome が `failure` → `success`」を監査スキーマの表記変更として記録し、リリースノートに引き継ぐ。→ `docs/archive/migration.{md,ja.md}` に記録 — 消費者は `action=denied`（dry-run は `observed`）への切替を案内。blocked `tools_list.verified` のコミット追加も併記
 
-**検証:** T-BASE、T-PROTOCOL。
+**検証:** T-BASE、T-PROTOCOL。（次にこの検証を実行したとき、件数（pass／fail／skip）を追記する — 遡っての再実行は求めない）
 
 **完了条件:** 許可ツールだけを残すフィルタリングの監査が `outcome=success` になり、ハッシュ不一致などの検証失敗は `failure` のまま。outcome の値域と割当が文書から読める。
 
@@ -1293,7 +1294,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 - [x] D-10: 起動前プローブに `proc_mount` を加える。`probe_grandchild`（`probe.rs:160-205`）で `unshare` の後、init と同じ `MS_REC|MS_PRIVATE` の処理に続けて `mount("proc", "/proc", "proc", 0, NULL)` を試し、失敗を `failed_stage=proc_mount` として報告する（プローブは自分の mountns を持つので host の `/proc` には影響しない）。`ProbeReport.missing()` に `proc_mount` を加え、`select.rs` の `requires`、`report.rs` の JSON（`missing` の列挙）、guide の `plan.mechanism` の説明（`guide.md:829`）に反映する。`auto` は namespaced 不可として native（要求を満たす場合）へ回り、`namespaced` 明示指定は拒否 — いずれも理由に `proc_mount` が出る。→ `ProbeReport.proc_mount` を追加 — `probe_proc_mount` が `unshare` 後に fork した pidns-init 子で `MS_PRIVATE|MS_REC` detach + `mount("proc","/proc")` を試行し、成否を exit status で返す（成功時は即 `MNT_DETACH` で復帰）。`missing()` の `proc_mount` トークン、`auto`→native フォールバックと `namespaced` 明示拒否（いずれも `missing`/`reason` が `proc_mount` を名指す）、`report.rs` の `namespaces.proc_mount`/`missing`、`MechanismSelection.probe`、guide の `plan.mechanism` 説明に反映。失敗 stage 名は init の `ERR proc-mount` に揃え、missing トークンは `proc_mount` のまま
 - [x] guide 英日の障害切り分け表（§7「How do I tell whether a failure came from …」）に init-order と proc-mount の行を足す。→ guide.md 3221・3227、guide.ja.md 1849・1855 — init-order 行（方向別文面・stderr 初回 1 行・`reason=init-order` の `mcp_message.denied`）と namespaced 環境制約行（`ERR <stage> errno=<n>` + 既知組合せヒント、起動前は `missing: ["proc_mount"]` として現れる旨）を追加
 
-**検証:** T-BASE、T-PROTOCOL、`tests/mcp_wire_e2e`（init-order の文面）、`tests/linux_mechanism_e2e.rs`（WSL2 実機で `proc_mount=true` の既存レグが通ること。`proc_mount=false` は fixture の probe 結果で選択を固定する）。入れ子のユーザー名前空間での実機再現はレポート側の環境に依るため、再現できなければ未確認と記録する。
+**検証:** T-BASE、T-PROTOCOL、`tests/mcp_wire_e2e`（init-order の文面）、`tests/linux_mechanism_e2e.rs`（WSL2 実機で `proc_mount=true` の既存レグが通ること。`proc_mount=false` は fixture の probe 結果で選択を固定する）。入れ子のユーザー名前空間での実機再現はレポート側の環境に依るため、再現できなければ未確認と記録する。（次にこの検証を実行したとき、件数（pass／fail／skip）を追記する — 遡っての再実行は求めない）
 
 **完了条件:** 再現手順どおりに操作したときに新しい理由文とヒントが出る。判定（拒否・選択）は D-10 の `auto` → native の経路以外は変わらない。
 
@@ -1316,7 +1317,7 @@ PR-30 を先に実施します。PR-31・PR-33・PR-34・PR-35 は変更先が�
 - [x] stderr に情報行を 1 つ出す: `info: policy version 2 — N field(s) would compose differently under version 3 (see policy resolve --version-diff)`、差が無ければ `… composes identically under version 3`。→ `print_summary` 末尾に `info:` 行を追加（stdout/`--report` 両経路で 1 行）。`simulation_failed` は `info: policy version N — simulated version 3 load failed: <reason>` を追加
 - [x] guide 英日 §4.15 に `migration` の説明と「移行は任意。`policy resolve --version-diff` で差分を確認してから `policy version=3` に書き換える」を追記する。→ guide.md / guide.ja.md の Result JSON メンバ列挙に `migration` を追加し、`Version-3 migration preview` / `version-3 移行プレビュー` の段落を新設（3 status の意味・`policy resolve --version-diff` との同一計算・情報扱いで status/exit code 不変・移行は任意を記述）
 
-**検証:** T-BASE、T-POLICY（`policy_check_e2e` に v2 ポリシーの `migration` 出力と、`status` 不変の対を追加）。
+**検証:** T-BASE、T-POLICY（`policy_check_e2e` に v2 ポリシーの `migration` 出力と、`status` 不変の対を追加）。（次にこの検証を実行したとき、件数（pass／fail／skip）を追記する — 遡っての再実行は求めない）
 
 **完了条件:** version 2 のポリシーに対する `check` の出力に移行に関する情報が含まれ、ポリシーの読み込みと執行の結果が変わらない。
 

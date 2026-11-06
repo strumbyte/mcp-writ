@@ -268,17 +268,17 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **前提（HEAD `f00e28a`）:** [ci.yml](../.github/workflows/ci.yml)・[linux-tests.yml](../.github/workflows/linux-tests.yml)・[platform-tests.yml](../.github/workflows/platform-tests.yml)・[mcp-servers.yml](../.github/workflows/mcp-servers.yml) に `schedule` トリガーは依然無い。基準以降、ci.yml・linux-tests.yml・mcp-servers.yml に `require_lifetime_boundary` の実測のため cgroup v2 ルート委譲ステップが加わり、mcp-servers.yml には check-server の replaceable-paths waiver 宣言が入った — 定期実行を足す際はこれらのステップを壊さない。test-matrix.md には Workflow inventory 表（`8`〜、`Trigger` 列で dispatch／call を集約）が既に整っている。レポートは `66e08c9` に対する CI 実行が Actions 一覧に無かったこと、前身の PR-31〜36 の記録に実行件数が無いことを指摘している。
 
-**主な変更先:** `.github/workflows/ci.yml`、`.github/workflows/linux-tests.yml`、`.github/workflows/mcp-servers.yml`、[docs/test-matrix.md](test-matrix.md)、前身の手順書「PRを閉じるとき」
+**主な変更先:** `.github/workflows/ci.yml`、`.github/workflows/linux-tests.yml`、`.github/workflows/mcp-servers.yml`、[docs/test-matrix.md](test-matrix.md)、[docs/releasing.md](releasing.md)、前身の手順書「PRを閉じるとき」
 
 **タスク**
 
-- [ ] `ci.yml` と `linux-tests.yml` に `schedule`（週 1 回、`main`）を加える。`platform-tests.yml` は対象外とする — `workflow_call` で release.yml から呼ばれる再利用ワークフローであり、定期実行を足すと release 経路と二重に走るため（理由を test-matrix.md に書く）。`mcp-servers.yml` は公式サーバーの版更新で壊れやすいので、同じ頻度で加えるか手動のままにするかを担当PRで決め、理由を test-matrix.md に書く。実 AArch64 のレグは self-hosted／有料ランナーの有無で判断する
-- [ ] `schedule` 実行の失敗を見落とさない手段を決める（Actions の通知、または README のバッジ）。issue の自動起票はしない（D-10）
-- [ ] [test-matrix.md](test-matrix.md) の Workflow inventory（`8`〜）の `Trigger` 列を `schedule` の頻度まで拡張するか `schedule` 列を足し、各ワークフローの頻度と対象ブランチを書く
-- [ ] 前身の手順書「PRを閉じるとき」に「実行した試験の件数（pass／fail／skip）を記録する」を明記する。前身の PR-31〜36 の検証欄に、次に実行したときの件数を追記する（遡っての再実行は求めない）
-- [ ] [docs/releasing.md](releasing.md) の手順 2（6 ワークフローの成功確認）に「直近の `schedule` 実行が当該コミットかその祖先で成功していること」を足す（release-gate の手順は既に記載済み — 触らない）
+- [x] `ci.yml` と `linux-tests.yml` に `schedule`（週 1 回、`main`）を加える。`platform-tests.yml` は対象外とする — `workflow_call` で release.yml から呼ばれる再利用ワークフローであり、定期実行を足すと release 経路と二重に走るため（理由を test-matrix.md に書く）。`mcp-servers.yml` は公式サーバーの版更新で壊れやすいので、同じ頻度で加えるか手動のままにするかを担当PRで決め、理由を test-matrix.md に書く。実 AArch64 のレグは self-hosted／有料ランナーの有無で判断する — **済**: `cron '17 3 * * 1'`（月曜 03:17 UTC — `schedule` は常にデフォルトブランチ `main` を対象）を ci.yml・linux-tests.yml・mcp-servers.yml に追加。platform-tests.yml に加え container-tests.yml・go-runtime.yml も同じ Release 呼出し理由で対象外（test-matrix.md に記録）。mcp-servers.yml は同頻度で追加と判断 — ピン留めサーバーとホストランナーイメージ間のドリフトを週次で露出させることが B-01 の目的そのものであり、手動のままでは同じ失敗を release-preflight まで先送りするだけのため（判断理由は test-matrix.md に記録）。実 AArch64 レグは既存の `ubuntu-24.04-arm`（パブリックリポジトリ向け無料のホストランナー）がそのまま週次実行に載るため self-hosted の要否判断は不要と確定
+- [x] `schedule` 実行の失敗を見落とさない手段を決める（Actions の通知、または README のバッジ）。issue の自動起票はしない（D-10） — **済**: Actions 通知に任せる（D-10 確定）— `schedule` 実行の失敗は cron 行を最後に編集したユーザーへ GitHub が通知する。README バッジは採用しない — 同一ワークフローの schedule 実行と Release 呼出し実行を 1 つのステータスに混ぜるため。issue 自動起票なし。test-matrix.md の Workflow inventory 後段に明記
+- [x] [test-matrix.md](test-matrix.md) の Workflow inventory（`8`〜）の `Trigger` 列を `schedule` の頻度まで拡張するか `schedule` 列を足し、各ワークフローの頻度と対象ブランチを書く — **済**: `Schedule` 列を追加（`weekly, Mon 03:17 UTC` / `— (Release-called)` / `— (self-hosted)`）。対象ブランチは `schedule` の仕様上デフォルトブランチ固定のため、頻度と併せて表直下の段落に明記。発動条件の段落も schedule 対象・除外理由・mcp-servers の判断・失敗通知経路を記述する形に更新
+- [x] 前身の手順書「PRを閉じるとき」に「実行した試験の件数（pass／fail／skip）を記録する」を明記する。前身の PR-31〜36 の検証欄に、次に実行したときの件数を追記する（遡っての再実行は求めない） — **済**: 「成功・失敗・スキップ・環境未確保を分ける」箇条の直後に件数記録の箇条を追加。PR-31〜36 の各 `**検証:**` 欄に「次にこの検証を実行したとき、件数（pass／fail／skip）を追記する — 遡っての再実行は求めない」を付記
+- [x] [docs/releasing.md](releasing.md) の手順 2（6 ワークフローの成功確認）に「直近の `schedule` 実行が当該コミットかその祖先で成功していること」を足す（release-gate の手順は既に記載済み — 触らない） — **済**: release-preflight の直後に、CI・Linux tests・MCP server verification の直近 `schedule` 実行の確認を追記。祖先で成功した週次実行はこの schedule 確認のみを満たし、preflight 本体は引き続き 6 ワークフロー全てが当該リリースコミット上で成功していることを要求する。「`main` 先端でタグを付すなら直近の週次実行がそのまま preflight を満たす」のは、その run がリリース対象コミットそのもので実行された場合に限る旨を明記
 
-**検証:** ワークフローの構文（`actionlint` があれば）、`workflow_dispatch` での試走 1 回。T-DOC。
+**検証:** ワークフローの構文（`actionlint` があれば）、`workflow_dispatch` での試走 1 回。T-DOC。 — **実施済み**（Windows 実機）: actionlint v1.7.12 — 変更した 3 ワークフローはクリーン（vm-tests.yml のカスタムラベル `kata`/`apple-container`/`hyperv`/`windows-sandbox`/`wslc`/`winiso` 警告は self-hosted ランナーの既存の既知の偽陽性で、本PRの変更外）。T-DOC: `cargo test --locked --test docs_check` 13/13 pass。`workflow_dispatch` での試走はブランチに push して Actions 上で実行するため、PR 作成時に実施して件数を記録する（`schedule` 実行自体はマージ後の次回月曜に自動で走る）。
 
 **完了条件:** `main` の先端に対する結合テストの実行結果が、手動操作なしに週 1 回 Actions に残る。`platform-tests.yml` を含め対象外としたワークフローの除外理由が test-matrix.md に記録されている。
 
