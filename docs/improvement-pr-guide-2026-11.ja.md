@@ -319,7 +319,7 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 - 探索の子プロセスは既定で Warden 経由（`tools_list.rs` `spawn_server_sandboxed` `1345-1459`・`discovery_policy` `243-263`・`528-566`）。組み込みプロファイル: deny-all egress、fs は解決済み実行ファイルの prefix／コマンドツリー／インタプリタprefix（`node_modules`・PATH helper・引数の親を含む実行時導出）、書込は専用 TMPDIR のみ、制限環境、secret overlay 有効
 - ポリシー構築は blocking pool 上で失敗時 fail-closed、子プロセスは `RunningChild` で子孫まで所有。`MCP_WRIT_SKIP_SANDBOX` は OS サンドボックスと子孫プロセスの寿命管理を外し、制限環境と専用 TMPDIR は維持、`--unsafe-unsandboxed-discovery` が ambient 継承のフルダウングレード
 - 警告文・static-only 案内は実態どおりに更新済み（E-08 解消）
-- 層の規則: 実装は `tools_list.rs` が `Warden::spawn_child_async_exe_with` を直接呼ぶ形。計画の「commands 層から stdio を渡す」分離は取らなかった — T-LAYER で許容されていることを確認し、判断を記録する
+- 層の規則: 実装は `tools_list.rs` が `Warden::spawn_child_async_exe_with` を直接呼ぶ形。計画の「commands 層から stdio を渡す」分離は取らなかった — **確認・記録済み**: `legislator`（層 4）→ `warden`（層 3）は下方向参照のため T-LAYER で例外なしに許容される（`tests/module_layering.rs` の `LAYERS` 表と `docs/modules.md` の層表で照合、`cargo test --locked --test module_layering` 16/16 PASS で実測）。分離を取らない判断はこれで確定 — 探索の spawn は組み込みポリシーの構築から `RunningChild` による子孫所有まで legislator 内で完結し、commands 層へ stdio を渡す中間経路は設けない
 
 **残件（コード変更・記録作業とも無し）:**
 
