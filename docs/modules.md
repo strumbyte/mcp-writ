@@ -171,11 +171,21 @@ cleanup. The update points, in order:
    `initialize` result against `SUPPORTED_INITIALIZE_VERSIONS`;
    `src/auditor/proxy_wire.rs` renders the `unsupported-version`
    refusal and `src/auditor/proxy_s2c.rs` stamps the
-   `server_protocol_version=` / `supported=` audit detail).
+   `server_protocol_version=` / `supported=` audit detail). For a
+   revision declared per request through `params._meta` rather than
+   negotiated through `initialize`, the Auditor path is instead
+   `WireState::request_version` (same file — selects the judging
+   revision for each C2S request and denies a mid-session switch on an
+   established wire) plus `meta_check` in `src/policy/mcp/decide.rs`,
+   which validates the request's `_meta` for that revision.
 4. `tests/protocol_versions.rs` plus a fixture server under
    `tests/fixtures/mcp_servers/` — positive fetch legs for the new
    revision and refusal legs for advertised-but-unimplemented
-   revisions.
+   revisions — and the Auditor wire legs in `tests/mcp_wire_e2e/`:
+   `protocol_version.rs` covers the negotiated-version refusals, and a
+   per-request `_meta` revision gets a round-trip leg alongside them
+   (`v26.rs`'s `v26_request_with_meta_round_trips` is the existing leg
+   for 2026-07-28).
 5. Capability matrix — review `src/enforcement/capability.rs` and the
    committed `docs/capability-matrix.json`. The catalog carries no
    protocol-version rows today, but if the revision changes what a

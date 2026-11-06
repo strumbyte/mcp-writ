@@ -427,8 +427,11 @@ replace them. Per host:
   canonicalizes the spelling first and checks the resolved target —
   keep both the spelled override chain and the resolved target's
   ancestry group-write-free whenever the group holds other users. An
-  invalid or relative override is a hard error, never a fall-through
-  to PATH.
+  invalid or relative override is a hard error for that driver, never
+  a fall-through to PATH — but under auto-detection it removes only
+  that engine from contention: a bad `MCP_WRIT_DOCKER_EXE` still lets
+  podman or buildah be selected, so pass `--engine docker` when Docker
+  specifically must serve.
   Apple's `container` tool — the `apple-container` driver — follows
   the same rule.
 - **Windows:** keep engines under `%ProgramFiles%` (Docker Desktop's
@@ -3173,15 +3176,26 @@ lose a handful of records per rotation. `create`-mode rotation (move
 aside + recreate + `postrotate kill -USR1 <pid>`) loses nothing, but
 the recreated file must be owned by the logging identity — `create
 0600 <user> <group>` — because a foreign-owned file is refused at the
-next open. On Windows there is no rotation path: the append handle
-grants no delete sharing, so the file can neither be moved nor replaced
-while the session lives — and no signal or CLI trigger reopens the
-sink in place. Rotation there is a planned session restart: schedule a
-stop of the guarded session, archive or rename the file once the
-handle is gone, and start the next session on a fresh `--audit-log`
-path or back on the same name. Restart-driven rotation is the only
-switch point on Windows; fold it into whatever restart cadence the
-deployment already keeps.
+next open. On Windows the sharing rules narrow the choices but do not
+end them: the append handle shares read and write but never delete, so
+the file can neither be moved nor replaced while the session lives —
+and no signal or CLI trigger reopens the sink in place, so a
+create-mode rotator has no path. A compatible rotator — running as the
+logging identity or SYSTEM, since the sink's owner+SYSTEM DACL still
+applies — can instead rotate the local log in place by copying it,
+then truncating it: the append handle resumes at offset zero with no
+session restart, at the same trade-off that records written between
+the copy and the truncate land in neither file. The copy is a new
+file — it lands with the destination directory's inherited
+permissions, not the sink's DACL, so create archives under a
+directory whose inheritable file ACEs are restrictive or apply a
+protected DACL to each archive at creation, then verify the
+resulting archive's DACL (`icacls` shows it) rather than relying on
+the live sink's permissions or directory inheritance. A planned session
+restart remains the other switch point: schedule a stop of the
+guarded session, archive or rename the file once the handle is gone,
+and start the next session on a fresh `--audit-log` path or back on
+the same name.
 
 **Disk-full behavior.** A write that fails because the filesystem is
 full — or hits a quota or file-size limit — is a sink fault like any

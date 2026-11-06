@@ -89,8 +89,8 @@ Windows, or macOS.
 4. Inspect the resulting archives and SHA-256 checksum files
    (`checksums-sha256.txt` for the archives, `runners-checksums-sha256.txt`
    for the embedded runners). Each archive must contain the CLI, a Linux
-   runner for the matching architecture, LICENSE, policy.example.kdl, and
-   the public documentation. The `windows-amd64` archive additionally
+   runner for the matching architecture, LICENSE, SECURITY.md,
+   policy.example.kdl, and the public documentation. The `windows-amd64` archive additionally
    carries `runners/mcp-secure-runner-windows-amd64.exe` — the Windows
    guest runner for Hyper-V-isolated Windows containers (a `crt-static`
    build, so it needs no MSVC redistributable on Server Core).
