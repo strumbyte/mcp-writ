@@ -481,7 +481,8 @@ container), never a silent substitute.
   belong to other layers — see the positioning note at the top.
 
 See the [security model](docs/guide.md#2-security-model) before choosing a
-deployment policy.
+deployment policy. To report a suspected vulnerability, use GitHub's private
+vulnerability reporting — see [SECURITY.md](SECURITY.md).
 
 ## Build and development
 
@@ -510,3 +511,4 @@ Licensed under the MIT License. See [LICENSE](LICENSE).
 - [Policy example](policy.example.kdl)
 - [Module guide](docs/modules.md)
 - [Development](docs/development.md) / [Releasing](docs/releasing.md)
+- [Security policy](SECURITY.md)
