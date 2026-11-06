@@ -222,7 +222,7 @@ async fn v3_policy_self_test_still_spawns() {
     let stderr = report.format_stderr();
     assert_eq!(
         report.spawn,
-        SpawnStatus::Started,
+        mcp_writ::legislator::self_test::SpawnStatus::Started,
         "a v3 draft must drive the enforced run: {stderr}"
     );
     assert_ne!(
