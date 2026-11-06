@@ -1975,7 +1975,7 @@ native Unix では、pin 済みスクリプトは実パスで起動するため�
 
 **共有 IP / 同居テナント。** *止められること:* アドレスより細かいものはない — 名由来の grant は解決された*アドレス*を認可するため、その上の同居テナント（共有 CDN・ロードバランサ IP）すべてがその grant を通じて到達可能になる。IP 層の評価器は `allow host=<name>` がアドレスを認可することを起動ごとに一度警告し、CONNECT プロキシだけが grant を名に束縛する。そのアドレスへの明示的な `deny cidr=` / IP リテラル `deny host=` は依然として勝つ — ただし許可した名前も一緒に拒否する。*検知できること:* レコードはどの名前がどのアドレスを認可したかを示す（`network_resolved` の `addrs`/`grants`、`network_allowed` の `basis=allowlist-grant`）。フローがどのテナントと話したかを区別する記録はない。*残るもの:* 名前層の保証は解決された名の範囲である — そのアドレス上の同居者の集合は設計上の対象外であり、同居テナントを区別する内容検査は存在しない。
 
-**ユーザ空間プロキシの信頼性。** 強制するプロキシは境界の一部であり、smoltcp/プロキシ実装のバグは境界のバグである。*緩和:* 小さくインプロセス（外部デーモン非依存）で、フローテーブル・カウンタ・パケットサイズはすべて境界付き、不正・断片パケットは計数付きで drop し、後始末は構造上 fail-closed — `PR_SET_PDEATHSIG` カスケードがサブツリーを回収し、親と共に閉じる TUN fd が全 egress を止める。実施済みの証跡は [validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) に記録済み。*検知できること:* `proxy_stats` カウンタが drop と監査抑制（`udp_audit_suppressed`）を公開する。supervisor/プロキシの喪失は、制御を静かに失うのではなく egress を止める設計である。*残るもの:* 不正パケット drop を超える異常入力ファジングは未実施であり、リレー内の CPU 枯渇へのレート制限はない。インプロセス supervisor を信用できない脅威モデルでは、文書化されたより強い経路は隔離バックエンド（`--isolation kata|apple-container|hyperv|windows-sandbox|wslc`）と Windows `psec` であり、別のユーザ空間プロキシではない。
+**ユーザ空間プロキシの信頼性。** 強制するプロキシは境界の一部であり、smoltcp/プロキシ実装のバグは境界のバグである。*緩和:* 小さくインプロセス（外部デーモン非依存）で、フローテーブル・カウンタ・パケットサイズはすべて境界付き、不正・断片パケットは計数付きで drop し、後始末は構造上 fail-closed — `PR_SET_PDEATHSIG` カスケードがサブツリーを回収し、親と共に閉じる TUN fd が全 egress を止める。実施済みの証跡は [validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) に記録済み。*検知できること:* `proxy_stats` カウンタが drop と監査抑制（`udp_audit_suppressed`）を公開する。supervisor/プロキシの喪失は、制御を静かに失うのではなく egress を止める設計である。*残るもの:* パケット分類境界は `namespaced_packet` ターゲットでファジング済み（§8.5）だが、リレー全体のループは対象外であり、リレー内の CPU 枯渇へのレート制限はない。インプロセス supervisor を信用できない脅威モデルでは、文書化されたより強い経路は隔離バックエンド（`--isolation kata|apple-container|hyperv|windows-sandbox|wslc`）と Windows `psec` であり、別のユーザ空間プロキシではない。
 
 ### 8.4 ネイティブ経路の IPC 封じ込め（AF_UNIX とシグナル）
 
@@ -1986,3 +1986,21 @@ native Unix では、pin 済みスクリプトは実パスで起動するため�
 - **デバイス ioctl。** `AccessFs::IoctlDev`（ABI v5）は扱わない — 許可したファイルシステムツリーはそのデバイス ioctl（`/dev/tty`・ptmx）を保持する。拒否すると端末ワークロードがすべて壊れるためである。
 
 namespaced 経路は同じ対象を別の仕組みで閉じる: 名前空間内 seccomp が `socket()` を IP ファミリへ絶対に固定し（`unix=` opt-in は選択時に拒否）、`CLONE_NEWPID` がシグナルを名前空間内 pid に限定し、`/run` をマスクする — Landlock ABI は一切不要である。
+
+### 8.5 PoC egress 経路を採用済みに上げる基準
+
+capability matrix にはまだ `adopted` でない opt-in の egress 経路が 3 つある: `unotify-run`（`poc`）、`ebpf-run`（`opt-in`）、`macos-proxy-run`（`opt-in`）。都合のよいホストで一度動くだけでは、採用済み既定経路に課す証拠の水準に達しない。次の 5 条件すべてを満たしたとき、経路は `adopted` に上がる:
+
+- **実機記録のある OS／カーネル範囲。** 経路が主張するホストが [テストマトリクス](test-matrix.md) の証拠テーブルに記録されていること — 実際に動かした OS リリースとカーネルバージョンが、経路がうたう全アーキテクチャで記録済みであること。カーネル機構では、機構が主張する最古カーネルと現行カーネルの両方が必要。
+- **入力境界のファジング実施。** 経路が攻撃者制御のバイト列を最初に解釈する箇所がすべて [fuzz ワークフロー](../.github/workflows/fuzz.yml) で完走するファズターゲットの下にあること。`fuzz/fuzz_targets/` は共有境界（フレーミング、JSON-RPC の解釈、namespaced パケット解析、DNS ゲートのワイヤ形式）をすでにカバーしており、`default-members` から外した兄弟パッケージの `noprop` が駆動するので通常ビルドでは決してコンパイルされない — 候補経路は自身が追加する境界のターゲットを追加する。クラッシュ入力は `fuzz-evidence` artifact として残る。`noprop` は縮小しないため、見つかった入力は手作業で最小化して単体試験 fixture にし、後続 PR で直す。
+- **拒否監査の網羅。** 経路が起こし得る OS レベルの拒否はすべて、`sandbox.network_denied` 系のレコードを残すか、仕様上観測不能であると断言されるかのどちらか — 黙って欠けることはない（`denial_audit_e2e` が固定する）。
+- **`plan`／`report`／JSONL の一致。** `plan`、起動 `--report`、監査ストリームが同じ起動について同じ制御を記述すること — 制御 id は capability-matrix 行と一致し、`not_applied` は主張せず開示する。
+- **限界の文書化開示。** `capability-matrix.json` の `deficiencies`/`select`/`refuse` 行が残存する開口部をすべて挙げていること — レビューで再発見されるものを残さない。
+
+現時点（v0.5.1）の充足状況:
+
+| 経路 | matrix | 記録済み範囲 | 境界ファジング | `adopted` に欠けるもの |
+|---|---|---|---|---|
+| `unotify-run` | `poc` | CI / Platform tests / Linux tests の hosted Ubuntu 脚で `unotify_e2e` | 共有ターゲットがフレーミング/プロトコル読みをカバー。seccomp-notify の判定経路自体は未ファジング | notify 経路のファジング。hosted-Ubuntu カーネル以外のカーネル範囲記録 |
+| `ebpf-run` | `opt-in` | 特権 WSL2 カーネル 6.18 の記録 1 件 — `ebpf_e2e` 9/9、手動のみ | 共有ターゲット以外なし | 主張カーネル範囲での実特権ホスト記録。CI で見える実行 |
+| `macos-proxy-run` | `opt-in` | Platform tests の macOS 脚で `macos_proxy_e2e` | 共有ターゲット以外なし | 2 件目の macOS リリース記録。CONNECT プロキシ経路のファジング |

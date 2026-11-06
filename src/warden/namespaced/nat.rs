@@ -274,7 +274,7 @@ impl NatTable {
 /// extension chains never reach here — the classifier drops them
 /// first, and this refuses the same way), or inconsistent — callers
 /// treat it as undeliverable.
-fn parse_tcp_tuple(frame: &[u8]) -> Option<(IpAddr, IpAddr, u16, u16)> {
+pub(crate) fn parse_tcp_tuple(frame: &[u8]) -> Option<(IpAddr, IpAddr, u16, u16)> {
     if frame.len() < 20 {
         return None;
     }

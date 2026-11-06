@@ -11,6 +11,8 @@ pub mod execution;
 pub mod framing;
 pub mod fsoverlap;
 pub mod fspriv;
+#[doc(hidden)]
+pub mod fuzz;
 pub mod inspector;
 pub mod legislator;
 pub mod pathutil;

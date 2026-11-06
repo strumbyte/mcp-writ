@@ -1,0 +1,30 @@
+[package]
+name = "mcp-writ-fuzz"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "noprop-driven boundary fuzz targets for mcp-writ — a workspace member excluded from default-members so normal builds skip it"
+
+[dependencies]
+mcp-writ.workspace = true
+noprop.workspace = true
+
+# One binary per fuzz target, laid out under fuzz_targets/ like a
+# cargo-fuzz crate — but these are plain `cargo run --bin` targets
+# driven by noprop, so no nightly toolchain is required.
+[[bin]]
+name = "framing"
+path = "fuzz_targets/framing.rs"
+
+[[bin]]
+name = "jsonrpc"
+path = "fuzz_targets/jsonrpc.rs"
+
+[[bin]]
+name = "namespaced_packet"
+path = "fuzz_targets/namespaced_packet.rs"
+
+[[bin]]
+name = "dnsgate_wire"
+path = "fuzz_targets/dnsgate_wire.rs"

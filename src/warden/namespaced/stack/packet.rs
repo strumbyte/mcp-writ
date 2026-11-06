@@ -17,15 +17,15 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 // Packet classification (reader task)
 // ---------------------------------------------------------------------------
 
-pub(super) struct UdpDgram {
-    pub(super) src: IpAddr,
-    pub(super) src_port: u16,
-    pub(super) dst: IpAddr,
-    pub(super) dst_port: u16,
-    pub(super) payload: Vec<u8>,
+pub(crate) struct UdpDgram {
+    pub(crate) src: IpAddr,
+    pub(crate) src_port: u16,
+    pub(crate) dst: IpAddr,
+    pub(crate) dst_port: u16,
+    pub(crate) payload: Vec<u8>,
 }
 
-pub(super) enum GateCtx {
+pub(crate) enum GateCtx {
     /// UDP DNS: reply packet is crafted dst→src, same family as the
     /// query arrived on.
     Udp {
@@ -36,13 +36,13 @@ pub(super) enum GateCtx {
     },
 }
 
-pub(super) struct GateReq {
-    pub(super) pkt: Vec<u8>,
-    pub(super) peer: SocketAddr,
-    pub(super) ctx: GateCtx,
+pub(crate) struct GateReq {
+    pub(crate) pkt: Vec<u8>,
+    pub(crate) peer: SocketAddr,
+    pub(crate) ctx: GateCtx,
 }
 
-pub(super) enum Classified {
+pub(crate) enum Classified {
     Tcp(Vec<u8>),
     UdpDns(GateReq),
     Udp(UdpDgram),
@@ -64,7 +64,7 @@ pub(super) enum Classified {
 /// datagrams must take the ordinary per-datagram evaluator path —
 /// classifying them as gate work would dead-letter them into a
 /// channel nobody drains (no verdict, no audit record, silent loss).
-pub(super) fn classify(frame: &[u8], dns_intercept: bool) -> Classified {
+pub(crate) fn classify(frame: &[u8], dns_intercept: bool) -> Classified {
     if frame.len() < 20 {
         return Classified::DropMalformed;
     }
@@ -192,7 +192,7 @@ fn classify_udp(
 /// (reply src = the original destination the workload addressed).
 /// `src`/`dst` always share a family — replies are built from the
 /// request's own tuple — so the version comes from `dst`.
-pub(super) fn craft_udp_packet(
+pub(crate) fn craft_udp_packet(
     src: IpAddr,
     src_port: u16,
     dst: IpAddr,

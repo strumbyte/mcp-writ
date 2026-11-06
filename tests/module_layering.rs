@@ -56,6 +56,10 @@ const LAYERS: &[(&str, u8)] = &[
     ("lib", 8),
     ("main", 8),
     ("bin", 8),
+    // Boundary-fuzzing adapter: wraps attacker-input parsers for the
+    // fuzz crate — an entry-point-adjacent façade, so it sits with
+    // the crate roots.
+    ("fuzz", 8),
 ];
 
 /// Allowed `(source_module, target_module)` edges that violate the rule.

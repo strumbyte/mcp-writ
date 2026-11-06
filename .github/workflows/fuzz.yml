@@ -1,0 +1,78 @@
+# Boundary fuzzing — manual dispatch only (push/PR triggers stay
+# off like every other verification workflow here). Four noprop-driven
+# targets cover the first attacker-input boundaries: framing, JSON-RPC
+# interpretation, the namespaced proxy packet parsers, and the DNS
+# gate wire parsers. The namespaced target is Linux-only code, so the
+# whole job runs on Linux.
+#
+# Each target run is bounded twice: a fixed accepted-case budget and a
+# `timeout` kill, so the whole sweep stays near five minutes. A failing
+# target leaves its exact last input plus the seeded replay recipe in
+# fuzz-artifacts/ (<target>.bin / <target>.txt), uploaded below —
+# replay one with
+#   cargo run --release --manifest-path fuzz/Cargo.toml --bin <target> -- --replay <target>.bin
+name: Fuzz
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Accepted-case budget per target; each run is also killed at 120 s,
+  # so the sweep stays near the five-minute mark.
+  FUZZ_CASES: "50000"
+
+jobs:
+  fuzz:
+    name: Boundary fuzz targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.99.0"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # The fuzz package is a workspace member but excluded from
+      # default-members: it shares the root lockfile, builds into the
+      # root target dir, and only builds on explicit invocation.
+      - name: Build fuzz targets
+        run: cargo build --release --locked --manifest-path fuzz/Cargo.toml
+
+      - name: Run fuzz targets
+        run: |
+          # pipefail: the target's failure (and timeout's 124) must
+          # reach `|| rc=1` instead of being masked by tee's status.
+          set -o pipefail
+          mkdir -p fuzz-artifacts fuzz-logs
+          rc=0
+          for t in framing jsonrpc namespaced_packet dnsgate_wire; do
+            echo "=== $t ==="
+            timeout 120 ./target/release/"$t" \
+              --cases "$FUZZ_CASES" --crash-dir fuzz-artifacts \
+              2>&1 | tee "fuzz-logs/$t.log" || rc=1
+          done
+          exit "$rc"
+
+      # Crash inputs + run reports ride the artifact even when a target
+      # failed — that is exactly when they matter.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: fuzz-evidence
+          path: |
+            fuzz-artifacts/
+            fuzz-logs/
+          if-no-files-found: warn

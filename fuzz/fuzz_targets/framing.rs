@@ -1,0 +1,128 @@
+//! Fuzz target: bounded stdio JSON-RPC framing.
+//!
+//! Input layout: `[u64 max_bytes LE][stream bytes]`. The property
+//! drains the stream through both boundary readers —
+//! `read_frame_bounded` (resumable, the Auditor's proxy loops) and
+//! `read_line_bounded` (fail-fast, the launcher) — asserting the
+//! framing invariants and cross-checking the two verdicts.
+//!
+//! Search space: caps biased to 0, window edges (8 KiB head/tail
+//! windows) and powers of two; frame lengths biased to `max±1`,
+//! window edges, and long newline-free runs; CRLF and unterminated
+//! tails included.
+
+use std::cell::Cell;
+
+use mcp_writ::fuzz::{FrameStats, drain_frames, drain_lines};
+
+const MAX_STREAM: usize = 96 * 1024;
+
+#[derive(Default)]
+struct Gates {
+    cases: Cell<usize>,
+    lines: Cell<usize>,
+    oversize: Cell<usize>,
+    fail_fast: Cell<usize>,
+    unterminated: Cell<usize>,
+    partial_consume: Cell<usize>,
+}
+
+fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
+    let max = noprop::sample_with_boundaries(
+        ctx,
+        &[
+            0usize, 1, 2, 63, 64, 65, 4095, 4096, 8191, 8192, 8193, 65535,
+        ],
+        noprop::Ratio::new(1, 2),
+        |ctx| noprop::sample_usize_in(ctx, 0..=MAX_STREAM),
+    );
+    let mut stream = Vec::new();
+    for _ in 0..noprop::sample_usize_in(ctx, 0..=6) {
+        let len = noprop::sample_with_boundaries(
+            ctx,
+            &[
+                0usize,
+                1,
+                max.saturating_sub(1),
+                max,
+                max.saturating_add(1),
+                8 * 1024 - 1,
+                8 * 1024,
+                8 * 1024 + 1,
+            ],
+            noprop::Ratio::new(1, 2),
+            |ctx| noprop::sample_usize_in(ctx, 0..=MAX_STREAM),
+        );
+        stream.extend(noprop::sample_bytes_vec(ctx, len));
+        match noprop::sample_weighted_index(ctx, &[6, 1, 1]) {
+            0 => stream.push(b'\n'),
+            1 => stream.extend_from_slice(b"\r\n"),
+            _ => {} // unterminated tail — EOF ends the frame
+        }
+    }
+    let mut input = (max as u64).to_le_bytes().to_vec();
+    input.extend_from_slice(&stream);
+    input
+}
+
+fn property(g: &Gates, data: &[u8]) {
+    if data.len() < 8 {
+        return;
+    }
+    let max = (u64::from_le_bytes(data[..8].try_into().unwrap())).min(usize::MAX as u64) as usize;
+    let stream = &data[8..];
+    let frames = drain_frames(stream, max);
+    let lines = drain_lines(stream, max);
+    cross_check(&frames, &lines);
+
+    g.cases.set(g.cases.get() + 1);
+    g.lines.set(g.lines.get() + usize::from(frames.lines > 0));
+    g.oversize
+        .set(g.oversize.get() + usize::from(frames.oversize > 0));
+    g.fail_fast
+        .set(g.fail_fast.get() + usize::from(lines.fail_fast));
+    g.unterminated
+        .set(g.unterminated.get() + usize::from(frames.unterminated_oversize > 0));
+    g.partial_consume
+        .set(g.partial_consume.get() + usize::from(lines.consumed < stream.len()));
+}
+
+/// The two readers see the same stream: a frame over `max` is
+/// `Oversize` in the resumable read and `TooLarge` in the fail-fast
+/// read — so fail-fast happens iff at least one oversize exists, and
+/// the fail-fast line count is a prefix of the resumable one.
+fn cross_check(frames: &FrameStats, lines: &FrameStats) {
+    assert_eq!(
+        lines.fail_fast,
+        frames.oversize > 0,
+        "reader disagreement: fail_fast={} vs oversize={}",
+        lines.fail_fast,
+        frames.oversize
+    );
+    assert!(lines.lines <= frames.lines + frames.oversize);
+}
+
+fn main() {
+    let args = mcp_writ_fuzz::parse_args("framing");
+    let g = Gates::default();
+    std::process::exit(mcp_writ_fuzz::run(
+        "framing",
+        &args,
+        gen_input,
+        |data| property(&g, data),
+        || {
+            assert!(g.cases.get() > 0, "no cases ran");
+            assert!(g.lines.get() > 0, "no in-limit frame seen");
+            assert!(g.oversize.get() > 0, "no oversized frame seen");
+            assert!(g.fail_fast.get() > 0, "fail-fast path never hit");
+            format!(
+                "lines={} oversize={} fail_fast={} unterminated={} partial={}",
+                g.lines.get(),
+                g.oversize.get(),
+                g.fail_fast.get(),
+                g.unterminated.get(),
+                g.partial_consume.get()
+            )
+        },
+    ));
+}
