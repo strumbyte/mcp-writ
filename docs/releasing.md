@@ -56,8 +56,17 @@ Windows, or macOS.
    Release run — a failure found there arrives after the tag is public.
    Then run `bash scripts/release-preflight.sh` on the commit: it exits
    non-zero unless all six workflows have a successful run on that exact
-   commit, and prints the run links to record. Per-test ownership of these
-   workflows is listed in the [test matrix](test-matrix.md).
+   commit, and prints the run links to record. CI, Linux tests, and MCP
+   server verification also run weekly on the default branch (PR-07):
+   confirm the latest `schedule`-triggered run of each succeeded on this
+   commit or one of its ancestors — a green scheduled run on the `main`
+   tip already satisfies the preflight for that workflow when the tag is
+   pushed there. A failed latest scheduled run is superseded only once
+   its cause has been investigated and found not to affect this release
+   — the successful dispatch verification on this exact commit then
+   stands in for it; an uninvestigated scheduled failure is not
+   superseded. Per-test ownership of these workflows is listed in the
+   [test matrix](test-matrix.md).
 3. Push a matching `v<version>` tag when ready to publish. The tag commit must
    be reachable from the default branch, and the pusher must hold admin/maintain
    permission — the Release workflow's `release-gate` job checks both through

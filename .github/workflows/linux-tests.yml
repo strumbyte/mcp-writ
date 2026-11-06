@@ -4,14 +4,20 @@
 #   - aarch64-gated unit tests (e.g. the aarch64 seccomp name resolution)
 #     running on real ARM hardware
 #
-# Manual dispatch only — no automatic triggers, matching the repo policy
-# of limiting GitHub Actions usage.
+# Manual dispatch plus the weekly schedule (PR-07): the aarch64 leg
+# leaves real-hardware evidence on the unreleased main tip. No
+# automatic PR triggers, matching the repo policy of limiting GitHub
+# Actions usage.
 
 name: Linux tests
 
 on:
   workflow_dispatch:
   workflow_call:
+  schedule:
+    # Weekly, Monday 03:17 UTC — `schedule` always targets the default
+    # branch (main).
+    - cron: '17 3 * * 1'
 
 permissions:
   contents: read

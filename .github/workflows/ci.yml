@@ -1,10 +1,15 @@
 # Automatic push/PR triggers stay off to limit GitHub Actions usage.
-# Run manually, or let Release call this verification workflow.
+# Run manually, let Release call this verification workflow, or let the
+# weekly schedule (PR-07) leave execution evidence for the unreleased
+# main tip — `schedule` always targets the default branch.
 name: CI
 
 on:
   workflow_dispatch:
   workflow_call:
+  schedule:
+    # Weekly, Monday 03:17 UTC — default branch (main).
+    - cron: '17 3 * * 1'
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

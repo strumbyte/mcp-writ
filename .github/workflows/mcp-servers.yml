@@ -1,10 +1,19 @@
 # Automatic push/PR triggers stay off to limit GitHub Actions usage.
-# This workflow is manual-dispatch only — Release does not call it.
-# Dispatch it on the release commit before tagging (docs/releasing.md).
+# Release does not call this workflow — dispatch it on the release
+# commit before tagging (docs/releasing.md). The weekly schedule
+# (PR-07) additionally runs it on the default branch: drift between
+# the pinned servers/toolchains and the hosted runner images is the
+# breakage the scheduled run exists to surface early (B-01), and a
+# scheduled failure arrives through Actions notifications rather than
+# at release-preflight.
 name: MCP server verification
 
 on:
   workflow_dispatch:
+  schedule:
+    # Weekly, Monday 03:17 UTC — `schedule` always targets the default
+    # branch (main).
+    - cron: '17 3 * * 1'
 
 concurrency:
   group: mcp-servers-${{ github.workflow }}-${{ github.ref }}
