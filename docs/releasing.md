@@ -24,7 +24,7 @@ Publish binary releases under this repository.
    project; workflow files alone do not require them before merging.
 5. Keep `SECURITY.md` in the published tree and confirm private
    vulnerability reporting is enabled on the destination repository
-   (repository Settings → Security and quality → Advanced Security →
+   (repository Settings → Advanced Security →
    Private vulnerability reporting),
    so the reporting channel it names actually exists.
 

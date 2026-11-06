@@ -418,7 +418,9 @@ replace them. Per host:
   `MCP_WRIT_PODMAN_EXE`, `MCP_WRIT_BUILDAH_EXE`,
   `MCP_WRIT_CONTAINER_EXE` each name one absolute path, validated
   under the caller class: every component of the resolved path must
-  be owned by the caller or root and carry no world-write bit — but
+  be owned by the caller or root, and world-write is refused on the
+  leaf always and on any non-sticky ancestor (a sticky world-writable
+  ancestor like `/tmp` is tolerated) — but
   on Unix a group-writable component still passes, since the caller's
   group is treated as sharing the caller's authority, so a *different*
   member of that group can replace the binary. Resolution
@@ -436,7 +438,9 @@ replace them. Per host:
   `%ProgramFiles%\WSL`, the Store package location, or System32 — so
   install WSL through the Store/`winget` channel rather than copying
   `wslc.exe` by hand. Fixture overrides exist for the helpers too —
-  `MCP_WRIT_WSL_EXE`, `MCP_WRIT_WSLC_EXE`, `MCP_WRIT_WSB_EXE` — under
+  `MCP_WRIT_WSL_EXE`, `MCP_WRIT_WSLC_EXE`, `MCP_WRIT_WSB_EXE`, plus the
+  diagnostics-probe overrides `MCP_WRIT_REG_EXE` and
+  `MCP_WRIT_PWSH_EXE` — under
   the same caller-class validation as the engine overrides.
 
 The two opt-outs differ in what they leave behind:

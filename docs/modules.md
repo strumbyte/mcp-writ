@@ -162,7 +162,8 @@ cleanup. The update points, in order:
    in revision × direction × kind form — rules may only target ledger
    methods; anything else is a load error in the parser and
    `unknown-method` fail-closed on the wire — plus `decide()`'s
-   default passage profile for the new revision.
+   default passage profile for the new revision (the `decide`
+   submodule lives in `src/policy/mcp/decide.rs`).
 3. Negotiation paths — the Legislator probe in
    `src/legislator/tools_list.rs` (`server/discover` on a disposable
    sibling process, `initialize` on a fresh child) and the Auditor's
