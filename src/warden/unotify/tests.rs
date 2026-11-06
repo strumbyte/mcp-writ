@@ -430,6 +430,13 @@ fn live_notification_round_trip() {
         },
         0
     );
+    // The filter program is built before the fork: a forked child of
+    // this multi-threaded test process must never allocate — a
+    // sibling thread holding the allocator lock across the fork
+    // deadlocks the child's first heap touch (the same rule
+    // `UnotifyChild::apply` documents). Panicking is equally unsafe —
+    // child-side errors report a diagnostic byte or exit bare.
+    let program = notify_program(&[CONNECT_NR]).unwrap();
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);
@@ -445,15 +452,30 @@ fn live_notification_round_trip() {
                 libc::_exit(0);
             }
         }
-        let program = notify_program(&[CONNECT_NR]).unwrap();
-        let listener = install_listener(&program).expect("install");
-        send_listener(pair[0], listener).expect("handoff");
+        let listener = match install_listener(&program) {
+            Ok(l) => l,
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            Err(_) => unsafe {
+                libc::send(pair[0], &b'I' as *const u8 as *const libc::c_void, 1, 0);
+                libc::_exit(1);
+            },
+        };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if send_listener(pair[0], listener).is_err() {
+            unsafe {
+                libc::close(listener);
+                libc::_exit(1);
+            }
+        }
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(listener) };
         // Trigger: connect to the discard port on loopback.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        assert!(s >= 0);
+        if s < 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::_exit(1) };
+        }
         let mut sa = [0u8; 16];
         sa[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
         sa[2..4].copy_from_slice(&9u16.to_be_bytes());
@@ -538,6 +560,9 @@ fn denied_connect_gets_eacces() {
         },
         0
     );
+    // Same pre-fork rule as the round-trip test — no allocation, no
+    // panicking inside the child.
+    let program = notify_program(&[CONNECT_NR]).unwrap();
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);
@@ -552,14 +577,29 @@ fn denied_connect_gets_eacces() {
                 libc::_exit(0);
             }
         }
-        let program = notify_program(&[CONNECT_NR]).unwrap();
-        let listener = install_listener(&program).expect("install");
-        send_listener(pair[0], listener).expect("handoff");
+        let listener = match install_listener(&program) {
+            Ok(l) => l,
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            Err(_) => unsafe {
+                libc::send(pair[0], &b'I' as *const u8 as *const libc::c_void, 1, 0);
+                libc::_exit(1);
+            },
+        };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if send_listener(pair[0], listener).is_err() {
+            unsafe {
+                libc::close(listener);
+                libc::_exit(1);
+            }
+        }
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(listener) };
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        assert!(s >= 0);
+        if s < 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::_exit(1) };
+        }
         let mut sa = [0u8; 16];
         sa[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
         sa[2..4].copy_from_slice(&9u16.to_be_bytes());
@@ -616,10 +656,10 @@ fn denied_connect_gets_eacces() {
 
 /// Emulated connect, happy path under a live rewrite: the child's
 /// connect reads its sockaddr from a MAP_SHARED page; once the
-/// notification arrives, a co-process rewrites the page to a different
-/// (refused) destination before the supervisor answers. Emulation
+/// notification arrives, the supervisor itself rewrites the page to a
+/// different (refused) destination before answering. Emulation
 /// replays the *pinned* bytes the verdict inspected, so the child's
-/// socket still lands on the original listener — under a
+/// socket still lands on the original listener — under a CONTINUE
 /// answer the kernel would instead consume the rewritten sockaddr and
 /// this connect would fail with ECONNREFUSED.
 ///
@@ -645,10 +685,17 @@ fn emulated_connect_uses_pinned_sockaddr() {
 /// the scenario's machinery broke before the verdict — a child dead
 /// before its notification existed (failed handoff, `ENOENT` on
 /// `NOTIF_RECV`), dying under it (unreadable sockaddr, emulation setup
-/// failure, `ENOENT` on `NOTIF_SEND`), never answering, or a dead
-/// rewriter — safe to retry after the child is reaped. Real assertion
-/// failures still panic; a deterministic bug fails all retries
-/// identically.
+/// failure, `ENOENT` on `NOTIF_SEND`), or never answering — safe to
+/// retry after the child is reaped. Real assertion failures still
+/// panic; a deterministic bug fails all retries identically.
+///
+/// The rewrite comes from the supervisor's own mapping of the shared
+/// page, not a co-process: the earlier design forked a rewriter
+/// grandchild off the notifying child, whose exit delivered SIGCHLD to
+/// the parked task — the signal interrupted the notification wait, the
+/// kernel discarded the notification, and `NOTIF_SEND` answered
+/// `ENOENT`. Under load the supervisor's answer routinely loses that
+/// race, so the clobber stays on this side of the fork.
 fn emulated_connect_attempt() -> bool {
     // Loopback listener: the pinned sockaddr's destination.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -671,7 +718,7 @@ fn emulated_connect_attempt() -> bool {
     assert_ne!(srv_port, 0);
 
     // Shared page the child's connect() reads its sockaddr from; the
-    // rewriter process flips it mid-notification.
+    // supervisor flips it mid-notification through its own mapping.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let page = unsafe {
         libc::mmap(
@@ -695,29 +742,27 @@ fn emulated_connect_attempt() -> bool {
     write_sa(srv_port);
 
     let mut res = [0 as RawFd; 2];
-    let mut trig = [0 as RawFd; 2];
-    for pair in [&mut res, &mut trig] {
-        assert_eq!(
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe {
-                libc::socketpair(
-                    libc::AF_UNIX,
-                    libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
-                    0,
-                    pair.as_mut_ptr(),
-                )
-            },
-            0
-        );
-    }
+    assert_eq!(
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                0,
+                res.as_mut_ptr(),
+            )
+        },
+        0
+    );
+    // Same pre-fork rule as the round-trip test — no allocation, no
+    // panicking inside the child.
+    let program = notify_program(&[CONNECT_NR]).unwrap();
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);
     if pid == 0 {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(res[1]) };
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { libc::close(trig[1]) };
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -726,31 +771,26 @@ fn emulated_connect_attempt() -> bool {
                 libc::_exit(0);
             }
         }
-        let program = notify_program(&[CONNECT_NR]).unwrap();
-        let listener = install_listener(&program).expect("install");
-        send_listener(res[0], listener).expect("handoff");
+        let listener = match install_listener(&program) {
+            Ok(l) => l,
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            Err(_) => unsafe {
+                libc::send(res[0], &b'I' as *const u8 as *const libc::c_void, 1, 0);
+                libc::_exit(1);
+            },
+        };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if send_listener(res[0], listener).is_err() {
+            unsafe {
+                libc::close(listener);
+                libc::_exit(1);
+            }
+        }
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(listener) };
-        // Rewriter: waits for the supervisor's trigger, then flips the
-        // shared sockaddr to 127.0.0.1:1 (guaranteed refused) — the
-        // window a CONTINUE answer would expose.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let rw = unsafe { libc::fork() };
-        if rw < 0 {
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { libc::_exit(1) };
-        }
-        if rw == 0 {
-            let mut b = [0u8; 1];
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            if unsafe { libc::recv(trig[0], b.as_mut_ptr().cast(), 1, 0) } == 1 {
-                write_sa(1);
-            }
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { libc::_exit(0) };
-        }
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { libc::close(trig[0]) };
+        // No second fork on this side — a notifying child's child
+        // would deliver SIGCHLD to it on exit, interrupting the
+        // parked connect (see the function doc).
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         if s < 0 {
@@ -775,24 +815,17 @@ fn emulated_connect_attempt() -> bool {
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(res[0]) };
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe { libc::close(trig[0]) };
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let sock = unsafe { File::from_raw_fd(res[1]) };
     // Tear down an attempt whose child is presumed dead (or parked on
-    // a notification the kernel already discarded): wake the rewriter
-    // grandchild off its `recv(trig[0])` first — an early-failed
-    // attempt never sent the 'X' trigger, and `close(trig[1])` alone
-    // only reaches it via EOF — then kill any survivor, reap it, and
-    // release this attempt's resources. The `sock` and `listener`
-    // Files close on scope exit.
+    // a notification the kernel already discarded): kill any survivor,
+    // reap it, and release this attempt's resources. The `sock` and
+    // `listener` Files close on scope exit.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let reap = |pid: libc::pid_t| unsafe {
-        let _ = libc::send(trig[1], &b'X' as *const u8 as *const libc::c_void, 1, 0);
         libc::kill(pid, libc::SIGKILL);
         let mut status = 0;
         libc::waitpid(pid, &mut status, 0);
         libc::close(srv);
-        libc::close(trig[1]);
         libc::munmap(page.cast(), 4096);
     };
     // A handoff that never lands is the same dead-task race — the
@@ -806,6 +839,17 @@ fn emulated_connect_attempt() -> bool {
     };
     let listener = match (UnotifyParent { sock: cloned }).recv_listener() {
         Ok(l) => l,
+        // A datagram that arrived without an fd is the child's own
+        // diagnostic ('N': no_new_privs refused, 'I': filter install
+        // failed) — a deterministic setup failure, not a race:
+        // retrying would only reproduce it, so report the cause
+        // instead of masking it behind the retry-exhaustion message.
+        // (InvalidData also covers a truncated control block — equally
+        // non-transient.)
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            reap(pid);
+            panic!("deterministic child-side setup failure: {e}");
+        }
         Err(_) => {
             reap(pid);
             return false;
@@ -856,15 +900,10 @@ fn emulated_connect_attempt() -> bool {
         }
         other => panic!("sockaddr decode failed: {other:?}"),
     };
-    // Let the rewriter clobber the child's buffer *after* inspection.
-    // A refused send means the rewriter's read end died — the same
-    // machinery race as a dead notified task.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    if unsafe { libc::send(trig[1], &b'X' as *const u8 as *const libc::c_void, 1, 0) } != 1 {
-        reap(pid);
-        return false;
-    }
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Clobber the child's buffer *after* inspection, through the
+    // supervisor's own mapping — the rewrite a CONTINUE answer would
+    // consume (127.0.0.1:1, guaranteed refused).
+    write_sa(1);
     // Emulate: dup the child's socket, connect on the pinned bytes. A
     // dead child fails the pidfd dup — the same death race.
     let errno = match emulate_connect(notif.pid, notif.data.args[0], &raw) {
@@ -910,8 +949,6 @@ fn emulated_connect_attempt() -> bool {
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(srv) };
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe { libc::close(trig[1]) };
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::munmap(page.cast(), 4096) };
     true
 }
@@ -936,6 +973,9 @@ fn emulated_connect_propagates_errno() {
         },
         0
     );
+    // Same pre-fork rule as the round-trip test — no allocation, no
+    // panicking inside the child.
+    let program = notify_program(&[CONNECT_NR]).unwrap();
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);
@@ -948,14 +988,29 @@ fn emulated_connect_propagates_errno() {
                 libc::_exit(0);
             }
         }
-        let program = notify_program(&[CONNECT_NR]).unwrap();
-        let listener = install_listener(&program).expect("install");
-        send_listener(pair[0], listener).expect("handoff");
+        let listener = match install_listener(&program) {
+            Ok(l) => l,
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            Err(_) => unsafe {
+                libc::send(pair[0], &b'I' as *const u8 as *const libc::c_void, 1, 0);
+                libc::_exit(1);
+            },
+        };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if send_listener(pair[0], listener).is_err() {
+            unsafe {
+                libc::close(listener);
+                libc::_exit(1);
+            }
+        }
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(listener) };
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        assert!(s >= 0);
+        if s < 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::_exit(1) };
+        }
         // 127.0.0.1:1 — nothing listens; ECONNREFUSED.
         let mut sa = [0u8; 16];
         sa[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
