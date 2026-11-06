@@ -20,11 +20,10 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use mcp_writ::fuzz::{
-        DNS_TCP_NAT_PORT, GATEWAY_V4, GATEWAY_V6, NatProbe, TCP_NAT_PORT, TunClassified,
-        WORKLOAD_V4, WORKLOAD_V6, craft_udp_reply, dns_parse_query, tun_classify, tun_tcp_tuple,
+        ALLOC_BASE, DNS_TCP_NAT_PORT, GATEWAY_V4, GATEWAY_V6, NatProbe, TCP_NAT_PORT,
+        TunClassified, WORKLOAD_V4, WORKLOAD_V6, craft_udp_reply, dns_parse_query, tun_classify,
+        tun_tcp_tuple,
     };
-
-    const ALLOC_BASE: u16 = 49152;
 
     #[derive(Default)]
     pub struct Gates {
@@ -179,7 +178,13 @@ mod imp {
         f.push(next);
         f.push(64); // hop limit
         let src = if workload_src || noprop::sample_ratio(ctx, noprop::Ratio::new(1, 4)) {
-            WORKLOAD_V6
+            // Both mintable v6 source forms: the fixed v6 address and
+            // the v4-mapped spelling a v6 socket uses for `::ffff:<v4>`.
+            if noprop::sample_bool(ctx) {
+                WORKLOAD_V6
+            } else {
+                WORKLOAD_V4.to_ipv6_mapped()
+            }
         } else {
             v6(ctx)
         };
@@ -280,7 +285,7 @@ mod imp {
     /// Flip src/dst addrs + ports of a bare TCP packet in place — the
     /// shape a stack reply takes.
     fn swap_tcp(f: &mut [u8]) {
-        if f.first().is_none_or(|b| b >> 4 == 4) {
+        if f.first().is_some_and(|b| b >> 4 == 4) && f.len() >= 20 {
             for i in 0..4 {
                 f.swap(12 + i, 16 + i);
             }
@@ -308,6 +313,7 @@ mod imp {
         match tun_classify(frame, intercept) {
             TunClassified::Tcp { len } => {
                 assert!(len <= frame.len(), "TCP capture exceeded frame");
+                assert!(len >= 40, "TCP capture below the header minimum");
                 g.tcp.set(g.tcp.get() + 1);
                 let orig = tun_tcp_tuple(frame);
                 let mut f = frame.to_vec();

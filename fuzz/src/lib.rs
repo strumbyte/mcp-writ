@@ -160,13 +160,20 @@ where
                         args,
                         &last.into_inner(),
                         &format!("coverage gate: {msg}"),
+                        false,
                     );
                     1
                 }
             }
         }
         Err(e) => {
-            fail(name, args, &last.into_inner(), &e.to_string());
+            fail(
+                name,
+                args,
+                &last.into_inner(),
+                &e.to_string(),
+                e.kind() == noprop::RunErrorKind::PropertyFailure,
+            );
             eprintln!("{e}");
             1
         }
@@ -185,7 +192,12 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// Write `<name>.bin` (the exact failing input — `--replay` it) and
 /// `<name>.txt` (seed, budget, replay hint) under `args.crash_dir`.
-fn fail(name: &str, args: &Args, input: &[u8], detail: &str) {
+/// `input_is_witness` distinguishes the failure modes: a property
+/// failure makes the recorded input a real reproducer, while a
+/// coverage-gate or rejection-limit failure is a generator shortfall
+/// — the `.bin` then holds the last *accepted* case and a `--replay`
+/// is expected to pass.
+fn fail(name: &str, args: &Args, input: &[u8], detail: &str, input_is_witness: bool) {
     // Shell-quote the replay path so a crash dir containing spaces still
     // parses as one argument; escape `\` first so it cannot eat the
     // closing quote, then the double-quote metacharacters.
@@ -200,9 +212,18 @@ fn fail(name: &str, args: &Args, input: &[u8], detail: &str) {
             .replace('$', "\\$")
             .replace('`', "\\`")
     );
+    let replay = if input_is_witness {
+        format!(
+            "replay: cargo run --release --manifest-path fuzz/Cargo.toml --bin {name} -- --replay {bin}"
+        )
+    } else {
+        format!(
+            "note:   {name}.bin is the last accepted input, not a failing witness — --replay is expected to pass"
+        )
+    };
     let report = format!(
         "target: {name}\nseed: {:#018x}\ncases: {}\ndetail: {detail}\n\n\
-         replay: cargo run --release --manifest-path fuzz/Cargo.toml --bin {name} -- --replay {bin}\n\
+         {replay}\n\
          rerun:  {SEED_ENV}={:#018x} cargo run --release --manifest-path fuzz/Cargo.toml --bin {name} -- --cases {}\n",
         args.seed, args.cases, args.seed, args.cases
     );

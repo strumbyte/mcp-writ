@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 /// First translated source port — stack-side only, so the ordinary
 /// ephemeral range is free (collisions are resolved by scanning).
-const ALLOC_BASE: u16 = 49152;
+pub(crate) const ALLOC_BASE: u16 = 49152;
 
 /// Hard cap on live NAT mappings. Every SYN that mints a flow is
 /// workload-controlled; without a ceiling a SYN flood exhausts the

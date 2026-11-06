@@ -283,6 +283,17 @@ fn property(g: &Gates, data: &[u8]) {
     if s.tools_page_ok {
         assert!(s.valid_json, "tools page accepted on invalid JSON");
     }
+    // Every extractor early-returns on `RawJson::parse` failure — any
+    // verdict or member from them implies the line parsed.
+    let extracted = s.is_response
+        || s.is_notification
+        || s.id.is_some()
+        || s.error_code.is_some()
+        || s.initialize_result_version.is_some();
+    assert!(
+        !extracted || s.valid_json,
+        "extractor verdict on invalid JSON"
+    );
     assert!(s.input_request_entries <= 64, "inputRequests cap exceeded");
     g.cases.set(g.cases.get() + 1);
     g.valid.set(g.valid.get() + usize::from(s.valid_json));

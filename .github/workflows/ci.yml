@@ -65,6 +65,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # The fuzz package is outside `default-members`, so the clippy
+      # run above never builds it — lint it explicitly or a façade-API
+      # drift would only surface at the next manual fuzz.yml dispatch.
+      - name: Fuzz targets
+        run: cargo clippy --locked --all-targets --manifest-path fuzz/Cargo.toml -- -D warnings
+
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings

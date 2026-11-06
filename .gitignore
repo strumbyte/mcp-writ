@@ -4,9 +4,11 @@
 mcp-writ-target/
 
 # Crash inputs recorded by the boundary fuzz targets (crash-dir is
-# relative to the cwd the target ran from — cover both spots)
+# relative to the cwd the target ran from — cover both spots), plus
+# the per-target run logs the workflow tees out
 /fuzz-artifacts/
 /fuzz/fuzz-artifacts/
+/fuzz-logs/
 
 # Local publication backups and private working notes
 /.local/

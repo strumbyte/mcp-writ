@@ -581,6 +581,9 @@ mod ns {
     pub const GATEWAY_V6: std::net::Ipv6Addr = crate::warden::namespaced::GATEWAY_V6;
     pub const TCP_NAT_PORT: u16 = crate::warden::namespaced::TCP_NAT_PORT;
     pub const DNS_TCP_NAT_PORT: u16 = crate::warden::namespaced::DNS_TCP_NAT_PORT;
+    /// First allocatable stack-side source port (`nat::ALLOC_BASE`) —
+    /// the minted-port lower bound the harness asserts.
+    pub const ALLOC_BASE: u16 = crate::warden::namespaced::nat::ALLOC_BASE;
 }
 
 #[cfg(target_os = "linux")]

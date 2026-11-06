@@ -1,5 +1,6 @@
-# Boundary fuzzing — manual dispatch only (push/PR triggers stay
-# off like every other verification workflow here). Four noprop-driven
+# Boundary fuzzing — manual dispatch only, like the repo's other
+# verification workflows (the always-on pull-request gate lives in
+# pr-checks.yml). Four noprop-driven
 # targets cover the first attacker-input boundaries: framing, JSON-RPC
 # interpretation, the namespaced proxy packet parsers, and the DNS
 # gate wire parsers. The namespaced target is Linux-only code, so the

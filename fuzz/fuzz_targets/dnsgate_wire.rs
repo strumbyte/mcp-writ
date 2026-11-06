@@ -262,6 +262,25 @@ fn property(g: &Gates, data: &[u8]) {
     // ---- query boundary (workload → gate) ----
     if let mcp_writ::fuzz::DnsQueryOutcome::Ok(q) = mcp_writ::fuzz::dns_parse_query(msg) {
         g.query_ok.set(g.query_ok.get() + 1);
+        // The section walk only moves forward and never past the buffer.
+        assert!(
+            q.question_end <= q.additional_start && q.additional_start <= msg.len(),
+            "section offsets out of order"
+        );
+        // `flags_relay`/`arcount` are the header words masked/copied —
+        // they must agree with the wire bytes.
+        assert_eq!(
+            q.flags_relay,
+            u16::from_be_bytes([msg[2], msg[3]]) & 0x0130,
+            "relay flags diverged from the header mask"
+        );
+        assert_eq!(
+            q.arcount,
+            u16::from_be_bytes([msg[10], msg[11]]),
+            "arcount diverged from the header"
+        );
+        // An OPT can only be seen if the additional section held one.
+        assert!(q.edns_udp_size.is_none() || q.arcount >= 1);
         // Forward composition must re-parse as a query.
         if let Some(fwd) = mcp_writ::fuzz::dns_forward_query(msg, &name) {
             g.forwarded.set(g.forwarded.get() + 1);
@@ -305,6 +324,13 @@ fn property(g: &Gates, data: &[u8]) {
     g.chained
         .set(g.chained.get() + usize::from(!resp.chain.is_empty()));
     assert!(resp.chain.len() <= 16, "alias chain escaped its bound");
+    if resp.chain_truncated {
+        assert_eq!(
+            resp.chain.len(),
+            16,
+            "chain flagged truncated below the depth bound"
+        );
+    }
     let _ = mcp_writ::fuzz::dns_response_truncated(msg);
     if msg.len() >= 12 {
         let id = u16::from_be_bytes([msg[0], msg[1]]);
