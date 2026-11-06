@@ -483,7 +483,9 @@ pub struct LoadWarning {
     /// transport); `replaced` — an overlay declaration dropped
     /// inherited entries; `inbound` — a `defaults.network`
     /// re-declaration skipped `inbound` while a listener grant stayed
-    /// live; `posture` — a declaration weakened a fail-secure setting.
+    /// live; `posture` — a declaration weakened a fail-secure setting;
+    /// `shadowed-allow` — a tool-level `network` block declared
+    /// `deny host="*"` beside allow rules the wildcard already covers.
     pub kind: LoadWarningKind,
     /// The file whose declaration the warning names.
     pub file: PathBuf,
@@ -498,6 +500,7 @@ pub enum LoadWarningKind {
     Replaced,
     Inbound,
     Posture,
+    ShadowedAllow,
 }
 
 impl LoadWarningKind {
@@ -507,6 +510,7 @@ impl LoadWarningKind {
             Self::Replaced => "replaced",
             Self::Inbound => "inbound",
             Self::Posture => "posture",
+            Self::ShadowedAllow => "shadowed-allow",
         }
     }
 }

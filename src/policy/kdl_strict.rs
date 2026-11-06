@@ -676,7 +676,7 @@ fn check_layer_children(cx: &mut Check<'_>, node: &KdlNode, ctx: &str) -> Result
         match name.as_str() {
             "filesystem" => check_fs_entries(cx, child)?,
             "syscalls" => check_list_entries(cx, child, "syscalls")?,
-            "network" => check_network_entries(cx, child)?,
+            "network" => check_tool_network_entries(cx, child, ctx)?,
             _ => {}
         }
     }
@@ -727,9 +727,78 @@ fn check_tool_node(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyError
             "profile" | "profiles" => check_profile_ref(cx, child, cx.version)?,
             "filesystem" => check_fs_entries(cx, child)?,
             "syscalls" => check_list_entries(cx, child, "syscalls")?,
-            "network" => check_network_entries(cx, child)?,
+            "network" => check_tool_network_entries(
+                cx,
+                child,
+                &format!(
+                    "tool '{}'",
+                    node.get(0)
+                        .and_then(|v| v.as_string())
+                        .unwrap_or("<unnamed>")
+                ),
+            )?,
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// Tool-level `network` checks — the duplicate scan every `network`
+/// block gets, plus a warning only tool-level blocks can raise: at
+/// this level `host="*"` is an ordinary wildcard rule, not a posture,
+/// so a `deny host="*"` beside `allow` entries is evaluated before
+/// them and covers them all — the allow list is already closed. The
+/// declaration is almost always a misread of the defaults-level
+/// posture spelling, so the load warns (never a schema error) and
+/// `check`/`run` name the dead allow entries. A `deny` carrying
+/// `proto=`/`port=` is a parse error upstream, and a qualified
+/// `host="*"` cannot appear on `deny`, so the wildcard is always the
+/// bare form here.
+///
+/// Scope is deliberately the single block — the declaration-site
+/// contradiction D-1 names. Cross-layer shadowing (a `deny host="*"`
+/// in `server-defaults` covering an `allow` the tool block adds, and
+/// vice versa) composes at load and is out of scope here; a lone
+/// `deny host="*"` with no sibling allow is "close this tool's
+/// egress", which reads coherently and is not warned.
+fn check_tool_network_entries(
+    cx: &mut Check<'_>,
+    node: &KdlNode,
+    ctx: &str,
+) -> Result<(), PolicyError> {
+    check_network_entries(cx, node)?;
+    let Some(children) = node.children() else {
+        return Ok(());
+    };
+    let mut wildcard_deny: Option<&KdlNode> = None;
+    let mut has_allow = false;
+    for child in children.nodes() {
+        match child.name().value() {
+            "deny" => {
+                if wildcard_deny.is_none()
+                    && child
+                        .get("host")
+                        .and_then(|v| v.as_string())
+                        .is_some_and(|h| h == "*")
+                {
+                    wildcard_deny = Some(child);
+                }
+            }
+            "allow" => has_allow = true,
+            _ => {}
+        }
+    }
+    if let (Some(deny), true) = (wildcard_deny, has_allow) {
+        cx.warnings.push(LoadWarning {
+            kind: LoadWarningKind::ShadowedAllow,
+            file: cx.file.to_path_buf(),
+            line: cx.line(deny),
+            message: format!(
+                "{ctx}: tool-level 'deny host=\"*\"' is an ordinary wildcard rule \
+                 evaluated before every allow in this block — the allow list is \
+                 already closed; remove the deny"
+            ),
+        });
     }
     Ok(())
 }

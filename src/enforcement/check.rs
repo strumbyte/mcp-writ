@@ -194,8 +194,10 @@ pub struct MigrationRecord {
 pub struct PolicyWarningRecord {
     /// `schema` (a v1 laxity the v2 grammar refuses), `replaced` (an
     /// overlay dropped inherited entries), `inbound` (a `defaults.network`
-    /// re-declaration kept a live listener grant), or `posture` (a
-    /// fail-secure setting was weakened).
+    /// re-declaration kept a live listener grant), `posture` (a
+    /// fail-secure setting was weakened), or `shadowed-allow` (a
+    /// tool-level `deny host="*"` covers every allow in its block —
+    /// the list is already closed and the deny misleads).
     pub kind: String,
     /// The file whose declaration the warning names.
     pub file: String,

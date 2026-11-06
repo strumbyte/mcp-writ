@@ -92,12 +92,13 @@ pub async fn run_generate_policy(args: GenPolicyArgs) {
         Some(crate::legislator::project_hints::analyze_project(&dir))
     });
 
-    let policy_kdl = crate::legislator::policy_generator::generate_policy(
+    let policy_kdl = crate::legislator::policy_generator::generate_policy_with_version(
         &validation,
         &capability,
         project_hint.as_ref(),
         tools,
         &workload,
+        args.policy_version,
     );
 
     match args.output {

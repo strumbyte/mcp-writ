@@ -2505,3 +2505,166 @@ fn grant_covered_respects_grant_mode() {
     assert!(grant_covered(Path::new("rw-grant/null"), &granted, "read"));
     assert!(grant_covered(Path::new("rw-grant/null"), &granted, "write"));
 }
+
+// ── PR-06: `--policy-version` draft versioning + the B-02 require-path trap ──
+
+/// The capability shape the B-02 tests share: `FileRead` grounded on
+/// `/usr/lib` strings so the draft's `defaults.filesystem` carries a
+/// real `allow` — the grant a v3 union would inherit into a tool's
+/// `require-path #false` block.
+fn b02_capability_and_result() -> (CapabilityProfile, CrossValidationResult) {
+    let cap = make_capability(
+        RiskFlags {
+            file_system: true,
+            ..Default::default()
+        },
+        &["read", "openat"],
+        vec![],
+        vec!["/usr/lib/libssl.so"],
+    );
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::FileRead,
+            Some("read_file"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+    (cap, result)
+}
+
+/// Put a `filesystem` block on the draft's `read_file` tool — the
+/// generated template emits it as a bare `side_effect` line.
+fn with_tool_fs_block(kdl: &str, fs_block: &str) -> String {
+    let tool_line = "tool \"read_file\" side_effect=\"read_only\"";
+    assert!(
+        kdl.contains(tool_line),
+        "generated template shape changed — tool line missing:\n{kdl}"
+    );
+    kdl.replacen(
+        tool_line,
+        &format!("tool \"read_file\" {{\n{fs_block}\n    }}"),
+        1,
+    )
+}
+
+/// `parse_kdl_policy_with_profiles` under an explicit composition-rules
+/// version — `None` replays the document's declared version.
+fn compose(
+    kdl: &str,
+    rules: Option<u32>,
+) -> Result<crate::policy::Policy, crate::error::PolicyError> {
+    crate::policy::kdl_loader::parse_kdl_policy_with_profiles(
+        kdl,
+        &HashMap::new(),
+        None,
+        &mut Vec::new(),
+        rules,
+    )
+}
+
+/// Default output is byte-identical to `--policy-version 2`: the
+/// opt-in flag must not move the v2 draft by one byte.
+#[test]
+fn policy_version_2_is_the_default_and_unchanged() {
+    let (cap, result) = b02_capability_and_result();
+    let default = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
+    let explicit_v2 =
+        generate_policy_with_version(&result, &cap, None, &[], &WorkloadHashes::default(), 2);
+    assert!(default.contains("policy version=2\n"), "{default}");
+    assert_eq!(default, explicit_v2);
+}
+
+/// The v3 draft is byte-identical to the default draft apart from the
+/// declared version line — the compatibility property a snapshot of
+/// the prior output would pin, stated here as the delta between the
+/// two generated outputs (the emitted body carries no
+/// version-sensitive spelling either grammar rejects).
+#[test]
+fn policy_version_3_differs_only_in_the_version_line() {
+    let (cap, result) = b02_capability_and_result();
+    let v2 = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
+    let v3 = generate_policy_with_version(&result, &cap, None, &[], &WorkloadHashes::default(), 3);
+    assert_eq!(
+        v2.replacen("policy version=2\n", "policy version=3\n", 1),
+        v3,
+        "the v3 draft must differ only in the declared version:\n{v3}"
+    );
+}
+
+/// `--policy-version 3` emits a draft that declares `version=3` and
+/// loads under v3 grammar outright — `check` then reports
+/// `migration: null` rather than simulating a v2 draft under v3 rules.
+#[test]
+fn policy_version_3_draft_declares_v3_and_loads() {
+    let (cap, result) = b02_capability_and_result();
+    let kdl = generate_policy_with_version(&result, &cap, None, &[], &WorkloadHashes::default(), 3);
+    assert!(kdl.contains("policy version=3\n"), "{kdl}");
+    let policy = compose(&kdl, None).unwrap_or_else(|e| panic!("v3 draft must load: {e}\n{kdl}"));
+    assert_eq!(policy.version, 3);
+}
+
+/// B-02: the v2-spelling `filesystem { allow none=#true;
+/// require-path #false }` is valid on its declared version, but the
+/// same draft composed under v3 rules unions the inherited defaults
+/// grant into the tool's allow side — `require-path #false` then fails
+/// for lack of an explicitly empty allow list. The regression report's
+/// "v2 draft read under v3 fails" event, reproduced on the generated
+/// template.
+#[test]
+fn b02_v2_require_path_block_fails_under_v3_rules() {
+    let (cap, result) = b02_capability_and_result();
+    let kdl = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
+    let edited = with_tool_fs_block(
+        &kdl,
+        "        filesystem {\n            allow none=#true\n            require-path #false\n        }",
+    );
+
+    // Declared v2 rules: the block composes exactly as written.
+    compose(&edited, None)
+        .unwrap_or_else(|e| panic!("v2 draft must load under v2 rules: {e}\n{edited}"));
+    // Simulated v3 rules (what `check`'s migration preview runs): the
+    // defaults grant unions in and the validator refuses.
+    let err = compose(&edited, Some(3))
+        .expect_err("B-02: v2 require-path spelling must fail under v3 rules");
+    assert!(
+        err.to_string()
+            .contains("require-path #false requires an explicitly empty allow-list"),
+        "B-02 failure must name the missing allow none=#true: {err}"
+    );
+}
+
+/// The v3-correct spelling replaces the inherited allow side
+/// (`replace=#true`) and declares the empty allow list explicitly —
+/// and the bare v2 spelling is refused at the v3 grammar so a stale
+/// draft cannot silently widen.
+#[test]
+fn b02_v3_spelling_replaces_and_declares_none() {
+    let (cap, result) = b02_capability_and_result();
+    let kdl = generate_policy_with_version(&result, &cap, None, &[], &WorkloadHashes::default(), 3);
+
+    // `filesystem replace=#true { allow none=#true; require-path
+    // #false }` — the inherited grant is dropped, pathless calls stay
+    // granted, the empty allow list is explicit.
+    let corrected = with_tool_fs_block(
+        &kdl,
+        "        filesystem replace=#true {\n            allow none=#true\n            require-path #false\n        }",
+    );
+    compose(&corrected, None)
+        .unwrap_or_else(|e| panic!("v3-corrected draft must load: {e}\n{corrected}"));
+
+    // The v2 spelling inside a v3 document is a grammar error — not a
+    // silent union.
+    let bare = with_tool_fs_block(
+        &kdl,
+        "        filesystem {\n            allow none=#true\n            require-path #false\n        }",
+    );
+    let err = compose(&bare, None)
+        .expect_err("bare 'allow none=#true' must require replace=#true under v3");
+    assert!(
+        err.to_string()
+            .contains("requires 'replace=#true' under policy version 3"),
+        "the v3 grammar must refuse the v2 spelling: {err}"
+    );
+}

@@ -270,6 +270,9 @@ pub struct GenPolicyArgs {
     pub binary_path: Option<PathBuf>,
     pub output: Option<PathBuf>,
     pub verbose: u8,
+    /// `policy version=` the draft declares (`--policy-version`,
+    /// default 2 — the v2 output is unchanged; 3 emits a v3 draft).
+    pub policy_version: u32,
     pub static_only: bool,
     pub unsafe_unsandboxed_discovery: bool,
     pub self_test: bool,
