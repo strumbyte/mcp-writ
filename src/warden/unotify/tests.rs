@@ -460,8 +460,8 @@ fn live_notification_round_trip() {
                 libc::_exit(1);
             },
         };
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if send_listener(pair[0], listener).is_err() {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::close(listener);
                 libc::_exit(1);
@@ -585,8 +585,8 @@ fn denied_connect_gets_eacces() {
                 libc::_exit(1);
             },
         };
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if send_listener(pair[0], listener).is_err() {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::close(listener);
                 libc::_exit(1);
@@ -779,8 +779,8 @@ fn emulated_connect_attempt() -> bool {
                 libc::_exit(1);
             },
         };
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if send_listener(res[0], listener).is_err() {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::close(listener);
                 libc::_exit(1);
@@ -996,8 +996,8 @@ fn emulated_connect_propagates_errno() {
                 libc::_exit(1);
             },
         };
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if send_listener(pair[0], listener).is_err() {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::close(listener);
                 libc::_exit(1);
