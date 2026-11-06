@@ -258,6 +258,46 @@ graph LR
 - Policies are isolated only as far as their configured paths and permissions allow: with non-overlapping grants (as in this example), the filesystem server cannot access git repos and the git server cannot run SQL
 - Review shared writable paths, credentials, and network grants across server policies
 
+### In series with a remote MCP gateway
+
+Organizations that front MCP traffic with a remote gateway product —
+authentication, centralized management, response inspection — can keep
+mcp-writ in the same path, on the host where the server runs:
+
+```mermaid
+graph LR
+    RC["Remote MCP client"] -->|"HTTPS / SSE"| GW["Remote MCP gateway"]
+    GW -->|"local stdio spawn"| MW["mcp-writ run<br/>Auditor + Warden"]
+    MW --> SRV["Local MCP server"]
+```
+
+**Key points:**
+- Configure the gateway's local-server integration to launch `mcp-writ
+  run --policy … --audit-log … -- <command>` as the stdio upstream —
+  one guard per server, each with its own policy, the same shape as
+  the multi-server deployment above. mcp-writ speaks stdio only; the
+  remote transport terminates at the gateway, never at the guard.
+- **The gateway's job:** remote transport termination, client
+  authentication and authorization, centralized catalog/policy
+  distribution, response inspection and DLP, fleet-wide telemetry.
+- **mcp-writ's job:** per-host enforcement next to the server — the OS
+  sandbox around the spawned child, `tools/list` verification, the
+  per-tool allowlist and argument checks, the secret overlay, and the
+  session audit log written on the server's own host.
+- **Boundary:** the gateway sees RPC payloads but not the server
+  process; mcp-writ sees the forwarded JSON-RPC stream but not the
+  remote principal — per-principal access is the gateway's call,
+  per-process containment is mcp-writ's. Neither substitutes for the
+  other: a gateway that filters tool calls cannot sandbox the child,
+  and the guard cannot authenticate a remote caller.
+- **Per-client separation:** one `mcp-writ run` wraps one stdio
+  session and one child, so a gateway multiplexing several remote
+  clients over that session shares the child's process-local state —
+  `confused_deputy_protection`'s `known_paths` set and the trajectory
+  check's last-side_effect are per process, not per client. When
+  either must be client-specific, run a separate guard + child per
+  client rather than multiplexing.
+
 ### Execution methods and support status
 
 `run` launches a host command, `run-image` launches a wrapped image, and
@@ -359,6 +399,73 @@ downgrades *every* driver resolution to the caller class for test rigs
 and installs that run engines from user-owned prefixes — a production
 launch must never set it, since it re-opens exactly the
 pre-containment substitution this hardening closes.
+
+**Driver placement (operations).** The provenance rule above means the
+engine binaries themselves must live where only an administrator can
+replace them. Per host:
+
+- **Linux:** install the engine through the system package manager so
+  it lands under `/usr/bin` — root-owned, writable by neither group
+  nor other. Distribution or upstream `apt`/`dnf` packages for
+  `docker`, `podman`, and `buildah` satisfy this; user-prefix installs
+  (`~/.local/bin`, cargo/pipx shims, hand-copied binaries under a home
+  directory, `root:staff`-style group-writable directories) do not.
+- **macOS:** Homebrew's `/opt/homebrew/bin` is owned by the installing
+  user, so an engine placed there fails administrator provenance and
+  the launch refuses rather than falls through. Install the engine
+  through a package that lands under an administrator-controlled root,
+  or pin the exact binary per driver — `MCP_WRIT_DOCKER_EXE`,
+  `MCP_WRIT_PODMAN_EXE`, `MCP_WRIT_BUILDAH_EXE`,
+  `MCP_WRIT_CONTAINER_EXE` each name one absolute path, validated
+  under the caller class: every component of the resolved path must
+  be owned by the caller or root, and world-write is refused on the
+  leaf always and on any non-sticky ancestor (a sticky world-writable
+  ancestor like `/tmp` is tolerated) — but
+  on Unix a group-writable component still passes, since the caller's
+  group is treated as sharing the caller's authority, so a *different*
+  member of that group can replace the binary. Resolution
+  canonicalizes the spelling first and checks the resolved target —
+  keep both the spelled override chain and the resolved target's
+  ancestry group-write-free whenever the group holds other users. An
+  invalid or relative override is a hard error for that driver, never
+  a fall-through to PATH — but under auto-detection it removes only
+  that engine from contention: a bad `MCP_WRIT_DOCKER_EXE` still lets
+  podman or buildah be selected, so pass `--engine docker` when Docker
+  specifically must serve.
+  Apple's `container` tool — the `apple-container` driver — follows
+  the same rule.
+- **Windows:** keep engines under `%ProgramFiles%` (Docker Desktop's
+  default install root) or another Administrators- /
+  SYSTEM-/TrustedInstaller-controlled tree. OS helpers never resolve
+  through PATH anyway — `wsl`/`wslc`/`wsb` come only from
+  `%ProgramFiles%\WSL`, the Store package location, or System32 — so
+  install WSL through the Store/`winget` channel rather than copying
+  `wslc.exe` by hand. Fixture overrides exist for the helpers too —
+  `MCP_WRIT_WSL_EXE`, `MCP_WRIT_WSLC_EXE`, `MCP_WRIT_WSB_EXE`, plus the
+  diagnostics-probe overrides `MCP_WRIT_REG_EXE` and
+  `MCP_WRIT_PWSH_EXE` — under
+  the same caller-class validation as the engine overrides.
+
+The two opt-outs differ in what they leave behind:
+`MCP_WRIT_ALLOW_REPLACEABLE_PATHS` — the waiver for
+replaceable-ancestry and trusted-source checks on authorized paths,
+policy/`@file` sources, entrypoint scripts, the audit sink, and
+report destinations (never driver provenance) — *is* recorded: the
+launch report carries the `allow_replaceable_paths` field (`true`
+only on the native `run` report — `run-image` and guest reports
+write `false` unconditionally, and host-side checks still honor the
+variable there, so `false` does not prove the opt-out was unarmed)
+and `server.connected` carries the `allow_replaceable_paths=true`
+token — again native `run` only, since `run-image`'s record comes
+from the guest runner, which strips the opt-out names before
+emitting it, so a missing token does not prove host checks stood —
+while `MCP_WRIT_ALLOW_REPLACEABLE_DRIVERS` has no dedicated
+report field: its only trace is a caller-managed driver resolving
+where provenance would have refused. `plan`'s `engine.resolve`
+check records the accepted engine's *name* only — it cannot attest
+the driver path or which trust class validated it, so review the
+launch environment and resolved path separately. Keep both opt-outs
+out of production launches.
 
 **Machine-readable matrix.** `mcp-writ capability-matrix` prints the
 same claims as JSON — one row per sandbox mechanism with its egress-layer
@@ -954,6 +1061,7 @@ A launch report carries:
 | `target` | `host_os`, `substrate_os`, `workload_os`, `workload_arch`, `substrate`, `engine` |
 | `policy` | Bound policy `{id, version, hash}` or `null` |
 | `dry_run` | Whether the session ran unsandboxed |
+| `allow_replaceable_paths` | Whether the `MCP_WRIT_ALLOW_REPLACEABLE_PATHS` opt-out — waiving the replaceable-ancestry and trusted-source checks on authorized paths, policy/`@file` sources, entrypoint scripts, the audit sink, and report destinations — was in force. Only the native `run` report can carry `true`: `run-image` and guest reports write `false` unconditionally even though host-side checks still honor the variable, so `false` there does not prove the opt-out was unarmed. `server.connected` carries the same fact as the `allow_replaceable_paths=true` token — native `run` only as well, since `run-image`'s record is emitted by the guest after it strips the opt-out names |
 | `plan` | The enforcement plan: `controls` (`os` / `rpc` / `launch` layers with `state` and `reason`), `grants`, `tools`, `limitations`, `egress_layers` (the name-layer/IP-layer correspondence table for outbound rules — `null` when no policy was available to evaluate) |
 | `observations` | Per-control observed `state` (`verified` / `partially_applied` / `skipped` / `unknown` / `failed` / …) with `basis` and `phase` |
 | `code_identity` | What the launch's hash pins fixed: `kind` (`native_file` / `interpreted_script` / `launcher_or_module` / `inline_eval` / `image_digest` / `image_tag`), the `resolved` executable or image reference, `pins` (per entry: `type`, `target`, `hash`, `role`, `checks`), and the `pinned` / `mutable` scope notes. `null` when no launch pipeline ran (pre-launch CLI/policy failures) |
@@ -3068,9 +3176,26 @@ lose a handful of records per rotation. `create`-mode rotation (move
 aside + recreate + `postrotate kill -USR1 <pid>`) loses nothing, but
 the recreated file must be owned by the logging identity — `create
 0600 <user> <group>` — because a foreign-owned file is refused at the
-next open. On Windows there is no rotation path: the append handle
-grants no delete sharing, so the file can neither be moved nor replaced
-while the session lives.
+next open. On Windows the sharing rules narrow the choices but do not
+end them: the append handle shares read and write but never delete, so
+the file can neither be moved nor replaced while the session lives —
+and no signal or CLI trigger reopens the sink in place, so a
+create-mode rotator has no path. A compatible rotator — running as the
+logging identity or SYSTEM, since the sink's owner+SYSTEM DACL still
+applies — can instead rotate the local log in place by copying it,
+then truncating it: the append handle resumes at offset zero with no
+session restart, at the same trade-off that records written between
+the copy and the truncate land in neither file. The copy is a new
+file — it lands with the destination directory's inherited
+permissions, not the sink's DACL, so create archives under a
+directory whose inheritable file ACEs are restrictive or apply a
+protected DACL to each archive at creation, then verify the
+resulting archive's DACL (`icacls` shows it) rather than relying on
+the live sink's permissions or directory inheritance. A planned session
+restart remains the other switch point: schedule a stop of the
+guarded session, archive or rename the file once the handle is gone,
+and start the next session on a fresh `--audit-log` path or back on
+the same name.
 
 **Disk-full behavior.** A write that fails because the filesystem is
 full — or hits a quota or file-size limit — is a sink fault like any

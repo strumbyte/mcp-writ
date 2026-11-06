@@ -137,4 +137,68 @@ hide a dependency from the scan. Its owning workflows are listed in the
   numbers (`x16`, `svc #0x80`) resolve against XNU BSD/Mach-trap tables in
   separate namespaces and must never reach a Linux seccomp allowlist.
 
+## Adding an MCP protocol revision
+
+Supported revisions are a closed ledger: an advertised revision this
+build does not implement is refused (`unsupported-version`), never
+inferred as compatible. Adopting a new revision is therefore a
+deliberate decision — per the D-4 rule, "a version is added as an
+addition to the closed method ledger, judged separately", not drift
+cleanup. The update points, in order:
+
+1. `src/protocol/mod.rs` — add the `MCP_VERSION_*` constant; extend
+   `SUPPORTED_PROTOCOL_VERSIONS`; add the `SupportedProtocolVersion`
+   variant (`as_str`/`parse`); extend `SUPPORTED_INITIALIZE_VERSIONS`
+   only when the revision negotiates through `initialize` (the
+   `2026-07-28` revision declares itself per request through `_meta`
+   and stays out of it — `server/discover` is an optional discovery
+   call, not a required preamble: a client may send `tools/list`
+   declaring the revision without discovering first); extend
+   `ProbeClassification`, `VersionProbeOutcome`, `ProtocolStep`, the
+   request builders, and `protocol::fields` extraction for any new
+   frame shapes; update the module doc-comment.
+2. `src/policy/mcp.rs` — add a `MethodSlot` version constant and
+   `METHOD_LEDGER` entries covering every method the revision defines,
+   in revision × direction × kind form — rules may only target ledger
+   methods; anything else is a load error in the parser and
+   `unknown-method` fail-closed on the wire — plus `decide()`'s
+   default passage profile for the new revision (the `decide`
+   submodule lives in `src/policy/mcp/decide.rs`).
+3. Negotiation paths — the Legislator probe in
+   `src/legislator/tools_list.rs` (`server/discover` on a disposable
+   sibling process, `initialize` on a fresh child) and the Auditor's
+   negotiated-version gate (`src/auditor/proxy_rpc/wire.rs` checks the
+   `initialize` result against `SUPPORTED_INITIALIZE_VERSIONS`;
+   `src/auditor/proxy_wire.rs` renders the `unsupported-version`
+   refusal and `src/auditor/proxy_s2c.rs` stamps the
+   `server_protocol_version=` / `supported=` audit detail). For a
+   revision declared per request through `params._meta` rather than
+   negotiated through `initialize`, the Auditor path is instead
+   `WireState::request_version` (same file — selects the judging
+   revision for each C2S request and denies a mid-session switch on an
+   established wire) plus `meta_check` in `src/policy/mcp/decide.rs`,
+   which validates the request's `_meta` for that revision.
+4. `tests/protocol_versions.rs` plus a fixture server under
+   `tests/fixtures/mcp_servers/` — positive fetch legs for the new
+   revision and refusal legs for advertised-but-unimplemented
+   revisions — and the Auditor wire legs in `tests/mcp_wire_e2e/`:
+   `protocol_version.rs` covers the negotiated-version refusals, and a
+   per-request `_meta` revision gets a round-trip leg alongside them
+   (`v26.rs`'s `v26_request_with_meta_round_trips` is the existing leg
+   for 2026-07-28).
+5. Capability matrix — review `src/enforcement/capability.rs` and the
+   committed `docs/capability-matrix.json`. The catalog carries no
+   protocol-version rows today, but if the revision changes what a
+   mechanism can express, regenerate with `mcp-writ capability-matrix`
+   (`tests/capability_matrix.rs` diffs the committed file against the
+   implementation).
+6. User docs — README/README.ja "Supported MCP versions" lists and
+   guide.md/guide.ja.md's version statements (the Legislator component
+   row, the `generate-policy` discovery paragraph, the
+   "MCP …(Auditor)" section heading, the `unsupported-version`
+   troubleshooting row). The `protocol=` property's parser error names
+   the supported list literally (`src/policy/kdl_parse/mcp_rules.rs`)
+   — grep the tree for the current date strings so no stale list
+   survives.
+
 See [Development](development.md) for checks and workflow responsibilities.

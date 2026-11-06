@@ -22,6 +22,11 @@ Publish binary releases under this repository.
    compatibility, Linux tests, and MCP server verification on the intended
    commit. Set branch protection or rulesets for the checks required by the
    project; workflow files alone do not require them before merging.
+5. Keep `SECURITY.md` in the published tree and confirm private
+   vulnerability reporting is enabled on the destination repository
+   (repository Settings → Advanced Security →
+   Private vulnerability reporting),
+   so the reporting channel it names actually exists.
 
 `.local/` is for private backups and working notes and is ignored by Git and
 excluded from Cargo packages. Do not upload a complete workspace ZIP without
@@ -84,8 +89,8 @@ Windows, or macOS.
 4. Inspect the resulting archives and SHA-256 checksum files
    (`checksums-sha256.txt` for the archives, `runners-checksums-sha256.txt`
    for the embedded runners). Each archive must contain the CLI, a Linux
-   runner for the matching architecture, LICENSE, policy.example.kdl, and
-   the public documentation. The `windows-amd64` archive additionally
+   runner for the matching architecture, LICENSE, SECURITY.md,
+   policy.example.kdl, and the public documentation. The `windows-amd64` archive additionally
    carries `runners/mcp-secure-runner-windows-amd64.exe` — the Windows
    guest runner for Hyper-V-isolated Windows containers (a `crt-static`
    build, so it needs no MSVC redistributable on Server Core).

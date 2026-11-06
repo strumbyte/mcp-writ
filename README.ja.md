@@ -453,7 +453,7 @@ server "my-mcp-server" {
 - 応答本文の DLP／マスキング、HTTP/SSE トランスポート、LLM による
   判定は別レイヤーの役割です（冒頭の位置づけを参照）。
 
-運用ポリシーを決める前に[セキュリティモデル](docs/guide.ja.md#2-セキュリティモデル)を確認してください。
+運用ポリシーを決める前に[セキュリティモデル](docs/guide.ja.md#2-セキュリティモデル)を確認してください。脆弱性の疑いを報告する場合は GitHub のプライベート脆弱性レポートを利用してください — [SECURITY.md](SECURITY.md) を参照。
 
 ## ビルドと開発
 
@@ -478,3 +478,4 @@ MITライセンスで公開しています。詳細は [LICENSE](LICENSE) を参
 - [ポリシーの記述例](policy.example.kdl)
 - [モジュールガイド](docs/modules.md)
 - [開発手順](docs/development.md) / [リリース手順](docs/releasing.md)
+- [セキュリティポリシー](SECURITY.md)

@@ -399,7 +399,7 @@ jobs:
 
             mkdir -p "${pkg}/runners"
 
-            cp README.md README.ja.md LICENSE policy.example.kdl "${pkg}/"
+            cp README.md README.ja.md LICENSE SECURITY.md policy.example.kdl "${pkg}/"
             cp -R docs "${pkg}/docs"
 
             cp "artifacts/guard-${platform}/${binary}" "${pkg}/"
