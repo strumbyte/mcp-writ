@@ -1174,3 +1174,206 @@ fn test_when_integrity_overrides_record_server_line() {
         );
     }
 }
+
+// ── PR-06 D-1: tool-level `deny host="*"` shadows the block's allows ──
+//
+// At tool level (and in the tool-level `profile`/`server-defaults`
+// layers) `host="*"` is an ordinary wildcard rule, not a posture —
+// a `deny host="*"` beside `allow` entries already covers them all.
+// The declaration is almost always a misread of the defaults-level
+// posture spelling, so the load warns; it never fails.
+
+fn shadowed(dir: &Path) -> Vec<LoadWarning> {
+    let (_policy, diag) = scanned(dir);
+    diag.warnings
+        .into_iter()
+        .filter(|w| w.kind == LoadWarningKind::ShadowedAllow)
+        .collect()
+}
+
+#[test]
+fn tool_network_deny_wildcard_with_allow_warns() {
+    let dir = make_test_dir("shadow_tool");
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            policy version=2
+            server "svc" {
+                tool "fetch" {
+                    network {
+                        allow host="example.com"
+                        deny host="*"
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let warnings = shadowed(&dir);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "one shadowed-allow warning: {warnings:?}"
+    );
+    let w = &warnings[0];
+    assert!(w.file.ends_with("child.kdl"));
+    assert_eq!(
+        w.line,
+        Some(7),
+        "the warning points at the `deny host=\"*\"` line"
+    );
+    assert!(
+        w.message.contains("tool 'fetch'"),
+        "the message names the tool: {}",
+        w.message
+    );
+    assert!(
+        w.message.contains("ordinary wildcard rule"),
+        "the message explains the rule semantics: {}",
+        w.message
+    );
+    assert!(
+        w.message.contains("remove the deny"),
+        "the message prescribes the fix: {}",
+        w.message
+    );
+}
+
+#[test]
+fn server_defaults_network_deny_wildcard_with_allow_warns() {
+    let dir = make_test_dir("shadow_server_defaults");
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            policy version=2
+            server "svc" {
+                server-defaults {
+                    network {
+                        allow host="example.com"
+                        deny host="*"
+                    }
+                }
+                tool "fetch"
+            }
+        "#,
+    )
+    .unwrap();
+
+    let warnings = shadowed(&dir);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "server-defaults is a tool-level layer: {warnings:?}"
+    );
+    assert!(warnings[0].message.contains("server-defaults"));
+}
+
+#[test]
+fn profile_network_deny_wildcard_with_allow_warns() {
+    let dir = make_test_dir("shadow_profile");
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            policy version=2
+            profile "net" {
+                network {
+                    allow host="example.com"
+                    deny host="*"
+                }
+            }
+            server "svc" {
+                tool "fetch" profile="net"
+            }
+        "#,
+    )
+    .unwrap();
+
+    let warnings = shadowed(&dir);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "a profile's tool-level layer warns at its declaration: {warnings:?}"
+    );
+    assert!(warnings[0].message.contains("profile 'net'"));
+}
+
+#[test]
+fn when_tool_network_deny_wildcard_warns_even_unmatched() {
+    // The warning names a self-contradictory declaration — it fires
+    // on the declaration, not on whether this environment applies the
+    // `when` block.
+    let dir = make_test_dir("shadow_when");
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            policy version=2
+            server "svc" {
+                tool "fetch"
+            }
+            when environment="prod" {
+                server "svc" {
+                    tool "fetch" {
+                        network {
+                            allow host="example.com"
+                            deny host="*"
+                        }
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let warnings = shadowed(&dir);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "a `when` block's tool-level network warns on declaration: {warnings:?}"
+    );
+}
+
+#[test]
+fn network_deny_wildcard_negative_cases_do_not_warn() {
+    // Defaults-level `deny host="*"` is the posture — allow entries
+    // beside it are exceptions, the intended spelling, no warning.
+    // A tool block with only a wildcard deny, or only allows, or a
+    // non-wildcard deny, declares nothing contradictory.
+    let dir = make_test_dir("shadow_none");
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            policy version=2
+            defaults {
+                network {
+                    allow host="example.com"
+                    deny host="*"
+                }
+            }
+            server "svc" {
+                tool "closed" {
+                    network {
+                        deny host="*"
+                    }
+                }
+                tool "open" {
+                    network {
+                        allow host="example.com"
+                    }
+                }
+                tool "scoped" {
+                    network {
+                        allow host="example.com"
+                        deny host="bad.example.com"
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    assert!(
+        shadowed(&dir).is_empty(),
+        "posture spelling, deny-only, allow-only, and non-wildcard deny must not warn"
+    );
+}

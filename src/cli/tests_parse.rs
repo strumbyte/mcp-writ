@@ -440,6 +440,41 @@ fn test_parse_generate_policy_conflicting_discovery_flags() {
 }
 
 #[test]
+fn test_parse_generate_policy_policy_version_default_is_2() {
+    let a = unwrap_gen_policy(parse_from(args("mcp-writ generate-policy -- echo hello")));
+    assert_eq!(a.policy_version, 2);
+}
+
+#[test]
+fn test_parse_generate_policy_policy_version_3() {
+    let a = unwrap_gen_policy(parse_from(args(
+        "mcp-writ generate-policy --policy-version 3 -- echo hello",
+    )));
+    assert_eq!(a.policy_version, 3);
+}
+
+#[test]
+fn test_parse_generate_policy_policy_version_rejects_other_values() {
+    for value in ["0", "1", "4", "three"] {
+        let result = parse_from(args(&format!(
+            "mcp-writ generate-policy --policy-version {value} -- echo hello"
+        )));
+        assert!(
+            matches!(result, Err(CliError::Parse(_))),
+            "--policy-version {value} must be a parse error"
+        );
+    }
+}
+
+#[test]
+fn test_parse_generate_policy_policy_version_requires_value() {
+    let result = parse_from(args(
+        "mcp-writ generate-policy --policy-version -- echo hello",
+    ));
+    assert!(matches!(result, Err(CliError::Parse(_))));
+}
+
+#[test]
 fn test_help_includes_all_subcommands() {
     let result = parse_from(args("mcp-writ --help"));
     match result {

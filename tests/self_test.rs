@@ -76,6 +76,29 @@ server "auto-generated" {
 "##
 }
 
+/// PR-06: the same probe policy declared at `version=3` — a v3 draft
+/// must drive an enforced run the same way (Warden spawn starts, the
+/// verdict ladder is unchanged).
+fn warden_probe_kdl_v3() -> &'static str {
+    r##"
+policy version=3
+defaults {
+    filesystem {
+        secret-overlay #false
+        allow "/workspace/**" mode="read"
+    }
+    syscalls {
+        allow "read" "write" "openat" "execve" "exit_group" "mmap" "brk" "close"
+    }
+}
+logging level="info" fail_closed=#false
+server "auto-generated" {
+    tool "read_file" args_schema="{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}"
+    tool "evil" deny=#true
+}
+"##
+}
+
 #[test]
 fn jsonrpc_policy_error_is_never_warden_pass() {
     let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Policy violation: tool 'read_file' is not allowed (path not allowed)"}}"#;
@@ -144,6 +167,68 @@ async fn non_linux_marks_warden_skipped() {
     assert!(
         stderr.contains("spawn:"),
         "report must record spawn vs skip: {stderr}"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn v3_policy_self_test_still_spawns() {
+    // A `policy version=3` draft launches an enforced run: the spawn
+    // starts (or records why it could not), and the verdict ladder is
+    // unchanged — never a parse-level refusal of the v3 draft itself.
+    let report = run_self_test(
+        warden_probe_kdl_v3(),
+        &fixture_open_path_py(),
+        Duration::from_secs(8),
+    )
+    .await
+    .expect("v3 policy must parse");
+    let stderr = report.format_stderr();
+    match report.warden {
+        WardenVerdict::Skipped => {
+            assert_eq!(
+                report.spawn,
+                SpawnStatus::Started,
+                "skipped requires spawn started: {stderr}"
+            );
+        }
+        WardenVerdict::Inconclusive => {
+            assert_ne!(
+                report.spawn,
+                SpawnStatus::Started,
+                "spawn that never started should be inconclusive: {stderr}"
+            );
+        }
+        other => panic!(
+            "expected skipped or inconclusive, got {}: {stderr}",
+            other.as_str()
+        ),
+    }
+    assert!(
+        stderr.contains("spawn:"),
+        "the report records the v3 policy's spawn state: {stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn v3_policy_self_test_still_spawns() {
+    let command = compile_open_path_server()
+        .map(|bin| vec![bin.to_string_lossy().into_owned()])
+        .unwrap_or_else(fixture_open_path_py);
+    let report = run_self_test(warden_probe_kdl_v3(), &command, Duration::from_secs(8))
+        .await
+        .expect("v3 policy must parse");
+    let stderr = report.format_stderr();
+    assert_eq!(
+        report.spawn,
+        SpawnStatus::Started,
+        "a v3 draft must drive the enforced run: {stderr}"
+    );
+    assert_ne!(
+        report.warden,
+        WardenVerdict::Fail,
+        "child must not serve /etc/passwd: {stderr}"
     );
 }
 

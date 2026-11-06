@@ -64,12 +64,31 @@ const NETWORK_SYSCALLS: &[&str] = &[
 /// `workload` carries the launch-target hashes the draft pins inside the
 /// `server` block (`binary-hash` / `entrypoint-hash`, or the reason a target
 /// cannot be bound). Pass `&WorkloadHashes::default()` to emit none.
+///
+/// The draft declares `policy version=2` — the historical default.
+/// [`generate_policy_with_version`] selects the declared version.
 pub fn generate_policy(
     result: &CrossValidationResult,
     capability: &CapabilityProfile,
     project_hint: Option<&crate::legislator::project_hints::ProjectHint>,
     tools: &[ToolDefinition],
     workload: &WorkloadHashes,
+) -> String {
+    generate_policy_with_version(result, capability, project_hint, tools, workload, 2)
+}
+
+/// [`generate_policy`] with an explicit `policy version=` — `--policy-version 3`
+/// emits a draft the v3 grammar accepts directly, so `check` reports
+/// `migration: null` instead of simulating a v2 draft under v3 rules (the
+/// B-02 migration-preview failure). Callers pass only validated versions
+/// (`2` or `3`); the CLI accepts nothing else.
+pub fn generate_policy_with_version(
+    result: &CrossValidationResult,
+    capability: &CapabilityProfile,
+    project_hint: Option<&crate::legislator::project_hints::ProjectHint>,
+    tools: &[ToolDefinition],
+    workload: &WorkloadHashes,
+    policy_version: u32,
 ) -> String {
     // Build the tools section first: when every emitted tool is denied
     // (dispatcher-shaped servers where nothing could be grounded — F-10)
@@ -131,7 +150,7 @@ pub fn generate_policy(
              // on tools you have reviewed and keep.\n"
         ));
     }
-    out.push_str("policy version=2\n");
+    out.push_str(&format!("policy version={policy_version}\n"));
     out.push('\n');
     out.push_str("// MCP passage rules default fail-closed: resources/prompts/\n");
     out.push_str("// completion/logging methods, server-originated requests, and MRTR\n");

@@ -40,6 +40,29 @@ pub(super) fn parse_gen_policy_args(
         None
     };
 
+    // --policy-version <2|3> (optional; default 2 — v3 emits
+    // `policy version=3` and the v3-required spellings, e.g. an
+    // explicit `allow none=#true` beside `require-path #false`)
+    let policy_version_taken = noargs::opt("policy-version")
+        .doc("Policy schema version to declare in the draft: 2 (default) or 3")
+        .take(&mut raw);
+    let policy_version = if policy_version_taken.is_value_present() {
+        match policy_version_taken.value().parse::<u32>() {
+            Ok(v @ (2 | 3)) => v,
+            _ => {
+                return Err(CliError::Parse(
+                    "--policy-version must be 2 or 3".to_string(),
+                ));
+            }
+        }
+    } else if policy_version_taken.is_present() {
+        return Err(CliError::Parse(
+            "--policy-version requires a value: 2 or 3".to_string(),
+        ));
+    } else {
+        2
+    };
+
     // -v / --verbose
     let verbose = if noargs::flag("verbose")
         .short('v')
@@ -113,6 +136,7 @@ pub(super) fn parse_gen_policy_args(
         binary_path,
         output,
         verbose,
+        policy_version,
         static_only,
         unsafe_unsandboxed_discovery,
         self_test,

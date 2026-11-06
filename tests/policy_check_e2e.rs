@@ -1182,6 +1182,299 @@ async fn check_v3_policy_reports_null_migration() {
     );
 }
 
+// ── PR-06: `--policy-version` drafts + the B-02 require-path trap ────
+
+#[tokio::test]
+async fn check_v2_require_path_migration_preview_is_simulation_failed() {
+    // B-02, reproduced on the generated-template shape: a v2 draft
+    // whose tool spells `filesystem { allow none=#true;
+    // require-path #false }` is valid as written, but under v3 union
+    // rules the inherited defaults grant merges into the tool's allow
+    // side — `require-path #false` then fails for want of an
+    // explicitly empty allow list. The preview reports that failure
+    // in-band; status and exit code do not move.
+    let dir = common::real_tempdir();
+    let path = dir.path().join("policy.kdl");
+    std::fs::write(
+        &path,
+        "policy version=2\ndefaults {\n    filesystem {\n        allow \"/usr/lib\" mode=\"read\"\n    }\n}\nserver \"svc\" {\n    tool \"probe\" {\n        filesystem {\n            allow none=#true\n            require-path #false\n        }\n    }\n}\n",
+    )
+    .unwrap();
+
+    let out = run_check(&["--policy".into(), policy_arg(&path)]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failed simulation is informational, not a finding: {}",
+        stderr_text(&out)
+    );
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "clean");
+
+    let migration = member(json.value(), "migration");
+    assert_eq!(
+        member(migration, "status").as_string_str().unwrap(),
+        "simulation_failed"
+    );
+    let reason = member(migration, "reason").as_string_str().unwrap();
+    assert!(
+        reason.contains("require-path #false requires an explicitly empty allow-list"),
+        "reason names the B-02 failure: {reason}"
+    );
+}
+
+#[tokio::test]
+async fn check_v3_require_path_spelling_loads_and_skips_preview() {
+    // The v3-correct spelling — `replace=#true` drops the inherited
+    // grant and `allow none=#true` declares the empty allow list —
+    // loads clean, and as a v3 policy it reports `migration: null`.
+    let dir = common::real_tempdir();
+    let path = dir.path().join("policy.kdl");
+    std::fs::write(
+        &path,
+        "policy version=3\ndefaults {\n    filesystem {\n        allow \"/usr/lib\" mode=\"read\"\n    }\n}\nserver \"svc\" {\n    tool \"probe\" {\n        filesystem replace=#true {\n            allow none=#true\n            require-path #false\n        }\n    }\n}\n",
+    )
+    .unwrap();
+
+    let out = run_check(&["--policy".into(), policy_arg(&path)]).await;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "clean");
+    assert!(
+        member(json.value(), "migration").kind().is_null(),
+        "v3 policies report migration: null"
+    );
+}
+
+#[tokio::test]
+async fn generate_policy_version_3_draft_reports_null_migration() {
+    // `generate-policy --policy-version 3` emits a draft `check`
+    // accepts as v3 — no simulation, `migration: null`. The draft's
+    // REVIEW markers still drive `drifted` (the unresolved_review
+    // contract), the same as a v2 draft.
+    let name = if cfg!(windows) { "py" } else { "python3" };
+    if mcp_writ::workload::resolve_command_path(name).is_err() {
+        common::skip_e2e_test("generate-policy v3: interpreter not on PATH");
+        return;
+    }
+    let argv = common::python3_script_argv("tests/fixtures/echo_stdio.py");
+    let dir = common::real_tempdir();
+    let draft = dir.path().join("draft.kdl");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("generate-policy")
+        .arg("--policy-version")
+        .arg("3")
+        .arg("--output")
+        .arg(&draft)
+        .arg("--")
+        .args(&argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = timeout(Duration::from_secs(TIMEOUT_SECS), cmd.output())
+        .await
+        .expect("generate-policy timed out")
+        .expect("run generate-policy");
+    assert!(
+        out.status.success(),
+        "generate-policy --policy-version 3 failed: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        std::fs::read_to_string(&draft)
+            .unwrap()
+            .contains("policy version=3"),
+        "the v3 draft declares policy version=3"
+    );
+
+    let out = run_check(&["--policy".into(), policy_arg(&draft)]).await;
+    let json = check_json(&out.stdout);
+    assert!(
+        member(json.value(), "migration").kind().is_null(),
+        "the v3 draft reports migration: null"
+    );
+}
+
+#[tokio::test]
+async fn generate_policy_version_2_draft_migration_never_fails() {
+    // The default draft declares `policy version=2`; `check`'s v3
+    // migration preview replays it under v3 rules and must never come
+    // back `simulation_failed` — B-02 was the generated template
+    // producing exactly that report. `fields_differ` or `unchanged`
+    // are both fine; the generated shape decides which.
+    let name = if cfg!(windows) { "py" } else { "python3" };
+    if mcp_writ::workload::resolve_command_path(name).is_err() {
+        common::skip_e2e_test("generate-policy v2: interpreter not on PATH");
+        return;
+    }
+    let argv = common::python3_script_argv("tests/fixtures/echo_stdio.py");
+    let dir = common::real_tempdir();
+    let draft = dir.path().join("draft.kdl");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("generate-policy")
+        .arg("--output")
+        .arg(&draft)
+        .arg("--")
+        .args(&argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = timeout(Duration::from_secs(TIMEOUT_SECS), cmd.output())
+        .await
+        .expect("generate-policy timed out")
+        .expect("run generate-policy");
+    assert!(
+        out.status.success(),
+        "generate-policy (default v2) failed: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        std::fs::read_to_string(&draft)
+            .unwrap()
+            .contains("policy version=2"),
+        "the default draft declares policy version=2"
+    );
+
+    let out = run_check(&["--policy".into(), policy_arg(&draft)]).await;
+    let json = check_json(&out.stdout);
+    let migration = member(json.value(), "migration");
+    assert!(
+        !migration.kind().is_null(),
+        "a v2 draft gets a v3 migration preview"
+    );
+    let status = member(migration, "status").as_string_str().unwrap();
+    assert!(
+        status == "fields_differ" || status == "unchanged",
+        "the generated template must not drive simulation_failed, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn generate_policy_version_rejects_other_values() {
+    let out = Command::new(bin())
+        .args(["generate-policy", "--policy-version", "5", "--", "x"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("run generate-policy");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--policy-version must be 2 or 3"),
+        "stderr names the accepted values: {}",
+        stderr_text(&out)
+    );
+}
+
+// ── PR-06 D-1: tool-level `deny host="*"` shadows the block's allows ──
+
+#[tokio::test]
+async fn check_warns_on_tool_level_deny_wildcard_shadowing_allow() {
+    // A tool-level `network` treats `host="*"` as an ordinary wildcard
+    // rule — `deny host="*"` beside `allow` entries already covers
+    // them all. `check` carries the finding in `warnings[]`; status
+    // and exit code do not move.
+    let dir = common::real_tempdir();
+    let path = dir.path().join("policy.kdl");
+    std::fs::write(
+        &path,
+        "policy version=2\nserver \"svc\" {\n    tool \"fetch\" {\n        network {\n            allow host=\"example.com\"\n            deny host=\"*\"\n        }\n    }\n}\n",
+    )
+    .unwrap();
+
+    let out = run_check(&["--policy".into(), policy_arg(&path)]).await;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "clean");
+
+    let warnings: Vec<_> = member(json.value(), "warnings")
+        .to_array()
+        .unwrap()
+        .collect();
+    let w = warnings
+        .iter()
+        .find(|w| member(**w, "kind").as_string_str().unwrap() == "shadowed-allow")
+        .unwrap_or_else(|| panic!("a shadowed-allow warning must be reported: {warnings:?}"));
+    let message = member(*w, "message").to_unquoted_string_str().unwrap();
+    assert!(
+        message.contains("ordinary wildcard rule"),
+        "the warning explains the rule semantics: {message}"
+    );
+    assert!(
+        message.contains("tool 'fetch'"),
+        "the warning names the tool: {message}"
+    );
+    assert_eq!(
+        member(*w, "line").as_number_str().unwrap(),
+        "6",
+        "the warning points at the `deny host=\"*\"` line"
+    );
+}
+
+#[tokio::test]
+async fn check_no_shadowed_allow_on_defaults_posture_or_clean_rules() {
+    // The defaults-level `deny host="*"` posture with allow entries is
+    // the intended spelling; a tool block with only a deny or only
+    // allows declares nothing contradictory — no warning.
+    let dir = common::real_tempdir();
+    let path = dir.path().join("policy.kdl");
+    std::fs::write(
+        &path,
+        "policy version=2\ndefaults {\n    network {\n        allow host=\"example.com\"\n        deny host=\"*\"\n    }\n}\nserver \"svc\" {\n    tool \"closed\" {\n        network {\n            deny host=\"*\"\n        }\n    }\n    tool \"open\" {\n        network {\n            allow host=\"example.com\"\n        }\n    }\n}\n",
+    )
+    .unwrap();
+
+    let out = run_check(&["--policy".into(), policy_arg(&path)]).await;
+    let json = check_json(&out.stdout);
+    let warnings: Vec<_> = member(json.value(), "warnings")
+        .to_array()
+        .unwrap()
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .all(|w| member(*w, "kind").as_string_str().unwrap() != "shadowed-allow"),
+        "no shadowed-allow warning expected: {warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_prints_tool_level_deny_wildcard_warning_on_load() {
+    // The scanned load's diagnostics reach the same `emit_warnings`
+    // surface the enforcing loaders call — `policy resolve --format
+    // kdl` prints the `Warning:` line `run` would, while keeping the
+    // finding out of the resolved document on stdout.
+    let dir = common::real_tempdir();
+    let path = dir.path().join("policy.kdl");
+    std::fs::write(
+        &path,
+        "policy version=2\nserver \"svc\" {\n    tool \"fetch\" {\n        network {\n            allow host=\"example.com\"\n            deny host=\"*\"\n        }\n    }\n}\n",
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .args(["policy", "resolve", "--policy", &policy_arg(&path)])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("run policy resolve");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "resolve succeeds — the warning is non-fatal: {}",
+        stderr_text(&out)
+    );
+    let stderr = stderr_text(&out);
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("ordinary wildcard rule"),
+        "the load prints the warning: {stderr}"
+    );
+}
+
 fn stderr_text(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }

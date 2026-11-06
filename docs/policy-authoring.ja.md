@@ -165,6 +165,8 @@ mcp-writ generate-policy --live-discovery --output policy.discovered.kdl -- pyth
 `--live-discovery` は既定で Warden サンドボックス内で `tools/list` を実行します — 制限された環境、deny-all の外向き通信、private TMPDIR、解決済みコマンドツリーとインタプリタランタイムへの読み取り許可、secret overlay、子孫プロセスの追跡を持つ発見用ポリシーで動き、サンドボックスを構築できない場合はプレーン実行へ戻らず fail-closed で失敗します。読み取り許可には各パス引数の親ディレクトリも含まれます — 予約名の carve は既知の秘密名だけを外すため、エントリポイントと同じディレクトリの兄弟ファイルはサンドボックス内から読め、deny-all egress が閉じるのはネットワークだけです。サーバー自身が返す `tools/list` はツール説明文に読み取った内容を載せられるため、未レビューのサーバーに `--live-discovery` を向けるときは、使い捨ての起動ディレクトリや VM／コンテナなど、隔離されたデータに限定してください。明示的なダウングレードは2通りあります — `--unsafe-unsandboxed-discovery` は周囲の親環境のまま直接実行し、親環境の内容すべてがサーバーへ届くため、未レビューのサーバーは使い捨ての VM かコンテナの中に限定してください。`MCP_WRIT_SKIP_SANDBOX` は OS サンドボックスと子孫プロセスの寿命管理を外しますが、制限環境と専用 TMPDIR は維持します。
 認証情報などの環境変数が渡らず検出に失敗する場合は、手動で設定を作る方法もあります。`run` は既定で子の環境を制限します — 親の環境変数が届くのは `defaults.environment` に `inherit-parent #true` を宣言するか `allow` に列挙した場合だけです。
 
+草案は既定で `policy version=2` を宣言します。`--policy-version 3` を渡すと `version=3` の草案になり、後述の「`policy version=3` — 既定は追加、置換は明示」の加算既定の合成規則でそのまま読めます — v3 では `require-path #false` のブロックに `replace=#true` と併記した明示的な `allow none=#true` が要るため、生成テンプレートが v3 の文法に反する書き方をすることはありません。v3 の草案に対する `check` は `migration: null`（シミュレーション対象外）を返し、既定の v2 草案の移行プレビューは `fields_differ` か `unchanged` で、`simulation_failed` にはなりません。
+
 生成した草案を土台にする前に、次を確認します。
 
 - `server` / `tool` がない場合は、利用する実際のツールを追加する。ポリシーにないツールは拒否される。
@@ -529,7 +531,7 @@ Windows の AppContainer はホスト単位の通信制限を行えないため�
 `defaults.network` のホスト許可リストと `deny host="*"` の併用は Windows では読み込みエラーになります。
 この例はサーバー内部の任意の接続先やリダイレクト先まで制限するものではありません。ホスト検査は URL のスキームやポートの制限でもありません。
 
-ツール単位の `network` ブロックに書けるのは `allow`/`deny` の通常規則だけです — `host="*"` は姿勢ではなくワイルドカード規則で、`tool.network` 内の `deny host="*"` は同じブロックの `allow` エントリより先に評価され、すべてを覆います。閉じた宛先許可リストは `allow` エントリだけで書きます — 許可リストに載らない宛先は既定で拒否されます — `deny` エントリはワイルドカード許可からの例外を切り出すために使います（例: `allow host="*.example.com"` と `deny host="bad.example.com"`）。
+ツール単位の `network` ブロックに書けるのは `allow`/`deny` の通常規則だけです — `host="*"` は姿勢ではなくワイルドカード規則で、`tool.network` 内の `deny host="*"` は同じブロックの `allow` エントリより先に評価され、すべてを覆います。閉じた宛先許可リストは `allow` エントリだけで書きます — 許可リストに載らない宛先は既定で拒否されます — `deny` エントリはワイルドカード許可からの例外を切り出すために使います（例: `allow host="*.example.com"` と `deny host="bad.example.com"`）。`deny host="*"` を `allow` エントリと同居させると、覆われる許可リストを指名する警告が読み込み時に出され、`check` の `warnings[]` にも載ります — その deny は削除してください。
 
 Linux へ移す場合は、ファイルパスと起動用 syscall を合わせ、必要な `socket` / `connect` なども確認します。TLS 通信では証明書、DNS 設定などの読み取りが必要になることがあります。
 `allow host="443"` のようなポートのみのエントリは、そのポートへの任意の宛先を許す Landlock 規則になり、ホスト名のエントリは警告付きでスキップされ Auditor のみの規則として残ります。
