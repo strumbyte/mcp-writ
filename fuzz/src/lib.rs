@@ -112,9 +112,14 @@ fn usage_fail(target: &str, msg: &str) -> ! {
 /// line for the log. On any failure the last generated input lands in
 /// `<crash-dir>/<name>.bin` next to a `<name>.txt` run report. The
 /// input is also rewritten before each case runs into
-/// `<name>.inflight.bin` (+ a `.inflight.txt` preamble), so a
+/// `<name>.inflight/bin` (+ a `txt` preamble beside it), so a
 /// `timeout` kill, abort, or OOM still leaves the in-flight input for
-/// `--replay` — and cannot clobber an earlier run's final artifacts.
+/// `--replay` — and cannot clobber an earlier run's final artifacts;
+/// an abandoned in-flight directory is renamed to
+/// `<name>.inflight.prev` in one rename (the pair inside cannot
+/// split) so the rerun does not erase the aborted input either —
+/// and if that rotation fails, the directory is left untouched while
+/// the run reports that it cannot persist inputs.
 pub fn run<G, F, C>(name: &str, args: &Args, sample_input: G, property: F, gates: C) -> i32
 where
     G: Fn(&mut noprop::TestCaseContext) -> Vec<u8>,
@@ -162,7 +167,9 @@ where
                     0
                 }
                 Err(payload) => {
-                    drop(live.into_inner());
+                    let live = live.into_inner();
+                    let keep = live.rotation_failed;
+                    drop(live);
                     let msg = panic_message(payload.as_ref());
                     fail(
                         name,
@@ -170,19 +177,23 @@ where
                         &last.into_inner(),
                         &format!("coverage gate: {msg}"),
                         false,
+                        keep,
                     );
                     1
                 }
             }
         }
         Err(e) => {
-            drop(live.into_inner());
+            let live = live.into_inner();
+            let keep = live.rotation_failed;
+            drop(live);
             fail(
                 name,
                 args,
                 &last.into_inner(),
                 &e.to_string(),
                 e.kind() == noprop::RunErrorKind::PropertyFailure,
+                keep,
             );
             eprintln!("{e}");
             1
@@ -200,37 +211,134 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Per-case crash persistence. `<name>.inflight.bin` is rewritten in
+/// Per-case crash persistence. `<name>.inflight/bin` is rewritten in
 /// place as each input is generated — a killed (`timeout`), aborted,
-/// or OOMed run still leaves the last generated input — and a
-/// preamble `<name>.inflight.txt` marks the run unfinished. The
-/// in-flight names are kept distinct from the final `<name>.bin` /
-/// `<name>.txt` crash artifacts: a previous failed run's evidence in
-/// the same directory is never truncated by a new run opening.
-/// `fail` writes the final pair and drops the in-flight pair;
-/// `clear` removes only the in-flight pair on a clean pass.
+/// or OOMed run still leaves the last generated input — and a `txt`
+/// preamble beside it marks the run unfinished. The in-flight
+/// directory is kept distinct from the final `<name>.bin` /
+/// `<name>.txt` crash artifacts: a previous failed run's evidence is
+/// never truncated by a new run opening, and a leftover in-flight
+/// directory is renamed to `<name>.inflight.prev` in one rename —
+/// moving the directory cannot split the pair across generations,
+/// and the older `prev` generation is stashed in `.inflight.grave`
+/// first so a failed rotation restores it untouched — one generation
+/// of aborted evidence survives a rerun, and a `grave` left by an
+/// interrupted or refused rotation is retained as evidence rather
+/// than cleaned away. If a leftover directory
+/// cannot be rotated, it is left untouched and the run proceeds
+/// without per-case persistence — `clear`/`fail` then leave the
+/// foreign directory in place too. `fail` writes the final pair and
+/// drops the in-flight directory; `clear` removes only the in-flight
+/// directory on a clean pass.
 struct LiveArtifacts {
     bin: Option<std::fs::File>,
     bin_path: PathBuf,
-    txt_path: PathBuf,
+    inflight_dir: PathBuf,
     warned: bool,
+    /// A leftover in-flight directory that refused rotation — this
+    /// run owns nothing in the crash dir, so `clear`/`fail` must not
+    /// delete the directory still sitting at the in-flight path.
+    rotation_failed: bool,
 }
 
-/// In-flight file name for `name`'s `kind` (`"bin"` | `"txt"`) —
-/// kept separate from the final crash artifacts `fail` writes.
-fn inflight_path(dir: &Path, name: &str, kind: &str) -> PathBuf {
-    dir.join(format!("{name}.inflight.{kind}"))
+/// In-flight directory for `name` — holds the `bin`/`txt` pair as
+/// one renameable unit, kept separate from the final crash artifacts
+/// `fail` writes.
+fn inflight_dir(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.inflight"))
 }
 
 impl LiveArtifacts {
     fn open(name: &str, args: &Args) -> Self {
         let dir = &args.crash_dir;
-        let bin_path = inflight_path(dir, name, "bin");
-        let txt_path = inflight_path(dir, name, "txt");
-        let bin = std::fs::create_dir_all(dir)
-            .and_then(|_| std::fs::File::create(&bin_path))
-            .ok();
-        if bin.is_none() {
+        let inflight_dir = inflight_dir(dir, name);
+        let bin_path = inflight_dir.join("bin");
+        let txt_path = inflight_dir.join("txt");
+        // A leftover in-flight directory means the previous run never
+        // reached a verdict — rename it aside whole (the pair inside
+        // cannot split) rather than truncating the aborted input's
+        // only evidence on this run's open. The older `prev`
+        // generation is stashed in `grave` first so a failed rotation
+        // can restore it. A lingering `grave` is evidence too — it is
+        // only ever removed after a rotation succeeds, so an
+        // interrupted or refused rotation never erases a generation.
+        let prev_dir = dir.join(format!("{name}.inflight.prev"));
+        let grave_dir = dir.join(format!("{name}.inflight.grave"));
+        let mut rotation_failed = false;
+        if inflight_dir.exists() {
+            let mut stashed = false;
+            if prev_dir.exists() {
+                // The stash cannot land on an occupied `grave` — the
+                // failure leaves every generation in place and says
+                // why, rather than deleting `grave` to make room.
+                match std::fs::rename(&prev_dir, &grave_dir) {
+                    Ok(()) => stashed = true,
+                    Err(e) => {
+                        eprintln!(
+                            "[{name}] warning: cannot stash {} to {}: {e}",
+                            prev_dir.display(),
+                            grave_dir.display()
+                        );
+                        rotation_failed = true;
+                    }
+                }
+            }
+            if !rotation_failed {
+                if let Err(rotate) = std::fs::rename(&inflight_dir, &prev_dir) {
+                    // A failed restore strands the older generation
+                    // at `grave` — report it with both paths so the
+                    // evidence stays locatable.
+                    if stashed && let Err(restore) = std::fs::rename(&grave_dir, &prev_dir) {
+                        eprintln!(
+                            "[{name}] warning: cannot rotate {} aside ({rotate}) and rollback \
+                             of {} to {} failed: {restore}",
+                            inflight_dir.display(),
+                            grave_dir.display(),
+                            prev_dir.display()
+                        );
+                    }
+                    rotation_failed = true;
+                } else {
+                    // The rotated report still points its replay hint
+                    // at the in-flight `bin` — re-point it at the
+                    // directory the pair now lives in. Rewrite
+                    // whatever path follows the `--replay` marker
+                    // rather than matching the old path text: the
+                    // writer may have spelled the crash dir
+                    // differently (relative, UNC, ...).
+                    let moved_txt = prev_dir.join("txt");
+                    if let Ok(report) = std::fs::read_to_string(&moved_txt) {
+                        const MARKER: &str = " -- --replay ";
+                        if let Some((head, tail)) = report.split_once(MARKER) {
+                            let rest = tail.split_once('\n').map_or("", |(_, r)| r);
+                            let updated = format!(
+                                "{head}{MARKER}{}\n{rest}",
+                                quoted_path(&prev_dir.join("bin"))
+                            );
+                            let _ = std::fs::write(&moved_txt, updated);
+                        }
+                    }
+                    let _ = std::fs::remove_dir_all(&grave_dir);
+                }
+            }
+        }
+        // A leftover directory that could not be rotated stays
+        // untouched — creating fresh files inside it would destroy
+        // the aborted run's evidence, the exact loss rotation
+        // prevents.
+        let bin = if rotation_failed {
+            eprintln!(
+                "[{name}] warning: leftover in-flight directory under {} could not be \
+                 rotated — leaving it untouched; per-case input persistence is off",
+                dir.display()
+            );
+            None
+        } else {
+            std::fs::create_dir_all(&inflight_dir)
+                .and_then(|_| std::fs::File::create(&bin_path))
+                .ok()
+        };
+        if bin.is_none() && !rotation_failed {
             eprintln!(
                 "[{name}] warning: cannot persist per-case inputs under {}",
                 dir.display()
@@ -239,12 +347,11 @@ impl LiveArtifacts {
         if bin.is_some() {
             let report = format!(
                 "target: {name}\nseed: {:#018x}\ncases: {}\n\
-                 detail: run in progress — if the process was killed or aborted, {} is the last generated input\n\n\
+                 detail: run in progress — if the process was killed or aborted, the bin beside this report is the last generated input\n\n\
                  replay: cargo run --release --manifest-path fuzz/Cargo.toml --bin {name} -- --replay {}\n\
                  rerun:  {SEED_ENV}={:#018x} cargo run --release --manifest-path fuzz/Cargo.toml --bin {name} -- --cases {}\n",
                 args.seed,
                 args.cases,
-                bin_path.file_name().unwrap().to_string_lossy(),
                 quoted_path(&bin_path),
                 args.seed,
                 args.cases
@@ -254,8 +361,9 @@ impl LiveArtifacts {
         Self {
             bin,
             bin_path,
-            txt_path,
+            inflight_dir,
             warned: false,
+            rotation_failed,
         }
     }
 
@@ -277,14 +385,16 @@ impl LiveArtifacts {
         }
     }
 
-    /// A fully-passing run removes its in-flight files — leftover
+    /// A fully-passing run removes its in-flight directory — leftover
     /// `<name>.bin`/`.txt` are then always final verdicts from a
-    /// `fail`, and leftover `.inflight.*` means the run never reached
-    /// one.
+    /// `fail`, and a leftover `.inflight` directory means the run
+    /// never reached one. When rotation failed at open the directory
+    /// belongs to an older run and is left in place.
     fn clear(self) {
         drop(self.bin);
-        let _ = std::fs::remove_file(&self.bin_path);
-        let _ = std::fs::remove_file(&self.txt_path);
+        if !self.rotation_failed {
+            let _ = std::fs::remove_dir_all(&self.inflight_dir);
+        }
     }
 }
 
@@ -310,7 +420,14 @@ fn quoted_path(path: &Path) -> String {
 /// coverage-gate or rejection-limit failure is a generator shortfall
 /// — the `.bin` then holds the last *accepted* case and a `--replay`
 /// is expected to pass.
-fn fail(name: &str, args: &Args, input: &[u8], detail: &str, input_is_witness: bool) {
+fn fail(
+    name: &str,
+    args: &Args,
+    input: &[u8],
+    detail: &str,
+    input_is_witness: bool,
+    keep_inflight: bool,
+) {
     let bin = quoted_path(&args.crash_dir.join(format!("{name}.bin")));
     let replay = if input_is_witness {
         format!(
@@ -330,11 +447,15 @@ fn fail(name: &str, args: &Args, input: &[u8], detail: &str, input_is_witness: b
     match write_crash(&args.crash_dir, name, input, &report) {
         Ok(dir) => {
             eprintln!("[{name}] FAILED — artifacts in {}", dir.display());
-            // The final pair supersedes the in-flight pair — drop it
-            // only now that the verdict files exist (the LiveArtifacts
-            // handle is already released, so the deletes are safe).
-            let _ = std::fs::remove_file(inflight_path(&args.crash_dir, name, "bin"));
-            let _ = std::fs::remove_file(inflight_path(&args.crash_dir, name, "txt"));
+            // The final pair supersedes the in-flight directory —
+            // drop it only now that the verdict files exist (the
+            // LiveArtifacts handle is already released, so the delete
+            // is safe). `keep_inflight` means the directory was never
+            // ours to begin with: rotation failed at open, so it is
+            // an older run's preserved evidence.
+            if !keep_inflight {
+                let _ = std::fs::remove_dir_all(inflight_dir(&args.crash_dir, name));
+            }
         }
         Err(e) => eprintln!("[{name}] FAILED — could not write artifacts: {e}\n{report}"),
     }

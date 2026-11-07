@@ -11,8 +11,9 @@
 # target leaves its exact last input plus the seeded replay recipe in
 # fuzz-artifacts/ (<target>.bin / <target>.txt), uploaded below — a
 # killed target leaves its in-flight input under the distinct
-# <target>.inflight.* names, so live files never clobber a finished
-# run's crash pair —
+# <target>.inflight/ directory, so live files never clobber a
+# finished run's crash pair, and an abandoned in-flight directory is
+# renamed to <target>.inflight.prev in one rename on the next open —
 # replay one with
 #   cargo run --release --manifest-path fuzz/Cargo.toml --bin <target> -- --replay <target>.bin
 name: Fuzz

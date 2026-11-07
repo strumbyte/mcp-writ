@@ -1,11 +1,14 @@
 //! Fuzz target: the DNS wire boundary the embedded gate defends.
 //!
-//! Input layout: `[u8 name_len][name][message]`. `name` is the
-//! canonical forwarded query name; `message` is a raw DNS packet.
-//! The property decodes it as a workload query (`parse_query`), feeds
-//! the gate's rebuild/refusal/truncated compositions, then reads it
-//! as an upstream response (`parse_response`, `response_matches`,
-//! `response_truncated`).
+//! Input layout: `[b"DNS1"][u8 name_len][name][u8 arm][message]`.
+//! `name` is the canonical forwarded query name; `arm` records which
+//! generator produced `message` so arm-specific oracles hold (the
+//! planted-extras arm's names/addrs are demanded back verbatim). The
+//! property decodes the message as a workload query (`parse_query`),
+//! feeds the gate's rebuild/refusal/truncated compositions, then
+//! reads it as an upstream response (`parse_response`,
+//! `response_matches`, `response_truncated`). The tag rejects stale
+//! artifacts — an older `.bin` would decode into a shifted message.
 //!
 //! Search space: random byte soups, structured messages (compression
 //! pointers incl. loops and forward refs, CNAME/DNAME/SVCB/HTTPS
@@ -14,6 +17,7 @@
 //! into matching responses.
 
 use std::cell::Cell;
+use std::net::IpAddr;
 
 #[derive(Default)]
 struct Gates {
@@ -28,7 +32,13 @@ struct Gates {
     chained: Cell<usize>,
     trunc_chain: Cell<usize>,
     matched: Cell<usize>,
+    extras_hit: Cell<usize>,
 }
+
+/// Format tag prefixed to every generated input — a saved artifact
+/// from a different layout fails loudly instead of decoding into a
+/// shifted, unrecognizable message.
+const INPUT_TAG: &[u8; 4] = b"DNS1";
 
 /// An uncompressed question name — `parse_query` rejects compression
 /// pointers here, so accepted queries must carry labels (UTF-8 only:
@@ -171,6 +181,15 @@ fn rr(ctx: &mut noprop::TestCaseContext, out: &mut Vec<u8>, name: &str) {
     }
 }
 
+/// Write a dotted name as uncompressed wire labels (no pointers).
+fn put_name(m: &mut Vec<u8>, n: &str) {
+    for label in n.split('.').filter(|l| !l.is_empty()) {
+        m.push(label.len().min(63) as u8);
+        m.extend_from_slice(&label.as_bytes()[..label.len().min(63)]);
+    }
+    m.push(0);
+}
+
 /// A response carrying exactly `hops` CNAME aliases — hop counts
 /// straddle the 16-deep chain bound so the truncated-at-cap path
 /// actually runs. An optional A record on the leaf exercises the
@@ -178,13 +197,6 @@ fn rr(ctx: &mut noprop::TestCaseContext, out: &mut Vec<u8>, name: &str) {
 fn chain_message(ctx: &mut noprop::TestCaseContext, name: &str) -> Vec<u8> {
     let hops = noprop::sample_choice(ctx, &[0usize, 1, 14, 15, 16, 17, 18, 24]);
     let leaf_a = noprop::sample_bool(ctx);
-    let put_name = |m: &mut Vec<u8>, n: &str| {
-        for label in n.split('.').filter(|l| !l.is_empty()) {
-            m.push(label.len().min(63) as u8);
-            m.extend_from_slice(&label.as_bytes()[..label.len().min(63)]);
-        }
-        m.push(0);
-    };
     let mut m = Vec::new();
     m.extend_from_slice(&noprop::sample_u16(ctx).to_be_bytes()); // id
     m.extend_from_slice(&0x8180u16.to_be_bytes()); // QR + RD + RA
@@ -219,7 +231,14 @@ fn chain_message(ctx: &mut noprop::TestCaseContext, name: &str) -> Vec<u8> {
         put_name(&mut m, &target);
     }
     if leaf_a {
-        let leaf = format!("h{hops}.{name}");
+        // h0 is the forwarded name itself, so a 0-hop leaf's owner is
+        // `name`, not a literal `h0.` label — otherwise the record
+        // never binds to the question and `addrs` stays unreachable.
+        let leaf = if hops == 0 {
+            name.to_string()
+        } else {
+            format!("h{hops}.{name}")
+        };
         put_name(&mut m, &leaf);
         m.extend_from_slice(&1u16.to_be_bytes()); // A
         m.extend_from_slice(&1u16.to_be_bytes()); // IN
@@ -228,6 +247,81 @@ fn chain_message(ctx: &mut noprop::TestCaseContext, name: &str) -> Vec<u8> {
         m.extend_from_slice(&noprop::sample_bytes_vec(ctx, 4));
     }
     m
+}
+
+/// A response with planted destination material outside the answer
+/// section: an authority CNAME and an additional A record, both with
+/// names derived from `name` so the property can demand them back in
+/// `extra_names`/`extra_addrs` — an implementation that drops them
+/// fails on comparison, not on a guess.
+fn extras_message(ctx: &mut noprop::TestCaseContext, name: &str) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.extend_from_slice(&noprop::sample_u16(ctx).to_be_bytes()); // id
+    m.extend_from_slice(&0x8180u16.to_be_bytes()); // QR + RD + RA
+    m.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    m.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT
+    m.extend_from_slice(&1u16.to_be_bytes()); // NSCOUNT
+    m.extend_from_slice(&1u16.to_be_bytes()); // ARCOUNT
+    put_name(&mut m, name);
+    m.extend_from_slice(&1u16.to_be_bytes()); // A
+    m.extend_from_slice(&1u16.to_be_bytes()); // IN
+    // Answer: a direct A record on the question name.
+    put_name(&mut m, name);
+    m.extend_from_slice(&1u16.to_be_bytes()); // A
+    m.extend_from_slice(&1u16.to_be_bytes()); // IN
+    m.extend_from_slice(&noprop::sample_u32(ctx).to_be_bytes()); // ttl
+    m.extend_from_slice(&4u16.to_be_bytes()); // rdlen
+    m.extend_from_slice(&EXTRAS_ANSWER_ADDR);
+    // Authority: `auth.<name>` CNAME → `ns1.<name>` — both names are
+    // destination material the verdict must collect.
+    put_name(&mut m, &extras_auth_name(name));
+    m.extend_from_slice(&5u16.to_be_bytes()); // CNAME
+    m.extend_from_slice(&1u16.to_be_bytes()); // IN
+    m.extend_from_slice(&noprop::sample_u32(ctx).to_be_bytes()); // ttl
+    let target = wire_len(&extras_ns_name(name));
+    m.extend_from_slice(&(target as u16).to_be_bytes());
+    put_name(&mut m, &extras_ns_name(name));
+    // Additional: `ns1.<name>` A → a dialable hint address.
+    put_name(&mut m, &extras_ns_name(name));
+    m.extend_from_slice(&1u16.to_be_bytes()); // A
+    m.extend_from_slice(&1u16.to_be_bytes()); // IN
+    m.extend_from_slice(&noprop::sample_u32(ctx).to_be_bytes()); // ttl
+    m.extend_from_slice(&4u16.to_be_bytes()); // rdlen
+    m.extend_from_slice(&EXTRAS_HINT_ADDR);
+    m
+}
+
+/// Planted address material for `extras_message` — fixed so the
+/// property can demand it back byte-for-byte.
+const EXTRAS_ANSWER_ADDR: [u8; 4] = [203, 0, 113, 7];
+const EXTRAS_HINT_ADDR: [u8; 4] = [198, 51, 100, 9];
+
+/// Authority-section owner — `auth.<name>` (or just `auth` for the
+/// root query name).
+fn extras_auth_name(name: &str) -> String {
+    if name.is_empty() {
+        "auth".to_string()
+    } else {
+        format!("auth.{name}")
+    }
+}
+
+/// The planted CNAME target / additional-A owner — `ns1.<name>`.
+fn extras_ns_name(name: &str) -> String {
+    if name.is_empty() {
+        "ns1".to_string()
+    } else {
+        format!("ns1.{name}")
+    }
+}
+
+/// Byte length a dotted name occupies on the wire (labels + root).
+fn wire_len(name: &str) -> usize {
+    name.split('.')
+        .filter(|l| !l.is_empty())
+        .map(|l| l.len().min(63) + 1)
+        .sum::<usize>()
+        + 1
 }
 
 fn wild_message(ctx: &mut noprop::TestCaseContext, name: &str) -> Vec<u8> {
@@ -281,7 +375,7 @@ fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
             "MiXeD.Case.Example".to_string(),
         ],
     );
-    let msg = match noprop::sample_weighted_index(ctx, &[20, 35, 28, 10, 15]) {
+    let (arm, msg) = match noprop::sample_weighted_index(ctx, &[20, 35, 28, 10, 15, 8]) {
         0 => {
             let n = noprop::sample_with_boundaries(
                 ctx,
@@ -289,36 +383,53 @@ fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
                 noprop::Ratio::new(1, 3),
                 |ctx| noprop::sample_usize_in(ctx, 0..=4096),
             );
-            noprop::sample_bytes_vec(ctx, n)
+            (0u8, noprop::sample_bytes_vec(ctx, n))
         }
         // A query the gate should accept — keeps the Ok arm busy.
-        1 => query_message(ctx, &name),
+        1 => (1, query_message(ctx, &name)),
         // Anything-goes message: rejections and response-side parses.
-        2 => wild_message(ctx, &name),
+        2 => (2, wild_message(ctx, &name)),
         // A CNAME chain sized around the 16-hop bound.
-        3 => chain_message(ctx, &name),
+        3 => (3, chain_message(ctx, &name)),
+        // Response carrying planted authority/additional destinations.
+        4 => (5, extras_message(ctx, &name)),
         _ => {
             // Structured then truncated — the short-read paths.
             let mut m = wild_message(ctx, &name);
             if !m.is_empty() {
                 m.truncate(noprop::sample_usize_in(ctx, 0..=m.len()));
             }
-            m
+            (4, m)
         }
     };
-    let mut input = vec![name.len().min(255) as u8];
+    let mut input = INPUT_TAG.to_vec();
+    input.push(name.len().min(255) as u8);
     input.extend_from_slice(&name.as_bytes()[..name.len().min(255)]);
+    input.push(arm);
     input.extend_from_slice(&msg);
     input
 }
 
 fn property(g: &Gates, data: &[u8]) {
+    let Some(data) = data.strip_prefix(INPUT_TAG) else {
+        panic!(
+            "dnsgate_wire input lacks the {} tag — stale or foreign artifact",
+            String::from_utf8_lossy(INPUT_TAG)
+        );
+    };
     let Some(&nl) = data.first() else { return };
     let Some(name_bytes) = data.get(1..1 + nl as usize) else {
         return;
     };
     let name = String::from_utf8_lossy(name_bytes);
-    let msg = &data[1 + nl as usize..];
+    let Some(&arm) = data.get(1 + nl as usize) else {
+        return;
+    };
+    let msg = &data[2 + nl as usize..];
+    // `parse_response`/`forward_query` take the canonical forwarded
+    // name — the gate canonicalizes before upstream exchange; feeding
+    // the wire-verbatim qname would never bind answer records.
+    let canon = mcp_writ::fuzz::dns_canonical_name(&name);
     let rcode = msg.get(3).map_or(5, |b| b & 0x0f);
 
     // ---- query boundary (workload → gate) ----
@@ -344,7 +455,7 @@ fn property(g: &Gates, data: &[u8]) {
         // An OPT can only be seen if the additional section held one.
         assert!(q.edns_udp_size.is_none() || q.arcount >= 1);
         // Forward composition must re-parse as a query.
-        if let Some(fwd) = mcp_writ::fuzz::dns_forward_query(msg, &name) {
+        if let Some(fwd) = mcp_writ::fuzz::dns_forward_query(msg, &canon) {
             g.forwarded.set(g.forwarded.get() + 1);
             assert!(
                 matches!(
@@ -421,7 +532,7 @@ fn property(g: &Gates, data: &[u8]) {
     let _ = mcp_writ::fuzz::dns_encode_name(&name);
 
     // ---- response boundary (upstream → gate) ----
-    let resp = mcp_writ::fuzz::dns_parse_response(msg, &name);
+    let resp = mcp_writ::fuzz::dns_parse_response(msg, &canon);
     g.resp_seen.set(g.resp_seen.get() + 1);
     g.decoded.set(g.decoded.get() + usize::from(resp.decoded));
     g.chained
@@ -454,6 +565,47 @@ fn property(g: &Gates, data: &[u8]) {
     }
     let expect_rcode = if msg.len() >= 12 { msg[3] & 0x0f } else { 0 };
     assert_eq!(resp.rcode, expect_rcode, "rcode diverged from the header");
+    // Arm-specific oracles: a fully-walked chain arm holds no
+    // unfollowed destination records — nothing survives into extras —
+    // and the extras arm's planted authority/additional records must
+    // be reported back, so an implementation that drops destination
+    // material fails on comparison, not on silence.
+    if arm == 3 && resp.decoded && !resp.chain_truncated {
+        assert!(
+            resp.extra_names.is_empty() && resp.extra_addrs.is_empty(),
+            "fully-walked chain message produced extra destinations"
+        );
+    }
+    if arm == 5 {
+        g.extras_hit.set(g.extras_hit.get() + 1);
+        let auth = extras_auth_name(&canon);
+        let ns1 = extras_ns_name(&canon);
+        assert!(resp.decoded, "planted extras response failed to decode");
+        assert!(
+            resp.extra_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&auth)),
+            "authority owner name missing from extra_names"
+        );
+        assert!(
+            resp.extra_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&ns1)),
+            "authority target name missing from extra_names"
+        );
+        assert!(
+            resp.extra_addrs
+                .iter()
+                .any(|a| *a == IpAddr::from(EXTRAS_HINT_ADDR)),
+            "hint address missing from extra_addrs"
+        );
+        assert!(
+            resp.addrs
+                .iter()
+                .any(|(a, _)| *a == IpAddr::from(EXTRAS_ANSWER_ADDR)),
+            "answer address missing from addrs"
+        );
+    }
     if msg.len() < 12 {
         assert!(
             !resp.decoded
@@ -468,7 +620,7 @@ fn property(g: &Gates, data: &[u8]) {
     let _ = mcp_writ::fuzz::dns_response_truncated(msg);
     if msg.len() >= 12 {
         let id = u16::from_be_bytes([msg[0], msg[1]]);
-        let _ = mcp_writ::fuzz::dns_response_matches(msg, id, &name, 1, 1);
+        let _ = mcp_writ::fuzz::dns_response_matches(msg, id, &canon, 1, 1);
     }
     g.cases.set(g.cases.get() + 1);
 }
@@ -486,8 +638,9 @@ fn main() {
             assert!(g.query_rej.get() > 0, "no query rejected");
             assert!(g.decoded.get() > 0, "no response decoded");
             assert!(g.trunc_chain.get() > 0, "chain bound never tripped");
+            assert!(g.extras_hit.get() > 0, "extras arm never ran");
             format!(
-                "query_ok={} rej={} fwd={} refused={} trunc={} decoded={} chained={} trunc_chain={} matched={}",
+                "query_ok={} rej={} fwd={} refused={} trunc={} decoded={} chained={} trunc_chain={} matched={} extras={}",
                 g.query_ok.get(),
                 g.query_rej.get(),
                 g.forwarded.get(),
@@ -496,7 +649,8 @@ fn main() {
                 g.decoded.get(),
                 g.chained.get(),
                 g.trunc_chain.get(),
-                g.matched.get()
+                g.matched.get(),
+                g.extras_hit.get()
             )
         },
     ));

@@ -411,6 +411,13 @@ pub struct DnsResponseSummary {
     pub extra_addrs: Vec<std::net::IpAddr>,
 }
 
+/// `canonical_name` — the forwarded-name identity the gate computes
+/// before upstream exchange; `parse_response`/`build_forward_query`
+/// expect this form, not a wire-verbatim qname.
+pub fn dns_canonical_name(name: &str) -> String {
+    crate::dnsgate::canonical_name(name)
+}
+
 /// Parse an upstream→gate response against the forwarded name
 /// (`wire::parse_response`).
 pub fn dns_parse_response(resp: &[u8], forwarded_name: &str) -> DnsResponseSummary {

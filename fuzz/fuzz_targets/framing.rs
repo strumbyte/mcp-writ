@@ -1,12 +1,14 @@
 //! Fuzz target: bounded stdio JSON-RPC framing.
 //!
-//! Input layout: `[u64 max_bytes LE][u32 window LE][stream bytes]`.
+//! Input layout: `[b"FRM1"][u64 max_bytes LE][u32 window LE][stream]`.
 //! `window` caps each `fill_buf` chunk the readers see (0 = the whole
 //! stream at once), so frames also span buffer refills. The property
 //! drains the stream through both boundary readers —
 //! `read_frame_bounded` (resumable, the Auditor's proxy loops) and
 //! `read_line_bounded` (fail-fast, the launcher) — asserting the
-//! framing invariants and cross-checking the two verdicts.
+//! framing invariants and cross-checking the two verdicts. The tag
+//! rejects stale artifacts: a `.bin` saved under an older layout
+//! would silently shift the stream, replaying a different input.
 //!
 //! Search space: caps biased to 0, window edges (8 KiB head/tail
 //! windows) and powers of two; frame lengths biased to `max±1`,
@@ -21,6 +23,11 @@ use std::cell::Cell;
 use mcp_writ::fuzz::{FrameStats, drain_frames, drain_lines};
 
 const MAX_STREAM: usize = 96 * 1024;
+
+/// Format tag prefixed to every generated input — a saved artifact
+/// from a different layout fails loudly instead of decoding into a
+/// shifted, unrecognizable stream.
+const INPUT_TAG: &[u8; 4] = b"FRM1";
 
 #[derive(Default)]
 struct Gates {
@@ -100,13 +107,20 @@ fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
     if (1..64).contains(&window) {
         stream.truncate(8 * 1024);
     }
-    let mut input = (max as u64).to_le_bytes().to_vec();
+    let mut input = INPUT_TAG.to_vec();
+    input.extend_from_slice(&(max as u64).to_le_bytes());
     input.extend_from_slice(&(window as u32).to_le_bytes());
     input.extend_from_slice(&stream);
     input
 }
 
 fn property(g: &Gates, data: &[u8]) {
+    let Some(data) = data.strip_prefix(INPUT_TAG) else {
+        panic!(
+            "framing input lacks the {} tag — stale or foreign artifact",
+            String::from_utf8_lossy(INPUT_TAG)
+        );
+    };
     if data.len() < 12 {
         return;
     }
