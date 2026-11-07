@@ -3861,6 +3861,6 @@ Standing today (v0.5.1):
 
 | Route | Matrix | Recorded range | Boundary fuzz | Missing for `adopted` |
 |---|---|---|---|---|
-| `unotify-run` | `poc` | `unotify_e2e` on hosted Ubuntu legs of CI / Platform tests / Linux tests | the shared targets cover its framing/protocol reads; the seccomp-notify decision path itself is not fuzzed | fuzzing of the notify path; kernel-range records beyond hosted-Ubuntu kernels |
+| `unotify-run` | `poc` | `unotify_e2e` on hosted Ubuntu legs of CI / Linux tests | the shared targets cover its framing/protocol reads; the seccomp-notify decision path itself is not fuzzed | fuzzing of the notify path; kernel-range records beyond hosted-Ubuntu kernels |
 | `ebpf-run` | `opt-in` | one privileged WSL2 kernel-6.18 record — `ebpf_e2e` 9/9, manual only | none beyond the shared targets | real privileged-host records across the claimed kernel range; any CI-visible run |
 | `macos-proxy-run` | `opt-in` | `macos_proxy_e2e` on the Platform tests macOS leg | none beyond the shared targets | a second recorded macOS release; CONNECT-proxy path fuzzing |

@@ -137,6 +137,12 @@ windows = { version = "0.62.2", features = [
 [dev-dependencies]
 tempfile = "3.27"
 
+[features]
+# `src/fuzz.rs` — the boundary-fuzzing façade — compiles only for the
+# sibling fuzz package and feature-enabled test runs, keeping it out
+# of shipped builds and the documented public API.
+fuzzing = []
+
 # The fuzz package is a member for dependency centralization only:
 # `default-members` keeps plain `cargo build`/`test`/`clippy` scoped to
 # this package, so the fuzz targets stay opt-in (`--manifest-path

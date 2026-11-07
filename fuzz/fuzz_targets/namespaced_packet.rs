@@ -26,6 +26,8 @@ mod imp {
         tun_classify, tun_tcp_tuple,
     };
 
+    /// Coverage counters the property ticks — the gate at the end of
+    /// a passing run asserts each classify/NAT path actually ran.
     #[derive(Default)]
     pub struct Gates {
         pub cases: Cell<usize>,
@@ -41,6 +43,8 @@ mod imp {
         pub nat_cap: Cell<usize>,
     }
 
+    /// Model-side state of one minted mapping — the post-DNAT reply
+    /// template plus the original tuple and its lifecycle marks.
     struct Flow {
         workload: IpAddr,
         alloc: u16,
@@ -63,14 +67,18 @@ mod imp {
         minted_at: Instant,
     }
 
+    /// A random IPv4 address.
     fn v4(ctx: &mut noprop::TestCaseContext) -> Ipv4Addr {
         Ipv4Addr::from(noprop::sample_u32(ctx))
     }
 
+    /// A random IPv6 address.
     fn v6(ctx: &mut noprop::TestCaseContext) -> Ipv6Addr {
         Ipv6Addr::from(noprop::sample_u128(ctx))
     }
 
+    /// A (src, dst) port pair — biased to service ports and the
+    /// 0/65535 edges.
     fn ports(ctx: &mut noprop::TestCaseContext) -> (u16, u16) {
         let pick = |ctx: &mut noprop::TestCaseContext| {
             noprop::sample_with_boundaries(
@@ -83,6 +91,8 @@ mod imp {
         (pick(ctx), pick(ctx))
     }
 
+    /// Append a 20-byte TCP header — SYN-heavy flags and mostly a
+    /// valid data offset, occasionally garbage.
     fn tcp_header(ctx: &mut noprop::TestCaseContext, f: &mut Vec<u8>) {
         let (sp, dp) = ports(ctx);
         f.extend_from_slice(&sp.to_be_bytes());
@@ -220,6 +230,9 @@ mod imp {
         f.extend_from_slice(&noprop::sample_bytes_vec(ctx, payload_len));
     }
 
+    /// Emit one input: `[u8 flags][u8 n_frames][frames][u8
+    /// n_ops][ops]` — frames are byte soups or semi-valid IPv4/IPv6
+    /// packets, ops drive the stateful NAT lifecycle.
     pub fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
         let flags: u8 = u8::from(noprop::sample_bool(ctx));
         let n_frames = noprop::sample_usize_in(ctx, 0..=10);
@@ -329,6 +342,8 @@ mod imp {
     /// SYN (or an ACK) must hit to reuse a live mapping.
     type FlowKey = (IpAddr, u16, IpAddr, u16);
 
+    /// The workload-side 4-tuple a repeat packet must hit for `f`'s
+    /// mapping to be reused.
     fn flow_key(f: &Flow) -> FlowKey {
         (f.workload, f.orig_src_port, f.orig_addr, f.orig_port)
     }
@@ -537,6 +552,9 @@ mod imp {
         }
     }
 
+    /// Classify one frame and, on TCP, drive `dnat_in`/`rev_nat_out`
+    /// — asserting the minted mapping against an independently parsed
+    /// tuple and recording it in the flow model.
     fn drive_frame(
         g: &Gates,
         model: &mut FlowModel,
@@ -624,6 +642,9 @@ mod imp {
         }
     }
 
+    /// Decode the input's frames and ops, drive the classify/NAT
+    /// boundary, then check every modeled flow's reverse-path
+    /// consistency.
     pub fn property(g: &Gates, data: &[u8]) {
         let Some(&flags) = data.first() else { return };
         let intercept = flags & 1 != 0;
@@ -823,6 +844,7 @@ mod imp {
         g.cases.set(g.cases.get() + 1);
     }
 
+    /// Parse the shared CLI and run the harness for this target.
     pub fn main() -> i32 {
         let args = mcp_writ_fuzz::parse_args("namespaced_packet");
         let g = Gates::default();
@@ -855,11 +877,15 @@ mod imp {
     }
 }
 
+/// Entry point — the real target lives in `imp`, which exists only
+/// on Linux.
 #[cfg(target_os = "linux")]
 fn main() {
     std::process::exit(imp::main());
 }
 
+/// Stub entry point — the namespaced path is Linux-only, so report
+/// and exit cleanly elsewhere.
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("[namespaced_packet] linux-only target — skipped on this platform");

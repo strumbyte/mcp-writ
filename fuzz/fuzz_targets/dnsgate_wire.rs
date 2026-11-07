@@ -19,6 +19,8 @@
 use std::cell::Cell;
 use std::net::IpAddr;
 
+/// Coverage counters the property ticks — the gate at the end of a
+/// passing run asserts each boundary actually ran.
 #[derive(Default)]
 struct Gates {
     cases: Cell<usize>,
@@ -175,8 +177,11 @@ fn rr(ctx: &mut noprop::TestCaseContext, out: &mut Vec<u8>, name: &str) {
     };
     out[rdlen_pos] = (claimed >> 8) as u8;
     out[rdlen_pos + 1] = claimed as u8;
-    // A lying rdlen that overshoots the buffer needs the bytes cut too.
-    if claimed < rdlen {
+    // An undershooting rdlen either cuts the record short — the wire
+    // then carries exactly `claimed` bytes — or keeps the full rdata
+    // so the surplus parses as the next record's bytes. The decoder
+    // must fail closed on both shapes.
+    if claimed < rdlen && noprop::sample_bool(ctx) {
         out.truncate(start + claimed as usize);
     }
 }
@@ -324,6 +329,9 @@ fn wire_len(name: &str) -> usize {
         + 1
 }
 
+/// An anything-goes message — sampled flag words and section counts
+/// filled by `wire_name`/`rr`, plus occasional trailing garbage the
+/// parser must reject.
 fn wild_message(ctx: &mut noprop::TestCaseContext, name: &str) -> Vec<u8> {
     let mut m = Vec::new();
     m.extend_from_slice(&noprop::sample_u16(ctx).to_be_bytes()); // id
@@ -363,6 +371,9 @@ fn wild_message(ctx: &mut noprop::TestCaseContext, name: &str) -> Vec<u8> {
     m
 }
 
+/// Emit one tagged input: `[DNS1][u8 name_len][name][u8
+/// arm][message]` — `arm` records which generator produced `message`
+/// so its arm-specific oracles apply.
 fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
     let name = noprop::sample_choice(
         ctx,
@@ -410,6 +421,8 @@ fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
     input
 }
 
+/// Run one input across the query and response boundaries, asserting
+/// parser verdicts and ticking the coverage gates.
 fn property(g: &Gates, data: &[u8]) {
     let Some(data) = data.strip_prefix(INPUT_TAG) else {
         panic!(
@@ -625,6 +638,7 @@ fn property(g: &Gates, data: &[u8]) {
     g.cases.set(g.cases.get() + 1);
 }
 
+/// Parse the shared CLI and run the harness for this target.
 fn main() {
     let args = mcp_writ_fuzz::parse_args("dnsgate_wire");
     let g = Gates::default();

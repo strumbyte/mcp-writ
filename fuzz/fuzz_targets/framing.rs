@@ -22,6 +22,8 @@ use std::cell::Cell;
 
 use mcp_writ::fuzz::{FrameStats, drain_frames, drain_lines};
 
+/// Largest generated stream — big enough for multi-frame cases,
+/// small enough that a tiny-window case still finishes quickly.
 const MAX_STREAM: usize = 96 * 1024;
 
 /// Format tag prefixed to every generated input — a saved artifact
@@ -29,6 +31,8 @@ const MAX_STREAM: usize = 96 * 1024;
 /// shifted, unrecognizable stream.
 const INPUT_TAG: &[u8; 4] = b"FRM1";
 
+/// Coverage counters the property ticks — the gate at the end of a
+/// passing run asserts each reader path actually ran.
 #[derive(Default)]
 struct Gates {
     cases: Cell<usize>,
@@ -40,6 +44,9 @@ struct Gates {
     chunked: Cell<usize>,
 }
 
+/// Emit one tagged input: `[FRM1][u64 max_bytes LE][u32 window
+/// LE][stream]` — caps and `fill_buf` window biased to boundaries,
+/// frame bodies kept newline-free.
 fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
     let max = noprop::sample_with_boundaries(
         ctx,
@@ -114,6 +121,8 @@ fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
     input
 }
 
+/// Drain one stream through both bounded readers, assert the
+/// framing invariants, and cross-check the two verdicts.
 fn property(g: &Gates, data: &[u8]) {
     let Some(data) = data.strip_prefix(INPUT_TAG) else {
         panic!(
@@ -157,9 +166,17 @@ fn cross_check(frames: &FrameStats, lines: &FrameStats) {
         lines.fail_fast,
         frames.oversize
     );
-    assert!(lines.lines <= frames.lines + frames.oversize);
+    // Every line the fail-fast reader returned is an in-limit frame
+    // the resumable reader counted too — the fail-fast total is a
+    // prefix of `frames.lines`, and a run that never hit `TooLarge`
+    // drained the stream, so the totals then agree exactly.
+    assert!(lines.lines <= frames.lines);
+    if !lines.fail_fast {
+        assert_eq!(lines.lines, frames.lines);
+    }
 }
 
+/// Parse the shared CLI and run the harness for this target.
 fn main() {
     let args = mcp_writ_fuzz::parse_args("framing");
     let g = Gates::default();

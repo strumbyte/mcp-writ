@@ -7,7 +7,9 @@ publish = false
 description = "noprop-driven boundary fuzz targets for mcp-writ — a workspace member excluded from default-members so normal builds skip it"
 
 [dependencies]
-mcp-writ.workspace = true
+# `fuzzing` exposes the `mcp_writ::fuzz` façade these targets drive —
+# off by default so the shipped binaries never compile it.
+mcp-writ = { workspace = true, features = ["fuzzing"] }
 noprop.workspace = true
 
 # One binary per fuzz target, laid out under fuzz_targets/ like a

@@ -61,15 +61,20 @@ impl Tracked<'_> {
 }
 
 impl tokio::io::AsyncBufRead for Tracked<'_> {
+    /// Expose the next `window`-capped slice — always `Ready`, the
+    /// reader never parks.
     fn poll_fill_buf(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
         Poll::Ready(Ok(&self.data[self.pos..self.chunk_end()]))
     }
+    /// Advance the position past the bytes the reader consumed.
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
         self.pos += amt;
     }
 }
 
 impl tokio::io::AsyncRead for Tracked<'_> {
+    /// Copy the next `window`-capped slice into `buf` — always
+    /// `Ready`, the reader never parks.
     fn poll_read(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -565,6 +570,8 @@ mod ns {
     }
 
     impl NatProbe {
+        /// Wrap a fresh `NatTable` with `dns_intercept` set — the
+        /// same flag the proxy launch passes.
         pub fn new(dns_intercept: bool) -> Self {
             Self {
                 inner: crate::warden::namespaced::nat::NatTable::new(dns_intercept),
@@ -642,6 +649,8 @@ pub use ns::*;
 mod tests {
     use super::*;
 
+    /// An oversized frame is drained through its newline and the
+    /// resumable reader keeps counting — one-shot and chunked.
     #[test]
     fn drain_frames_recovers_oversize() {
         let big = vec![b'x'; 300];
@@ -657,6 +666,8 @@ mod tests {
         }
     }
 
+    /// `TooLarge` stops the fail-fast reader mid-stream — `consumed`
+    /// stays short of the input.
     #[test]
     fn drain_lines_fails_fast() {
         let mut data = vec![b'x'; 200];
@@ -670,6 +681,8 @@ mod tests {
         }
     }
 
+    /// `jsonrpc_line` survives garbage and reports the shape of a
+    /// well-formed tools/list page.
     #[test]
     fn jsonrpc_line_handles_garbage_and_valid() {
         let s = jsonrpc_line("not json at all");
@@ -680,6 +693,8 @@ mod tests {
         assert!(s.tools_page_ok);
     }
 
+    /// A minimal `a.b` A/IN query decodes and its forward rebuild
+    /// re-parses — the seam's smoke coverage.
     #[test]
     fn dns_round_trip_smoke() {
         // A minimal query: id, RD-flag header, one A/IN question for a.b.

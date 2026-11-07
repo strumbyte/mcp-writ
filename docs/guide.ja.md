@@ -2001,6 +2001,6 @@ capability matrix にはまだ `adopted` でない opt-in の egress 経路が 3
 
 | 経路 | matrix | 記録済み範囲 | 境界ファジング | `adopted` に欠けるもの |
 |---|---|---|---|---|
-| `unotify-run` | `poc` | CI / Platform tests / Linux tests の hosted Ubuntu 脚で `unotify_e2e` | 共有ターゲットがフレーミング/プロトコル読みをカバー。seccomp-notify の判定経路自体は未ファジング | notify 経路のファジング。hosted-Ubuntu カーネル以外のカーネル範囲記録 |
+| `unotify-run` | `poc` | CI / Linux tests の hosted Ubuntu 脚で `unotify_e2e` | 共有ターゲットがフレーミング/プロトコル読みをカバー。seccomp-notify の判定経路自体は未ファジング | notify 経路のファジング。hosted-Ubuntu カーネル以外のカーネル範囲記録 |
 | `ebpf-run` | `opt-in` | 特権 WSL2 カーネル 6.18 の記録 1 件 — `ebpf_e2e` 9/9、手動のみ | 共有ターゲット以外なし | 主張カーネル範囲での実特権ホスト記録。CI で見える実行 |
 | `macos-proxy-run` | `opt-in` | Platform tests の macOS 脚で `macos_proxy_e2e` | 共有ターゲット以外なし | 2 件目の macOS リリース記録。CONNECT プロキシ経路のファジング |

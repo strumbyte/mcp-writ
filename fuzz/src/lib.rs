@@ -91,6 +91,8 @@ fn parse_seed(raw: &str) -> Result<u64, String> {
         .map_err(|e| format!("bad seed {raw:?}: {e} (decimal or 0x-hex)"))
 }
 
+/// Print the shared CLI contract to stderr — every target accepts
+/// the same flags, so usage only varies by name.
 fn usage(target: &str) {
     eprintln!(
         "usage: {target} [--cases N] [--seed HEX|DEC] [--crash-dir DIR] [--replay FILE]\n\
@@ -98,6 +100,8 @@ fn usage(target: &str) {
     );
 }
 
+/// Exit 2 on a CLI misuse — a bad invocation is a user error, not a
+/// fuzz finding.
 fn usage_fail(target: &str, msg: &str) -> ! {
     eprintln!("{target}: {msg}");
     usage(target);
@@ -201,6 +205,8 @@ where
     }
 }
 
+/// Message text of a panic payload — `String` or `&'static str`, the
+/// two shapes `assert!`/`panic!` produce.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
@@ -249,6 +255,10 @@ fn inflight_dir(dir: &Path, name: &str) -> PathBuf {
 }
 
 impl LiveArtifacts {
+    /// Open the in-flight directory for this run — rotating an
+    /// abandoned one aside first, and disabling per-case persistence
+    /// when that rotation refuses rather than touching the older
+    /// evidence.
     fn open(name: &str, args: &Args) -> Self {
         let dir = &args.crash_dir;
         let inflight_dir = inflight_dir(dir, name);
@@ -318,7 +328,15 @@ impl LiveArtifacts {
                             let _ = std::fs::write(&moved_txt, updated);
                         }
                     }
-                    let _ = std::fs::remove_dir_all(&grave_dir);
+                    // Only this rotation's own stash is disposable —
+                    // a `grave` left by an earlier interrupted or
+                    // refused rotation stays as evidence, and its
+                    // presence makes the next stash hit the same
+                    // refused-rotation path instead of silently
+                    // erasing a generation.
+                    if stashed {
+                        let _ = std::fs::remove_dir_all(&grave_dir);
+                    }
                 }
             }
         }
@@ -461,6 +479,8 @@ fn fail(
     }
 }
 
+/// Create `dir` and write the `<name>.bin` / `<name>.txt` pair —
+/// the evidence a later `--replay` needs.
 fn write_crash(dir: &Path, name: &str, input: &[u8], report: &str) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join(format!("{name}.bin")), input)?;

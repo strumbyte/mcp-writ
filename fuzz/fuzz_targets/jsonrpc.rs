@@ -14,6 +14,8 @@
 
 use std::cell::Cell;
 
+/// Coverage counters the property ticks — the gate at the end of a
+/// passing run asserts each parser path actually ran.
 #[derive(Default)]
 struct Gates {
     cases: Cell<usize>,
@@ -73,6 +75,9 @@ const KEYS: &[&str] = &[
     "arguments",
 ];
 
+/// Literal pool — protocol versions, method names, enum values, and
+/// hostile strings (replacement char, empty) the grammar splices
+/// into scalar positions.
 const STRINGS: &[&str] = &[
     "2.0",
     "initialize",
@@ -103,6 +108,8 @@ const STRINGS: &[&str] = &[
     "�",
 ];
 
+/// Emit one JSON scalar — pooled strings, boundary-biased integers
+/// (error-code and edge values), and literals.
 fn scalar(ctx: &mut noprop::TestCaseContext, out: &mut String) {
     match noprop::sample_weighted_index(ctx, &[45, 30, 15, 10]) {
         0 => {
@@ -140,6 +147,8 @@ fn scalar(ctx: &mut noprop::TestCaseContext, out: &mut String) {
     }
 }
 
+/// Emit one JSON value from the protocol-key grammar — object,
+/// array, or scalar, with `depth` capping the nesting.
 fn json_value(ctx: &mut noprop::TestCaseContext, depth: usize, out: &mut String) {
     if depth >= 5 {
         scalar(ctx, out);
@@ -278,6 +287,8 @@ fn template(ctx: &mut noprop::TestCaseContext) -> String {
     }
 }
 
+/// Emit one case: raw bytes, printable soup, grammar-driven JSON, or
+/// an MCP-flavored template — a quarter get truncated or spliced.
 fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
     let mut doc = match noprop::sample_weighted_index(ctx, &[25, 20, 30, 25]) {
         0 => {
@@ -309,6 +320,9 @@ fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
     doc
 }
 
+/// Interpret one frame body and assert the cross-parse invariants —
+/// extractor verdicts imply valid JSON, and `inputRequests` must hit
+/// the 64-member extractor cap exactly, not just stay under it.
 fn property(g: &Gates, data: &[u8]) {
     let line = String::from_utf8_lossy(data);
     let s = mcp_writ::fuzz::jsonrpc_line(&line);
@@ -366,6 +380,7 @@ fn property(g: &Gates, data: &[u8]) {
     g.meta.set(g.meta.get() + usize::from(s.meta_present));
 }
 
+/// Parse the shared CLI and run the harness for this target.
 fn main() {
     let args = mcp_writ_fuzz::parse_args("jsonrpc");
     let g = Gates::default();
