@@ -78,7 +78,7 @@ PR 単位の作業順序は [improvement-pr-guide-2026-11.ja.md](improvement-pr-
 | ID | 指摘（出典） | HEAD での判定 | 優先度 | PR |
 |---|---|---|---|---|
 | R-01 | stdio 限定。リモート MCP と集中管理はカバーしない | **非目標**（§7）。ゲートウェイ製品と直列に置く構成例は無い | P2 | PR-08（構成例のみ） |
-| R-02 | OS ごとの保証差（macOS の sandbox-exec は非推奨、Windows AppContainer は宛先制御不可、Ubuntu 24.04 は非特権 userns を既定で制限）。後継機構として Microsoft Execution Containers（2026-10-07 GA）と macOS Endpoint Security の `es_new_descendants_client`（macOS 27 以降）を挙げる | **設計どおり開示済み**（capability matrix・guide の OS 別表）。後継機構の評価は未着手。Landlock も ABI v9 までで、v10（UDP 制限、Linux 7.2）はクレート 0.4.7 に未収録 | P2 | PR-11（調査のみ） |
+| R-02 | OS ごとの保証差（macOS の sandbox-exec は非推奨、Windows AppContainer は宛先制御不可、Ubuntu 24.04 は非特権 userns を既定で制限）。後継機構として Microsoft Execution Containers（2026-10-07 GA）と macOS Endpoint Security の `es_new_descendants_client`（macOS 27 以降）を挙げる | **設計どおり開示済み**（capability matrix・guide の OS 別表）。後継機構の評価は **PR-11 で実施済み**（[記録](validation/successor-mechanisms-2026-11.md)）: MXC は **保留** — GA 後の tier-1（BaseContainer/PSEC）で fs・env 配信・非ループバック宛先制御・stdio 契約は実測良好だが、`ole32.dll` がコンテナ内で初期化失敗（`0xC0000142`）し node.exe が起動不能、かつ host loopback は egress ルール適用外の全許可/全拒否のみ。解除条件: ole32 起因の起動失敗が解消される OS 版、または tier-2/3（要管理者 host-prep）での検証、loopback 方針の決着、監査（CaptureDenials）の実測。ES descendants client は **見送り** — IP ネットワークに auth イベントが無く Warden の中核契約を表現不能（実機未検証・entitlement 未取得）。Landlock v10/v11 は **保留** — v10 の UDP 制御はポート単位で宛先制御は不可、クレート 0.4.7 は ABI 9 止まり（upstream #140 未リリース）・参照ホストの WSL カーネルは ABI 7 実測。Ubuntu userns 制限と `auto` の挙動・文書は **現状正しいことを確認** | P2 | PR-11（調査のみ） |
 | R-03 | ツール単位の OS 隔離は構造的に不可能 | **設計どおり開示済み**（README L430–438、guide §8.1、前身の D-6）。対応しない | — | — |
 | R-04 | ハッシュ固定したスクリプトは実パスで起動し、隙間が閉じるのは namespaced と Windows のみ | **設計どおり開示済み**（guide §8.2）。README 英日の未更新は E-05 | — | PR-01 |
 | R-05 | 監査ログの運用。Windows に再オープンの契機が無い。容量枯渇は fail-closed で復帰しない | **設計どおり**（前身の PR-27 の決定）。Windows の再オープン契機は判断事項として記録する | P2 | —（D-9） |
@@ -114,7 +114,7 @@ PR 単位の作業順序は [improvement-pr-guide-2026-11.ja.md](improvement-pr-
 |---|---|
 | **次版（v0.6 想定）** | P0 の PR-01（文書・例の即時修正）はタグ前に必須。P1 の PR-02〜05・PR-07（起動コスト・引数分類・自由記述欄・namespaced の起動前判定・CI 定期実行）は含める範囲をリリース時に判断 |
 | **次版以降** | P2 の PR-06・PR-08・PR-10・PR-11（v3 草案と警告、運用文書、ファジング基盤、後継機構の調査）。PR-09 は v0.5.1 で実装済み（探索が既定で Warden 内）で D-2 の結論も §5 に記録済み — 文書追従の残件も PR-01 で完了済み |
-| **別計画** | microVM 隔離の強化（既存の `--isolation` バックエンドの延長）。PR-11 の調査結果を入力にする |
+| **別計画** | microVM 隔離の強化（既存の `--isolation` バックエンドの延長）。PR-11 の調査結果（[記録](validation/successor-mechanisms-2026-11.md)）を入力にする: MXC は ole32 起動失敗の解消・tier-2/3 検証・loopback 方針を条件に条件付き候補、ES descendants client はネットワーク制御不能で見送り、Landlock v10/v11 はクレート/カーネル要件を条件に保留 — 現状、microVM 系が宛先単位制御の唯一の代替経路という結論は変わらない |
 
 ## 7. 非目標（継続）
 

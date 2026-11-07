@@ -385,6 +385,8 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **移行・戻し方:** コード変更なし。
 
+**調査メモ:** 記録は [validation/successor-mechanisms-2026-11.md](validation/successor-mechanisms-2026-11.md)（結論は改善計画 R-02・§6 に反映済み）。実機計測は Windows 26200.9711 で `mxc-sdk` 1.0.1 を使い、PSEC は `QueryProcessSecurityEnvironmentSupport` flags が `0x3`→`0xf`・v1.1 受理に拡張され GA 後の契約面が固まったことを確認。ただし tier-1（BaseContainer）では `ole32.dll` が子プロセスの初期化で失敗し node.exe が起動不能 — 採用のブロッカーとして記録。loopback が direct-egress ルールの適用外（`host_loopback` ビットのみの全許可/全拒否）である点もポリシー写像上の制約（`networkProxy` 経路は未検証）。macOS は entitlement 未取得のため文書調査止まり（未検証と明記）、Landlock は参照ホストの ABI が 7（WSL2 6.18）で v10/v11 は計測不能 — クレート側の未収録が第一のゲート。Ubuntu userns 制限下の `auto` は select.rs の契約記述と文書の照合で評価した — 制限有効ホストでの実走行は未検証（WSL ホストでは制限 sysctl 自体が不在で再現不能）。制限下の具体的な挙動は未検証のまま保留。
+
 <a id="release-next"></a>
 
 ### リリース: 次版（v0.6 想定）— PR-01 の完了後（PR-02〜05・07 は含める範囲を判断）
