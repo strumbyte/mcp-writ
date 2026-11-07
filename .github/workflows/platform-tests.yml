@@ -36,8 +36,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      # --features fuzzing: the `fuzz` façade module is gated behind
+      # the non-default `fuzzing` feature — its unit tests only exist
+      # when the feature is on.
       - name: Unit tests
-        run: cargo test --locked --lib --bins --no-fail-fast
+        run: cargo test --locked --lib --bins --no-fail-fast --features fuzzing
       - name: Documentation tests
         run: cargo test --locked --doc
       - name: Integration tests

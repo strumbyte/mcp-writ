@@ -206,6 +206,9 @@ pub async fn read_line_bounded<R: AsyncBufRead + Unpin>(
             if acc.is_empty() {
                 return Ok(None);
             }
+            // `acc` cannot exceed `max_bytes` — the accumulation guard
+            // below refuses to extend past it — so this arm is a
+            // fail-closed check on that invariant, not a live path.
             if acc.len() > max_bytes {
                 return Err(FramingError::TooLarge {
                     bytes: acc.len(),

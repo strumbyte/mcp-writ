@@ -63,7 +63,7 @@ mod netlink;
 mod probe;
 pub(crate) mod report;
 mod spawn;
-mod stack;
+pub(crate) mod stack;
 
 pub(crate) use probe::{ProbeReport, run_probe};
 pub(crate) use spawn::{

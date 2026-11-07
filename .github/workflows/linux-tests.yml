@@ -76,8 +76,11 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps
 
+      # --features fuzzing: the `fuzz` façade module is gated behind
+      # the non-default `fuzzing` feature — its unit tests only exist
+      # when the feature is on.
       - name: Unit tests
-        run: cargo test --locked --lib --bins --no-fail-fast
+        run: cargo test --locked --lib --bins --no-fail-fast --features fuzzing
 
       - name: Documentation tests
         run: cargo test --locked --doc

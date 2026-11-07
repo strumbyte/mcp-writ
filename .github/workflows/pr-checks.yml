@@ -23,6 +23,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "rustfmt.toml"
+      - "fuzz/**"
       - ".github/workflows/pr-checks.yml"
   workflow_dispatch:
 
@@ -75,8 +76,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # The fuzz package is outside `default-members`, so the clippy
+      # run above never builds it — lint it explicitly or a façade-API
+      # drift would only surface at the next manual fuzz.yml dispatch.
+      - name: Fuzz targets
+        run: cargo clippy --locked --all-targets --manifest-path fuzz/Cargo.toml -- -D warnings
+
+      # --features fuzzing: the `fuzz` façade module is gated behind
+      # the non-default `fuzzing` feature — its unit tests only exist
+      # when the feature is on.
       - name: Unit tests (incl. CLI parse)
-        run: cargo test --locked --lib --bins --no-fail-fast
+        run: cargo test --locked --lib --bins --no-fail-fast --features fuzzing
 
       - name: Guard-rail tests
         run: >-

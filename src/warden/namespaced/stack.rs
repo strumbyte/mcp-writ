@@ -34,7 +34,7 @@
 //! device, per-conn bookkeeping, the task wiring, and the TCP core.
 
 mod backend;
-mod packet;
+pub(crate) mod packet;
 mod udp;
 
 use std::collections::{HashMap, VecDeque};

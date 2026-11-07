@@ -3780,8 +3780,9 @@ recorded in
 [validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md).
 *Detects:* `proxy_stats` counters expose drops and audit suppression
 (`udp_audit_suppressed`); a supervisor or proxy loss stops egress rather
-than losing control silently. *Remains:* abnormal-input fuzzing beyond
-malformed-packet drops is not exercised, and there is no rate limiting
+than losing control silently. *Remains:* the packet-classification
+boundary is fuzzed by the `namespaced_packet` target (§8.5), but the
+full relay loop is not, and there is no rate limiting
 against CPU exhaustion inside the relay. For a threat model that must
 not trust an in-process supervisor, the documented stronger routes are
 the isolation backends (`--isolation kata|apple-container|hyperv|
@@ -3821,3 +3822,45 @@ in-namespace seccomp pins `socket()` to IP families absolutely (a
 `unix=` opt-in refuses at selection), `CLONE_NEWPID` confines signals
 to in-namespace pids, and `/run` is masked — no Landlock ABI is
 required for any of it.
+
+### 8.5 Promoting a PoC egress route to adopted
+
+The capability matrix carries three opt-in egress routes that are not
+yet `adopted`: `unotify-run` (`poc`), `ebpf-run` (`opt-in`), and
+`macos-proxy-run` (`opt-in`). Working once on a friendly host is not
+the bar an adopted default carries. A route rises when all five hold:
+
+- **Recorded OS/kernel range.** The hosts the route claims appear in
+  the [test matrix](test-matrix.md) evidence table — the OS release
+  and kernel version actually exercised, on every architecture the
+  route advertises; for kernel mechanisms, both the oldest kernel the
+  mechanism claims and a current one.
+- **Fuzzed input boundary.** Every place the route first interprets
+  attacker-controlled bytes sits under a fuzz target that runs to
+  completion in the [fuzz workflow](../.github/workflows/fuzz.yml).
+  `fuzz/fuzz_targets/` already covers the shared boundaries —
+  framing, JSON-RPC interpretation, the namespaced packet parsers,
+  the DNS gate wire format — driven by `noprop` in a sibling package
+  excluded from `default-members`, so normal builds never compile it;
+  a candidate route adds targets for any boundary it introduces. Crash inputs upload as the `fuzz-evidence`
+  artifact; `noprop` does not shrink, so a found input becomes a
+  hand-minimized unit-test fixture in a follow-up PR.
+- **Denial-audit coverage.** Every OS-level deny the route can
+  produce either leaves a `sandbox.network_denied`-family record or
+  is asserted unobservable by specification — never silently absent
+  (`denial_audit_e2e` pins this).
+- **plan / report / JSONL agreement.** `plan`, the launch `--report`,
+  and the audit stream describe the same controls for the same launch
+  — ids matching the capability-matrix row, `not_applied` disclosed
+  rather than claimed.
+- **Disclosed limits.** The route's `deficiencies`/`select`/`refuse`
+  rows in `capability-matrix.json` name every residual gap — nothing
+  left to be rediscovered in review.
+
+Standing today (v0.5.1):
+
+| Route | Matrix | Recorded range | Boundary fuzz | Missing for `adopted` |
+|---|---|---|---|---|
+| `unotify-run` | `poc` | `unotify_e2e` on hosted Ubuntu legs of CI / Linux tests | the shared targets cover its framing/protocol reads; the seccomp-notify decision path itself is not fuzzed | fuzzing of the notify path; kernel-range records beyond hosted-Ubuntu kernels |
+| `ebpf-run` | `opt-in` | one privileged WSL2 kernel-6.18 record — `ebpf_e2e` 9/9, manual only | none beyond the shared targets | real privileged-host records across the claimed kernel range; any CI-visible run |
+| `macos-proxy-run` | `opt-in` | `macos_proxy_e2e` on the Platform tests macOS leg | none beyond the shared targets | a second recorded macOS release; CONNECT-proxy path fuzzing |

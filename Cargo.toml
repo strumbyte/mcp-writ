@@ -6,9 +6,8 @@ readme = "README.md"
 repository = "https://github.com/strumbyte/mcp-writ"
 keywords = ["mcp", "sandbox", "security", "json-rpc"]
 categories = ["command-line-utilities"]
-edition = "2024"
-# Matches the toolchain pinned in rust-toolchain.toml (kdl itself needs >=1.95).
-rust-version = "1.99.0"
+edition.workspace = true
+rust-version.workspace = true
 license = "MIT"
 # docs_check is a repo-hygiene check that requires .github/, which is
 # excluded above; keeping it out of the package avoids a spurious
@@ -20,6 +19,10 @@ exclude = [
     "/tests/fixtures/real_servers/node/node_modules/**",
     "/tests/fixtures/real_servers/python/.venv/**",
     "/tests/fixtures/real_servers/mingit/**",
+    # The fuzz harness is a sibling workspace package — keep it out of
+    # the published crate so `cargo package`/`publish` never tries to
+    # absorb its manifest.
+    "/fuzz/**",
 ]
 
 [[bin]]
@@ -133,3 +136,29 @@ windows = { version = "0.62.2", features = [
 
 [dev-dependencies]
 tempfile = "3.27"
+
+[features]
+# `src/fuzz.rs` — the boundary-fuzzing façade — compiles only for the
+# sibling fuzz package and feature-enabled test runs, keeping it out
+# of shipped builds and the documented public API.
+fuzzing = []
+
+# The fuzz package is a member for dependency centralization only:
+# `default-members` keeps plain `cargo build`/`test`/`clippy` scoped to
+# this package, so the fuzz targets stay opt-in (`--manifest-path
+# fuzz/Cargo.toml`) and never ride normal builds — the same isolation
+# cargo-fuzz's non-member layout provides, with one shared lockfile.
+[workspace]
+members = ["fuzz"]
+default-members = ["."]
+
+[workspace.package]
+edition = "2024"
+# Matches the toolchain pinned in rust-toolchain.toml (kdl itself needs >=1.95).
+rust-version = "1.99.0"
+
+[workspace.dependencies]
+mcp-writ = { path = "." }
+# Dependency-free, stable-toolchain property runner (chosen over
+# cargo-fuzz/libFuzzer to keep the new dependency set minimal).
+noprop = "0.2.1"

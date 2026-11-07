@@ -65,13 +65,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # The fuzz package is outside `default-members`, so the clippy
+      # run above never builds it — lint it explicitly or a façade-API
+      # drift would only surface at the next manual fuzz.yml dispatch.
+      - name: Fuzz targets
+        run: cargo clippy --locked --all-targets --manifest-path fuzz/Cargo.toml -- -D warnings
+
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps
 
+      # --features fuzzing: the `fuzz` façade module is gated behind
+      # the non-default `fuzzing` feature — its unit tests only exist
+      # when the feature is on.
       - name: Unit tests
-        run: cargo test --locked --lib --bins --no-fail-fast
+        run: cargo test --locked --lib --bins --no-fail-fast --features fuzzing
 
       - name: Documentation tests
         run: cargo test --locked --doc

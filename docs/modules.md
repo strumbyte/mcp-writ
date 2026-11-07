@@ -48,7 +48,7 @@ may reference another.
 
 | Layer | Modules |
 |---|---|
-| 8 | `lib.rs`, `main.rs`, `bin/mcp-secure-runner.rs`, `bin/mcp-writ-wsb-relay.rs` |
+| 8 | `lib.rs`, `main.rs`, `bin/mcp-secure-runner.rs`, `bin/mcp-writ-wsb-relay.rs`, `fuzz` (boundary-fuzzing adapter — `#[doc(hidden)]` façade over the attacker-input parsers for the sibling `fuzz/` crate) |
 | 7 | `commands` |
 | 6 | `cli` |
 | 5 | `runtime`, `container` |

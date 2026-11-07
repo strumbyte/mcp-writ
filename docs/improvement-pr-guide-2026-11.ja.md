@@ -344,17 +344,19 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **タスク**
 
-- [ ] ファジング対象を列挙し、純粋関数として切り出せる入口（バイト列 → 解析結果）を特定する。OS 資源に触れる経路は対象外にする
-- [ ] `fuzz/fuzz_targets/` に、フレーミング（`--max-frame-bytes` 境界を含む）、JSON-RPC の解釈（`protocol`）、namespaced プロキシの TCP／UDP／DNS パケット解析、DNS ゲートの応答解析の各ターゲットを置く。ワークフローは手動 dispatch（`fuzz.yml`）で、時間上限を設けて走らせ、クラッシュ入力は artifact に残す
-- [ ] 見つかった不具合は本PRでは直さず、再現 fixture を単体試験に移して別PRで直す（本PRは基盤のみ）
-- [ ] guide 英日 §8 に「PoC 経路を採用済みに上げる基準」を書く — 実機記録のある OS／カーネルの範囲、ファジングの実施、拒否監査の網羅、`plan`／`report`／JSONL の一致、文書の限界開示、の各条件と、現時点の各 PoC（`unotify-run`・`ebpf-run`・`macos-proxy-run`）の充足状況
-- [ ] test-matrix.md に `fuzz.yml` を登録する
+- [x] ファジング対象を列挙し、純粋関数として切り出せる入口（バイト列 → 解析結果）を特定する。OS 資源に触れる経路は対象外にする
+- [x] `fuzz/fuzz_targets/` に、フレーミング（`--max-frame-bytes` 境界を含む）、JSON-RPC の解釈（`protocol`）、namespaced プロキシの TCP／UDP／DNS パケット解析、DNS ゲートの応答解析の各ターゲットを置く。ワークフローは手動 dispatch（`fuzz.yml`）で、時間上限を設けて走らせ、クラッシュ入力は artifact に残す
+- [x] 見つかった不具合は本PRでは直さず、再現 fixture を単体試験に移して別PRで直す（本PRは基盤のみ）
+- [x] guide 英日 §8 に「PoC 経路を採用済みに上げる基準」を書く — 実機記録のある OS／カーネルの範囲、ファジングの実施、拒否監査の網羅、`plan`／`report`／JSONL の一致、文書の限界開示、の各条件と、現時点の各 PoC（`unotify-run`・`ebpf-run`・`macos-proxy-run`）の充足状況
+- [x] test-matrix.md に `fuzz.yml` を登録する
 
 **検証:** ファジングの各ターゲットが短時間（CI で 5 分程度）走り切ること。T-DOC。
 
 **完了条件:** 境界コードのファジングが手動 dispatch で実行でき、PoC の昇格基準が文書から読める。
 
 **移行・戻し方:** 製品コードの変更は入口の切り出し（純粋関数化）に限り、挙動は変えない。
+
+**実装メモ（計画からの差異）:** 「主な変更先」が想定した `cargo-fuzz` は採用せず、依存ゼロ・stable ツールチェーンで動く property runner の `noprop` に置き換えた — 本PRが新規に追加する外部依存を `noprop` だけに留めるため（`cargo-fuzz` は nightly ツールチェーンと `libfuzzer-sys`/`arbitrary` 等の追加依存を要する）。ターゲットは `cargo-fuzz` 慣習の `fuzz/fuzz_targets/` 配置を保ちつつ、通常の `[[bin]]` の `cargo run --bin` ターゲットとして実装し、縮小（shrinking）非対応ぶんは失敗時に生入力と再現手順を `fuzz-artifacts/` に残す方式で補った。ワークスペース構成も調整済み: `fuzz` は `workspace.dependencies` でバージョンをルート一元管理するためメンバーには含めるが、`default-members` からは外してあり、通常の `cargo build`/`test`/`clippy` は従来通り `mcp-writ` だけを対象にする（`[package] exclude` の `/fuzz/**` は publish 対象からの除外として残置）。
 
 <a id="pr-11"></a>
 
