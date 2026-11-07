@@ -16,13 +16,14 @@
 #[cfg(target_os = "linux")]
 mod imp {
     use std::cell::Cell;
+    use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::{Duration, Instant};
 
     use mcp_writ::fuzz::{
-        ALLOC_BASE, DNS_TCP_NAT_PORT, GATEWAY_V4, GATEWAY_V6, NatProbe, TCP_NAT_PORT,
-        TunClassified, WORKLOAD_V4, WORKLOAD_V6, craft_udp_reply, dns_parse_query, tun_classify,
-        tun_tcp_tuple,
+        ALLOC_BASE, DNS_TCP_NAT_PORT, GATEWAY_V4, GATEWAY_V6, MAX_NAT_MAPPINGS, NatProbe,
+        TCP_NAT_PORT, TunClassified, WORKLOAD_V4, WORKLOAD_V6, craft_udp_reply, dns_parse_query,
+        tun_classify, tun_tcp_tuple,
     };
 
     #[derive(Default)]
@@ -37,6 +38,7 @@ mod imp {
         pub reaped: Cell<usize>,
         pub removed: Cell<usize>,
         pub crafted: Cell<usize>,
+        pub nat_cap: Cell<usize>,
     }
 
     struct Flow {
@@ -55,6 +57,10 @@ mod imp {
         /// Touched by a reap landing exactly on the deadline — real
         /// elapsed µs decide which side it fell, so do not assert.
         maybe_reaped: bool,
+        /// Wall-clock mint time — mirrors `FlowOrig::minted`, which
+        /// the cap refusal path's internal `reap_expired` measures
+        /// against real `Instant::now()`, not an injected clock.
+        minted_at: Instant,
     }
 
     fn v4(ctx: &mut noprop::TestCaseContext) -> Ipv4Addr {
@@ -248,7 +254,7 @@ mod imp {
         out.push(n_ops.min(255) as u8);
         for _ in 0..n_ops {
             let mut op = Vec::new();
-            match noprop::sample_weighted_index(ctx, &[3, 3, 3, 4]) {
+            match noprop::sample_weighted_index(ctx, &[9, 9, 9, 12, 1]) {
                 0 | 1 => {
                     // 0 = mark_associated, 1 = remove — the index into
                     // the flow list is decoded modulo length.
@@ -266,7 +272,7 @@ mod imp {
                     );
                     op.extend_from_slice(&secs.to_be_bytes());
                 }
-                _ => {
+                3 => {
                     op.push(3u8);
                     op.push(u8::from(noprop::sample_bool(ctx))); // v6?
                     let (sp, dp) = ports(ctx);
@@ -275,11 +281,239 @@ mod imp {
                     let n = noprop::sample_usize_in(ctx, 0..=1200);
                     op.extend_from_slice(&noprop::sample_bytes_vec(ctx, n));
                 }
+                _ => {
+                    // 4 = SYN flood — mint `count` distinct flows.
+                    // Mostly shallow walks (≤512 mints — alloc churn,
+                    // tuple reuse); ~10% reach for the 4096-mapping cap
+                    // — a saturation costs ~50 ms, so it stays rare.
+                    op.push(4u8);
+                    let n = match noprop::sample_weighted_index(ctx, &[9, 1]) {
+                        0 => noprop::sample_usize_in(ctx, 0..=512) as u16,
+                        _ => noprop::sample_with_boundaries(
+                            ctx,
+                            &[4096usize, 4097, 5000, 8192],
+                            noprop::Ratio::new(1, 2),
+                            |ctx| noprop::sample_usize_in(ctx, 4000..=8192),
+                        ) as u16,
+                    };
+                    op.extend_from_slice(&n.to_be_bytes());
+                    op.extend_from_slice(&noprop::sample_u16(ctx).to_be_bytes()); // base sport
+                    op.extend_from_slice(&noprop::sample_u16(ctx).to_be_bytes()); // dst port
+                    op.extend_from_slice(&v4(ctx).octets()); // dst addr
+                }
             }
             out.extend_from_slice(&(op.len() as u16).to_be_bytes());
             out.extend_from_slice(&op);
         }
         out
+    }
+
+    /// A minimal workload→`dst` IPv4/TCP SYN — headers only; the NAT
+    /// path reads the tuple and flags, and recomputes the checksums.
+    fn syn_v4(sport: u16, dport: u16, dst: Ipv4Addr) -> Vec<u8> {
+        let mut f = vec![0u8; 40];
+        f[0] = 0x45;
+        f[2..4].copy_from_slice(&40u16.to_be_bytes()); // total len
+        f[8] = 64; // ttl
+        f[9] = 6; // tcp
+        f[12..16].copy_from_slice(&WORKLOAD_V4.octets());
+        f[16..20].copy_from_slice(&dst.octets());
+        f[20..22].copy_from_slice(&sport.to_be_bytes());
+        f[22..24].copy_from_slice(&dport.to_be_bytes());
+        f[32] = 5 << 4; // data offset
+        f[33] = 0x02; // SYN
+        f
+    }
+
+    /// Workload-side 4-tuple — mirrors `nat::FlowKey`, what a repeat
+    /// SYN (or an ACK) must hit to reuse a live mapping.
+    type FlowKey = (IpAddr, u16, IpAddr, u16);
+
+    fn flow_key(f: &Flow) -> FlowKey {
+        (f.workload, f.orig_src_port, f.orig_addr, f.orig_port)
+    }
+
+    /// Model of the NAT flow state: one row per `(workload, alloc)` —
+    /// `NatTable::by_alloc`'s key — indexed by `by_alloc` so repeated
+    /// mint recording stays O(1). Rows are never deleted (dead rows
+    /// are marked in place and can be reset on a recycled alloc), so
+    /// the index positions stay valid for the life of the model.
+    #[derive(Default)]
+    struct FlowModel {
+        flows: Vec<Flow>,
+        by_alloc: HashMap<(IpAddr, u16), usize>,
+        /// Live workload-side tuples — shadows `NatTable::by_flow` so
+        /// `flood`'s hit check stays O(1) at table-cap sizes.
+        live_keys: HashSet<FlowKey>,
+    }
+
+    impl FlowModel {
+        /// Record a `dnat_in` Some — fresh mint or re-emit. A live hit
+        /// keeps its state — `maybe_reaped` included: the impl may
+        /// have dropped and re-minted the mapping, so the real
+        /// deadline stays unknowable. A dead-row hit means
+        /// `next_alloc` wrapped onto a fresh mapping — floods plus
+        /// drive mints reach the 49152→65535→wrap inside
+        /// `mint_budget` — so the row takes the current dial's tuple
+        /// and restarts unassociated, unexpired, and freshly clocked;
+        /// the old mapping is definitely gone, so `maybe_reaped`
+        /// clears along with the deadline markers.
+        fn record_mint(
+            &mut self,
+            alloc_key: (IpAddr, u16),
+            reply: Vec<u8>,
+            orig_dst: (IpAddr, u16),
+            orig_src_port: u16,
+        ) {
+            let (workload, alloc) = alloc_key;
+            match self.by_alloc.get(&alloc_key).copied() {
+                Some(i) => {
+                    let fl = &mut self.flows[i];
+                    let was_live = !(fl.removed || fl.reaped);
+                    self.live_keys.remove(&flow_key(fl));
+                    fl.reply = reply;
+                    fl.orig_addr = orig_dst.0;
+                    fl.orig_port = orig_dst.1;
+                    fl.orig_src_port = orig_src_port;
+                    fl.removed = false;
+                    fl.reaped = false;
+                    if !was_live {
+                        fl.associated = false;
+                        fl.maybe_reaped = false;
+                        fl.minted_at = Instant::now();
+                    }
+                    // The reinsert must claim the key — a false return
+                    // means a second live model row holds this tuple,
+                    // which `by_flow` can map to only one alloc:
+                    // model/table divergence.
+                    assert!(
+                        self.live_keys.insert(flow_key(fl)),
+                        "flow key duplicated across live model rows"
+                    );
+                }
+                None => {
+                    self.by_alloc.insert(alloc_key, self.flows.len());
+                    self.flows.push(Flow {
+                        workload,
+                        alloc,
+                        reply,
+                        orig_addr: orig_dst.0,
+                        orig_port: orig_dst.1,
+                        orig_src_port,
+                        associated: false,
+                        removed: false,
+                        reaped: false,
+                        maybe_reaped: false,
+                        minted_at: Instant::now(),
+                    });
+                    self.live_keys
+                        .insert((workload, orig_src_port, orig_dst.0, orig_dst.1));
+                }
+            }
+        }
+    }
+
+    /// Decoded flood op: `count` distinct workload→`dst:dport` SYNs,
+    /// source ports walking `base..`.
+    struct FloodOp {
+        count: usize,
+        base: u16,
+        dport: u16,
+        dst: Ipv4Addr,
+    }
+
+    /// Consecutive refusals proving the cap before the flood stops —
+    /// past the first `None` every new tuple pays the same O(table)
+    /// reap-then-refuse, so a short streak is plenty.
+    const REFUSAL_STREAK: usize = 64;
+
+    /// Mint `op.count` distinct SYNs back-to-back. For this shape the
+    /// [`MAX_NAT_MAPPINGS`] table cap is the only legal `dnat_in`
+    /// refusal — the first `None` must land exactly at the cap, never
+    /// before, and no new tuple may mint past it.
+    fn flood(
+        g: &Gates,
+        model: &mut FlowModel,
+        nat: &mut NatProbe,
+        op: FloodOp,
+        next_reap_at: &mut Instant,
+        mint_budget: &mut usize,
+    ) {
+        // Two situations where the model cannot know the table's true
+        // occupancy — skip rather than guess:
+        // - a `maybe_reaped` row straddles the deadline, so it may or
+        //   may not still hold a slot;
+        // - a row minted >3 s ago could die to the *internal* reap the
+        //   refusal path runs on the wall clock before the model's
+        //   injected-clock bookkeeping notices.
+        if model.flows.iter().any(|f| {
+            !(f.removed || f.reaped)
+                && (f.maybe_reaped || f.minted_at.elapsed() > Duration::from_secs(3))
+        }) {
+            return;
+        }
+        let workload: IpAddr = WORKLOAD_V4.into();
+        let dst_ip: IpAddr = op.dst.into();
+        let live = model
+            .flows
+            .iter()
+            .filter(|f| !(f.removed || f.reaped))
+            .count();
+        let mut minted = 0usize;
+        let mut none_streak = 0usize;
+        for i in 0..op.count.min(8192) {
+            let sport = op.base.wrapping_add(i as u16);
+            // A SYN replaying a live tuple reuses its mapping rather
+            // than minting — `live_keys` shadows `by_flow`.
+            let known = model
+                .live_keys
+                .contains(&(workload, sport, dst_ip, op.dport));
+            if !known && *mint_budget == 0 {
+                break; // this case's mint budget is spent
+            }
+            let mut fr = syn_v4(sport, op.dport, op.dst);
+            match nat.dnat_in(&mut fr) {
+                Some(rw) => {
+                    none_streak = 0;
+                    if known {
+                        continue;
+                    }
+                    assert!(
+                        live + minted < MAX_NAT_MAPPINGS,
+                        "NAT table admitted past the {MAX_NAT_MAPPINGS} cap"
+                    );
+                    minted += 1;
+                    *mint_budget -= 1;
+                    let mut reply = fr.clone();
+                    swap_tcp(&mut reply);
+                    model.record_mint(
+                        (workload, rw.new_src_port),
+                        reply,
+                        (dst_ip, op.dport),
+                        sport,
+                    );
+                    g.minted.set(g.minted.get() + 1);
+                }
+                None => {
+                    assert!(!known, "NAT refused a SYN on a live flow");
+                    assert_eq!(
+                        live + minted,
+                        MAX_NAT_MAPPINGS,
+                        "NAT refusal below the {MAX_NAT_MAPPINGS} cap"
+                    );
+                    // The saturated branch ran `reap_expired` on the
+                    // wall clock and re-armed `next_reap` at ~now+1 s,
+                    // shadowed here so later reap ops resolve against
+                    // the reset throttle.
+                    *next_reap_at = Instant::now() + Duration::from_secs(1);
+                    g.nat_cap.set(g.nat_cap.get() + 1);
+                    none_streak += 1;
+                    if none_streak >= REFUSAL_STREAK {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Flip src/dst addrs + ports of a bare TCP packet in place — the
@@ -305,7 +539,7 @@ mod imp {
 
     fn drive_frame(
         g: &Gates,
-        flows: &mut Vec<Flow>,
+        model: &mut FlowModel,
         nat: &mut NatProbe,
         intercept: bool,
         frame: &[u8],
@@ -315,22 +549,38 @@ mod imp {
                 assert!(len <= frame.len(), "TCP capture exceeded frame");
                 assert!(len >= 40, "TCP capture below the header minimum");
                 g.tcp.set(g.tcp.get() + 1);
+                // The pre-rewrite tuple, parsed independently of the
+                // NAT path — every expectation below derives from it,
+                // never from a value `dnat_in`/`rev_nat_out` returned,
+                // so a mis-recorded flow cannot launder its own check.
                 let orig = tun_tcp_tuple(frame);
                 let mut f = frame.to_vec();
                 if let Some(rw) = nat.dnat_in(&mut f) {
                     g.minted.set(g.minted.get() + 1);
-                    let expect_gw: IpAddr = match rw.orig_addr {
+                    let (osrc, odst, osport, odport) = orig.expect("classified TCP has a tuple");
+                    assert_eq!(
+                        (rw.orig_addr, rw.orig_port),
+                        (odst, odport),
+                        "dnat_in misreported the original destination"
+                    );
+                    let expect_gw: IpAddr = match osrc {
                         IpAddr::V4(_) => GATEWAY_V4.into(),
                         IpAddr::V6(_) => GATEWAY_V6.into(),
                     };
                     assert_eq!(rw.new_dst, expect_gw, "DNAT landed off-gateway");
-                    assert!(
-                        rw.new_dst_port == TCP_NAT_PORT || rw.new_dst_port == DNS_TCP_NAT_PORT,
-                        "unexpected NAT listener port {}",
-                        rw.new_dst_port
+                    // DNS-over-TCP intercept: only an armed gate on a
+                    // port-53 dial.
+                    let expect_dns = intercept && odport == 53;
+                    assert_eq!(rw.dns_tcp, expect_dns, "dns_tcp flag diverged");
+                    assert_eq!(
+                        rw.new_dst_port,
+                        if expect_dns {
+                            DNS_TCP_NAT_PORT
+                        } else {
+                            TCP_NAT_PORT
+                        },
+                        "unexpected NAT listener port"
                     );
-                    // dns_tcp only under an armed intercept on port 53.
-                    assert_eq!(rw.dns_tcp, rw.new_dst_port == DNS_TCP_NAT_PORT);
                     assert!(rw.new_src_port >= ALLOC_BASE);
                     let mut reply = f.clone();
                     swap_tcp(&mut reply);
@@ -342,38 +592,14 @@ mod imp {
                         .rev_nat_out(&mut probe)
                         .expect("minted flow missing on the reverse path");
                     g.rev_ok.set(g.rev_ok.get() + 1);
-                    assert_eq!((src, sport), (rw.orig_addr, rw.orig_port));
-                    assert_eq!(dport, orig.expect("classified TCP has a tuple").2);
+                    assert_eq!((src, sport), (odst, odport));
+                    assert_eq!(dport, osport);
                     // `dnat_in` answers Some on retransmits and on any
                     // packet riding an existing mapping — not just the
                     // SYN that minted it. Track one model entry per
                     // (workload, alloc) key or a `remove`/`reap` op would
                     // split two tracked rows for the same real mapping.
-                    let key = (orig.unwrap().0, rw.new_src_port);
-                    match flows.iter_mut().find(|f| (f.workload, f.alloc) == key) {
-                        Some(fl) => {
-                            // Same live mapping re-emitting: the entry
-                            // provably exists now, so clear death marks
-                            // (a `removed` hit cannot be the same mapping
-                            // — alloc ports do not recycle — reset it too).
-                            fl.reply = reply;
-                            fl.removed = false;
-                            fl.reaped = false;
-                            fl.maybe_reaped = false;
-                        }
-                        None => flows.push(Flow {
-                            workload: key.0,
-                            alloc: key.1,
-                            reply,
-                            orig_addr: rw.orig_addr,
-                            orig_port: rw.orig_port,
-                            orig_src_port: orig.unwrap().2,
-                            associated: false,
-                            removed: false,
-                            reaped: false,
-                            maybe_reaped: false,
-                        }),
-                    }
+                    model.record_mint((osrc, rw.new_src_port), reply, (odst, odport), osport);
                 }
             }
             TunClassified::UdpDns {
@@ -404,7 +630,7 @@ mod imp {
         let Some(&n_frames) = data.get(1) else { return };
         let mut pos = 2;
         let mut nat = NatProbe::new(intercept);
-        let mut flows: Vec<Flow> = Vec::new();
+        let mut model = FlowModel::default();
         for _ in 0..n_frames {
             let Some(h) = data.get(pos..pos + 2) else {
                 break;
@@ -415,13 +641,17 @@ mod imp {
                 break;
             };
             pos += len;
-            drive_frame(g, &mut flows, &mut nat, intercept, frame);
+            drive_frame(g, &mut model, &mut nat, intercept, frame);
         }
-        // Shadow of `NatTable::next_reap` in whole seconds from the
-        // probe's construction instant — `reap_if_due` runs only when
-        // the supplied `at` reaches it, then advances it by the 1 s
-        // throttle.
-        let mut reap_threshold: u32 = 1;
+        // Shadow of `NatTable::next_reap` in real Instants —
+        // `reap_if_due` runs only when the supplied `at` reaches it,
+        // then re-arms to `at + 1 s`. Kept on the wall clock because
+        // the cap-refusal path can also re-arm it internally.
+        let mut next_reap_at = Instant::now() + Duration::from_secs(1);
+        // Per-case bound on fresh mints — reaching the cap costs ~4 k
+        // mints, and a couple of saturate→reap→re-saturate cycles are
+        // all the coverage the oracle needs.
+        let mut mint_budget: usize = 16384;
         if let Some(&n_ops) = data.get(pos) {
             pos += 1;
             for _ in 0..n_ops {
@@ -439,11 +669,11 @@ mod imp {
                         if let Some(i) = op
                             .get(1..3)
                             .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
-                            && !flows.is_empty()
+                            && !model.flows.is_empty()
                         {
                             let fl = {
-                                let idx = i % flows.len();
-                                &mut flows[idx]
+                                let idx = i % model.flows.len();
+                                &mut model.flows[idx]
                             };
                             nat.mark_associated(fl.workload, fl.alloc);
                             fl.associated = true;
@@ -453,36 +683,48 @@ mod imp {
                         if let Some(i) = op
                             .get(1..3)
                             .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
-                            && !flows.is_empty()
+                            && !model.flows.is_empty()
                         {
                             let fl = {
-                                let idx = i % flows.len();
-                                &mut flows[idx]
+                                let idx = i % model.flows.len();
+                                &mut model.flows[idx]
                             };
                             nat.remove(fl.workload, fl.alloc);
                             fl.removed = true;
+                            model.live_keys.remove(&flow_key(fl));
                             g.removed.set(g.removed.get() + 1);
                         }
                     }
                     Some(&2) => {
                         if let Some(secs) = op.get(1..3).map(|b| u16::from_be_bytes([b[0], b[1]])) {
-                            nat.reap_at(Instant::now() + Duration::from_secs(secs.into()));
-                            // `reap_if_due` is throttled (1 s) and drops
-                            // unassociated entries older than the 5 s
-                            // deadline. Model both: a run only happens
-                            // when `at` clears the current throttle.
-                            if u32::from(secs) >= reap_threshold {
-                                for fl in flows.iter_mut() {
+                            let at = Instant::now() + Duration::from_secs(u64::from(secs));
+                            nat.reap_at(at);
+                            // A run drops unassociated rows past the 5 s
+                            // deadline and re-arms the throttle at
+                            // `at + 1 s`. `at` landing just under the
+                            // throttle is ambiguous — the impl's clock
+                            // read may fall either side — so model the
+                            // marks as `maybe` and keep the earlier
+                            // deadline, biasing later ops to "ran".
+                            let ambiguous = at < next_reap_at
+                                && next_reap_at.duration_since(at) < Duration::from_millis(50);
+                            if ambiguous || at >= next_reap_at {
+                                let definite = !ambiguous;
+                                for fl in model.flows.iter_mut() {
                                     if fl.associated || fl.removed || fl.reaped {
                                         continue;
                                     }
-                                    if secs >= 6 {
+                                    let age = at.saturating_duration_since(fl.minted_at);
+                                    if definite && age > Duration::from_millis(5050) {
                                         fl.reaped = true;
-                                    } else if secs == 5 {
+                                        model.live_keys.remove(&flow_key(fl));
+                                    } else if age > Duration::from_millis(4950) {
                                         fl.maybe_reaped = true;
                                     }
                                 }
-                                reap_threshold = u32::from(secs) + 1;
+                                if definite {
+                                    next_reap_at = at + Duration::from_secs(1);
+                                }
                             }
                             g.reaped.set(g.reaped.get() + 1);
                         }
@@ -522,6 +764,29 @@ mod imp {
                             }
                         }
                     }
+                    Some(&4) => {
+                        if let Some(count) = op.get(1..3).map(|b| u16::from_be_bytes([b[0], b[1]]))
+                            && let Some(base) =
+                                op.get(3..5).map(|b| u16::from_be_bytes([b[0], b[1]]))
+                            && let Some(dport) =
+                                op.get(5..7).map(|b| u16::from_be_bytes([b[0], b[1]]))
+                            && let Some(dst) = op.get(7..11)
+                        {
+                            flood(
+                                g,
+                                &mut model,
+                                &mut nat,
+                                FloodOp {
+                                    count: count as usize,
+                                    base,
+                                    dport,
+                                    dst: Ipv4Addr::new(dst[0], dst[1], dst[2], dst[3]),
+                                },
+                                &mut next_reap_at,
+                                &mut mint_budget,
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -531,7 +796,7 @@ mod imp {
         // associated or still inside its deadline — keeps reversing.
         // `maybe_reaped` entries straddle the 5 s boundary and are
         // skipped rather than guessed at.
-        for fl in &mut flows {
+        for fl in &mut model.flows {
             if fl.maybe_reaped && !fl.reaped {
                 continue;
             }
@@ -571,8 +836,9 @@ mod imp {
                 assert!(g.udp.get() + g.udp_dns.get() > 0, "no UDP classified");
                 assert!(g.minted.get() > 0, "no DNAT flow minted");
                 assert!(g.crafted.get() > 0, "no reply crafted");
+                assert!(g.nat_cap.get() > 0, "NAT table cap never hit");
                 format!(
-                    "tcp={} udp={} udp_dns={} drops={} minted={} rev={} reaped_ops={} removed={} crafted={}",
+                    "tcp={} udp={} udp_dns={} drops={} minted={} rev={} reaped_ops={} removed={} crafted={} nat_cap={}",
                     g.tcp.get(),
                     g.udp.get(),
                     g.udp_dns.get(),
@@ -581,7 +847,8 @@ mod imp {
                     g.rev_ok.get(),
                     g.reaped.get(),
                     g.removed.get(),
-                    g.crafted.get()
+                    g.crafted.get(),
+                    g.nat_cap.get()
                 )
             },
         )

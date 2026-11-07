@@ -2,6 +2,7 @@
 /target/
 # CARGO_TARGET_DIR scratch dirs (e.g. WSL/mangled-path accidents)
 mcp-writ-target/
+target-linux/
 
 # Crash inputs recorded by the boundary fuzz targets (crash-dir is
 # relative to the cwd the target ran from — cover both spots), plus

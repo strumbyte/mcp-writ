@@ -23,6 +23,9 @@ struct Gates {
     error: Cell<usize>,
     tools_ok: Cell<usize>,
     meta: Cell<usize>,
+    req_map: Cell<usize>,
+    req_malformed: Cell<usize>,
+    req_overrun: Cell<usize>,
 }
 
 /// Member names the extractors look for — the grammar mostly picks
@@ -173,7 +176,7 @@ fn json_value(ctx: &mut noprop::TestCaseContext, depth: usize, out: &mut String)
 /// paths (tools/list page, initialize result, probe error).
 fn template(ctx: &mut noprop::TestCaseContext) -> String {
     let id = noprop::sample_u32(ctx);
-    match noprop::sample_weighted_index(ctx, &[3, 2, 2, 2, 3]) {
+    match noprop::sample_weighted_index(ctx, &[3, 2, 2, 2, 3, 2]) {
         0 => {
             // tools/list response page.
             let mut tools = String::new();
@@ -217,6 +220,39 @@ fn template(ctx: &mut noprop::TestCaseContext) -> String {
                 )
             } else {
                 "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}".to_string()
+            }
+        }
+        4 => {
+            // MRTR interim result — `inputRequests` maps sized around
+            // the 64-entry extractor cap; occasionally a non-object so
+            // the fail-closed `Malformed` verdict runs too.
+            if noprop::sample_ratio(ctx, noprop::Ratio::new(1, 7)) {
+                let junk = noprop::sample_choice(ctx, &["[]", "[1]", "\"x\"", "42", "true"]);
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"inputRequests\":{junk}}}}}"
+                )
+            } else {
+                let n = noprop::sample_with_boundaries(
+                    ctx,
+                    &[0usize, 1, 63, 64, 65, 100, 128],
+                    noprop::Ratio::new(2, 3),
+                    |ctx| noprop::sample_usize_in(ctx, 0..=160),
+                );
+                let mut reqs = String::new();
+                for i in 0..n {
+                    if i > 0 {
+                        reqs.push(',');
+                    }
+                    reqs.push_str(&format!("\"k{i}\":"));
+                    match noprop::sample_weighted_index(ctx, &[8, 1, 1]) {
+                        0 => reqs.push_str("{\"method\":\"m\",\"params\":{}}"),
+                        1 => reqs.push_str("{\"method\":1}"),
+                        _ => reqs.push_str("42"),
+                    }
+                }
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"inputRequests\":{{{reqs}}}}}}}"
+                )
             }
         }
         _ => {
@@ -295,6 +331,28 @@ fn property(g: &Gates, data: &[u8]) {
         "extractor verdict on invalid JSON"
     );
     assert!(s.input_request_entries <= 64, "inputRequests cap exceeded");
+    // Exact cap oracle — not just the bound: an object over 64
+    // members must be Overrun (never a truncated Map), a Map verdict
+    // must carry every member, and non-objects/absent members count
+    // zero members.
+    match s.input_requests {
+        "map" => {
+            g.req_map.set(g.req_map.get() + 1);
+            assert_eq!(
+                s.input_request_entries, s.input_request_members,
+                "map verdict dropped inputRequests entries"
+            );
+        }
+        "malformed" => g.req_malformed.set(g.req_malformed.get() + 1),
+        "overrun" => {
+            g.req_overrun.set(g.req_overrun.get() + 1);
+            assert!(
+                s.input_request_members > 64,
+                "overrun verdict below the cap"
+            );
+        }
+        _ => assert_eq!(s.input_request_members, 0),
+    }
     g.cases.set(g.cases.get() + 1);
     g.valid.set(g.valid.get() + usize::from(s.valid_json));
     g.response
@@ -320,14 +378,20 @@ fn main() {
             assert!(g.valid.get() > 0, "no valid JSON generated");
             assert!(g.tools_ok.get() > 0, "tools/list page never parsed");
             assert!(g.response.get() > 0, "no response-shaped line");
+            assert!(g.req_map.get() > 0, "inputRequests map never parsed");
+            assert!(g.req_malformed.get() > 0, "inputRequests never malformed");
+            assert!(g.req_overrun.get() > 0, "inputRequests cap never tripped");
             format!(
-                "valid={} response={} notif={} error={} tools_ok={} meta={}",
+                "valid={} response={} notif={} error={} tools_ok={} meta={} req_map={} req_malf={} req_over={}",
                 g.valid.get(),
                 g.response.get(),
                 g.notification.get(),
                 g.error.get(),
                 g.tools_ok.get(),
-                g.meta.get()
+                g.meta.get(),
+                g.req_map.get(),
+                g.req_malformed.get(),
+                g.req_overrun.get()
             )
         },
     ));

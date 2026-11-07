@@ -7,9 +7,12 @@
 # whole job runs on Linux.
 #
 # Each target run is bounded twice: a fixed accepted-case budget and a
-# `timeout` kill, so the whole sweep stays near five minutes. A failing
+# `timeout` kill, so the whole sweep stays under ten minutes. A failing
 # target leaves its exact last input plus the seeded replay recipe in
-# fuzz-artifacts/ (<target>.bin / <target>.txt), uploaded below —
+# fuzz-artifacts/ (<target>.bin / <target>.txt), uploaded below — a
+# killed target leaves its in-flight input under the distinct
+# <target>.inflight.* names, so live files never clobber a finished
+# run's crash pair —
 # replay one with
 #   cargo run --release --manifest-path fuzz/Cargo.toml --bin <target> -- --replay <target>.bin
 name: Fuzz
@@ -27,8 +30,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # Accepted-case budget per target; each run is also killed at 120 s,
-  # so the sweep stays near the five-minute mark.
+  # so the sweep stays under the ten-minute mark.
   FUZZ_CASES: "50000"
+  # namespaced_packet mints up to 4096 live mappings per saturating
+  # flood, so a case is orders of magnitude heavier there — a smaller
+  # budget keeps it inside the same kill bound.
+  FUZZ_CASES_NS: "20000"
 
 jobs:
   fuzz:
@@ -60,9 +67,11 @@ jobs:
           mkdir -p fuzz-artifacts fuzz-logs
           rc=0
           for t in framing jsonrpc namespaced_packet dnsgate_wire; do
+            cases=$FUZZ_CASES
+            [ "$t" = namespaced_packet ] && cases=$FUZZ_CASES_NS
             echo "=== $t ==="
             timeout 120 ./target/release/"$t" \
-              --cases "$FUZZ_CASES" --crash-dir fuzz-artifacts \
+              --cases "$cases" --crash-dir fuzz-artifacts \
               2>&1 | tee "fuzz-logs/$t.log" || rc=1
           done
           exit "$rc"

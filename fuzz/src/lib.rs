@@ -110,7 +110,11 @@ fn usage_fail(target: &str, msg: &str) -> ! {
 /// point and asserts. `gates` runs once after a fully-passing run —
 /// the noprop coverage-gate pattern — and returns a coverage report
 /// line for the log. On any failure the last generated input lands in
-/// `<crash-dir>/<name>.bin` next to a `<name>.txt` run report.
+/// `<crash-dir>/<name>.bin` next to a `<name>.txt` run report. The
+/// input is also rewritten before each case runs into
+/// `<name>.inflight.bin` (+ a `.inflight.txt` preamble), so a
+/// `timeout` kill, abort, or OOM still leaves the in-flight input for
+/// `--replay` — and cannot clobber an earlier run's final artifacts.
 pub fn run<G, F, C>(name: &str, args: &Args, sample_input: G, property: F, gates: C) -> i32
 where
     G: Fn(&mut noprop::TestCaseContext) -> Vec<u8>,
@@ -131,12 +135,15 @@ where
         };
     }
     println!("[{name}] cases={} seed={:#018x}", args.cases, args.seed);
+    let live = RefCell::new(LiveArtifacts::open(name, args));
     let last: RefCell<Vec<u8>> = RefCell::new(Vec::new());
     let mut runner = noprop::Runner::new(args.seed);
     let outcome = runner.run(args.cases, |ctx| {
         {
             let mut slot = last.borrow_mut();
+            slot.clear();
             *slot = sample_input(ctx);
+            live.borrow_mut().record(&slot);
             property(&slot);
         }
         Ok(())
@@ -151,9 +158,11 @@ where
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(gates)) {
                 Ok(report) => {
                     println!("[{name}] coverage: {report}");
+                    live.into_inner().clear();
                     0
                 }
                 Err(payload) => {
+                    drop(live.into_inner());
                     let msg = panic_message(payload.as_ref());
                     fail(
                         name,
@@ -167,6 +176,7 @@ where
             }
         }
         Err(e) => {
+            drop(live.into_inner());
             fail(
                 name,
                 args,
@@ -190,6 +200,109 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Per-case crash persistence. `<name>.inflight.bin` is rewritten in
+/// place as each input is generated — a killed (`timeout`), aborted,
+/// or OOMed run still leaves the last generated input — and a
+/// preamble `<name>.inflight.txt` marks the run unfinished. The
+/// in-flight names are kept distinct from the final `<name>.bin` /
+/// `<name>.txt` crash artifacts: a previous failed run's evidence in
+/// the same directory is never truncated by a new run opening.
+/// `fail` writes the final pair and drops the in-flight pair;
+/// `clear` removes only the in-flight pair on a clean pass.
+struct LiveArtifacts {
+    bin: Option<std::fs::File>,
+    bin_path: PathBuf,
+    txt_path: PathBuf,
+    warned: bool,
+}
+
+/// In-flight file name for `name`'s `kind` (`"bin"` | `"txt"`) —
+/// kept separate from the final crash artifacts `fail` writes.
+fn inflight_path(dir: &Path, name: &str, kind: &str) -> PathBuf {
+    dir.join(format!("{name}.inflight.{kind}"))
+}
+
+impl LiveArtifacts {
+    fn open(name: &str, args: &Args) -> Self {
+        let dir = &args.crash_dir;
+        let bin_path = inflight_path(dir, name, "bin");
+        let txt_path = inflight_path(dir, name, "txt");
+        let bin = std::fs::create_dir_all(dir)
+            .and_then(|_| std::fs::File::create(&bin_path))
+            .ok();
+        if bin.is_none() {
+            eprintln!(
+                "[{name}] warning: cannot persist per-case inputs under {}",
+                dir.display()
+            );
+        }
+        if bin.is_some() {
+            let report = format!(
+                "target: {name}\nseed: {:#018x}\ncases: {}\n\
+                 detail: run in progress — if the process was killed or aborted, {} is the last generated input\n\n\
+                 replay: cargo run --release --manifest-path fuzz/Cargo.toml --bin {name} -- --replay {}\n\
+                 rerun:  {SEED_ENV}={:#018x} cargo run --release --manifest-path fuzz/Cargo.toml --bin {name} -- --cases {}\n",
+                args.seed,
+                args.cases,
+                bin_path.file_name().unwrap().to_string_lossy(),
+                quoted_path(&bin_path),
+                args.seed,
+                args.cases
+            );
+            let _ = std::fs::write(&txt_path, report);
+        }
+        Self {
+            bin,
+            bin_path,
+            txt_path,
+            warned: false,
+        }
+    }
+
+    /// Rewrite `.bin` with the input about to run — `write` puts the
+    /// bytes in the page cache, which survives the process dying.
+    fn record(&mut self, input: &[u8]) {
+        use std::io::{Seek, SeekFrom, Write};
+        let Some(bin) = &mut self.bin else { return };
+        let r = bin
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| bin.write_all(input))
+            .and_then(|_| bin.set_len(input.len() as u64));
+        if r.is_err() && !self.warned {
+            self.warned = true;
+            eprintln!(
+                "[harness] warning: cannot update {}",
+                self.bin_path.display()
+            );
+        }
+    }
+
+    /// A fully-passing run removes its in-flight files — leftover
+    /// `<name>.bin`/`.txt` are then always final verdicts from a
+    /// `fail`, and leftover `.inflight.*` means the run never reached
+    /// one.
+    fn clear(self) {
+        drop(self.bin);
+        let _ = std::fs::remove_file(&self.bin_path);
+        let _ = std::fs::remove_file(&self.txt_path);
+    }
+}
+
+/// Shell-quote a path so a crash dir containing spaces still parses as
+/// one argument; escape `\` first so it cannot eat the closing quote,
+/// then the double-quote metacharacters.
+fn quoted_path(path: &Path) -> String {
+    format!(
+        "\"{}\"",
+        path.display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('`', "\\`")
+    )
+}
+
 /// Write `<name>.bin` (the exact failing input — `--replay` it) and
 /// `<name>.txt` (seed, budget, replay hint) under `args.crash_dir`.
 /// `input_is_witness` distinguishes the failure modes: a property
@@ -198,20 +311,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// — the `.bin` then holds the last *accepted* case and a `--replay`
 /// is expected to pass.
 fn fail(name: &str, args: &Args, input: &[u8], detail: &str, input_is_witness: bool) {
-    // Shell-quote the replay path so a crash dir containing spaces still
-    // parses as one argument; escape `\` first so it cannot eat the
-    // closing quote, then the double-quote metacharacters.
-    let bin = format!(
-        "\"{}\"",
-        args.crash_dir
-            .join(format!("{name}.bin"))
-            .display()
-            .to_string()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('$', "\\$")
-            .replace('`', "\\`")
-    );
+    let bin = quoted_path(&args.crash_dir.join(format!("{name}.bin")));
     let replay = if input_is_witness {
         format!(
             "replay: cargo run --release --manifest-path fuzz/Cargo.toml --bin {name} -- --replay {bin}"
@@ -228,7 +328,14 @@ fn fail(name: &str, args: &Args, input: &[u8], detail: &str, input_is_witness: b
         args.seed, args.cases, args.seed, args.cases
     );
     match write_crash(&args.crash_dir, name, input, &report) {
-        Ok(dir) => eprintln!("[{name}] FAILED — artifacts in {}", dir.display()),
+        Ok(dir) => {
+            eprintln!("[{name}] FAILED — artifacts in {}", dir.display());
+            // The final pair supersedes the in-flight pair — drop it
+            // only now that the verdict files exist (the LiveArtifacts
+            // handle is already released, so the deletes are safe).
+            let _ = std::fs::remove_file(inflight_path(&args.crash_dir, name, "bin"));
+            let _ = std::fs::remove_file(inflight_path(&args.crash_dir, name, "txt"));
+        }
         Err(e) => eprintln!("[{name}] FAILED — could not write artifacts: {e}\n{report}"),
     }
 }

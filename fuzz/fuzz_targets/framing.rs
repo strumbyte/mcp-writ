@@ -1,6 +1,8 @@
 //! Fuzz target: bounded stdio JSON-RPC framing.
 //!
-//! Input layout: `[u64 max_bytes LE][stream bytes]`. The property
+//! Input layout: `[u64 max_bytes LE][u32 window LE][stream bytes]`.
+//! `window` caps each `fill_buf` chunk the readers see (0 = the whole
+//! stream at once), so frames also span buffer refills. The property
 //! drains the stream through both boundary readers —
 //! `read_frame_bounded` (resumable, the Auditor's proxy loops) and
 //! `read_line_bounded` (fail-fast, the launcher) — asserting the
@@ -8,8 +10,11 @@
 //!
 //! Search space: caps biased to 0, window edges (8 KiB head/tail
 //! windows) and powers of two; frame lengths biased to `max±1`,
-//! window edges, and long newline-free runs; CRLF and unterminated
-//! tails included.
+//! window edges, and long newline-free runs — frame bodies carry no
+//! `\n`, since a random newline would silently split a boundary-length
+//! frame before the readers see it; CRLF and unterminated tails
+//! included; `fill_buf` chunk sizes biased to tiny splits and the
+//! oversize transition.
 
 use std::cell::Cell;
 
@@ -25,6 +30,7 @@ struct Gates {
     fail_fast: Cell<usize>,
     unterminated: Cell<usize>,
     partial_consume: Cell<usize>,
+    chunked: Cell<usize>,
 }
 
 fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
@@ -32,6 +38,27 @@ fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
         ctx,
         &[
             0usize, 1, 2, 63, 64, 65, 4095, 4096, 8191, 8192, 8193, 65535,
+        ],
+        noprop::Ratio::new(1, 2),
+        |ctx| noprop::sample_usize_in(ctx, 0..=MAX_STREAM),
+    );
+    // `fill_buf` chunk size — biased to tiny splits and the `max`±1
+    // oversize transition; 0 hands the readers the whole stream at
+    // once.
+    let window = noprop::sample_with_boundaries(
+        ctx,
+        &[
+            0usize,
+            1,
+            3,
+            8,
+            64,
+            255,
+            4096,
+            8 * 1024,
+            max.saturating_sub(1),
+            max,
+            max.saturating_add(1),
         ],
         noprop::Ratio::new(1, 2),
         |ctx| noprop::sample_usize_in(ctx, 0..=MAX_STREAM),
@@ -53,29 +80,46 @@ fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
             noprop::Ratio::new(1, 2),
             |ctx| noprop::sample_usize_in(ctx, 0..=MAX_STREAM),
         );
-        stream.extend(noprop::sample_bytes_vec(ctx, len));
+        let mut body = noprop::sample_bytes_vec(ctx, len);
+        // A random `\n` inside the body would split the frame early —
+        // the boundary lengths sampled above must reach the readers.
+        for b in &mut body {
+            if *b == b'\n' {
+                *b = b'x';
+            }
+        }
+        stream.extend_from_slice(&body);
         match noprop::sample_weighted_index(ctx, &[6, 1, 1]) {
             0 => stream.push(b'\n'),
             1 => stream.extend_from_slice(b"\r\n"),
             _ => {} // unterminated tail — EOF ends the frame
         }
     }
+    // A sub-64-byte window costs one `fill_buf` per byte — cap the
+    // stream so a tiny window cannot turn one case into a time hog.
+    if (1..64).contains(&window) {
+        stream.truncate(8 * 1024);
+    }
     let mut input = (max as u64).to_le_bytes().to_vec();
+    input.extend_from_slice(&(window as u32).to_le_bytes());
     input.extend_from_slice(&stream);
     input
 }
 
 fn property(g: &Gates, data: &[u8]) {
-    if data.len() < 8 {
+    if data.len() < 12 {
         return;
     }
     let max = (u64::from_le_bytes(data[..8].try_into().unwrap())).min(usize::MAX as u64) as usize;
-    let stream = &data[8..];
-    let frames = drain_frames(stream, max);
-    let lines = drain_lines(stream, max);
+    let window = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    let stream = &data[12..];
+    let frames = drain_frames(stream, max, window);
+    let lines = drain_lines(stream, max, window);
     cross_check(&frames, &lines);
 
     g.cases.set(g.cases.get() + 1);
+    g.chunked
+        .set(g.chunked.get() + usize::from(window > 0 && window < stream.len()));
     g.lines.set(g.lines.get() + usize::from(frames.lines > 0));
     g.oversize
         .set(g.oversize.get() + usize::from(frames.oversize > 0));
@@ -115,13 +159,15 @@ fn main() {
             assert!(g.lines.get() > 0, "no in-limit frame seen");
             assert!(g.oversize.get() > 0, "no oversized frame seen");
             assert!(g.fail_fast.get() > 0, "fail-fast path never hit");
+            assert!(g.chunked.get() > 0, "no case spanned buffer refills");
             format!(
-                "lines={} oversize={} fail_fast={} unterminated={} partial={}",
+                "lines={} oversize={} fail_fast={} unterminated={} partial={} chunked={}",
                 g.lines.get(),
                 g.oversize.get(),
                 g.fail_fast.get(),
                 g.unterminated.get(),
-                g.partial_consume.get()
+                g.partial_consume.get(),
+                g.chunked.get()
             )
         },
     ));

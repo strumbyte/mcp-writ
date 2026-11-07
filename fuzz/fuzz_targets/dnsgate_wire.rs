@@ -26,6 +26,7 @@ struct Gates {
     resp_seen: Cell<usize>,
     decoded: Cell<usize>,
     chained: Cell<usize>,
+    trunc_chain: Cell<usize>,
     matched: Cell<usize>,
 }
 
@@ -170,6 +171,65 @@ fn rr(ctx: &mut noprop::TestCaseContext, out: &mut Vec<u8>, name: &str) {
     }
 }
 
+/// A response carrying exactly `hops` CNAME aliases — hop counts
+/// straddle the 16-deep chain bound so the truncated-at-cap path
+/// actually runs. An optional A record on the leaf exercises the
+/// visited-owner address collection.
+fn chain_message(ctx: &mut noprop::TestCaseContext, name: &str) -> Vec<u8> {
+    let hops = noprop::sample_choice(ctx, &[0usize, 1, 14, 15, 16, 17, 18, 24]);
+    let leaf_a = noprop::sample_bool(ctx);
+    let put_name = |m: &mut Vec<u8>, n: &str| {
+        for label in n.split('.').filter(|l| !l.is_empty()) {
+            m.push(label.len().min(63) as u8);
+            m.extend_from_slice(&label.as_bytes()[..label.len().min(63)]);
+        }
+        m.push(0);
+    };
+    let mut m = Vec::new();
+    m.extend_from_slice(&noprop::sample_u16(ctx).to_be_bytes()); // id
+    m.extend_from_slice(&0x8180u16.to_be_bytes()); // QR + RD + RA
+    m.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    m.extend_from_slice(&((hops + usize::from(leaf_a)) as u16).to_be_bytes());
+    m.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    m.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    put_name(&mut m, name);
+    m.extend_from_slice(&1u16.to_be_bytes()); // A
+    m.extend_from_slice(&1u16.to_be_bytes()); // IN
+    // Hop i rewrites owner h{i-1}.<name> to target h{i}.<name> —
+    // h0.<name> is <name> itself, the forwarded name the chain starts
+    // from.
+    for i in 0..hops {
+        let owner = if i == 0 {
+            name.to_string()
+        } else {
+            format!("h{i}.{name}")
+        };
+        put_name(&mut m, &owner);
+        m.extend_from_slice(&5u16.to_be_bytes()); // CNAME
+        m.extend_from_slice(&1u16.to_be_bytes()); // IN
+        m.extend_from_slice(&noprop::sample_u32(ctx).to_be_bytes()); // ttl
+        let target = format!("h{}.{name}", i + 1);
+        let rdlen: usize = target
+            .split('.')
+            .filter(|l| !l.is_empty())
+            .map(|l| l.len().min(63) + 1)
+            .sum::<usize>()
+            + 1;
+        m.extend_from_slice(&(rdlen as u16).to_be_bytes());
+        put_name(&mut m, &target);
+    }
+    if leaf_a {
+        let leaf = format!("h{hops}.{name}");
+        put_name(&mut m, &leaf);
+        m.extend_from_slice(&1u16.to_be_bytes()); // A
+        m.extend_from_slice(&1u16.to_be_bytes()); // IN
+        m.extend_from_slice(&noprop::sample_u32(ctx).to_be_bytes()); // ttl
+        m.extend_from_slice(&4u16.to_be_bytes()); // rdlen
+        m.extend_from_slice(&noprop::sample_bytes_vec(ctx, 4));
+    }
+    m
+}
+
 fn wild_message(ctx: &mut noprop::TestCaseContext, name: &str) -> Vec<u8> {
     let mut m = Vec::new();
     m.extend_from_slice(&noprop::sample_u16(ctx).to_be_bytes()); // id
@@ -221,7 +281,7 @@ fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
             "MiXeD.Case.Example".to_string(),
         ],
     );
-    let msg = match noprop::sample_weighted_index(ctx, &[20, 35, 30, 15]) {
+    let msg = match noprop::sample_weighted_index(ctx, &[20, 35, 28, 10, 15]) {
         0 => {
             let n = noprop::sample_with_boundaries(
                 ctx,
@@ -235,6 +295,8 @@ fn gen_input(ctx: &mut noprop::TestCaseContext) -> Vec<u8> {
         1 => query_message(ctx, &name),
         // Anything-goes message: rejections and response-side parses.
         2 => wild_message(ctx, &name),
+        // A CNAME chain sized around the 16-hop bound.
+        3 => chain_message(ctx, &name),
         _ => {
             // Structured then truncated — the short-read paths.
             let mut m = wild_message(ctx, &name);
@@ -306,6 +368,47 @@ fn property(g: &Gates, data: &[u8]) {
             "accepted query does not match itself as a response"
         );
         g.matched.set(g.matched.get() + 1);
+        // And the gate must refuse the same bytes once one field
+        // diverges — QR clear, wrong id/name, or another type/class.
+        assert!(
+            !mcp_writ::fuzz::dns_response_matches(msg, q.id, &q.qname, q.qtype, q.qclass),
+            "query with QR clear passed the response gate"
+        );
+        assert!(
+            !mcp_writ::fuzz::dns_response_matches(
+                &resp,
+                q.id.wrapping_add(1),
+                &q.qname,
+                q.qtype,
+                q.qclass
+            ),
+            "wrong response id accepted"
+        );
+        let other = format!("{}.gate.invalid", q.qname);
+        assert!(
+            !mcp_writ::fuzz::dns_response_matches(&resp, q.id, &other, q.qtype, q.qclass),
+            "wrong response name accepted"
+        );
+        assert!(
+            !mcp_writ::fuzz::dns_response_matches(
+                &resp,
+                q.id,
+                &q.qname,
+                q.qtype.wrapping_add(1),
+                q.qclass
+            ),
+            "wrong response type accepted"
+        );
+        assert!(
+            !mcp_writ::fuzz::dns_response_matches(
+                &resp,
+                q.id,
+                &q.qname,
+                q.qtype,
+                q.qclass.wrapping_add(1)
+            ),
+            "wrong response class accepted"
+        );
     } else {
         g.query_rej.set(g.query_rej.get() + 1);
     }
@@ -323,12 +426,43 @@ fn property(g: &Gates, data: &[u8]) {
     g.decoded.set(g.decoded.get() + usize::from(resp.decoded));
     g.chained
         .set(g.chained.get() + usize::from(!resp.chain.is_empty()));
+    g.trunc_chain
+        .set(g.trunc_chain.get() + usize::from(resp.chain_truncated));
     assert!(resp.chain.len() <= 16, "alias chain escaped its bound");
     if resp.chain_truncated {
         assert_eq!(
             resp.chain.len(),
             16,
             "chain flagged truncated below the depth bound"
+        );
+    }
+    // Field consistency: `min_ttl` covers exactly the followed
+    // aliases and the collected address records — present iff either
+    // exists, and never above any collected record's ttl. `rcode` is
+    // the header nibble for a full header and 0 below it, where every
+    // observation field must stay empty.
+    assert_eq!(
+        resp.min_ttl.is_some(),
+        !resp.chain.is_empty() || !resp.addrs.is_empty(),
+        "min_ttl disagreed with the collected chain/addrs"
+    );
+    if let Some(min) = resp.min_ttl {
+        assert!(
+            resp.addrs.iter().all(|(_, ttl)| min <= *ttl),
+            "min_ttl above an address record's ttl"
+        );
+    }
+    let expect_rcode = if msg.len() >= 12 { msg[3] & 0x0f } else { 0 };
+    assert_eq!(resp.rcode, expect_rcode, "rcode diverged from the header");
+    if msg.len() < 12 {
+        assert!(
+            !resp.decoded
+                && resp.chain.is_empty()
+                && resp.addrs.is_empty()
+                && resp.min_ttl.is_none()
+                && resp.extra_names.is_empty()
+                && resp.extra_addrs.is_empty(),
+            "short message produced observations"
         );
     }
     let _ = mcp_writ::fuzz::dns_response_truncated(msg);
@@ -351,8 +485,9 @@ fn main() {
             assert!(g.query_ok.get() > 0, "no query decoded");
             assert!(g.query_rej.get() > 0, "no query rejected");
             assert!(g.decoded.get() > 0, "no response decoded");
+            assert!(g.trunc_chain.get() > 0, "chain bound never tripped");
             format!(
-                "query_ok={} rej={} fwd={} refused={} trunc={} decoded={} chained={} matched={}",
+                "query_ok={} rej={} fwd={} refused={} trunc={} decoded={} chained={} trunc_chain={} matched={}",
                 g.query_ok.get(),
                 g.query_rej.get(),
                 g.forwarded.get(),
@@ -360,6 +495,7 @@ fn main() {
                 g.truncated.get(),
                 g.decoded.get(),
                 g.chained.get(),
+                g.trunc_chain.get(),
                 g.matched.get()
             )
         },

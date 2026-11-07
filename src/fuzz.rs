@@ -39,14 +39,30 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 
 /// In-memory `AsyncBufRead` that records consumption so the harness can
 /// check the reader drained (or, on fail-fast, deliberately did not).
+/// `window` caps the slice each `fill_buf` hands out — 0 serves the
+/// whole remainder at once — so the generator can also drive frames
+/// that span buffer refills (the multi-`fill_buf` accumulation paths a
+/// single-shot buffer never reaches).
 struct Tracked<'a> {
     data: &'a [u8],
     pos: usize,
+    window: usize,
+}
+
+impl Tracked<'_> {
+    /// End offset of the slice the next `fill_buf`/`read` exposes.
+    fn chunk_end(&self) -> usize {
+        if self.window == 0 {
+            self.data.len()
+        } else {
+            self.pos.saturating_add(self.window).min(self.data.len())
+        }
+    }
 }
 
 impl tokio::io::AsyncBufRead for Tracked<'_> {
     fn poll_fill_buf(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
-        Poll::Ready(Ok(&self.data[self.pos..]))
+        Poll::Ready(Ok(&self.data[self.pos..self.chunk_end()]))
     }
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
         self.pos += amt;
@@ -59,7 +75,7 @@ impl tokio::io::AsyncRead for Tracked<'_> {
         _cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let avail = &self.data[self.pos..];
+        let avail = &self.data[self.pos..self.chunk_end()];
         let n = avail.len().min(buf.remaining());
         buf.put_slice(&avail[..n]);
         self.pos += n;
@@ -91,13 +107,19 @@ pub struct FrameStats {
 
 /// Feed `data` through [`framing::read_frame_bounded`](crate::framing)
 /// until EOF — the Auditor's resumable variant, which drains oversized
-/// frames through their newline. Asserts the module's own invariants
+/// frames through their newline. `window` caps each `fill_buf` chunk
+/// (0 = one shot) so frames spanning buffer refills are exercised too.
+/// Asserts the module's own invariants
 /// (bounded head/tail windows, `bytes > max_bytes`, full consumption)
 /// so a violation is the fuzz finding rather than a quiet statistic.
-pub fn drain_frames(data: &[u8], max_bytes: usize) -> FrameStats {
+pub fn drain_frames(data: &[u8], max_bytes: usize, window: usize) -> FrameStats {
     use crate::framing::{BoundedFrame, read_frame_bounded};
 
-    let mut r = Tracked { data, pos: 0 };
+    let mut r = Tracked {
+        data,
+        pos: 0,
+        window,
+    };
     let mut stats = FrameStats::default();
     loop {
         match block_on(read_frame_bounded(&mut r, max_bytes)) {
@@ -126,11 +148,16 @@ pub fn drain_frames(data: &[u8], max_bytes: usize) -> FrameStats {
 /// Feed `data` through [`framing::read_line_bounded`](crate::framing)
 /// until EOF or `TooLarge` — the launcher's fail-fast variant: oversize
 /// is fatal and the reader keeps the refused frame mid-stream, which
-/// `consumed` < `data.len()` then records.
-pub fn drain_lines(data: &[u8], max_bytes: usize) -> FrameStats {
+/// `consumed` < `data.len()` then records. `window` caps each
+/// `fill_buf` chunk (0 = one shot).
+pub fn drain_lines(data: &[u8], max_bytes: usize, window: usize) -> FrameStats {
     use crate::framing::{FramingError, read_line_bounded};
 
-    let mut r = Tracked { data, pos: 0 };
+    let mut r = Tracked {
+        data,
+        pos: 0,
+        window,
+    };
     let mut stats = FrameStats::default();
     loop {
         match block_on(read_line_bounded(&mut r, max_bytes)) {
@@ -189,6 +216,10 @@ pub struct JsonrpcSummary {
     /// `inputRequests` member state: "absent" | "map" | "malformed" | "overrun".
     pub input_requests: &'static str,
     pub input_request_entries: usize,
+    /// Member count of the `inputRequests` object itself — 0 for
+    /// absent/null/non-object. The harness compares this against the
+    /// verdict to check the cap exactly, not just its lower bound.
+    pub input_request_members: usize,
 }
 
 /// Run the protocol interpretation boundary on one frame body.
@@ -256,6 +287,14 @@ pub fn jsonrpc_line(line: &str) -> JsonrpcSummary {
         let _ = fields::ttl_ms(result);
         let _ = fields::cache_scope(result);
         let _ = fields::request_state(result);
+        if let Some(members) = result
+            .to_member("inputRequests")
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|v| v.to_object().ok())
+        {
+            s.input_request_members = members.count();
+        }
         match fields::input_requests(result) {
             fields::InputRequests::Absent => {}
             fields::InputRequests::Map(entries) => {
@@ -584,6 +623,9 @@ mod ns {
     /// First allocatable stack-side source port (`nat::ALLOC_BASE`) —
     /// the minted-port lower bound the harness asserts.
     pub const ALLOC_BASE: u16 = crate::warden::namespaced::nat::ALLOC_BASE;
+    /// Live-mapping ceiling (`nat::MAX_NAT_MAPPINGS`) — the refusal
+    /// bound the harness asserts floods hit exactly.
+    pub const MAX_NAT_MAPPINGS: usize = crate::warden::namespaced::nat::MAX_NAT_MAPPINGS;
 }
 
 #[cfg(target_os = "linux")]
@@ -599,10 +641,13 @@ mod tests {
         let mut data = big.clone();
         data.push(b'\n');
         data.extend_from_slice(b"ok\n");
-        let stats = drain_frames(&data, 64);
-        assert_eq!(stats.oversize, 1);
-        assert_eq!(stats.lines, 1);
-        assert_eq!(stats.consumed, data.len());
+        // One-shot and chunked readers see the same stream.
+        for window in [0usize, 7] {
+            let stats = drain_frames(&data, 64, window);
+            assert_eq!(stats.oversize, 1);
+            assert_eq!(stats.lines, 1);
+            assert_eq!(stats.consumed, data.len());
+        }
     }
 
     #[test]
@@ -610,10 +655,12 @@ mod tests {
         let mut data = vec![b'x'; 200];
         data.push(b'\n');
         data.extend_from_slice(b"next\n");
-        let stats = drain_lines(&data, 100);
-        assert!(stats.fail_fast);
-        // Not drained: the reader stops mid-frame.
-        assert!(stats.consumed < data.len());
+        for window in [0usize, 5] {
+            let stats = drain_lines(&data, 100, window);
+            assert!(stats.fail_fast);
+            // Not drained: the reader stops mid-frame.
+            assert!(stats.consumed < data.len());
+        }
     }
 
     #[test]
