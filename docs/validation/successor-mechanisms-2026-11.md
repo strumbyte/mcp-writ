@@ -1305,10 +1305,11 @@ grandchild inheritance — with four architecture-level conditions:
 Secondary deviations to price in (measured, not blocking): (a) the fs
 baseline is *curated-allow read-only*, not strict default-deny —
 system areas (`C:\Windows`, `Program Files`, `C:\Users\Public`) read
-ambient with **no ambient write surface**, though profiles/secrets/
-other drives stay denied and explicit `denied_paths` are
-junction/`\\?\`/ADS-proof; **adoption condition — it applies to
-every ambient-readable path, not only the image dir**: the child
+ambient with **no ambient write surface**, though the tested
+profile, secret, and other-drive paths stay denied and explicit
+`denied_paths` are junction/`\\?\`/ADS-proof; **adoption condition —
+it applies to every ambient-readable path, not only the image
+dir**: the child
 executable's directory is also ambiently readable (the launch image
 ran from `%TEMP%` with no grant covering it — the mechanism
 implicitly read-grants the image path; suppressing that auto-grant is

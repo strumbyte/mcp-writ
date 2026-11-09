@@ -7,3 +7,7 @@ exclude_paths:
   # tests/scripts/ holds test harnesses: asserts/subprocess with
   # env-configured paths there are intentional, not shipped code.
   - "tests/scripts/**"
+  # docs/validation/pr11-mxc/ is a sanitized probe/evidence bundle
+  # backing the PR-11 validation record — deliberate unsafe/raw-API
+  # probes, not product code (same exclusion as .coderabbit.yaml).
+  - "docs/validation/pr11-mxc/**"

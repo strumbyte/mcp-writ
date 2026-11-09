@@ -149,6 +149,7 @@ struct Echo {
 }
 
 impl Echo {
+    /// Bind the echo listener on `ip:0` and spawn its accept loop.
     fn bind(ip: std::net::IpAddr) -> Self {
         let listener = match TcpListener::bind((ip, 0)) {
             Ok(l) => l,
@@ -183,6 +184,8 @@ impl Echo {
     }
 }
 
+/// One accepted echo connection: read a line, write it back, repeat
+/// until the peer closes.
 fn echo_conn(stream: TcpStream) {
     let mut read = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
@@ -204,6 +207,7 @@ fn echo_conn(stream: TcpStream) {
 }
 
 impl Drop for Echo {
+    /// Signal the accept loop to stop and join it.
     fn drop(&mut self) {
         if let Some(tx) = self.stop.take() {
             let _ = tx.send(());
@@ -234,7 +238,23 @@ fn workdir(tag: &str) -> PathBuf {
 /// is not an MCP server; the `server "probe"` block only exists so
 /// `--server probe` binds). `rules` is the egress rule set under test.
 fn write_policy(dir: &Path, rules: &str) -> PathBuf {
+    write_policy_opts(dir, rules, true)
+}
+
+/// `write_policy` with the `require_lifetime_boundary` waiver made
+/// optional — `boundary_waiver: false` omits the `sandbox` line so
+/// the launch meets the default `#true` gate instead.
+fn write_policy_opts(dir: &Path, rules: &str, boundary_waiver: bool) -> PathBuf {
     let policy = dir.join("policy.kdl");
+    let waiver = if boundary_waiver {
+        "// `macos-proxy-run` is a supervised launch — macOS has no\n\
+         // kernel-enforced descendant boundary, so the default `#true`\n\
+         // would refuse it (same gate as `run`); the fixture exercises the\n\
+         // proxy mechanism under the explicit waiver.\n\
+         sandbox require_lifetime_boundary=#false\n\n"
+    } else {
+        ""
+    };
     let body = format!(
         r#"policy version=1
 
@@ -249,13 +269,7 @@ defaults {{
     }}
 }}
 
-// `macos-proxy-run` is a supervised launch — macOS has no
-// kernel-enforced descendant boundary, so the default `#true`
-// would refuse it (same gate as `run`); the fixture exercises the
-// proxy mechanism under the explicit waiver.
-sandbox require_lifetime_boundary=#false
-
-server "probe" {{
+{waiver}server "probe" {{
     tool "probe"
 }}
 "#
@@ -264,13 +278,20 @@ server "probe" {{
     policy
 }
 
+/// A completed `mcp-writ` invocation: exit code plus the drained
+/// stdout/stderr.
 struct Run {
     code: i32,
     stdout: String,
     stderr: String,
 }
 
+/// Spawn `cmd`, drain both pipes on reader threads, and wait up to
+/// `TEST_TIMEOUT` — a hang kills the child and panics rather than
+/// stalling the suite.
 fn run_with_timeout(cmd: &mut Command) -> Run {
+    /// Copy `pipe` to a String on a dedicated thread so a full pipe
+    /// buffer cannot deadlock the child.
     fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<String> {
         std::thread::spawn(move || {
             let mut s = String::new();
@@ -345,6 +366,8 @@ fn probe_argv(target: &str, extra: &[&str]) -> Vec<String> {
     v
 }
 
+/// Every line of the audit log (empty when the file was never
+/// written — a prelaunch refusal may leave no sink behind).
 fn audit_lines(audit: &Path) -> Vec<String> {
     std::fs::read_to_string(audit)
         .unwrap_or_default()
@@ -353,6 +376,7 @@ fn audit_lines(audit: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The audit lines carrying a `sandbox.network_denied` record.
 fn denied_records(audit: &Path) -> Vec<String> {
     audit_lines(audit)
         .into_iter()
@@ -360,6 +384,7 @@ fn denied_records(audit: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The audit lines carrying a `sandbox.network_allowed` record.
 fn allowed_records(audit: &Path) -> Vec<String> {
     audit_lines(audit)
         .into_iter()
@@ -367,6 +392,7 @@ fn allowed_records(audit: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The `--report` file's contents (empty string when absent).
 fn report_body(report: &Path) -> String {
     std::fs::read_to_string(report).unwrap_or_default()
 }
@@ -1090,5 +1116,36 @@ fn native_run_path_unaffected_by_proxy_opt_in() {
     assert!(
         !combined.contains("connect_proxy"),
         "native path must not emit the proxy pin: {combined}"
+    );
+}
+
+/// The fixture's `require_lifetime_boundary=#false` waiver is what
+/// lets the other tests reach the proxy at all — omitting it
+/// exercises the default `#true` gate: the supervised launch is
+/// refused before the proxy task or the workload exists (the gate
+/// precedes even `sandbox-exec` helper validation, so no helper
+/// check applies), the report records a `failed` state naming the
+/// dial, and the workload never runs.
+#[test]
+fn proxy_launch_refuses_without_lifetime_boundary_waiver() {
+    let dir = workdir("no-waiver");
+    let policy = write_policy_opts(&dir, "        deny host=\"*\"\n", false);
+    // Side-effect oracle: the marker exists only if the workload ran.
+    let marker = dir.join("workload-launched");
+    let argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!("echo ran > {}", marker.display()),
+    ];
+    let (run, _audit, report) = proxy_run(&dir, &policy, &argv);
+    assert_eq!(run.code, 1, "stderr: {}", run.stderr);
+    let body = report_body(&report);
+    assert!(
+        body.contains("\"state\":\"failed\"") && body.contains("require_lifetime_boundary"),
+        "report must record the lifetime-boundary refusal: {body}"
+    );
+    assert!(
+        !marker.exists(),
+        "the workload must never launch under the default gate"
     );
 }

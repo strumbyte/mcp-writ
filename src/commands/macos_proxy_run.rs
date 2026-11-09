@@ -70,6 +70,10 @@ mod imp {
         ProxyLost,
     }
 
+    /// The macOS implementation — the full pre-launch contract then a
+    /// select over workload exit, forwarded signals, audit-sink loss,
+    /// and proxy-task loss. Every refusal writes the report and exits
+    /// nonzero; never returns.
     pub async fn run(args: MacosProxyArgs) -> ! {
         let launch_id = uuid::Uuid::now_v7();
         let mut session_audit = SessionAuditContext::pre_policy(launch_id, "mcp-writ-macos-proxy");
