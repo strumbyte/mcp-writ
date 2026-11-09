@@ -14,9 +14,13 @@ Status: **investigation complete — see per-target verdicts** — recorded
 - **Windows**: Windows 11 Pro 26200.9711 (25H2, retail) x86-64,
   session 1, non-elevated (IL 8192), `mxc-sdk` crate 1.0.1
   (crates.io, 2026-10-17, MIT), rustc stable. Evidence bundle:
-  `.local/pr11-mxc/` (probe outputs; durable probe sources under
-  `.local/pr11-mxc/src/` — `mxc-probe/`, `winiso-copy/`, `dl.rs`,
-  `ll.py`).
+  `.local/pr11-mxc/` on the measurement host (probe outputs; durable
+  probe sources under `.local/pr11-mxc/src/` — `mxc-probe/`,
+  `winiso-copy/`, `dl.rs`, `ll.py`). `.local/` is gitignored, so the
+  bundle is **not in the repository** — it is retained on the original
+  Windows measurement host; reproducing the legs from a fresh checkout
+  requires that host or a committed copy of the sanitized sources
+  (none exists yet — tracked as a follow-up).
 - **Linux**: WSL2 on the same host, Ubuntu 24.04.2, kernel
   `6.18.54.1-microsoft-standard-WSL2`, x86-64.
 - **macOS**: no probe possible (no macOS 27 host, entitlement not
@@ -29,7 +33,7 @@ the matrix axes before any verdict. `—` = no hook exists.
 
 | axis | MXC ProcessContainer (tier 1, measured) | ES `es_new_descendants_client` (docs) | Landlock v10/v11 (docs + ABI probe) |
 |---|---|---|---|
-| fs | `readonly_paths`/`readwrite_paths`/`denied_paths`/`enumerate_paths` — default-deny, measured enforced (ro-write/deny/ungranted → `err:5`) | auth events for open/mutation across the descendant subtree | fs rights unchanged since v9 (UDP/net only in v10); fs is not the delta |
+| fs | `readonly_paths`/`readwrite_paths`/`denied_paths`/`enumerate_paths` — **curated-readable baseline, not strict default-deny**: system dirs (`C:\Windows`/`Program Files`/`Public`) and the child executable's own directory are readable without grants (adjacent non-granted files may be readable too); profiles/secrets/other drives denied; measured enforced (ro-write/deny/ungranted → `err:5`) | auth events for open/mutation across the descendant subtree | fs rights unchanged since v9 (UDP/net only in v10); fs is not the delta |
 | network destination | direct egress `default` + `allow[]`/`deny[]` of `cidr`+`protocol`+`port` — enforced on **non-local** destinations (v4+v6, allow/deny/`except` all work); **all host-local addresses (loopback + every interface IP, v4+v6) are exempt — gated all-or-nothing by `ingress.host_loopback`**, which despite its name covers `192.168.x`/`172.21.x`/ULA addrs too; **`UDP` is unmediated entirely — deny-all, deny rules, and proxy mode all leave UDP egress open (delivery verified).** `runtimeConfig.networkProxy` mode measured: raw TCP egress fail-closed except the proxy endpoint; destination scoping moves to the proxy layer | **no authorization event for IP networking** — cannot express allow/deny | v10 `LANDLOCK_ACCESS_NET_BIND_UDP` + `CONNECT_SEND_UDP` — **port-scoped only, never address-scoped** (same model as TCP since v4); mediates unconnected `sendto`/`sendmsg` destinations as implicit connects |
 | syscall | container-side seccomp surface is OS-managed; no caller knob measured | — | — (orthogonal; warden's seccomp baseline stays regardless) |
 | IPC | object namespace is private: host `Local\` **and** `Global\` mutex/event/file-mapping all `Open*`→`err:2` (invisible); own `CreateMutex` `ok`; **named pipes bounded too** (host pipe + `\\.\pipe\lsarpc` → `err:5`, own pipe creatable) — measured | auth for unix-domain IPC + macOS-27 XPC/bootstrap ops | v6 scoping (abstract unix, signals) already ≥ our baseline; v9 named-unix connect is the last relevant item (already handled) |
