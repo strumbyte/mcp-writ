@@ -29,7 +29,7 @@
 
 本書のPR番号は本計画内の番号です。前身の手順書 [archive/improvement-pr-guide-2026-10.ja.md](archive/improvement-pr-guide-2026-10.ja.md) の PR-01〜36 とは無関係で、前身の PR を指すときは「前身の PR-xx」と書きます。
 
-ロードマップ対応: P0 の PR-01 は次版（v0.6 想定）のタグ前に必須、P1 の PR-02〜05・PR-07 は含める範囲をリリース時に判断、P2 の PR-06・PR-08・PR-10・PR-11 は次版以降です。PR-09 は基準以降に中核が実装済み（探索が既定で Warden 内）で、D-2 の結論も記録済み — 残件は PR-01 の文書に織り込み済みです。バージョンを上げる条件と手順は、作業の流れの中のリリース節（[次版](#release-next)）に記載します — その時点で確認するものなので、先読みは不要です。
+ロードマップ対応: P0 の PR-01 は次版（v0.6 想定）のタグ前に必須、P1 の PR-02〜05・PR-07 は含める範囲をリリース時に判断、P2 の PR-06・PR-08・PR-10 は次版以降、PR-11（調査のみ）は実施済みです。PR-09 は基準以降に中核が実装済み（探索が既定で Warden 内）で、D-2 の結論も記録済み — 残件は PR-01 の文書に織り込み済みです。バージョンを上げる条件と手順は、作業の流れの中のリリース節（[次版](#release-next)）に記載します — その時点で確認するものなので、先読みは不要です。
 
 ## 共通手順
 
@@ -66,7 +66,7 @@
 - [PR-08 運用文書 — ドライバ配置、版の追加手順、直列構成、SECURITY.md](#pr-08)
 - [PR-09 探索の OS サンドボックス適用 — 実装済み・結論記録済み（残件は文書のみ、PR-01 内）](#pr-09)
 - [PR-10 ファジング基盤と PoC 昇格基準](#pr-10)
-- [PR-11 後継機構・新 ABI の評価（調査のみ）](#pr-11)
+- [PR-11 後継機構・新 ABI の評価（調査のみ）— 調査済み・採否記録済み](#pr-11)
 - [リリース: 次版（v0.6 想定）— PR-01 の完了後（PR-02〜05・07 は含める範囲を判断）](#release-next)
 
 依存と順序は次のとおりです。
@@ -83,9 +83,9 @@
 | PR-08 | P2 | PR-01 の後（README・guide が重なる）。D-7 の判断で SECURITY.md を決める | guide 英日、README 英日、`SECURITY.md`（新規）、`docs/releasing.md` |
 | PR-09 | —（実装済み） | 中核は v0.5.1 で実装済み。D-2 の結論は改善計画 §5 に記録済み。文書の残件は PR-01 に織り込み済み（E-04・E-10） | （文書は PR-01 の対象と同じ） |
 | PR-10 | P2 | なし | `fuzz/`（新規）、`src/framing.rs`・`src/warden/namespaced` の入力境界、guide 英日、`docs/test-matrix.md` |
-| PR-11 | P2 | なし。調査のみでコード変更を含まない | `docs/validation/`（調査記録）、改善計画 |
+| PR-11 | —（調査済み） | なし。調査のみでコード変更を含まない。採否と着手条件は改善計画 R-02・§6 に反映済み | `docs/validation/`（調査記録）、改善計画 |
 
-PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が分かれているので並行できます。PR-04 は PR-03 の後、PR-06 は PR-04 の後、PR-08 は PR-01 の後に着手します。PR-10・PR-11 は他と重なりません。PR-09 は実装・D-2 の結論記録とも済みのため着手対象外です（残る文書追従は PR-01）。
+PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が分かれているので並行できます。PR-04 は PR-03 の後、PR-06 は PR-04 の後、PR-08 は PR-01 の後に着手します。PR-10・PR-11 は他と重なりません。PR-09 は実装・D-2 の結論記録とも済み、PR-11 は調査と採否の記録が済みのため、ともに着手対象外です（PR-09 の残る文書追従は PR-01）。
 
 <a id="pr-01"></a>
 
@@ -360,9 +360,9 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 <a id="pr-11"></a>
 
-### PR-11 後継機構・新 ABI の評価（調査のみ）
+### PR-11 後継機構・新 ABI の評価（調査のみ）— 調査済み・採否記録済み
 
-対応論点: 改善計画 §3 R-02。直接依存: なし。着手・公開条件: P2 — 次版以降。コード変更を含まない。
+対応論点: 改善計画 §3 R-02。直接依存: なし。着手・公開条件: P2 — 次版以降。コード変更を含まない。状態: **調査完了** — 記録は [validation/successor-mechanisms-2026-11.md](validation/successor-mechanisms-2026-11.md)（macOS 側の実機評価は [validation/macos-parity-2026-11.md](validation/macos-parity-2026-11.md)）、採否と着手条件は改善計画 R-02・§6 に反映済み。
 
 **目的:** OS 間の機能差を埋める方針のもとで、評価レポートが挙げた後継機構と新しい ABI が、既存の OS サンドボックスを維持したまま差を縮める手段になるかを調べ、採否と着手条件を記録する。結果は microVM 隔離強化の別計画の入力にもなる。
 
@@ -375,13 +375,13 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 
 **タスク**
 
-- [ ] 各機構の一次ソース（公式文書・ヘッダ・カーネルの `syscalls.c`・クレートの CHANGELOG）を読み、表現できる制御を capability matrix の項目（fs・network 宛先・syscall・IPC・process）に対応付ける
-- [ ] 実機で試せるもの（Linux の新 ABI、Windows の GA 機能）は最小の試作で確認し、環境・結果を `docs/validation/` に記録する。試せないもの（macOS 27 の entitlement）は未確認と記す
-- [ ] 採否と着手条件（OS の版・配布要件・特権要否・既存経路との共存）を改善計画に追記する。採用する場合は新しい PR として起票し、本PRでは実装しない
+- [x] 各機構の一次ソース（公式文書・ヘッダ・カーネルの `syscalls.c`・クレートの CHANGELOG）を読み、表現できる制御を capability matrix の項目（fs・network 宛先・syscall・IPC・process）に対応付ける — **済**: 記録の「Capability-matrix mapping (all targets)」節で 4 対象すべてを行列項目に対応付け。GA spec（FlatBuffers）の CIDR・`PortRule`・INGRESS・PROXY・`ALLOWED_APPCONTAINER_PEER`・fs enumerate を matrix 軸へ写像し、`windows-psec` の欠点が v1.0 エンコーダ制約であって OS 上限ではないことを確定（v1.1 発行化で宛先制御ギャップの大半を埋められる）
+- [x] 実機で試せるもの（Linux の新 ABI、Windows の GA 機能）は最小の試作で確認し、環境・結果を `docs/validation/` に記録する。試せないもの（macOS 27 の entitlement）は未確認と記す — **済**: Windows 26200.9711 + `mxc-sdk` 1.0.1 で実測（`ui.disable=false` 下の node.exe v24.11.1 動作・egress/proxy/fs/env/UI 表面・`SendInput` 残存面・非ローカル UDP 無仲裁・capabilities ゲート等、詳細は調査メモ）。macOS は 26.6.2 実機（[macos-parity-2026-11.md](validation/macos-parity-2026-11.md)）で ES descendants client のみ entitlement 未取得のため文書評価止まり。Landlock v10/v11 は参照ホスト ABI 7（WSL2 6.18）で計測不能、Ubuntu userns 制限下の `auto` は制限 sysctl 不在で実走行未検証 — いずれも記録に明記
+- [x] 採否と着手条件（OS の版・配布要件・特権要否・既存経路との共存）を改善計画に追記する。採用する場合は新しい PR として起票し、本PRでは実装しない — **済**: MXC ProcessContainer=条件付き候補（要件 a–e、§6 の別計画の入力）、ES descendants client=見送り（ネットワーク制御不能・entitlement 厳格）、Landlock v10/v11=保留（クレート #140 未リリース・参照カーネル ABI 7 で不足）、Ubuntu `auto`=コード・文書は整合・制限ホスト実走行は未検証を R-02・§6 に反映。warden PSEC の v1.1 発行化（採用ゲートは `IsProcessSecurityEnvironmentVersionSupported`、着地は `psec_spec.rs`＋`validator/psec.rs`）は後続の実装 PR 候補として記録
 
 **検証:** 調査記録の T-DOC のみ。
 
-**完了条件:** 調査対象ごとに「採用／見送り／保留と解除条件」が記録され、改善計画のロードマップに反映される。
+**完了条件:** 充足済み — 調査対象ごとの採否（MXC=条件付き候補／ES descendants client=見送り／Landlock v10/v11=保留・解除条件はクレートリリースと参照カーネル／Ubuntu `auto`=保留・解除条件は制限有効ホストでの実走行）が [successor-mechanisms-2026-11.md](validation/successor-mechanisms-2026-11.md) に記録され、改善計画 R-02・§6 のロードマップ（別計画 microVM 隔離強化の入力）に反映済み。
 
 **移行・戻し方:** コード変更なし。
 

@@ -113,7 +113,7 @@ PR 単位の作業順序は [improvement-pr-guide-2026-11.ja.md](improvement-pr-
 | 版 | 内容 |
 |---|---|
 | **次版（v0.6 想定）** | P0 の PR-01（文書・例の即時修正）はタグ前に必須。P1 の PR-02〜05・PR-07（起動コスト・引数分類・自由記述欄・namespaced の起動前判定・CI 定期実行）は含める範囲をリリース時に判断 |
-| **次版以降** | P2 の PR-06・PR-08・PR-10・PR-11（v3 草案と警告、運用文書、ファジング基盤、後継機構の調査）。PR-09 は v0.5.1 で実装済み（探索が既定で Warden 内）で D-2 の結論も §5 に記録済み — 文書追従の残件も PR-01 で完了済み |
+| **次版以降** | P2 の PR-06・PR-08・PR-10（v3 草案と警告、運用文書、ファジング基盤）。PR-09 は v0.5.1 で実装済み（探索が既定で Warden 内）で D-2 の結論も §5 に記録済み — 文書追従の残件も PR-01 で完了済み。PR-11（後継機構の調査）は実施済み — 記録は [validation/successor-mechanisms-2026-11.md](validation/successor-mechanisms-2026-11.md)、採否は R-02 と下段「別計画」に反映済み |
 | **別計画** | microVM 隔離の強化（既存の `--isolation` バックエンドの延長）。PR-11 の調査結果（[記録](validation/successor-mechanisms-2026-11.md)）を入力にする: MXC ProcessContainer は条件付き候補 — 確立済み要件: (a) `ui.disable=false` + `ui.isolation=container`（win32k 露出受容、`desktop` は実デスクトップ共有で選択禁止）・(b) **明示 env ブロック必須**（既定はプロファイル環境を流出）・(c) **UDP egress 無フィルタ**（全モード実測 — 別系の遮断手段が見つからない限り、UDP 無制限を許容するポリシーに限定；オペレータ受容のみを強制と見なすのは不安全な格下げ）・(d) 宛先制御は宣言 peer + proxy 層経路で **tier-1 固定**（T2/T3 は昇格 `winhttp-proxy-shim`+LoopbackExempt が必要）・(e) **fs はベースライン可読型**（子実行ファイルのディレクトリはポリシー無しでも可読、明示許可のない隣接ファイルも可読の場合あり — 厳密 default-deny ではない前提で扱う）、IsolationSession はポリシー非対応で不適格、ES descendants client はネットワーク制御不能で見送り、Landlock v10/v11 はクレート/カーネル要件を条件に保留 — MXC 採用でも宛先単位制御は proxy 層依存となり、microVM 系の優位は維持される |
 
 ## 7. 非目標（継続）
