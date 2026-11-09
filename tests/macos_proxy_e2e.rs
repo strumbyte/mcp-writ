@@ -249,6 +249,12 @@ defaults {{
     }}
 }}
 
+// `macos-proxy-run` is a supervised launch — macOS has no
+// kernel-enforced descendant boundary, so the default `#true`
+// would refuse it (same gate as `run`); the fixture exercises the
+// proxy mechanism under the explicit waiver.
+sandbox require_lifetime_boundary=#false
+
 server "probe" {{
     tool "probe"
 }}

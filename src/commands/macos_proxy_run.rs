@@ -188,6 +188,23 @@ mod imp {
                 std::process::exit(1);
             }
         };
+        // Same gate as `warden/spawn.rs` — this is a supervised launch,
+        // and macOS carries no kernel-enforced descendant-lifetime
+        // boundary (the group sweeps below are best-effort, escapable
+        // by `setsid`). Under `require_lifetime_boundary` refuse before
+        // the proxy or the child exists; `=#false` is the waiver.
+        if policy.sandbox.require_lifetime_boundary {
+            let detail = "sandbox.require_lifetime_boundary: macOS provides \
+                          no kernel-enforced descendant-lifetime boundary \
+                          — the supervised launch is refused rather than \
+                          run unbounded"
+                .to_string();
+            eprintln!("Error: {detail}");
+            write_report("failed", Some(&detail), None, None);
+            lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail)
+                .await;
+            std::process::exit(1);
+        }
         let policy_context = match policy.audit_context() {
             Ok(ctx) => Some(ctx),
             Err(e) => {

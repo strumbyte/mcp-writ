@@ -1,0 +1,1 @@
+fn main(){ let mut v:Vec<_>=std::env::vars().collect(); v.sort(); for(k,val)in v{ let s=if val.chars().count()>60 {format!("{}...",val.chars().take(60).collect::<String>())} else {val}; println!("{k}={s}") } }

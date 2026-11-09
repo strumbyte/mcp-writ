@@ -14,13 +14,18 @@ Status: **investigation complete — see per-target verdicts** — recorded
 - **Windows**: Windows 11 Pro 26200.9711 (25H2, retail) x86-64,
   session 1, non-elevated (IL 8192), `mxc-sdk` crate 1.0.1
   (crates.io, 2026-10-17, MIT), rustc stable. Evidence bundle:
-  `.local/pr11-mxc/` on the measurement host (probe outputs; durable
-  probe sources under `.local/pr11-mxc/src/` — `mxc-probe/`,
-  `winiso-copy/`, `dl.rs`, `ll.py`). `.local/` is gitignored, so the
-  bundle is **not in the repository** — it is retained on the original
-  Windows measurement host; reproducing the legs from a fresh checkout
-  requires that host or a committed copy of the sanitized sources
-  (none exists yet — tracked as a follow-up).
+  probe sources and wire requests are committed at
+  [`pr11-mxc/`](pr11-mxc/) — `src/` single-file probes plus the
+  `mxc-probe/` crate, and `req/requests.json` for the
+  `__ffi::spawn_container_json` requests, keyed by leg name
+  (sanitized: host-specific paths, LAN addresses and the real
+  AppContainer SID are substituted per the bundle README). Raw probe
+  outputs stay in `.local/pr11-mxc/` on the measurement host —
+  `.local/` is gitignored, so outputs are **not in the repository**.
+  `winiso-copy/` was a working copy of
+  `tests/fixtures/windows_isolation/` (only `ffi.rs`'s
+  `ole32`→`combase` link-name delta) — the committed fixture tree is
+  the durable source for the direct-PSEC legs.
 - **Linux**: WSL2 on the same host, Ubuntu 24.04.2, kernel
   `6.18.54.1-microsoft-standard-WSL2`, x86-64.
 - **macOS**: no probe possible (no macOS 27 host, entitlement not
@@ -33,8 +38,8 @@ the matrix axes before any verdict. `—` = no hook exists.
 
 | axis | MXC ProcessContainer (tier 1, measured) | ES `es_new_descendants_client` (docs) | Landlock v10/v11 (docs + ABI probe) |
 |---|---|---|---|
-| fs | `readonly_paths`/`readwrite_paths`/`denied_paths`/`enumerate_paths` — **curated-readable baseline, not strict default-deny**: system dirs (`C:\Windows`/`Program Files`/`Public`) and the child executable's own directory are readable without grants (adjacent non-granted files may be readable too); profiles/secrets/other drives denied; measured enforced (ro-write/deny/ungranted → `err:5`) | auth events for open/mutation across the descendant subtree | fs rights unchanged since v9 (UDP/net only in v10); fs is not the delta |
-| network destination | direct egress `default` + `allow[]`/`deny[]` of `cidr`+`protocol`+`port` — enforced on **non-local** destinations (v4+v6, allow/deny/`except` all work); **all host-local addresses (loopback + every interface IP, v4+v6) are exempt — gated all-or-nothing by `ingress.host_loopback`**, which despite its name covers `192.168.x`/`172.21.x`/ULA addrs too; **`UDP` is unmediated entirely — deny-all, deny rules, and proxy mode all leave UDP egress open (delivery verified).** `runtimeConfig.networkProxy` mode measured: raw TCP egress fail-closed except the proxy endpoint; destination scoping moves to the proxy layer | **no authorization event for IP networking** — cannot express allow/deny | v10 `LANDLOCK_ACCESS_NET_BIND_UDP` + `CONNECT_SEND_UDP` — **port-scoped only, never address-scoped** (same model as TCP since v4); mediates unconnected `sendto`/`sendmsg` destinations as implicit connects |
+| fs | `readonly_paths`/`readwrite_paths`/`denied_paths`/`enumerate_paths` — **curated-readable baseline, not strict default-deny**: system dirs (`C:\Windows`/`Program Files`/`Public`) and the child executable's own directory are readable without grants (adjacent non-granted files may be readable too); the **tested** profile/secret paths and other drives denied — but adjacent ungranted files (secrets included) may still be readable; measured enforced (ro-write/deny/ungranted → `err:5`) | auth events for open/mutation across the descendant subtree | fs rights unchanged since v9 (UDP/net only in v10); fs is not the delta |
+| network destination | direct egress `default` + `allow[]`/`deny[]` of `cidr`+`protocol`+`port` — enforced on **non-local** destinations (v4+v6; deny/`except`/port-narrowing measured — allow-side delivery to a genuinely non-local listener **unverified**); **all host-local addresses (loopback + every interface IP, v4+v6) are exempt — gated all-or-nothing by `ingress.host_loopback`**, which despite its name covers `192.168.x`/`172.21.x`/ULA addrs too; **`UDP` is unmediated entirely — deny-all, deny rules, and proxy mode all leave UDP egress open (delivery verified).** `runtimeConfig.networkProxy` mode measured: raw TCP egress fail-closed except the proxy endpoint; destination scoping moves to the proxy layer | **no authorization event for IP networking** — cannot express allow/deny | v10 `LANDLOCK_ACCESS_NET_BIND_UDP` + `CONNECT_SEND_UDP` — **port-scoped only, never address-scoped** (same model as TCP since v4); mediates unconnected `sendto`/`sendmsg` destinations as implicit connects |
 | syscall | container-side seccomp surface is OS-managed; no caller knob measured | — | — (orthogonal; warden's seccomp baseline stays regardless) |
 | IPC | object namespace is private: host `Local\` **and** `Global\` mutex/event/file-mapping all `Open*`→`err:2` (invisible); own `CreateMutex` `ok`; **named pipes bounded too** (host pipe + `\\.\pipe\lsarpc` → `err:5`, own pipe creatable) — measured | auth for unix-domain IPC + macOS-27 XPC/bootstrap ops | v6 scoping (abstract unix, signals) already ≥ our baseline; v9 named-unix connect is the last relevant item (already handled) |
 | process | grandchild spawn measured `ok` — inherits fs/net/reg policy (fs `err:5`, egress `10013`), fresh per-process AC SID, tree dies with the container | auth for exec/process controls; caller+descendants **cannot exec setuid/setgid** unless euid 0 | v8 `TSYNC` (process-wide enforce) / v11 `NO_NEW_PRIVS` flag — cosmetic for our child-launch model (already `prctl`) |
@@ -172,11 +177,16 @@ backend).
   skeletons). Nothing written by denied-policy children lands
   there, but the GUID churn is permanent host-side garbage and a
   marker trail of every run.
-- egress: `default deny` + `allow {to cidr, port P}` verified in both
-  directions — off-rule non-loopback `203.0.113.1:443` → `WSAEACCES
-  10013`; a non-loopback allowed destination+port (host LAN IP
-  `172.21.240.1:59111`, listener on `0.0.0.0`) → **connected**. CIDR+port
-  rules are enforced as documented for non-loopback destinations.
+- egress: `default deny` + `allow {to cidr, port P}` — the deny side
+  verified: off-rule non-loopback `203.0.113.1:443` → `WSAEACCES
+  10013`. The allow-side `connected` result went to
+  `172.21.240.1:59111` — the host's *own* vEthernet address, which
+  sits in the host-local exemption class rather than the non-local
+  rule path — so it does not prove CIDR+port delivery to a genuinely
+  non-local destination. Rule *evaluation* on non-local destinations
+  is measured (deny `10013`, `except` carve-outs, port narrowing);
+  non-local allow-side *delivery* stays **unverified** — it needs a
+  listener on another host.
 - **host-address exemption (security-relevant, measured)**: the
   `ingress.host_loopback` bit is mis-named — it gates **every
   host-local address**, not just loopback. With `Allow`, a loopback
@@ -317,11 +327,18 @@ backend).
   host mailslot open → `err:5`; raw `SOCK_RAW/IPPROTO_TCP` socket
   → `10013`; raw `SOCK_RAW/IPPROTO_ICMP` *created* but `sendto`
   fails `WSAEAFNOSUPPORT 10047` (unusable); **UDP inbound
-  mediated** — datagrams to a bound container socket (loopback
-  and wildcard listeners, host-source via LAN addr) never arrive.
-  Combined with the pipe/object findings: the only socket-family
-  egress that escapes policy is UDP *send*, and nothing inbound
-  or IPC-shaped crosses the boundary.
+  mediated in the tested listener configuration** — datagrams to a
+  bound container socket (loopback `127.0.0.1:port` and wildcard
+  `0.0.0.0:port` listeners, host-source via the LAN address, under
+  the default `host_loopback=deny` posture) never arrive. Inbound
+  is *not* unconditionally closed, though: with `host_loopback=Allow`
+  host TCP connections do reach bound container listeners (the
+  `ing-lb`/`host-connect-ok` legs — the bit is a bidirectional
+  gate), and on the direct PSEC child path UDP inbound was delivered
+  under `host_loopback=1`; whether `hostLoopback=allow` UDP inbound
+  also delivers on the MXC path is **untested**. Combined with the
+  pipe/object findings: under the tested deny posture the only
+  socket-family traffic that escapes policy is outbound UDP *send*.
 - **`process.cwd` semantics (measured)**: `cwd` is optional and
   needs no fs grant for launch. An explicit denied cwd does not
   fail spawn — the child comes up in a fallback dir (`cmd /c cd`
@@ -911,13 +928,20 @@ backend).
   `udp:53` while denying the rest (resolver DNS restored,
   DNS-tunnel exfil risk accepted) instead of killing all
   UDP. Still gated on ≥7.2 kernels + an unreleased crate.
-- **DNS unaffected in both modes**: `ToSocketAddrs` inside the
-  container resolved `example.com` (v4+v6), `localhost`, and returned
-  NXDOMAIN for `.invalid` under both direct deny-all and proxy mode —
-  resolution rides the host `dnscache` service, not a raw egress flow
-  (`dns-deny-direct.txt`, `dns-proxy-mode.txt`). Relevant upside:
-  name-scoped policy could mint IP grants at resolve time, as the
-  native Landlock path already does.
+- **DNS resolves only where the host-loopback posture allows it**:
+  the "unaffected" readings were taken with `hostLoopback=allow` —
+  `ToSocketAddrs` inside the container resolved `example.com` (v4+v6),
+  `localhost`, and returned NXDOMAIN for `.invalid` under both direct
+  deny-all and proxy mode because resolution rides the host
+  `dnscache` service, not a raw egress flow (`dns-deny-direct.txt`,
+  `dns-proxy-mode.txt`). With `hostLoopback=deny` — the default and
+  the posture the validated proxy architecture requires — `dnscache`
+  is unreachable and `example.com` fails `11001` (`dns-default.txt`,
+  `req-dns-lbdeny.json` leg); `localhost` still resolves from hosts
+  data. So DNS is *not* unaffected under deny posture, and minting
+  IP grants at resolve time is not viable there — name handling must
+  live in the proxy (CONNECT authority), as the namespaced route does
+  with `dnsgate`.
 - **proxy mode (`runtimeConfig.networkProxy`) measured**: requires
   `ingress.default=Allow` and is mutually exclusive with egress rule
   lists. With a local HTTP proxy at `127.0.0.1:59199`, every **raw**
@@ -978,9 +1002,14 @@ backend).
   default above); the per-AppContainer-identity socket scoping
   observed with `allowedProxyPeer` is the same mechanism that
   keeps containers from sharing each other's loopback services.
-  Implication for warden: parallel MCP children cannot
-  communicate or collide — no shared object namespace, files,
-  processes, or sockets.
+  Implication for warden: parallel MCP children have no shared
+  object namespace, package directories, process visibility, or
+  sockets — as measured between two containers with distinct
+  package dirs and no shared fs grants. The isolation statement
+  does not extend to paths covered by a common `readwrite_paths`
+  grant: two containers granted the same directory could still
+  communicate through or modify files inside it — treat shared
+  grants as a deliberate channel, not an isolation property.
 
 - Symptom (first probe round): a child image that **imports
   `ole32.dll` exits `0xC0000142` (`STATUS_DLL_INIT_FAILED`) before
@@ -1223,8 +1252,10 @@ grandchild inheritance — with four architecture-level conditions:
    documents exactly which surface each flag governs.
 3. **Egress destination scoping via peer-scoped proxy — proven
    end-to-end on T1.** Direct egress enforces CIDR+port on
-   **non-local** destinations (v4+v6, allow/deny/`except` all work —
-   `except` exists only on allow rules); **all host-local addresses
+   **non-local** destinations (v4+v6; deny/`except`/port-narrowing
+   measured — allow-side delivery to a genuinely non-local listener
+   **unverified**, needs a second host; `except` exists only on
+   allow rules); **all host-local addresses
    are exempt** — `host_loopback` is a bidirectional "host's own
    addresses" gate covering every interface IP. The validated
    architecture: **proxy +
@@ -1273,18 +1304,22 @@ grandchild inheritance — with four architecture-level conditions:
 
 Secondary deviations to price in (measured, not blocking): (a) the fs
 baseline is *curated-allow read-only*, not strict default-deny —
-system areas (`C:\Windows`, `Program Files`, `Public`) read ambient
-with **no ambient write surface**, though profiles/secrets/other
-drives stay denied and explicit `denied_paths` are
-junction/`\\?\`/ADS-proof; **adoption condition**: the child
-executable's directory is also ambiently readable — the launch image
-ran from `%TEMP%` with no grant covering it, i.e. the mechanism
-implicitly read-grants the image path. Suppressing that auto-grant is
-not possible through the measured config surface (no field removes
-image readability); treat it as a **filesystem contract gap**, not a
-non-blocking deviation — adoption requires accepting that the child
-image dir is policy-blind readable (writes remain denied; explicit
-`denied_paths` elsewhere stay robust). (b) `CaptureDenials` records no `network`
+system areas (`C:\Windows`, `Program Files`, `C:\Users\Public`) read
+ambient with **no ambient write surface**, though profiles/secrets/
+other drives stay denied and explicit `denied_paths` are
+junction/`\\?\`/ADS-proof; **adoption condition — it applies to
+every ambient-readable path, not only the image dir**: the child
+executable's directory is also ambiently readable (the launch image
+ran from `%TEMP%` with no grant covering it — the mechanism
+implicitly read-grants the image path; suppressing that auto-grant is
+not possible through the measured config surface), and whether an
+explicit `denied_paths` entry can mask a baseline-readable system
+path is unverified. Adoption therefore requires either enforcing a
+deny over each ambient-readable location the workload must not
+reach, or explicitly accepting every one of them — `C:\Windows`,
+`Program Files`, `C:\Users\Public`, and the image dir — as
+policy-blind readable (writes remain denied everywhere ambient;
+explicit `denied_paths` elsewhere stay robust). (b) `CaptureDenials` records no `network`
 denials — egress audit must come from the proxy layer; (c)
 containers can `bind()` listeners — host access is gated by the same
 `host_loopback` bit (bidirectional), and `ingress.default` coverage
@@ -1472,11 +1507,11 @@ profile stays **pending real-host testing**.
 |---|---|
 | target | improvement plan §3 R-02 / PR guide PR-11 (baseline `f00e28a`, v0.5.1) |
 | environment | Windows 11 Pro 26200.9711 x86-64 non-elevated; WSL2 Ubuntu 24.04.2, kernel 6.18.54.1; mxc-sdk 1.0.1; landlock crate 0.4.7 |
-| reproduction | Full sources kept in the durable bundle `.local/pr11-mxc/src/` — `mxc-probe/` (Cargo manifest + `src/main.rs`; `cargo run -- support|run|spawn|proxy`, env toggles `MXC_PROBE_EXE`/`MXC_PROBE_COMMAND`/`MXC_PROBE_BIND`/`MXC_PROBE_ALLOW_ADDR`/`MXC_PROBE_ALLOW_CIDR`/`MXC_PROBE_ALLOW_EXCEPT`/`MXC_PROBE_ALLOW_NOPORT`/`MXC_PROBE_DENY_ADDR`/`MXC_PROBE_NO_LB`/`MXC_PROBE_NO_FS`/`MXC_PROBE_NO_NET`/`MXC_PROBE_NO_WD`/`MXC_PROBE_EXTRA_RO`/`MXC_PROBE_DEFAULT_ENV`/`MXC_PROBE_UI`/`MXC_PROBE_PROXY`/`MXC_PROBE_CAPTURE`/`MXC_PROBE_CAPTURE_ALLOW`/`MXC_PROBE_ISO`/`MXC_PROBE_EGRESS_ALLOW_ALL`/`MXC_PROBE_DENY_CIDR`/`MXC_PROBE_DENY_UDP`/`MXC_PROBE_TIMEOUT_MS`), `winiso-copy/` (the `tests/fixtures/windows_isolation` tree with only `ffi.rs`'s `ole32`→`combase` link-name change, rebuilt `rustc --edition 2021 -O`), `dl.rs` (LoadLibraryW user32/ole32/gdi32 leg), `ui.rs` (clipboard/SendInput/window/system-params probe), `dn.rs` (`ToSocketAddrs` DNS leg), `v6.rs` (v6-capable TCP connect probe — the winiso `attempts` net legs are IPv4-only), `udp.rs` (UDP sendto/connect+send leg), `udprx.rs` (host-side UDP delivery listener), `desk.rs` (window-station/desktop/input-desktop scope probe), `obj.rs` (named-object visibility probe), `gc.rs` (grandchild policy-inheritance shim), `fsx.rs`/`fs2.rs`/`fs3.rs`/`fs4.rs` (fs baseline + `\\?\`/ADS/slash/junction bypass legs), `bind.rs` (container listener / ingress leg), `ipc.rs` (process-enum/token-privilege/HKCU probe), `mxc-json.rs` (raw `__ffi::spawn_container_json` driver — exercises the full wire contract incl. `processContainer.*`), `req-*.json` (the JSON requests used), `udp6.rs`, `fsw.rs` (ambient-write probe), `pipe.rs` (NPFS boundary probe), `icmp.rs`, `acspawn.rs` (named-AppContainer-profile listener spawn — `CreateAppContainerProfile` + `SECURITY_CAPABILITIES`), `bindsid.rs`/`rsid3.rs`/`rsid4.rs` (SID-token probes), `envd.rs` (default-env dump), `hl.rs` (hardlink/symlink/GLOBALROOT/PhysicalDrive/write+exec bypass probe), `xsrv.rs`/`xcli.rs` (cross-container sibling pair), `hello.rs` (user32-free exec probe), `fr.rs` (direct file-read probe), `ipc2.rs` (AF_UNIX/mailslot/raw-socket/UDP-inbound battery), `tcp.rs` (egress precedence/connect probe), `fs5.rs` (fs normalization bypass battery), `tok.rs` (token IL/elevation surface), `fams.rs` (socket-family sweep + self-loopback), `mxc-run.rs` (`mxc_engine::run` run-to-completion driver — Windows Sandbox/hyperlight legs), `ll.py` (`landlock_create_ruleset` version syscall 444). Required inputs: four scratch dirs with `ro-read.txt`/`deny-read.txt`/`ungranted.txt` (probe creates them), a host TCP listener (probe binds it), the winiso `attempts` battery as the child binary; `unshare --user --map-root-user --net` for the userns leg |
+| reproduction | Durable probe sources + wire requests committed at [`pr11-mxc/`](pr11-mxc/) (sanitized per its README; raw outputs stay in `.local/pr11-mxc/` on the measurement host) — `mxc-probe/` (Cargo manifest + `src/main.rs`; `cargo run -- support\|run\|spawn\|proxy`, env toggles `MXC_PROBE_EXE`/`MXC_PROBE_COMMAND`/`MXC_PROBE_BIND`/`MXC_PROBE_ALLOW_ADDR`/`MXC_PROBE_ALLOW_CIDR`/`MXC_PROBE_ALLOW_EXCEPT`/`MXC_PROBE_ALLOW_NOPORT`/`MXC_PROBE_DENY_ADDR`/`MXC_PROBE_NO_LB`/`MXC_PROBE_NO_FS`/`MXC_PROBE_NO_NET`/`MXC_PROBE_NO_WD`/`MXC_PROBE_EXTRA_RO`/`MXC_PROBE_DEFAULT_ENV`/`MXC_PROBE_UI`/`MXC_PROBE_PROXY`/`MXC_PROBE_CAPTURE`/`MXC_PROBE_CAPTURE_ALLOW`/`MXC_PROBE_ISO`/`MXC_PROBE_EGRESS_ALLOW_ALL`/`MXC_PROBE_DENY_CIDR`/`MXC_PROBE_DENY_UDP`/`MXC_PROBE_TIMEOUT_MS`), `winiso-copy/` (the `tests/fixtures/windows_isolation` tree with only `ffi.rs`'s `ole32`→`combase` link-name change, rebuilt `rustc --edition 2021 -O`), `dl.rs` (LoadLibraryW user32/ole32/gdi32 leg), `ui.rs` (clipboard/SendInput/window/system-params probe), `dn.rs` (`ToSocketAddrs` DNS leg), `v6.rs` (v6-capable TCP connect probe — the winiso `attempts` net legs are IPv4-only), `udp.rs` (UDP sendto/connect+send leg), `udprx.rs` (host-side UDP delivery listener), `desk.rs` (window-station/desktop/input-desktop scope probe), `obj.rs` (named-object visibility probe), `gc.rs` (grandchild policy-inheritance shim), `fsx.rs`/`fs2.rs`/`fs3.rs`/`fs4.rs` (fs baseline + `\\?\`/ADS/slash/junction bypass legs), `bind.rs` (container listener / ingress leg), `ipc.rs` (process-enum/token-privilege/HKCU probe), `mxc-json.rs` (raw `__ffi::spawn_container_json` driver — exercises the full wire contract incl. `processContainer.*`), `req-*.json` (the JSON requests used), `udp6.rs`, `fsw.rs` (ambient-write probe), `pipe.rs` (NPFS boundary probe), `icmp.rs`, `acspawn.rs` (named-AppContainer-profile listener spawn — `CreateAppContainerProfile` + `SECURITY_CAPABILITIES`), `bindsid.rs`/`rsid3.rs`/`rsid4.rs` (SID-token probes), `envd.rs` (default-env dump), `hl.rs` (hardlink/symlink/GLOBALROOT/PhysicalDrive/write+exec bypass probe), `xsrv.rs`/`xcli.rs` (cross-container sibling pair), `hello.rs` (user32-free exec probe), `fr.rs` (direct file-read probe), `ipc2.rs` (AF_UNIX/mailslot/raw-socket/UDP-inbound battery), `tcp.rs` (egress precedence/connect probe), `fs5.rs` (fs normalization bypass battery), `tok.rs` (token IL/elevation surface), `fams.rs` (socket-family sweep + self-loopback), `mxc-run.rs` (`mxc_engine::run` run-to-completion driver — Windows Sandbox/hyperlight legs), `ll.py` (`landlock_create_ruleset` version syscall 444). Required inputs: four scratch dirs with `ro-read.txt`/`deny-read.txt`/`ungranted.txt` (probe creates them), a host TCP listener (probe binds it), the winiso `attempts` battery as the child binary; `unshare --user --map-root-user --net` for the userns leg |
 | counts | Windows: `support` + 6 attempts-battery `run` legs + 1 `spawn` + ~32 `run` legs + **15 JSON-contract legs via `__ffi::spawn_container_json`** (allowedProxyPeer validation ×4 incl. **positive peer test with a named-profile AppContainer listener**, ui.isolation=desktop, enumeratePaths, learningMode, capabilities, appcontainer backend ×3, DNS under LB=deny, default-env dump, concurrency ×3, **hardlink/symlink/GLOBALROOT/PhysicalDrive/write+exec bypass battery, fs grants ×3, env semantics ×3, cross-container ×2, default-posture network ×3, peer port-scoping, subpath-deny, file-level grant, HKLM surface, ui.isolation handles/atoms gradient, ui clipboard/systemSettings knob legs, capabilities documentsLibrary, deny-except validator leg, `containment:"process"` resolution, windows_sandbox wire check, **AF_UNIX/mailslot/raw-socket/UDP-inbound battery ×2, ingress default×3 + host-connect, egress precedence + allow-except, cwd denied/ambient/ungranted ×3, package-dir persistence, stderr/exit capture, **fs-normalization bypass battery ×11, token IL surface, socket-family sweep ×7 + self-loopback, same-`containerId` sibling connect, **contract-version containment matrix ×9 (0.9/1.0/1.1-alpha × experimental), windows_sandbox run-to-completion real VM launch (+ staging/.wsb inspection, rendezvous-timeout, caller-kill orphan), hyperlight/microvm/wslc run-path rejections**) + host-side `acspawn.rs` (named-profile spawn) — ≈ 190 measured attempt ops + targeted legs, all produced evidence; ole32 bisect 6 exes; Linux: 1 ABI probe + 1 userns leg — pass; macOS: 0 runs — unverified |
 | controls | see mapping table + per-target sections |
 | audit | `CaptureDenials` **measured both modes**: Block = deny+record (`total_denials:5`); **Allow = learning mode — ungranted access permitted+recorded (`total_denials:11`), explicit denies still enforced**; per-denial JSON (`resource`/`resourceType`/`accessType`/`pid`/`filetime`) + run summary; **gap: `network` denials are NOT captured** (measured — 2 denied connects, 0 network records); ES notify ≠ enforcement; Landlock v7+ audit deltas (v10 quiet flag, v11 tracepoints) are watch items |
 | compatibility | node.exe **runs** in tier-1 with `ui.disable=false` — clipboard/system-settings stay denied; `SendInput` lands in the container's **private desktop** (`WinSta0`→`err:5`, `EnumWindows`→0 — but `ui.isolation="desktop"` shares the real desktop: 283 windows reachable — keep `container`); Python ok; **all host-local addresses exempt from egress rules** → proxy mode is the per-destination TCP route, and `allowedProxyPeer` + `hostLoopback=deny` **proven end-to-end at (identity × declared-endpoint) granularity** (named-profile listener reachable; same identity different port `10013`; same endpoint via LAN addr `10013`); **no-network-block default = TCP default-deny** (non-local+loopback+host addr all `10013`, LB default deny → dnscache dead) — **UDP still fully open under that default, v4+v6, on the tested AppContainer-family dispatch** (`"appcontainer"` wire name is an alias re-running the same T1 dispatch; T2/T3 unforceable — equivalence unverified, delivery verified on T1) — biggest measured hole; fs baseline curated-allow **read-only** (system areas ambient, profiles/drives/secrets denied, denies junction/`\\?\`/ADS/hardlink/`GLOBALROOT`-proof, zero ambient writes, `enumerate_paths` = list-without-read, grants lift baseline + deny always wins + **sub-path deny inside granted parent works** + file-level grants work, **write+exec allowed** — no CI); **fs deny on T1 is PSEC-native — no host DACL mutation** (ACE stamping is T2/T3-only, reverted on drop); PhysicalDrive0 blocked; containers can `bind()` listeners (host access gated by `host_loopback` both directions; non-host ingress unverified); named pipes bounded (host/`lsarpc` `err:5`); ICMP blocked; `capabilities` don't override deny rules or open fs (`documentsLibrary` no effect); **egress `to`=NetworkPeer{cidr,except}/`ports`=NetworkPort{port}; deny > allow precedence + allow-except carves exclusions**; ingress schema = `{default, hostLoopback}` only (no rules) — `ingress.default` unmapped in T1 (no measurable effect), host↔container inbound governed by `hostLoopback` bidirectionally (incl. host LAN addr), default posture fail-closed; **all remaining IPC bounded** — AF_UNIX `10013`, mailslots `err:5` both ways, raw TCP `10013`, raw ICMP create-only (send `10047`), **UDP hole was egress-only in the tested listener config** (inbound never delivered there; `hostLoopback=allow` inbound untested — do not generalize to all configs); `cwd` optional + grant-free + denied→System32 fallback; stderr/exit retrievable via Child handle; **package dirs never cleaned** (41 `sandbox.{guid}` accumulated) and **not policy-exempt** (writes denied at AC root + AC\Temp); **fs-deny survives all normalization evasions** (case/8.3 `SECRET~1`/trailing dot-space/fwd slashes/`.\`/`\\??\`/UNC-localhost); **token = Low IL + IsAppContainer=1**; exotic socket families OS-absent (INET/INET6 only); **self-loopback denied — no in-container sidecar**; **same-`containerId` siblings still isolated** (per-spawn identity); **`windows_sandbox` reaches a real disposable-VM launch via run-to-completion** (`1.1.0-alpha`+experimental, .wsb staged, zygote-derived partition live) — streaming spawn rejects it, guest rendezvous unverified (no completion in ~15 min), and **caller death orphans the VM** (SYSTEM vmwp); hyperlight needs WHP (absent), microvm/wslc not compiled; stable request surface fully mapped (lifecycle/telemetry/fallback/ui/captureDenials fields incl. `retainEtl`); captureDenials emits per-event JSON audit records; **PSEC host spec = v1.1 all-bits (flags 0xf, minor 1) — matrix `windows-psec` deficiencies are v1.0-encoder bounds, not OS limits** (spec carries CIDR/ports/protocol/ingress/proxy/peer/fs-grants natively; v1.1 upgrade would close the Windows destination-control gap modulo UDP+names); process/object namespaces private; token = 2 privileges; HKCU own AC hive readable, **HKLM/HKU reads denied by default**; **cross-container isolation complete** (objects/pipes/pids/package-dirs all `err:2/5`, unique `sandbox.{guid}` dirs); destination-scoped UDP impossible at any Landlock ABI; DNS resolves via dnscache only when LB allowed (default/LB=deny → dead; name handling lives in the proxy); **default env = user PROFILE block (persistent vars incl. secrets leak — explicit env mandatory; presence-only `SYSTEMROOT`+`LOCALAPPDATA` minimum; OS appends `Packages\sandbox.{id}` + injects TEMP/TMP)**; ui isolation gradient: `container` private > `handles` (input desktop reachable, windows confined) > `atoms` ≈ `desktop` (283+ windows); several ui knobs no-op on T1 (clipboard:read, systemSettings:parameters); **job object = UI limits + kill-on-close only — no memory/CPU limits**; grandchildren inherit policy + fresh AC SID + win32k mitigation (user32-linked exes `0xC0000142`); `least_privilege_mode` = LPAC attr |
 | resources | ProcessContainer launch ≈ **80–85 ms** (`v1::run`, cmd workload); `IsolationSession` launch ≈ **3.4 s**; timeout enforced at +73 ms over request; unmeasured: ES event volume, tier-2/3 launch cost |
-| cleanup | scratch probe outside the repo; `.local/pr11-mxc/` evidence only (≈65 files incl. `src/`); probe-spawned listeners/processes terminated, container-spawned grandchildren verified gone (pids no longer exist); repo tree clean; no system settings changed |
+| cleanup | scratch probe outside the repo; `.local/pr11-mxc/` holds raw outputs only (probe sources + requests committed under `docs/validation/pr11-mxc/`); probe-spawned listeners/processes terminated, container-spawned grandchildren verified gone (pids no longer exist); repo tree clean; no system settings changed |
 | next decision | MXC ProcessContainer: **conditional candidate** — conditions: (a) **effective UDP block outside ProcessContainer rules required before deny-all enforcement can be claimed** (no tier-1 mechanism measured; absent such a block, restrict to policies explicitly permitting unrestricted UDP — operator acceptance alone is an unsafe downgrade, not enforcement; the hole was egress-only *in the tested listener config* — inbound under `hostLoopback=allow` is untested), (b) `ui.disable=false` + `isolation=container` acceptance (SendInput scoped to private desktop — measured; `desktop` shares the real desktop — never select), (c) proxy-mediated TCP egress — **`allowedProxyPeer` + `hostLoopback=deny` proven (identity × declared-endpoint)-scoped** (named-profile peer reachable; same-identity other port `10013`; addr-level bypass `10013`); requires proxy under a named AppContainer profile + DNS moved into the proxy — **verified end-to-end unprivileged on T1** (measured spec prerequisites: peer + no-egress + `privateNetworkClientServer`; r17 ladder + live leg) — on T2/T3 and the AppContainer-runner fallback the proxy path instead needs UAC-elevated `winhttp-proxy-shim` + LoopbackExempt, so tier pinning is mandatory; (d) **explicit env block mandatory** (default = user profile env — persistent-secret leak measured); (e) note gaps: no memory/CPU limits on this surface; T2/T3 fs enforcement mutates host DACLs (`allowDaclMutation` consent); IsolationSession: **disqualified** (no fs/net/env policy surface); **WindowsSandbox one-shot: candidate for the microVM plan's input only** — real VM launch confirmed (`1.1.0-alpha`+experimental, run-to-completion) but streaming I/O unsupported, guest rendezvous unverified on this host, caller death orphans the VM, and its `.wsb` has no per-destination network control (Networking Enable/Disable only) — stronger isolation, weaker control surface; **matrix `windows-psec` upgrade path documented**: host is PSEC v1.1-complete, so the v1.0-only deficiencies (IPv4/32, no ports, no ingress) are liftable by emitting v1.1 spec fields — closes most of the Windows destination-control gap without a backend switch; ES: declined; Landlock v10/v11: hold → crate release (#140 merged, unpublished) + ≥7.2 kernel gates; Ubuntu/`auto`: code/doc comparison only — restricted-host runtime **unverified**, real-host test pending |

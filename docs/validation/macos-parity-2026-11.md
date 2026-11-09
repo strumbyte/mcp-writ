@@ -11,7 +11,10 @@ Status: **probes executed on the reference host** — macOS 26.6.2
 (build 25G83), arm64, xnu-12377.161.14, 2026-11-08. Evidence sources and
 binaries kept in `.local/pr11-macos/` (`src/es_gate.c`, `src/desc_probe.c`,
 `src/kq_bisect.c`, `src/kq_bisect2.c`, `src/desc_probe2.c`, `src/spawn_try.c`,
-`src/udp_relay.py`, `src/udp_wk.py`, `ent.plist`).
+`src/udp_relay.py`, `src/udp_wk.py`, `ent.plist`) on the reference host —
+`.local/` is gitignored and the probe sources are **not committed** (a
+sanitized-source commit is tracked as a follow-up; see the execution
+summary for per-class reproduction guidance).
 
 ## What the gap is
 
@@ -20,10 +23,15 @@ mach-IPC / inbound-listen / loopback-pinned TCP. The parity gaps versus
 the Linux namespaced route:
 
 1. **descendant-lifetime boundary** — `sandbox require_lifetime_boundary`
-   (default `#true`) refuses macOS supervised launches outright:
-   "no cgroup, no subreaper" (`src/warden/spawn.rs` x2 call sites). With
-   `=#false` the only teardown is `killpg`, which `setsid` escapes
-   (`macos_proxy_run.rs::kill_group` documents the pgid assumption).
+   (default `#true`) refuses macOS supervised launches:
+   "no cgroup, no subreaper" (`src/warden/spawn.rs` x2 call sites).
+   `macos-proxy-run` — also a supervised launch — did not consult the
+   flag: its measured runs launched under the default `#true` and relied
+   on process-group `killpg` teardown, which `setsid` escapes
+   (`macos_proxy_run.rs::kill_group` documents the pgid assumption). A
+   guard matching `spawn.rs` now refuses this route under the flag too;
+   under `=#false` the teardown contract is unchanged — group sweeps
+   only, never a kernel boundary.
 2. **destination-scoped UDP egress** — proxy mode denies UDP outright;
    Linux namespaced has `dnsgate` (name-bound UDP answers mint grants).
 3. **kernel-deny observability** — Linux emits audit records for
@@ -40,7 +48,7 @@ the Linux namespaced route:
 | NOTE_FORK → `proc_listallpids` + ppid-ancestry enumeration | **best-effort — measured race** | `desc_probe2 supervise all`: all spawn patterns discovered (fork-exec, posix_spawn, **setsid-escape caught**, `sh -c 'sleep &'` grandchildren, double-fork) and kill-swept to `still-alive=0` — **but** when the intermediate process exits before the sweep walks the orphan's ancestry, the link is lost: the orphan reparents to launchd (ppid=1 observed) and survives the kill sweep (observed in an early run; later runs won the race). Enumeration-based tracking cannot atomically capture an orphan — exactly what `NOTE_TRACK` used to do in-kernel. |
 | `proc_pidinfo` ppid walk / `sysctl` | same enumeration class — the race is inherent, not implementation-specific | covered by the desc_probe2 mechanism |
 | ES `es_new_descendants_client` (macOS 27+) | **kernel-scoped subtree visibility — cannot run here** | symbol absent on 26.6.2 (`dlsym` → NULL); macOS-27 SDK header + Apple docs: auth+notify for the whole descendant subtree, existing + future, recursive — but **event delivery is not a complete sweep roster**: messages can be dropped under load and concurrent forks, so the supervisor's method for obtaining a guaranteed-complete descendant set (reconciliation beyond the event stream) is an open design question — the lifetime-boundary claim stays **conditional until that roster method is established**, alongside the other caveats: header notes state "Descendants clients can already kill or suspend their child processes directly"; no auto-teardown when the client dies; caller/descendants cannot exec setuid/setgid unless euid 0; still **no IP-network auth event** (26/27 SDK `es_event_type_t`: UIPC_*/XPC_CONNECT/BOOTSTRAP_* auth events exist; nothing for TCP/UDP). Third-party dev evidence (ukai "reciprocal custody" experiment) shows guardian+ward descendants clients covering fork/exec/exit and killing on custody loss — the pattern is real, entitlement-gated. |
-| **Seatbelt `(deny process-fork)`** | **kernel-enforced — the only lifetime boundary available to the native path today** | `spawn_try` under the profile: `fork()`/`posix_spawn()`/`vfork()` all → `EPERM`. A workload that needs no children gets subtree = {self} for free — cgroup/job-object equivalent for that policy class. |
+| **Seatbelt `(deny process-fork)`** | **kernel-enforced child-creation restriction — the strongest containment available to the native path today** | `spawn_try` under the profile: `fork()`/`posix_spawn()`/`vfork()` all → `EPERM`. A workload that needs no children can never grow a subtree ({self} only) — but this is **not** a lifetime boundary: nothing terminates the workload if the supervisor dies (no job-object-style kill-on-close, no cgroup teardown). It bounds the process tree's width, not its lifetime. |
 | `(deny process-exec)` | **unusable for launching** | the workload's own first exec is denied → `sandbox-exec` fails `execvp` (exit 71). Cannot express "exec once then no more". |
 | pf per-uid egress / OpenBSM `/dev/auditpipe` | **root-only** — out of scope for the unprivileged CLI | `pfctl -sr` → `/dev/pf: Permission denied`; `/dev/auditpipe` is `crw------- root:wheel` |
 | Apple `container` (Virtualization.framework VM) | already validated (`apple-container.md`) — VM teardown is the strong boundary | `container` 1.5.0 installed on this host |
@@ -49,11 +57,14 @@ the Linux namespaced route:
 kernel-enforced descendant teardown for a *multi-process* workload on
 macOS ≤ 26 — confirmed negatively with measurements, not just absence of
 docs. The honest ladder: (a) policies tolerating `deny process-fork`
-gain a real kernel boundary today (currently unconditionally allowed in
-the generated profile — an opt-in policy knob would close this class);
-(b) macOS 27's ES descendants client gives race-free subtree membership +
-kill authority, gated on the Apple-granted entitlement plus a supervisor
-that sweeps on client death; (c) strong-boundary workloads keep the
+gain a kernel-enforced child-creation restriction (subtree stays {self};
+currently unconditionally allowed in the generated profile — an opt-in
+policy knob would close this class) — not a lifetime boundary: the
+workload itself still survives the supervisor's death; (b) macOS 27's
+ES descendants client gives race-free subtree membership + kill
+authority, gated on the Apple-granted entitlement plus a supervisor
+that sweeps on client death (and on a verified complete-roster method —
+see the verdict table); (c) strong-boundary workloads keep the
 `container` VM route.
 
 ### 2. Destination-scoped UDP — loopback datagram relay is viable
@@ -116,11 +127,14 @@ enforcement. Note: deduplicated as "N duplicate reports" for repeats.
 ### 5. Resource limits — partial parity levers exist
 
 `proc_rlimit_control` (sys/resource.h) exposes `RLIMIT_CPU_USAGE_MONITOR`
-+ `CPUMON_MAKE_FATAL`, `RLIMIT_WAKEUPS_MONITOR` + `WAKEMON_MAKE_FATAL`,
-and `RLIMIT_FOOTPRINT_INTERVAL` — per-process fatal-on-exceed CPU /
-wake-rate caps and footprint tracking (Darwin `RLIMIT_AS` is historically
-unreliable). No cgroup-parity, but CPU-fatal limiting is expressible
-against a spawned workload today.
++ `CPUMON_MAKE_FATAL` and `RLIMIT_FOOTPRINT_INTERVAL` — a per-process
+fatal CPU cap (accepted — xnu sets `TASK_RUSECPU_FLAGS_FATAL_CPUMON`,
+round 2) and footprint tracking (Darwin `RLIMIT_AS` is historically
+unreliable). `RLIMIT_WAKEUPS_MONITOR`/`WAKEMON_MAKE_FATAL` exists in the
+header but is a **silent no-op in current xnu** ("no longer supported" in
+`kern_resource.c`) — it does not enforce a wake-rate cap. No
+cgroup-parity, but CPU-fatal limiting is expressible against a spawned
+workload today.
 
 ### 6. sandbox-exec standing on this host
 
@@ -161,7 +175,7 @@ ES-descendants (27+, entitlement) → `container` VM.
 | `sandbox_init` (libsandbox, deprecated since 10.8) | **works — programmatic SBPL application** | `sb_init`/`stub`: custom SBPL applied in-process; stub → `sandbox_init` → `execvp(workload)` — profile survives exec, fs deny + `deny network*` enforced (cat → EPERM, connect → EPERM). Removes the `/usr/bin/sandbox-exec` binary dependency (an mcp-writ-owned stub does init+exec). Same deprecation class as the CLI, but the kernel side is shared. `sandbox_init_with_parameters` additionally exported (undeclared — Chromium-style `dlsym` entry, adds `-D` param substitution). |
 | **Nested `sandbox_init`** | **denied once sandboxed — measured** | first init → 0; second init inside the sandbox → `EPERM` under both an `allow default` outer and a `sandbox-exec` outer. A sandboxed workload can neither escape nor tighten; sandbox can only be applied pre-exec by an unsandboxed stub. (The codex issue's "nested sandbox-exec failure mode" is this same wall.) |
 | **App Sandbox** (`com.apple.security.app-sandbox`) | **activatable but coarse** | ad-hoc codesign with the entitlement + embedded `__TEXT,__info_plist` (CFBundleIdentifier) → secinit applies the real app sandbox: ssh_config read EPERM, `/tmp` write EPERM. Without the plist the same binary is SIGTRAP'd at secinit. Not Apple-gated (unlike ES), but expressiveness is entitlement-level: all-or-nothing file/net — cannot express per-path grants or per-destination egress → fails warden's contract granularity. |
-| **`sandbox_check(pid, op, type, arg)`** (private, `libsandbox`) | **post-spawn enforcement verification — measured working unprivileged** | `sandbox_check(sandboxed_child, "file-read-data", 1, path)` → 1 = would-be-denied for the ssh path, 0 = allowed for /etc/hosts; `network-outbound` → 1 under deny, `network-inbound` → 0, `mach-lookup` → 1, `process-fork` → 0. **This refutes the product's "in-kernel profile acceptance is not observable"** — a launcher can assert per-op enforcement on the spawned pid at runtime. |
+| **`sandbox_check(pid, op, type, arg)`** (private, `libsandbox`) | **post-spawn sampled-enforcement verification — measured working unprivileged** | `sandbox_check(sandboxed_child, "file-read-data", 1, path)` → 1 = would-be-denied for the ssh path, 0 = allowed for /etc/hosts; `network-outbound` → 1 under deny, `network-inbound` → 0, `mach-lookup` → 1, `process-fork` → 0. Each call verifies a single (operation, target) query on the spawned pid — the results apply only to the queries tested and do **not** establish that the complete intended profile was accepted (an unqueried op or path could still be misapplied). It narrows "in-kernel profile acceptance is not observable" to a sampled per-op check, not a whole-profile proof. |
 | `sandbox_inspect_pid` | present but returns 1/empty on our children — no useful introspection | `inspect*.c` |
 
 ### Extended SBPL op matrix (profile-load acceptance, `(deny OP)`)
@@ -276,7 +290,7 @@ model. Sources in `.local/pr11-macos/src/` (`csops_probe.c`).
 | `file-issue-extension` / `mach-issue-extension` ops | **accepted** — extension-issuance is gateable; `file-issue-extension-target` does not exist |
 | setuid exec inside sandbox (`sudo`) | **execvp → EPERM** — sandboxed processes cannot exec setuid binaries (consistent with the ES descendants restriction) |
 | `log show --style json` deny records | records carry `eventMessage`/`formatString` — parseable but formatted strings (no structured op/path fields) |
-| **`sandbox_check` against the real product profile** | **verified end-to-end**: spawned `mcp-writ run --policy p.kdl --audit-log … -- /bin/sleep 60` (real SBPL from `macos_sandbox.rs`), then `sandbox_check(69466, …)` returned DENIED for `file-read-data /private/etc/ssh/ssh_config`, `network-outbound`, `network-inbound`, `mach-lookup com.apple.mDNSResponder`, `file-write-data` on `~/.ssh` and `/tmp`, `signal`; **allowed** for `file-read-data /etc/hosts` and `process-fork` — matching the generated profile (`deny host="*"`, deny-default fs writes outside grants, `process-fork` allowed, `signal (target self)`). The "profile acceptance not observable" gap is closed at the product level, not just toy profiles |
+| **`sandbox_check` against the real product profile** | **verified end-to-end**: spawned `mcp-writ run --policy p.kdl --audit-log … -- /bin/sleep 60` (real SBPL from `macos_sandbox.rs`), then `sandbox_check(69466, …)` returned DENIED for `file-read-data /private/etc/ssh/ssh_config`, `network-outbound`, `network-inbound`, `mach-lookup com.apple.mDNSResponder`, `file-write-data` on `~/.ssh` and `/tmp`, `signal`; **allowed** for `file-read-data /etc/hosts` and `process-fork` — matching the generated profile (`deny host="*"`, deny-default fs writes outside grants, `process-fork` allowed, `signal (target self)`). The "profile acceptance not observable" gap is narrowed at the product level — sampled (op, target) queries against the real generated profile, not just toy profiles; the unqueried surface is still unproven |
 
 ## Round 7 (same host, 2026-11-08) — task ports, QoS/resource policy, last ops
 
@@ -313,12 +327,12 @@ product-level verification. The parity story is fully bounded.
 
 | mechanism | verdict |
 |---|---|
-| `(deny process-fork)` policy opt-in | **adoptable now** — kernel-enforced subtree={self} for child-free policies; new policy knob + profile line |
+| `(deny process-fork)` policy opt-in | **adoptable now** — kernel-enforced subtree={self} for child-free policies; new policy knob + profile line. Bounds the tree's width only — it does **not** terminate the workload when the supervisor dies (no kill-on-close/teardown) |
 | loopback UDP datagram relay | **adoptable now (PoC)** — extends the connect-proxy architecture to UDP + DNS; closes the last native egress gap |
 | unified-log `Sandbox:` deny observation | **adoptable now** — observation channel only; makes macOS kernel denies auditable (fs + net + mach + inbound measured) |
 | `sandbox_init` in-stub application | **adoptable now** — removes the `/usr/bin/sandbox-exec` binary dependency; sandbox applied pre-exec by an mcp-writ-owned stub; same deprecation class as the CLI |
-| `sandbox_check` post-spawn verification | **adoptable now** — private API via `dlsym`; verifies per-op kernel enforcement on the spawned pid (file/net/mach measured). Upgrades profile acceptance from "unobservable" to verifiable — note the API is private, so treat as advisory: compare each returned verdict against the policy's *expected* verdict for that op and refuse only on a mismatch (an expected deny is a pass); warn, don't refuse, if the symbol/API is absent |
-| ES `es_new_descendants_client` (macOS 27+) | **conditional hold** — race-free subtree tracking + kill authority would satisfy `require_lifetime_boundary`, but: hard entitlement (exec-time kill measured), OS floor 27, still no IP-network auth (declined as an *enforcement* mechanism stands — this is a *lifecycle* re-evaluation), no auto-teardown on client death. Revisit when: entitlement is obtainable for distribution, or the product accepts an entitlement-gated opt-in backend on 27+ |
+| `sandbox_check` post-spawn verification | **adoptable now** — private API via `dlsym`; verifies per-(op, target) kernel enforcement on the spawned pid (file/net/mach measured). Upgrades profile acceptance from "unobservable" to *sampled* verification — the checked query set covers only the ops probed and does not prove the complete intended profile was accepted. Note the API is private, so treat as advisory: compare each returned verdict against the policy's *expected* verdict for that op and refuse only on a mismatch (an expected deny is a pass); warn, don't refuse, if the symbol/API is absent |
+| ES `es_new_descendants_client` (macOS 27+) | **conditional hold** — race-free subtree tracking + kill authority alone do **not** satisfy `require_lifetime_boundary`: complete descendant tracking additionally needs a verified reconciliation method yielding a guaranteed-complete roster (event delivery can drop messages under load/concurrent forks — the open sweep-roster question above). Other gates: hard entitlement (exec-time kill measured), OS floor 27, still no IP-network auth (declined as an *enforcement* mechanism stands — this is a *lifecycle* re-evaluation), no auto-teardown on client death. Revisit when: the roster-reconciliation method is established *and* the entitlement is obtainable for distribution, or the product accepts an entitlement-gated opt-in backend on 27+ |
 | `NOTE_TRACK` | **dead** — kernel-disabled in current xnu (measured + source-verified); do not design around it |
 | NOTE_FORK + ancestry enumeration + pgid/pid sweep | **best-effort keep** — measured orphan race; valid as the `require_lifetime_boundary=#false` sweep, never as the boundary claim |
 | launchd user-domain job teardown | **rejected** — pgid-scoped only; setsid'd descendants survive bootout (measured) |
@@ -338,11 +352,11 @@ product-level verification. The parity story is fully bounded.
 |---|---|
 | target | improvement plan §3 R-02 / PR guide PR-11 — macOS-side parity continuation of `successor-mechanisms-2026-11.md` |
 | environment | macOS 26.6.2 (25G83) arm64, xnu-12377.161.14; Command Line Tools SDKs 26.5/27.0; `sandbox-exec` present; `container` 1.5.0; clang; rustc 1.99.0 |
-| reproduction | `.local/pr11-macos/` — `es_gate` (dlsym + `es_new_client`, plain and ad-hoc-entitled), `kq_bisect`/`kq_bisect2` (EVFILT_PROC flag matrix), `desc_probe`/`desc_probe2` (NOTE_TRACK attempt; NOTE_FORK + `proc_listallpids`/ppid ancestry sweep + kill), `spawn_try` (fork/posix_spawn/vfork under `(deny process-fork)`), `udp_relay.py`+`udp_wk.py` under a `(remote udp "localhost:PORT")` profile, `log stream`/`log show` captures under deliberate fs/net/mach denies; round 2: `escapes`+`job.plist` (launchd bootstrap/bootout teardown), `sb_init`/`stub`/`nested` (programmatic + nested sandbox_init), `hello`+`Info.plist` (App Sandbox activation), `sbcheck*`/`inspect*` (`sandbox_check`/`sandbox_inspect_pid` via dlsym), `cpumon*` (proc_rlimit_control + RLIMIT_CPU), `spawn_internal.h`/`kern_exec.c`/`coalition.c`/`kern_resource.c`/`kern_proc.c` (xnu source cross-checks); round 3: `jetsam`/`cpumon_spawn`/`suspended` (spawn-attr resource/suspend battery), `misc_probe` (task_for_pid/ptrace/bsdinfo-flags/filedesclimit), `fdlimit` (fd-cap check), `last_probe` (pid_suspend/pid_shutdown_sockets/setmacpolicyinfo), `psd` (socket-teardown leg) |
+| reproduction | `.local/pr11-macos/` on the **macOS reference host** — `.local/` is gitignored and the probe sources are **not committed**; they are retained on the host that ran the legs (not this checkout). Committing sanitized copies is tracked as a follow-up. Non-sensitive reproduction notes: every SBPL leg above quotes its profile string — `sandbox-exec -p '<profile>' -- <cmd>` replays the enforcement side; `log stream --predicate 'subsystem == "com.apple.sandbox"'`/`log show` captures the deny records; the product-route legs are reproducible from committed fixtures (`tests/fixtures/macos_proxy/` — `connect_probe.py`, `sigterm_probe.rs` — driven by `tests/macos_proxy_e2e.rs`); `es_gate`/`sandbox_check` legs are `dlsym` lookups against `libsandbox`/`libEndpointSecurity` on a same-OS host. Probe inventory: `es_gate` (dlsym + `es_new_client`, plain and ad-hoc-entitled), `kq_bisect`/`kq_bisect2` (EVFILT_PROC flag matrix), `desc_probe`/`desc_probe2` (NOTE_TRACK attempt; NOTE_FORK + `proc_listallpids`/ppid ancestry sweep + kill), `spawn_try` (fork/posix_spawn/vfork under `(deny process-fork)`), `udp_relay.py`+`udp_wk.py` under a `(remote udp "localhost:PORT")` profile, `log stream`/`log show` captures under deliberate fs/net/mach denies; round 2: `escapes`+`job.plist` (launchd bootstrap/bootout teardown), `sb_init`/`stub`/`nested` (programmatic + nested sandbox_init), `hello`+`Info.plist` (App Sandbox activation), `sbcheck*`/`inspect*` (`sandbox_check`/`sandbox_inspect_pid` via dlsym), `cpumon*` (proc_rlimit_control + RLIMIT_CPU), `spawn_internal.h`/`kern_exec.c`/`coalition.c`/`kern_resource.c`/`kern_proc.c` (xnu source cross-checks); round 3: `jetsam`/`cpumon_spawn`/`suspended` (spawn-attr resource/suspend battery), `misc_probe` (task_for_pid/ptrace/bsdinfo-flags/filedesclimit), `fdlimit` (fd-cap check), `last_probe` (pid_suspend/pid_shutdown_sockets/setmacpolicyinfo), `psd` (socket-teardown leg) |
 | results | NOTE_TRACK ENOTSUP ×7 configurations; enumeration sweep caught setsid/sh/double-fork patterns with one measured orphan-leak race; `deny process-fork` EPERM ×3 spawn syscalls; `deny process-exec` blocks launch exec itself; UDP relay duplex + two EPERM legs; deny lines for fs/network-outbound/network-inbound/mach-lookup observed; es_new_client→`ERR_NOT_PRIVILEGED`; ad-hoc ES entitlement → exec kill; round 2: launchd bootout leaks 2/2 setsid'd descendants; `sandbox_init` works in-stub and sandbox survives exec; nested init EPERM ×2 environments; App Sandbox applies for ad-hoc+plist-signed binary (ssh_config + /tmp write EPERM); `sandbox_check` verdicts verified for file-read-data/network-outbound/network-inbound/mach-lookup/process-fork (deny=1/allow=0); unix connect+bind EPERM under `deny network*`; RLIMIT_CPU SIGXCPU kill; coalition spawn gating + `unrestrict_coalition_syscalls` source-verified; round 3: jetsam memlimit advisory (400MiB survived a 50MB fatal request), cpumonitor exception-only (hog alive at 8s under 5%/1s), START_SUSPENDED → SSTOP + SIGCONT resume, task_for_pid `kr=5` + ptrace `EPERM` + pid_suspend `EPERM`, pid_shutdown_sockets accepted unprivileged, macpolicyinfo spawn extension accepted (format-gated), bsdinfo flags non-discriminating |
 | controls | see tables above — mapped to lifetime-boundary, UDP egress, deny-observability, entitlement-gate, sandbox-dependency, resource-limit axes |
 | audit | unified log is the macOS kernel-deny channel (unprivileged); `sandbox_check` gives launcher-side per-op enforcement verification; ES descendants client would add subtree auth events on 27+ only |
-| compatibility | no product code touched; `deny process-fork` opt-in, the UDP relay, `sandbox_init`-stub application and `sandbox_check` verification are additive surfaces; `sandbox_check` is private API — advisory use only |
+| compatibility | `macos-proxy-run` now honors `require_lifetime_boundary` — the default `#true` refuses the launch (same gate as `run`), so existing launches must declare `sandbox require_lifetime_boundary=#false` to keep working (process-group teardown, unchanged). Other product code untouched; `deny process-fork` opt-in, the UDP relay, `sandbox_init`-stub application and `sandbox_check` verification are additive surfaces; `sandbox_check` is private API — advisory use only |
 | resources | enumeration sweep is O(#pids × ancestry) per FORK event — negligible at workload scale; `log stream` tailing is cheap but external to the launcher; `sandbox_check` is a per-op syscall — usable post-spawn/assertion time |
 | cleanup | all probe-spawned sleeps killed and verified gone (incl. the leaked orphan and the launchd-job survivors, removed by `pkill`/`kill`); test job booted out; no system settings changed; scratch confined to `.local/pr11-macos/` |
-| next decision | five adoptable-now candidates (fork-deny opt-in, UDP relay PoC, deny-audit channel, `sandbox_init`-stub application, `sandbox_check` post-spawn verification) → candidate follow-up PRs; ES descendants client stays **hold** with concrete unblock conditions (entitlement + macOS 27 host + supervisor-side death-sweep design); launchd/coalition/notes recorded as measured rejections; `require_lifetime_boundary` stays refusing on macOS native for multi-process workloads — a `deny process-fork`-shaped policy class could satisfy it for subtree={self} cases without new kernel support |
+| next decision | five adoptable-now candidates (fork-deny opt-in, UDP relay PoC, deny-audit channel, `sandbox_init`-stub application, `sandbox_check` post-spawn verification) → candidate follow-up PRs; ES descendants client stays **hold** with concrete unblock conditions (entitlement + macOS 27 host + a verified complete-roster reconciliation method + supervisor-side death-sweep design); launchd/coalition/notes recorded as measured rejections; `require_lifetime_boundary` stays refusing on macOS native — a `deny process-fork`-shaped policy narrows the subtree to {self} but does **not** satisfy the requirement on its own (the workload still survives supervisor death — it is containment, not teardown; satisfying the flag would need another boundary that terminates the workload). `macos-proxy-run` now honors the flag identically to `run` — a guard at the spawn boundary refuses under the default; the measured PoC runs predated it and launched under `#true` on process-group sweeps |
