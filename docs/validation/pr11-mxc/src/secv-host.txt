@@ -1,0 +1,9 @@
+processmodel.dll h=0x7ffe3f980000 err=0
+QuerySupport -> hr=0x00000000 flags=0x000000000000000f
+  FileSystemDeny(0x1)     = true
+  bit1 (0x2)              = true
+  FileSystemEnumerate(0x4)= true
+  NetworkIngress(0x8)     = true
+  upper bits              = 0x0
+Version major=1 -> hr=0x00000000 available=1 minor=1
+Version major=2 -> hr=0x00000000 available=0 minor=0

@@ -1,0 +1,6 @@
+# docs/validation/pr11-mxc/ is a sanitized probe/evidence bundle
+# backing the PR-11 validation record — not product code. Excluding
+# it keeps review diffs focused on the actual changes.
+reviews:
+  path_filters:
+    - "!docs/validation/pr11-mxc/**"

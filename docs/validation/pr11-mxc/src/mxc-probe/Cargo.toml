@@ -1,0 +1,11 @@
+[package]
+name = "mxc-probe"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+mxc-sdk = { version = "1.0.1", features = ["isolation_session"] }
+
+
