@@ -3857,7 +3857,7 @@ the bar an adopted default carries. A route rises when all five hold:
   rows in `capability-matrix.json` name every residual gap — nothing
   left to be rediscovered in review.
 
-Standing today (v0.5.1):
+Standing today (v0.5.2):
 
 | Route | Matrix | Recorded range | Boundary fuzz | Missing for `adopted` |
 |---|---|---|---|---|

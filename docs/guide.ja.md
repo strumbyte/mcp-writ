@@ -1997,7 +1997,7 @@ capability matrix にはまだ `adopted` でない opt-in の egress 経路が 3
 - **`plan`／`report`／JSONL の一致。** `plan`、起動 `--report`、監査ストリームが同じ起動について同じ制御を記述すること — 制御 id は capability-matrix 行と一致し、`not_applied` は主張せず開示する。
 - **限界の文書化開示。** `capability-matrix.json` の `deficiencies`/`select`/`refuse` 行が残存する開口部をすべて挙げていること — レビューで再発見されるものを残さない。
 
-現時点（v0.5.1）の充足状況:
+現時点（v0.5.2）の充足状況:
 
 | 経路 | matrix | 記録済み範囲 | 境界ファジング | `adopted` に欠けるもの |
 |---|---|---|---|---|
