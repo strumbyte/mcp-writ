@@ -137,7 +137,9 @@ overlay — `--unsafe-unsandboxed-discovery` is the ambient-environment
 opt-out, where unreviewed servers belong inside a throwaway VM or
 container; `--unsafe-discovery-best-effort-lifetime` is the narrower
 opt-out that keeps the sandbox but waives the kernel descendant-lifetime
-boundary on macOS / Linux without writable cgroup v2), and records what
+boundary — descendants may outlive the discovery run and their cleanup
+is only best-effort — on macOS / Linux without writable cgroup v2), and
+records what
 it verified — an excerpt of the draft:
 
 ```kdl

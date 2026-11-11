@@ -220,6 +220,29 @@ fn check_shebang_interpreter(
         .and_then(|s| s.to_str())
         .is_some_and(|n| n == "env");
     if !is_env {
+        // An interpreter that delegates exec onward — `env`, `nice`,
+        // `sudo`, a shell, a package executor… — selects the program it
+        // execs from its own argv at run time. Validation cannot follow
+        // that second selection, so the interpreter itself must be the
+        // terminal image. The canonical image is checked as well as the
+        // spelling: a `launcher` symlink whose target is `env` execs
+        // onward through the kernel identically.
+        if let Some((_, launcher)) = crate::workload::delegating_launcher(interp) {
+            return Err(bad(format!(
+                "interpreter '{interp}' is the '{launcher}' launcher — \
+                 it selects what it execs at run time"
+            )));
+        }
+        if let Ok(canon_interp) = Path::new(interp).canonicalize()
+            && let Some((_, launcher)) =
+                crate::workload::delegating_launcher(&canon_interp.to_string_lossy())
+        {
+            return Err(bad(format!(
+                "interpreter '{interp}' resolves to the '{launcher}' \
+                 launcher ('{}') — it selects what it execs at run time",
+                canon_interp.display()
+            )));
+        }
         return check_interpreter_path(canon, Path::new(interp), trust);
     }
     // `env` itself runs pre-containment — validate it — and then
@@ -228,7 +251,7 @@ fn check_shebang_interpreter(
     // workload resolver launches by, so validation and expansion
     // cannot diverge.
     let arg = opt_arg.ok_or_else(|| bad("'env' lacks a command name".to_string()))?;
-    let (name, _) = crate::workload::env_command_spelling(&arg).map_err(bad)?;
+    let (name, extra) = crate::workload::env_command_spelling(&arg).map_err(bad)?;
     check_interpreter_path(canon, Path::new(interp), trust)?;
     // `env` resolves its command exactly like `env_command_path`: bare
     // names through PATH, absolute spellings directly, and a relative
@@ -236,6 +259,46 @@ fn check_shebang_interpreter(
     // against the child's cwd, so a PATH join would validate a file
     // `env` never runs.
     let resolved = crate::workload::env_command_path(&name).map_err(bad)?;
+    // A selected command that delegates exec onward — a second `env`,
+    // `sudo`, a shell… — selects the program it execs at run time, a
+    // selection this binding cannot follow. Only a terminal,
+    // validated object is allowed past the delegation — the resolved
+    // image is checked as well as the spelled name, so a `launcher`
+    // symlink to `env` cannot slip the delegation past the check.
+    if let Some((_, launcher)) = crate::workload::delegating_launcher(&name) {
+        return Err(bad(format!(
+            "'env' command '{name}' is the '{launcher}' launcher — it \
+             selects what it execs at run time"
+        )));
+    }
+    if let Some((_, launcher)) = crate::workload::delegating_launcher(&resolved.to_string_lossy()) {
+        return Err(bad(format!(
+            "'env' command '{name}' resolves to the '{launcher}' \
+             launcher ('{}') — it selects what it execs at run time",
+            resolved.display()
+        )));
+    }
+    // `env -S` words after the command reach the interpreter as argv
+    // before the leaf — `env -S sh /tmp/x` would have `sh` interpret
+    // an unvalidated file instead of the driver leaf. Options and
+    // operands cannot be told apart per interpreter, so any extra
+    // word refuses.
+    if !extra.is_empty() {
+        return Err(bad(format!(
+            "'env -S' arguments after '{name}' would reach the \
+             interpreter ahead of the validated leaf"
+        )));
+    }
+    // A bare command name reaches `env` through PATH at check time and
+    // reaches it through the child's PATH again at exec — the child's
+    // PATH may select a different file than the one just validated.
+    // Only an absolute spelling binds the object `env` execs.
+    if !Path::new(&name).is_absolute() {
+        return Err(bad(format!(
+            "'env' command '{name}' resolves through the child's PATH \
+             at exec — name an absolute path"
+        )));
+    }
     check_interpreter_path(canon, &resolved, trust)
 }
 
@@ -812,6 +875,9 @@ fn open_dir_pin(path: &Path) -> std::io::Result<std::fs::File> {
         )
     })?;
     let fd = loop {
+        // `open(2)` directly — `O_PATH` cannot be spelled through
+        // `OpenOptions::custom_flags` (see the doc comment above).
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let fd = unsafe {
             libc::open(
                 cpath.as_ptr(),
@@ -826,6 +892,9 @@ fn open_dir_pin(path: &Path) -> std::io::Result<std::fs::File> {
             return Err(err);
         }
     };
+    // `fd` is a fresh, exclusively-owned descriptor — `File` takes
+    // ownership and closes it on drop.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
@@ -1280,26 +1349,47 @@ mod tests {
         assert!(err.contains("env"), "{err}");
     }
 
-    /// `#!/usr/bin/env sh` still binds: `env` itself and the
-    /// PATH-selected `sh` both satisfy the same trust class.
+    /// `#!/usr/bin/env sh` refuses: `env` resolves `sh` through the
+    /// child's PATH at exec, which may select a different file than
+    /// the one validation just inspected — only an absolute `env`
+    /// command binds the validated object.
     #[cfg(unix)]
     #[test]
-    fn shebang_env_selected_command_validates() {
-        let Some(sh) = crate::workload::search_path("sh") else {
-            return; // no `sh` on PATH here — nothing to assert
-        };
-        if crate::workload::shebang_line(&sh).is_some() {
-            return; // this host's `sh` is a script — the refusal is correct there
-        }
+    fn shebang_env_path_selected_command_refuses() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("tool");
         std::fs::write(&exe, b"#!/usr/bin/env sh\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            validate_driver_path(&exe).is_ok(),
-            "an env delegation to a validated interpreter must bind"
-        );
+        let err = validate_driver_path(&exe).unwrap_err();
+        assert!(err.contains("PATH"), "{err}");
+    }
+
+    /// `env -S env /tmp/x` delegates exec a second time — the inner
+    /// `env` re-enters command selection past anything this binding can
+    /// follow, so the driver refuses rather than let an unvalidated
+    /// program run pre-containment. `env -S` words after the command
+    /// refuse for the same reason: they reach the interpreter as argv
+    /// ahead of the validated leaf.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_env_delegating_command_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"#!/usr/bin/env -S env /tmp/x\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = validate_driver_path(&exe).unwrap_err();
+        assert!(err.contains("launcher"), "{err}");
+
+        let Some(sh) = crate::workload::search_path("sh") else {
+            return; // no `sh` on PATH here — nothing further to assert
+        };
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, format!("#!/usr/bin/env -S {} /tmp/x\n", sh.display())).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = validate_driver_path(&exe).unwrap_err();
+        assert!(err.contains("arguments"), "{err}");
     }
 
     /// `env` execs a command spelling containing a separator against

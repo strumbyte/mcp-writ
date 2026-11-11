@@ -91,8 +91,9 @@ EOF
 は周囲の環境のまま実行します（未レビューのサーバーは使い捨ての
 VM かコンテナの中に限定してください）。
 `--unsafe-discovery-best-effort-lifetime` はサンドボックスを維持
-したままカーネルの子孫プロセス寿命境界だけを外す、より狭い
-opt-out です（macOS / writable cgroup v2 の無い Linux 向け）。
+したままカーネルの子孫プロセス寿命境界だけを外します — 子孫は
+検出終了後も残り得て回収は best-effort に留まる、macOS /
+writable cgroup v2 の無い Linux 向けのより狭い opt-out です。
 `MCP_WRIT_SKIP_SANDBOX` は
 OS サンドボックスと子孫プロセスの寿命管理を外し、制限環境と専用
 TMPDIR は維持します — 残存する子孫プロセスは回収されないため、

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 mod common;
 
-use mcp_writ::legislator::tools_list::{ToolsListError, ToolsListFetch};
+use mcp_writ::legislator::tools_list::{DiscoveryOptions, ToolsListError, ToolsListFetch};
 use mcp_writ::protocol::SupportedProtocolVersion;
 
 fn fixture_server(name: &str) -> Vec<String> {
@@ -18,13 +18,25 @@ fn fixture_server(name: &str) -> Vec<String> {
 
 /// Sandboxed discovery mutates the fixture dirs' DACLs; parallel
 /// fetches race grant/restore read-modify-write and can drop a sibling
-/// session's ACE mid-run, so these fetches serialize.
+/// session's ACE mid-run, so these fetches serialize. Fixture fetches
+/// run with `allow_best_effort_lifetime` so hosts without a writable
+/// cgroup v2 hierarchy (or macOS, which has no descendant-lifetime
+/// boundary at all) still exercise the fetch — the production default
+/// stays strict.
 async fn fetch_tools_list_detailed(
     command: &[String],
     timeout: Option<Duration>,
 ) -> Result<ToolsListFetch, ToolsListError> {
     let _g = common::sandbox_spawn_lock().lock().await;
-    mcp_writ::legislator::tools_list::fetch_tools_list_detailed(command, timeout).await
+    mcp_writ::legislator::tools_list::fetch_tools_list_detailed_with(
+        command,
+        timeout,
+        &DiscoveryOptions {
+            allow_best_effort_lifetime: true,
+            ..DiscoveryOptions::default()
+        },
+    )
+    .await
 }
 
 fn fetch_timeout() -> Option<Duration> {

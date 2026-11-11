@@ -638,8 +638,16 @@ fn stage1_live_discovery(spec: &ServerSpec, argv: &[String], work: &Path) {
     let mut stderr = String::new();
     let mut succeeded = false;
     for attempt in 0..2 {
+        // Fixture discovery waives the descendant-lifetime boundary so
+        // hosts without a writable cgroup v2 hierarchy (or macOS) still
+        // exercise the live path — the production default stays strict.
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"))
-            .args(["generate-policy", "--live-discovery", "--output"])
+            .args([
+                "generate-policy",
+                "--live-discovery",
+                "--unsafe-discovery-best-effort-lifetime",
+                "--output",
+            ])
             .arg(&out)
             .arg("--")
             .args(argv)

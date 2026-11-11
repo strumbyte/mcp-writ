@@ -165,8 +165,8 @@ pub fn resolve_launch(argv0: &str, expand_shebang: bool) -> io::Result<LaunchRes
 /// `env` option spellings it cannot model exactly.
 #[cfg(unix)]
 fn expand_shebang_launch(argv0: &str, script: PathBuf) -> io::Result<LaunchResolution> {
-    let line = leaf_shebang_line(&script)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let line =
+        leaf_shebang_line(&script).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let Some(line) = line else {
         return Ok(LaunchResolution {
             exe: script,
@@ -218,6 +218,30 @@ fn expand_shebang_launch(argv0: &str, script: PathBuf) -> io::Result<LaunchResol
             }
         }
     };
+    // The resolved image must also be the terminal exec — a launcher
+    // that selects and execs another program from its own argv at run
+    // time (`env`, `nice`, `timeout`, `sudo`, `npx`, `py`, a shell, a
+    // package executor…) continues execution outside the hash boundary
+    // a pin on the launcher can certify. `env`'s selected command lands
+    // here too: `env -S env /tmp/x` re-enters this resolution with no
+    // binding left for the program two selections out. The spelled name
+    // is checked alongside the canonical image — a `launcher` symlink
+    // to `env` execs onward identically, and either name delegating
+    // refuses.
+    if let Some((_, launcher)) =
+        delegating_launcher(&argv0_spelling).or_else(|| delegating_launcher(&exe.to_string_lossy()))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "shebang interpreter '{}' in '{}' is the '{launcher}' \
+                 launcher — it selects what it execs at run time, \
+                 outside the hash boundary a pin establishes",
+                exe.display(),
+                script.display()
+            ),
+        ));
+    }
     // The interpreter must be the terminal exec image: if it carries its
     // own `#!` line the kernel selects yet another interpreter at exec
     // time — one this resolution never hashed or pinned, and the `#!`
@@ -340,14 +364,22 @@ fn is_executable_file(_path: &Path) -> bool {
 #[cfg(unix)]
 pub(crate) fn env_command_spelling(arg: &str) -> Result<(String, Vec<String>), String> {
     if let Some(rest) = arg.strip_prefix("-S").or_else(|| {
-        arg.strip_prefix("--split-string").and_then(|r| {
-            match r.chars().next() {
+        arg.strip_prefix("--split-string")
+            .and_then(|r| match r.chars().next() {
                 None => Some(r),
                 Some('=') => Some(&r[1..]),
                 _ => None,
-            }
-        })
+            })
     }) {
+        // GNU `env -S` processes quotes and escapes inside the string
+        // before splitting — `'x y'`, `"x y"`, `\ ` and `\x` sequences
+        // join or alter the words a whitespace split produces. The
+        // parsing cannot be reproduced here, so a spelling carrying a
+        // quote or escape refuses rather than tokenize differently
+        // from what `env` would run.
+        if rest.contains(['\'', '"', '\\']) {
+            return Err("'env -S' with quotes or escapes cannot be modeled safely".to_string());
+        }
         let mut words = rest.split_whitespace();
         let Some(name) = words.next() else {
             return Err("'env -S' lacks a command name".to_string());
@@ -1468,7 +1500,10 @@ pub(crate) fn shebang_body_parts(line: &str) -> (&str, Option<String>) {
     let body = line.trim_start_matches([' ', '\t']);
     match body.split_once([' ', '\t']) {
         Some((i, rest)) => (i, {
-            let rest = rest.trim();
+            // The kernel strips trailing spaces and tabs only — every
+            // other whitespace byte stays inside the single argument
+            // it would hand the interpreter.
+            let rest = rest.trim_matches([' ', '\t']);
             (!rest.is_empty()).then(|| rest.to_string())
         }),
         None => (body, None),
@@ -2364,8 +2399,11 @@ mod tests {
 
         // `--split-string=S` carries its value after `=` like env's
         // own getopt, then the string splits into command + argv.
-        std::fs::write(&script, "#!/usr/bin/env --split-string=python3 -V\nprint(1)\n")
-            .expect("write");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env --split-string=python3 -V\nprint(1)\n",
+        )
+        .expect("write");
         let res = resolve_launch(&script.to_string_lossy(), true).expect("resolve");
         let argv = res.into_argv(&[script.to_string_lossy().into_owned()]);
         assert_eq!(argv[0], "python3");
@@ -2400,8 +2438,7 @@ mod tests {
 
         // A longer name sharing the option's prefix is not the option —
         // getopt rejects it outright, so the resolver fails closed too.
-        std::fs::write(&script, "#!/usr/bin/env --split-stringfoo\nprint(1)\n")
-            .expect("write");
+        std::fs::write(&script, "#!/usr/bin/env --split-stringfoo\nprint(1)\n").expect("write");
         let err = match resolve_launch(&script.to_string_lossy(), true) {
             Err(e) => e,
             Ok(_) => panic!("a `--split-stringfoo` spelling must refuse"),
@@ -2661,8 +2698,7 @@ mod tests {
         // NBSP is `char::is_whitespace` but not a kernel separator:
         // the interpreter token is the whole `{sh}\u{a0}x` spelling,
         // which cannot resolve.
-        std::fs::write(&script, format!("#!{}\u{a0}x\n", sh.display()))
-            .expect("write script");
+        std::fs::write(&script, format!("#!{}\u{a0}x\n", sh.display())).expect("write script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
             .expect("chmod script");
 

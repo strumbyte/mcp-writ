@@ -1340,7 +1340,10 @@ async fn run_image_inner(
 /// comparison alone misses a configured spelling that reaches its
 /// object through a symlinked ancestor *inside* the share: it resolves
 /// outside today, yet the workload can repoint the link and seize the
-/// location the next launch reads through that same spelling.
+/// location the next launch reads through that same spelling. The same
+/// hold applies to a link the resolution merely *traverses*: a chain
+/// like `outside/alias → share/mid → real` ends outside and spells no
+/// share path lexically, yet `share/mid` is the repointable hop.
 /// `runner.artifact.source`, `--runner-binary`, and `--report` all keep
 /// their configured forms here — each spelled ancestor is resolved
 /// separately so the check holds however the share itself was spelled.
@@ -1352,7 +1355,8 @@ fn log_share_conflicts_artifact(log_resolved: &Path, artifact: &Path) -> bool {
         return true;
     }
     // The share reaches the artifact — the resolved object, or any
-    // ancestor of the spelled path resolving inside it.
+    // ancestor of the spelled path resolving inside it, or any
+    // component the resolution itself traverses inside it.
     crate::fsoverlap::absolutize_lexical(artifact)
         .ancestors()
         .any(|a| {
@@ -1360,6 +1364,97 @@ fn log_share_conflicts_artifact(log_resolved: &Path, artifact: &Path) -> bool {
                 .unwrap_or_else(|| a.to_path_buf());
             crate::fsoverlap::path_covers(log_resolved, &real)
         })
+        || link_chain_enters(log_resolved, artifact)
+}
+
+/// Whether resolving `path` traverses a link or object located inside
+/// `root`. The spelling's components are inspected in
+/// filesystem-resolution order — a `..` pops a *resolved* component,
+/// never a spelled one, so `a_link/../x` where `a_link` points inside
+/// the share still counts as traversing it, and a link target carrying
+/// `..` resolves against the link's real parent rather than its
+/// spelling. An intermediate inside the share is repointable by the
+/// workload and redirects whatever reads through `path` on the next
+/// launch. A link cycle — or a chain deeper than the kernel's own
+/// symlink ceiling — cannot establish a safe traversal and conflicts
+/// rather than passing uninspected.
+fn link_chain_enters(root: &Path, path: &Path) -> bool {
+    let spelled = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir().and_then(|d| d.canonicalize()) {
+            Ok(cwd) => cwd.join(path),
+            // No base to resolve `..` against — no safe traversal.
+            Err(_) => return true,
+        }
+    };
+    resolve_ordered(
+        root,
+        PathBuf::new(),
+        spelled.components(),
+        &mut std::collections::HashSet::new(),
+        0,
+    )
+    .is_none()
+}
+
+/// Resolve `comps` against `base` in filesystem order, returning the
+/// resolved location — `None` the moment a component, a link, or a
+/// link target lands inside `root`, or traversal cannot be proven safe
+/// (a link cycle, or a chain past the depth ceiling). `base` is
+/// canonical and link-free by construction: every `Normal` component
+/// is probed for a link before it joins, and a followed link resumes
+/// at its resolved target — so `..` always pops a resolved component.
+fn resolve_ordered(
+    root: &Path,
+    mut base: PathBuf,
+    comps: std::path::Components<'_>,
+    expanding: &mut std::collections::HashSet<PathBuf>,
+    depth: u8,
+) -> Option<PathBuf> {
+    // A chain this deep cannot resolve under the kernel's own symlink
+    // ceiling — no safe traversal to establish.
+    if depth > 63 {
+        return None;
+    }
+    for comp in comps {
+        match comp {
+            std::path::Component::Prefix(_) => base = PathBuf::from(comp.as_os_str()),
+            // `RootDir` follows `Prefix` on Windows (`C:` + `\`) —
+            // append, so the drive is not lost.
+            std::path::Component::RootDir => base.push(comp.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                base.pop();
+            }
+            std::path::Component::Normal(name) => {
+                let cand = base.join(name);
+                if crate::fsoverlap::path_covers(root, &cand) {
+                    return None;
+                }
+                match std::fs::read_link(&cand) {
+                    Ok(target) => {
+                        // A cycle cannot resolve — and cannot be proven
+                        // disjoint either.
+                        if !expanding.insert(cand.clone()) {
+                            return None;
+                        }
+                        let tbase = if target.is_absolute() {
+                            PathBuf::new()
+                        } else {
+                            base.clone()
+                        };
+                        let resolved =
+                            resolve_ordered(root, tbase, target.components(), expanding, depth + 1);
+                        expanding.remove(&cand);
+                        base = resolved?;
+                    }
+                    Err(_) => base = cand,
+                }
+            }
+        }
+    }
+    Some(base)
 }
 
 /// The running CLI's own image joins `sensitive` — runner

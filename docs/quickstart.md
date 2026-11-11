@@ -89,8 +89,9 @@ downgrades exist: `--unsafe-unsandboxed-discovery` runs the server with
 the ambient environment (keep unreviewed servers inside a throwaway VM
 or container there), `--unsafe-discovery-best-effort-lifetime` keeps
 the sandbox but waives only the kernel descendant-lifetime boundary —
-the narrower opt-out for macOS / Linux without writable cgroup v2 —
-and `MCP_WRIT_SKIP_SANDBOX` drops the OS sandbox
+descendants may outlive the discovery run and their cleanup is only
+best-effort — the narrower opt-out for macOS / Linux without writable
+cgroup v2 — and `MCP_WRIT_SKIP_SANDBOX` drops the OS sandbox
 and the Warden's descendant teardown while keeping the restricted
 environment and private TMPDIR — surviving descendant processes are
 not cleaned up, so do not rely on this downgrade to reap them:
