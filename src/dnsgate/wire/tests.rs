@@ -537,6 +537,94 @@ fn response_parse_svcb_off_chain_owner_ignored() {
     assert!(parsed.chain.is_empty());
 }
 
+#[test]
+fn response_parse_conflicting_cnames_fail_closed() {
+    // Two different CNAME targets under ONE owner is semantically
+    // conflicting wire data — a resolver may select either, so the
+    // chain can never judge the unchosen one. Refuse the whole
+    // answer rather than relay an unjudged destination.
+    let pkt = response(
+        "www.example",
+        0,
+        &[
+            ("www.example", RRTYPE_CNAME, 60, &name_wire("ok.example")),
+            (
+                "www.example",
+                RRTYPE_CNAME,
+                60,
+                &name_wire("denied.example"),
+            ),
+        ],
+    );
+    assert!(!parse_response(&pkt, "www.example").decoded);
+}
+
+#[test]
+fn response_parse_conflicting_dnames_fail_closed() {
+    // Same conflict on the DNAME family: one owner, two different
+    // substitution targets.
+    let pkt = response(
+        "www.a.example",
+        0,
+        &[
+            ("a.example", RRTYPE_DNAME, 60, &name_wire("b.example")),
+            ("a.example", RRTYPE_DNAME, 60, &name_wire("c.example")),
+        ],
+    );
+    assert!(!parse_response(&pkt, "www.a.example").decoded);
+}
+
+#[test]
+fn response_parse_duplicate_identical_cname_decodes() {
+    // Same owner, same target repeated is not a conflict — some
+    // upstreams emit duplicates. The chain still follows the one
+    // target the owner names.
+    let a_rdata = [203, 0, 113, 9];
+    let pkt = response(
+        "www.example",
+        0,
+        &[
+            ("www.example", RRTYPE_CNAME, 60, &name_wire("cdn.example")),
+            ("www.example", RRTYPE_CNAME, 60, &name_wire("cdn.example")),
+            ("cdn.example", RRTYPE_A, 50, &a_rdata),
+        ],
+    );
+    let parsed = parse_response(&pkt, "www.example");
+    assert!(parsed.decoded);
+    assert_eq!(parsed.chain, vec!["cdn.example"]);
+    assert_eq!(parsed.addrs, vec![("203.0.113.9".parse().unwrap(), 50)]);
+}
+
+#[test]
+fn response_parse_stray_answer_alias_joins_deny_set() {
+    // A CNAME whose owner is unrelated to this query never joins the
+    // chain — but the relay still ships it, so both ends land in the
+    // deny-judged extra set instead of passing unobserved.
+    let pkt = response(
+        "www.example",
+        0,
+        &[
+            ("www.example", RRTYPE_A, 60, &[203, 0, 113, 9]),
+            (
+                "unrelated.example",
+                RRTYPE_CNAME,
+                60,
+                &name_wire("hidden.example"),
+            ),
+        ],
+    );
+    let parsed = parse_response(&pkt, "www.example");
+    assert!(parsed.decoded);
+    assert!(parsed.chain.is_empty());
+    for name in ["unrelated.example", "hidden.example"] {
+        assert!(
+            parsed.extra_names.contains(&name.to_string()),
+            "missing {name}: {:?}",
+            parsed.extra_names
+        );
+    }
+}
+
 /// A response carrying records in all three sections — `an`/`ns`/`ar`
 /// are `(owner, rtype, ttl, rdata)` lists in wire order.
 fn response_sections(

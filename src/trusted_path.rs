@@ -149,8 +149,147 @@ fn check_driver_candidate(
         if leaf_md.permissions().mode() & 0o111 == 0 {
             return Err(format!("'{}' is not executable", canon.display()));
         }
+        check_shebang_interpreter(canon, leaf_file, trust)?;
     }
     let _ = leaf_file;
+    Ok(())
+}
+
+/// The driver leaf's `#!` line read *through the pinned handle* — the
+/// object judged is the object bound, not whatever the path re-resolves
+/// to. Falls back to a path read when no handle was retained.
+///
+/// `Ok(None)` is the *absence* of a shebang — the only pass: the raw
+/// bytes are checked for the `#!` prefix before the line is parsed, so
+/// a `#!` that fails to parse (e.g. invalid UTF-8 in the first line)
+/// and a failed read are both refusals, never "no shebang".
+#[cfg(unix)]
+fn shebang_line_via(file: Option<&std::fs::File>, path: &Path) -> Result<Option<String>, String> {
+    let mut buf = [0u8; 256];
+    let n = match file {
+        Some(f) => {
+            use std::os::unix::fs::FileExt;
+            f.read_at(&mut buf, 0)
+        }
+        None => std::fs::File::open(path).and_then(|mut f| {
+            use std::io::Read;
+            f.read(&mut buf)
+        }),
+    }
+    .map_err(|e| format!("'{}' cannot be probed: {e}", path.display()))?;
+    crate::workload::shebang_from_head(&buf[..n], path)
+}
+
+/// A `#!` driver leaf delegates its exec to the interpreter the
+/// shebang names — that image runs with the launcher's full authority
+/// before any containment exists, so it must satisfy the same
+/// provenance class the leaf itself just passed. An interpreter this
+/// resolver cannot model exactly — a relative spelling, an `env`
+/// delegation whose selected command fails the class, a nested `#!`
+/// script that restarts kernel interpreter selection, or a `#!` line
+/// that cannot be read or parsed — refuses the driver rather than let
+/// the kernel pick unvalidated bytes.
+#[cfg(unix)]
+fn check_shebang_interpreter(
+    canon: &Path,
+    leaf_file: Option<&std::fs::File>,
+    trust: DriverTrust,
+) -> Result<(), String> {
+    let bad = |detail: String| format!("'{}' shebang: {detail}", canon.display());
+    let line = shebang_line_via(leaf_file, canon).map_err(bad)?;
+    let Some(line) = line else {
+        return Ok(());
+    };
+    // Same grammar the workload resolver applies: the kernel skips
+    // blanks after `#!`, takes the first token as the interpreter,
+    // and hands the rest of the line over as ONE optional argument.
+    let body = line.trim_start();
+    let (interp, opt_arg) = match body.split_once(char::is_whitespace) {
+        Some((i, rest)) => (i, {
+            let rest = rest.trim();
+            (!rest.is_empty()).then(|| rest.to_string())
+        }),
+        None => (body, None),
+    };
+    if interp.is_empty() {
+        return Err(bad("interpreter is empty".to_string()));
+    }
+    if !Path::new(interp).is_absolute() {
+        return Err(bad(format!(
+            "interpreter '{interp}' is not an absolute path"
+        )));
+    }
+    let is_env = Path::new(interp)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n == "env");
+    if !is_env {
+        return check_interpreter_path(canon, Path::new(interp), trust);
+    }
+    // `env` itself runs pre-containment — validate it — and then
+    // re-resolves its command through the child's PATH, which is the
+    // parent's here. Emulate only the spellings the workload resolver
+    // models exactly (a bare name, or -S/--split-string) and refuse
+    // everything else rather than guess which file `env` would pick.
+    let arg = opt_arg.ok_or_else(|| bad("'env' lacks a command name".to_string()))?;
+    let name = if let Some(rest) = arg
+        .strip_prefix("-S")
+        .or_else(|| arg.strip_prefix("--split-string"))
+    {
+        rest.split_whitespace()
+            .next()
+            .ok_or_else(|| bad("'env -S' lacks a command name".to_string()))?
+            .to_string()
+    } else if arg.contains(char::is_whitespace) {
+        return Err(bad(format!("'env' command '{arg}' cannot be resolved")));
+    } else if arg.starts_with('-') {
+        return Err(bad(format!("uses unsupported 'env' option '{arg}'")));
+    } else {
+        arg
+    };
+    check_interpreter_path(canon, Path::new(interp), trust)?;
+    // `env` resolves its command exactly like `env_command_path`: bare
+    // names through PATH, absolute spellings directly, and a relative
+    // spelling carrying a separator is refused — `env` would exec it
+    // against the child's cwd, so a PATH join would validate a file
+    // `env` never runs.
+    let resolved = crate::workload::env_command_path(&name).map_err(bad)?;
+    check_interpreter_path(canon, &resolved, trust)
+}
+
+/// Provenance check for one interpreter path a `#!` driver delegates
+/// to — the same trust-class walk [`check_driver_candidate`] runs on
+/// the leaf, plus a nested-`#!` refusal: a script interpreter would
+/// restart kernel interpreter selection, and this binding has no slot
+/// to carry a second delegation.
+#[cfg(unix)]
+fn check_interpreter_path(wrapper: &Path, interp: &Path, trust: DriverTrust) -> Result<(), String> {
+    let bad = |detail: String| format!("'{}' shebang interpreter: {detail}", wrapper.display());
+    let canon = interp
+        .canonicalize()
+        .map_err(|e| bad(format!("'{}' cannot be resolved: {e}", interp.display())))?;
+    let md = std::fs::metadata(&canon)
+        .map_err(|e| bad(format!("'{}' cannot be inspected: {e}", canon.display())))?;
+    if !md.is_file() {
+        return Err(bad(format!("'{}' is not a regular file", canon.display())));
+    }
+    if let Some(gap) = driver_replacement_gap(&canon, None, &md, trust) {
+        return Err(bad(format!(
+            "'{}' (or ancestor '{}') is replaceable by an untrusted principal",
+            canon.display(),
+            gap.display()
+        )));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if md.permissions().mode() & 0o111 == 0 {
+        return Err(bad(format!("'{}' is not executable", canon.display())));
+    }
+    if shebang_line_via(None, &canon).map_err(bad)?.is_some() {
+        return Err(bad(format!(
+            "'{}' is itself a script — a nested interpreter cannot be bound",
+            canon.display()
+        )));
+    }
     Ok(())
 }
 
@@ -667,23 +806,45 @@ fn open_driver_pin(path: &Path) -> std::io::Result<(std::fs::File, crate::fspriv
 /// spelling's dirfd and for `fstatat`. `O_NOFOLLOW` is belt and
 /// suspenders: the canonical spelling's parent is already link-free,
 /// a planted link would fail `ELOOP` rather than be traversed.
+///
+/// `O_PATH` cannot go through `OpenOptions::custom_flags`: std masks
+/// custom flags with `!O_ACCMODE`, and `O_ACCMODE` includes the
+/// `O_PATH` bit — the flag is silently dropped and the open
+/// degenerates to a plain `O_RDONLY`, refusing exactly the
+/// search-only directory this fd exists to cover. `open(2)` is called
+/// directly instead.
 #[cfg(target_os = "linux")]
 fn open_dir_pin(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("'{}' has no parent directory", path.display()),
         )
     })?;
-    // `.read(true)` only satisfies `OpenOptions`' requirement that an
-    // access mode be set — `O_RDONLY` contributes zero flag bits and
-    // the kernel ignores access mode entirely under `O_PATH`, so no
-    // read permission is demanded on the directory.
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(parent)
+    let cpath = std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("'{}' contains an interior NUL byte", parent.display()),
+        )
+    })?;
+    let fd = loop {
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            break fd;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    };
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// Probe the pinned leaf and pin its parent directory when the leaf
@@ -1086,6 +1247,168 @@ mod tests {
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
         let err = validate_driver_path(&f).unwrap_err();
         assert!(err.contains("executable"), "{err}");
+    }
+
+    /// A `#!` driver delegates exec to the interpreter its shebang
+    /// names — that image runs pre-containment, so a *nested* `#!`
+    /// script interpreter (which would restart kernel interpreter
+    /// selection outside any binding) refuses under every class.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_script_interpreter_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        // The named interpreter is itself a script — a shim shape
+        // provenance validation must never hand to the kernel.
+        let shim = dir.path().join("interp");
+        write_executable(&shim);
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, format!("#!{}\n", shim.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = validate_driver_path(&exe).unwrap_err();
+        assert!(err.contains("itself a script"), "{err}");
+    }
+
+    /// A relative interpreter spelling is unmodelable — the kernel
+    /// would resolve it against no usable base — so the driver
+    /// refuses instead of canonicalizing it against the process cwd.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_relative_interpreter_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"#!./helper\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = validate_driver_path(&exe).unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    /// An `env` option spelling the resolver cannot model refuses
+    /// closed rather than guessing which interpreter `env` would pick.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_env_unmodeled_option_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"#!/usr/bin/env -i\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = validate_driver_path(&exe).unwrap_err();
+        assert!(err.contains("env"), "{err}");
+    }
+
+    /// `#!/usr/bin/env sh` still binds: `env` itself and the
+    /// PATH-selected `sh` both satisfy the same trust class.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_env_selected_command_validates() {
+        let Some(sh) = crate::workload::search_path("sh") else {
+            return; // no `sh` on PATH here — nothing to assert
+        };
+        if crate::workload::shebang_line(&sh).is_some() {
+            return; // this host's `sh` is a script — the refusal is correct there
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"#!/usr/bin/env sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            validate_driver_path(&exe).is_ok(),
+            "an env delegation to a validated interpreter must bind"
+        );
+    }
+
+    /// `env` execs a command spelling containing a separator against
+    /// the child's cwd — an object this resolver cannot bind — so a
+    /// non-absolute `env` command carrying a separator refuses rather
+    /// than validating the different file a PATH join would name.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_env_relative_separator_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        for arg in ["subdir/tool", "-S subdir/tool", "./tool"] {
+            let exe = dir.path().join("tool");
+            std::fs::write(&exe, format!("#!/usr/bin/env {arg}\n")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let err = validate_driver_path(&exe).unwrap_err();
+            assert!(
+                err.contains("plain command name"),
+                "'env {arg}' must refuse a separator-carrying relative spelling: {err}"
+            );
+        }
+    }
+
+    /// An absolute `env` command names the file `env` execs directly —
+    /// no PATH lookup applies, so the spelled file itself is validated.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_env_absolute_command_validates() {
+        let Some(sh) = crate::workload::search_path("sh") else {
+            return; // no `sh` on PATH here — nothing to assert
+        };
+        if crate::workload::shebang_line(&sh).is_some() {
+            return; // this host's `sh` is a script — the refusal is correct there
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, format!("#!/usr/bin/env {}\n", sh.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            validate_driver_path(&exe).is_ok(),
+            "an env delegation to an absolute, validated interpreter must bind"
+        );
+    }
+
+    /// A CRLF shebang refuses at bind time: the kernel ends the line
+    /// only at `\n`, so `#!/bin/sh\r\n` execs `/bin/sh\r` — stripping
+    /// the `\r` would validate a file the kernel never runs.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_cr_terminated_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"#!/bin/sh\r\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = validate_driver_path(&exe).unwrap_err();
+        assert!(err.contains("CR-terminated"), "{err}");
+    }
+
+    /// A `#!` prefix followed by a line that cannot be parsed (invalid
+    /// UTF-8) is a script the resolver cannot model — the driver
+    /// refuses rather than treating the prefix as absent.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_unparseable_line_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"#!/\xff\xfe\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = validate_driver_path(&exe).unwrap_err();
+        assert!(err.contains("cannot be parsed"), "{err}");
+    }
+
+    /// A leaf that cannot be read at all cannot be proven shebang-free —
+    /// the probe failure is a refusal, never "no shebang". (Root reads
+    /// through permission bits, so the leg only holds for a real user.)
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_leaf_probe_refuses() {
+        if crate::fspriv::running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let err = validate_driver_path(&exe).unwrap_err();
+        assert!(err.contains("cannot be probed"), "{err}");
     }
 
     /// The identity binding: a driver renamed away and recreated after

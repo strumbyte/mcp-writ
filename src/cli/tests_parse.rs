@@ -440,6 +440,31 @@ fn test_parse_generate_policy_conflicting_discovery_flags() {
 }
 
 #[test]
+fn test_parse_generate_policy_best_effort_lifetime_flag() {
+    // The narrower unsafe opt-out implies live discovery like its
+    // sibling flag, keeping the sandbox but waiving the boundary.
+    let a = unwrap_gen_policy(parse_from(args(
+        "mcp-writ generate-policy --unsafe-discovery-best-effort-lifetime -- echo hello",
+    )));
+    assert!(!a.static_only);
+    assert!(a.unsafe_discovery_best_effort_lifetime);
+    assert!(!a.unsafe_unsandboxed_discovery);
+}
+
+#[test]
+fn test_parse_generate_policy_best_effort_lifetime_conflicts() {
+    let result = parse_from(args(
+        "mcp-writ generate-policy --unsafe-unsandboxed-discovery --unsafe-discovery-best-effort-lifetime -- echo hello",
+    ));
+    assert!(matches!(result, Err(CliError::Parse(_))));
+
+    let result = parse_from(args(
+        "mcp-writ generate-policy --static-only --unsafe-discovery-best-effort-lifetime -- echo hello",
+    ));
+    assert!(matches!(result, Err(CliError::Parse(_))));
+}
+
+#[test]
 fn test_parse_generate_policy_policy_version_default_is_2() {
     let a = unwrap_gen_policy(parse_from(args("mcp-writ generate-policy -- echo hello")));
     assert_eq!(a.policy_version, 2);

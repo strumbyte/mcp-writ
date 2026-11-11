@@ -411,7 +411,7 @@ PR-01 を先に実施します。PR-02・PR-03・PR-05・PR-07 は変更先が�
 - [x] [Cargo.toml](../Cargo.toml) の `version` を確定した版に更新し、`Cargo.lock` を再生成する — `0.5.2` に更新（ワーキングツリー）
 - [x] 最新コミットで T-BASE・T-DOC・該当する実機記録を再確認し、実行件数を記録する — 2026-11-10、版更新済みワーキングツリー（`ccd1082` + 0.5.2 版更新・文書更新）で T-BASE・T-DOC を Windows 実機で実施: `cargo fmt --all -- --check` クリーン、`cargo clippy --locked --all-targets -- -D warnings` クリーン、`cargo test --locked --lib --bins` 2502 pass / 0 fail、`cargo doc --locked --no-deps` クリーン、`cargo test --locked --doc` 0 件、`cargo test --locked --test docs_check` 13 pass。実機記録は各PRの検証欄（test-matrix.md の証拠表）が正 — 2026-11-09 の週次 `schedule` 実行（CI・Linux tests・MCP server verification、`ccd1082`）は全て成功
 - [ ] タグ `vX.Y.Z` を付ける — push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests・MCP server verification の成功が前提（[releasing.md](releasing.md) 手順 2）。付けるタグは `v0.5.2`
-- [ ] リリースノートに「この版で保証する制御」と「残る限界」（改善計画 §3 の対応状況）を明記する。PR-01 の README 修正（スクリプト起動の隙間・探索の実態）は「記述の訂正」として明示する — 草案は `.local/release-notes-v0.5.2.md` に用意済みだが、`.local/` は git 管理外かつ Cargo パッケージ除外で、Release ワークフローは `generate_release_notes` の自動生成のみで草案を参照しない。リリース作成時に本文へ転記して初めて完了
+- [ ] リリースノートに「この版で保証する制御」と「残る限界」（改善計画 §3 の対応状況）を明記する。PR-01 の README 修正（スクリプト起動の隙間・探索の実態）は「記述の訂正」として明示する — レビュー済みの草案は `.local/release-notes-v0.5.2.md` に用意済みだが、`.local/` は git 管理外かつ Cargo パッケージ除外で、現行の Release ワークフローは `generate_release_notes` の自動生成本文のみで草案を参照しない。**公開の前に**レビュー済みノートがリリース本文になることを確認して初めて完了 — ワークフローをレビュー済みノートを本文に使う形（`body_path` 等）に改めるか、リリースを draft として作成して本文を草案で編集し、確認してから公開する手順のいずれかを取る。公開後の転記で済ませることは本項目の完了としない
 
 ## 実装結果として残す記録
 

@@ -119,7 +119,10 @@ mcp-writ generate-policy --live-discovery --output draft.kdl \
 （制限環境・deny-all の外向き通信・private TMPDIR・コマンドツリーへの
 fs 許可・secret overlay — `--unsafe-unsandboxed-discovery` が周囲環境
 実行の明示的な opt-out で、未レビューのサーバーは使い捨ての VM か
-コンテナの中に限定します）、検証できた内容を記録します — ドラフトの抜粋:
+コンテナの中に限定します。`--unsafe-discovery-best-effort-lifetime`
+はサンドボックスを維持したままカーネルの子孫プロセス寿命境界だけを
+外す、より狭い opt-out です — macOS / writable cgroup v2 の無い
+Linux 向け）、検証できた内容を記録します — ドラフトの抜粋:
 
 ```kdl
 server "auto-generated" {

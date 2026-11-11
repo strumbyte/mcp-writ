@@ -209,7 +209,13 @@ async fn evaluate(args: CheckArgs) -> CheckReport {
 
     check_hash_pins(&bound, args.engine, &mut report.pins).await;
     check_launch_binding(&bound, &args.command, &mut report.pins);
-    check_tools_list_pins(&bound, &args.command, &mut report.pins).await;
+    check_tools_list_pins(
+        &bound,
+        &args.command,
+        args.unsafe_discovery_best_effort_lifetime,
+        &mut report.pins,
+    )
+    .await;
 
     finalize(report)
 }
@@ -610,7 +616,16 @@ async fn image_pin_result(
 /// fresh `tools/list` (the same restricted-environment spawn
 /// `generate-policy` live discovery uses). No command ⇒ `unverified`:
 /// a pin the check could not run is drift, not a pass.
-async fn check_tools_list_pins(policy: &Policy, command: &[String], pins: &mut Vec<PinResult>) {
+/// `allow_best_effort_lifetime` forwards the explicit
+/// `--unsafe-discovery-best-effort-lifetime` opt-out: the respawn
+/// still runs inside the Warden but need not carry a kernel
+/// descendant-lifetime boundary.
+async fn check_tools_list_pins(
+    policy: &Policy,
+    command: &[String],
+    allow_best_effort_lifetime: bool,
+    pins: &mut Vec<PinResult>,
+) {
     if policy.tools_list_hashes.is_empty() {
         return;
     }
@@ -638,6 +653,7 @@ async fn check_tools_list_pins(policy: &Policy, command: &[String], pins: &mut V
         None,
         &DiscoveryOptions {
             restrict_environment: true,
+            allow_best_effort_lifetime,
         },
     )
     .await;

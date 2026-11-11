@@ -286,6 +286,79 @@ async fn default_container_isolation_passes_the_gate() {
     );
 }
 
+/// The resolved runner source sits outside the log share when its
+/// configured spelling traverses a share-local symlink — the spelled
+/// comparison must still refuse, since the workload can repoint the
+/// link and seize the location the next launch resolves.
+#[cfg(unix)]
+#[test]
+fn log_share_refuses_runner_spelled_through_share_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let share = dir.path().join("share");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&real).unwrap();
+    let runner = real.join("mcp-secure-runner");
+    std::fs::write(&runner, b"#!").unwrap();
+    std::os::unix::fs::symlink(&real, share.join("runner-parent")).unwrap();
+    let spelled = share.join("runner-parent").join("mcp-secure-runner");
+    let log_resolved = std::fs::canonicalize(&share).unwrap();
+
+    // Sanity: the spelled path resolves outside the share — only the
+    // spelled-chain comparison catches the overlap.
+    let resolved = std::fs::canonicalize(&spelled).unwrap();
+    assert!(!resolved.starts_with(&log_resolved));
+    assert!(
+        log_share_conflicts_artifact(&log_resolved, &spelled),
+        "a runner spelled through a share-local symlink must conflict"
+    );
+    // The real object itself is honestly outside the share — clean.
+    assert!(!log_share_conflicts_artifact(&log_resolved, &runner));
+}
+
+/// The plain overlap directions still hold: an artifact inside the
+/// share refuses, an unrelated path stays clean, and a share inside a
+/// sensitive ancestor refuses.
+#[test]
+fn log_share_overlap_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let share = dir.path().join("share");
+    std::fs::create_dir_all(&share).unwrap();
+    let log_resolved = std::fs::canonicalize(&share).unwrap();
+
+    assert!(log_share_conflicts_artifact(
+        &log_resolved,
+        &share.join("policy.kdl")
+    ));
+    assert!(log_share_conflicts_artifact(&log_resolved, dir.path()));
+    assert!(!log_share_conflicts_artifact(
+        &log_resolved,
+        &dir.path().join("elsewhere")
+    ));
+}
+
+/// An unavailable `current_exe` (`/proc/self/exe` unreadable, a
+/// renamed-away image) must abort the launch — the overlap check
+/// cannot prove the running image is outside the share.
+#[test]
+fn current_exe_failure_aborts_launch() {
+    let mut sensitive = Vec::new();
+    let err = push_current_exe(
+        &mut sensitive,
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no /proc/self/exe",
+        )),
+    )
+    .expect_err("an unavailable executable path must abort");
+    assert!(err.contains("cannot establish"), "{err}");
+    assert!(sensitive.is_empty());
+
+    // The success path keeps the resolved image in the sensitive set.
+    push_current_exe(&mut sensitive, std::env::current_exe()).unwrap();
+    assert_eq!(sensitive.len(), 1);
+}
+
 #[test]
 fn test_image_ref_is_digest_pinned() {
     assert!(image_ref_is_digest_pinned(

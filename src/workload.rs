@@ -223,12 +223,12 @@ fn expand_shebang_launch(argv0: &str, script: PathBuf) -> io::Result<LaunchResol
     };
     // Resolve the interpreter to the exec image: `env name` searches the
     // PATH env itself would consult (the child's PATH is the parent's —
-    // `restricted_base_env` always carries it); a spelled path is
+    // `restricted_base_env` always carries it), an absolute `env` command
+    // names its file directly, and a separator-carrying relative spelling
+    // is refused — `env` would exec it against the cwd; a spelled path is
     // canonicalized like `resolve_command_path`.
     let exe = if is_env {
-        let found = search_path(&argv0_spelling)
-            .ok_or_else(|| not_found(&format!("'{argv0_spelling}' is not on PATH")))?;
-        std::fs::canonicalize(&found).unwrap_or(found)
+        env_command_path(&argv0_spelling).map_err(|e| not_found(&e))?
     } else {
         let p = Path::new(&argv0_spelling);
         match std::fs::canonicalize(p) {
@@ -240,6 +240,36 @@ fn expand_shebang_launch(argv0: &str, script: PathBuf) -> io::Result<LaunchResol
             }
         }
     };
+    // The interpreter must be the terminal exec image: if it carries its
+    // own `#!` line the kernel selects yet another interpreter at exec
+    // time — one this resolution never hashed or pinned, and the `#!`
+    // argv grammar has no slot that could bind the script two hops out.
+    // A pinned launch cannot represent that second selection, so it
+    // refuses rather than certify a hash boundary the kernel will step
+    // past. (`expand_shebang=false` launches are unpinned by contract —
+    // the kernel resolves the whole chain at run time there.)
+    let probe = shebang_probe(&exe).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "shebang interpreter '{}' in '{}': {e}",
+                exe.display(),
+                script.display()
+            ),
+        )
+    })?;
+    if probe.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "shebang interpreter '{}' in '{}' is itself a script — a \
+                 nested `#!` delegation cannot be hash-bound; name a native \
+                 interpreter in the shebang line",
+                exe.display(),
+                script.display()
+            ),
+        ));
+    }
     let mut argv_head = vec![argv0_spelling];
     argv_head.extend(extra);
     argv_head.push(argv0.to_string());
@@ -313,6 +343,31 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable_file(_path: &Path) -> bool {
     true
+}
+
+/// The exec image `env <name>` would select, resolved the way `env`
+/// resolves it — so the file validated here is the file `env` runs.
+/// A bare command name goes through PATH (the lookup `env` itself
+/// performs); an absolute spelling names the file directly; a
+/// *relative* spelling containing a path separator is refused — `env`
+/// would exec it against the child's cwd, an object this resolution
+/// cannot bind, while a PATH join would validate a different file
+/// entirely.
+#[cfg(unix)]
+pub(crate) fn env_command_path(name: &str) -> Result<PathBuf, String> {
+    let spelled = Path::new(name);
+    if spelled.is_absolute() {
+        return std::fs::canonicalize(spelled)
+            .map_err(|e| format!("'env' command '{name}' cannot be resolved: {e}"));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(format!(
+            "'env' command '{name}' is not a plain command name"
+        ));
+    }
+    let found =
+        search_path(name).ok_or_else(|| format!("'env' command '{name}' is not on PATH"))?;
+    Ok(std::fs::canonicalize(&found).unwrap_or(found))
 }
 
 pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
@@ -1309,10 +1364,59 @@ pub(crate) fn shebang_line(path: &Path) -> Option<String> {
             f.read(&mut buf)
         })
         .ok()?;
-    // Only the first line is the shebang — invalid UTF-8 further into the
-    // file must not hide it, and a CRLF ending loses its `\r`.
-    let end = buf[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
-    let line = buf[..end].strip_suffix(b"\r").unwrap_or(&buf[..end]);
+    shebang_line_from_bytes(&buf[..n])
+}
+
+/// Probe `path`'s raw prefix and report its `#!` line the way
+/// [`shebang_line`] does — with the failure modes kept distinct:
+/// `Ok(None)` only when the file reads *without* a `#!` prefix; a `#!`
+/// that cannot be parsed and a read failure are both `Err`, never
+/// "no shebang".
+#[cfg(unix)]
+pub(crate) fn shebang_probe(path: &Path) -> Result<Option<String>, String> {
+    let mut buf = [0u8; 256];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read(&mut buf)
+        })
+        .map_err(|e| format!("'{}' cannot be probed: {e}", path.display()))?;
+    shebang_from_head(&buf[..n], path)
+}
+
+/// The `#!`-prefix-aware line check shared by [`shebang_probe`] and
+/// handle-read callers: `Ok(None)` only when `head` does not begin
+/// with `#!` — a `#!` that cannot be parsed is a refusal, not
+/// "no shebang". A CR-terminated line refuses too: the kernel ends the
+/// shebang only at `\n`, so the `\r` is part of the interpreter name it
+/// would exec — validating the stripped spelling names a different
+/// file than the kernel runs. (Lenient callers keep their `\r`
+/// stripping in [`shebang_line_from_bytes`].)
+#[cfg(unix)]
+pub(crate) fn shebang_from_head(head: &[u8], path: &Path) -> Result<Option<String>, String> {
+    if !head.starts_with(b"#!") {
+        return Ok(None);
+    }
+    let end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    if head[..end].ends_with(b"\r") {
+        return Err(format!(
+            "'{}' shebang line is CR-terminated — the kernel would exec \
+             a different interpreter than the stripped spelling",
+            path.display()
+        ));
+    }
+    shebang_line_from_bytes(head)
+        .map(Some)
+        .ok_or_else(|| format!("'{}' shebang line cannot be parsed", path.display()))
+}
+
+/// The `#!` line parse shared by [`shebang_line`] and handle-read
+/// callers: only the first line can be a shebang — invalid UTF-8
+/// further into the buffer must not hide it, and a CRLF ending loses
+/// its `\r`.
+pub(crate) fn shebang_line_from_bytes(head: &[u8]) -> Option<String> {
+    let end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line = head[..end].strip_suffix(b"\r").unwrap_or(&head[..end]);
     let first = std::str::from_utf8(line).ok()?;
     first.strip_prefix("#!").map(|s| s.trim().to_string())
 }
@@ -2194,6 +2298,43 @@ mod tests {
         assert!(resolve_launch(&script.to_string_lossy(), true).is_err());
     }
 
+    /// `env <name>` resolves like `env` itself resolves it: a bare name
+    /// goes through PATH, an absolute spelling is used verbatim, and a
+    /// relative spelling carrying a path separator refuses — `env`
+    /// would exec it against the child's cwd, so a PATH join would pin
+    /// a file `env` never runs.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_launch_env_command_separator_refuses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("entry");
+
+        for line in ["#!/usr/bin/env sub/tool\n", "#!/usr/bin/env -S sub/tool\n"] {
+            std::fs::write(&script, line).expect("write");
+            let err = match resolve_launch(&script.to_string_lossy(), true) {
+                Err(e) => e,
+                Ok(_) => {
+                    panic!("a separator-carrying relative env command must refuse")
+                }
+            };
+            assert!(
+                err.to_string().contains("plain command name"),
+                "line {line:?}: unexpected refusal reason: {err}"
+            );
+        }
+
+        // An absolute env command is the file env execs directly.
+        if let Some(sh) = search_path("sh") {
+            std::fs::write(&script, format!("#!/usr/bin/env {}\n", sh.display())).expect("write");
+            let res = resolve_launch(&script.to_string_lossy(), true).expect("resolve");
+            assert!(
+                same_file(&res.exe, &sh),
+                "exe must be the env command's absolute spelling: {}",
+                res.exe.display()
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_resolve_launch_no_shebang_is_direct() {
@@ -2203,5 +2344,134 @@ mod tests {
         let res = resolve_launch(&exe.to_string_lossy(), true).expect("resolve");
         assert!(same_file(&res.exe, &exe));
         assert_eq!(res.argv_head, vec![exe.to_string_lossy().into_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_launch_refuses_nested_shebang_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // The interpreter the payload's shebang names is itself a `#!`
+        // script (a shim delegating onward). The kernel would select a
+        // third image at exec — outside the hash boundary — so a pinned
+        // launch must refuse instead of pinning the middle hop.
+        let shim = dir.path().join("shim");
+        std::fs::write(&shim, "#!/bin/sh\nexec real \"$@\"\n").expect("write shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod shim");
+
+        let script = dir.path().join("entry");
+        std::fs::write(&script, format!("#!{} -x\necho hi\n", shim.display()))
+            .expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        let err = match resolve_launch(&script.to_string_lossy(), true) {
+            Err(e) => e,
+            Ok(_) => panic!("nested shebang interpreter must refuse a pinned launch"),
+        };
+        assert!(
+            err.to_string().contains("nested"),
+            "unexpected refusal reason: {err}"
+        );
+
+        // The unpinned contract still resolves: the kernel expands the
+        // whole chain at exec time, so nothing here needs to model it.
+        let plain = resolve_launch(&script.to_string_lossy(), false).expect("unpinned resolve");
+        assert!(same_file(&plain.exe, &script));
+    }
+
+    /// An interpreter whose own shebang is CRLF-terminated delegates
+    /// to a file the resolver cannot name — the kernel keeps the `\r`
+    /// in the interpreter path it execs — so the nested probe refuses
+    /// rather than strip and model a different file.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_launch_refuses_cr_terminated_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let shim = dir.path().join("shim");
+        std::fs::write(&shim, b"#!/bin/sh\r\n").expect("write shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod shim");
+
+        let script = dir.path().join("entry");
+        std::fs::write(&script, format!("#!{}\necho hi\n", shim.display())).expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        let err = match resolve_launch(&script.to_string_lossy(), true) {
+            Err(e) => e,
+            Ok(_) => panic!("a CR-terminated interpreter shebang must refuse"),
+        };
+        assert!(
+            err.to_string().contains("CR-terminated"),
+            "unexpected refusal reason: {err}"
+        );
+    }
+
+    /// An interpreter whose first bytes open with `#!` but whose line
+    /// cannot be parsed (invalid UTF-8) is a script the resolver cannot
+    /// model — the launch must refuse rather than treat the failed
+    /// parse as "no shebang" and pin a script as the exec image.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_launch_refuses_unparseable_shebang_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let shim = dir.path().join("shim");
+        std::fs::write(&shim, b"#!\xff\xfe\n").expect("write shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod shim");
+
+        let script = dir.path().join("entry");
+        std::fs::write(&script, format!("#!{}\necho hi\n", shim.display())).expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        let err = match resolve_launch(&script.to_string_lossy(), true) {
+            Err(e) => e,
+            Ok(_) => panic!("an interpreter with an unparseable `#!` line must refuse"),
+        };
+        assert!(
+            err.to_string().contains("cannot be parsed"),
+            "unexpected refusal reason: {err}"
+        );
+    }
+
+    /// An interpreter that cannot be read cannot be proven shebang-free —
+    /// the probe failure refuses the launch, never "no shebang". (Root
+    /// reads through permission bits, so the leg only holds for a real
+    /// user.)
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_launch_refuses_unreadable_interpreter() {
+        if crate::fspriv::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let shim = dir.path().join("shim");
+        std::fs::write(&shim, b"#!/bin/sh\n").expect("write shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o111))
+            .expect("chmod shim");
+
+        let script = dir.path().join("entry");
+        std::fs::write(&script, format!("#!{}\necho hi\n", shim.display())).expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        let err = match resolve_launch(&script.to_string_lossy(), true) {
+            Err(e) => e,
+            Ok(_) => panic!("an unreadable interpreter must refuse"),
+        };
+        assert!(
+            err.to_string().contains("cannot be probed"),
+            "unexpected refusal reason: {err}"
+        );
     }
 }

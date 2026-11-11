@@ -135,7 +135,10 @@ runs `tools/list` inside the Warden sandbox (restricted environment,
 deny-all egress, private TMPDIR, command-tree filesystem grants, secret
 overlay — `--unsafe-unsandboxed-discovery` is the ambient-environment
 opt-out, where unreviewed servers belong inside a throwaway VM or
-container), and records what it verified — an excerpt of the draft:
+container; `--unsafe-discovery-best-effort-lifetime` is the narrower
+opt-out that keeps the sandbox but waives the kernel descendant-lifetime
+boundary on macOS / Linux without writable cgroup v2), and records what
+it verified — an excerpt of the draft:
 
 ```kdl
 server "auto-generated" {

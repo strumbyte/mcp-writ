@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::container::backends::{self, LaunchSpec, ShareMount};
 use crate::container::engine::{ContainerEngine, EngineError, EngineKind, resolve_engine};
@@ -898,7 +898,10 @@ async fn run_image_inner(
             // launch evidence. Both sides reduce through
             // `resolve_grant_spelling` so a relative or dotted artifact
             // spelling and a not-yet-created report file compare as the
-            // real objects they name.
+            // real objects they name — and each artifact's *spelled*
+            // form is walked ancestor-by-ancestor, so a configured path
+            // that reaches its object through a symlink inside the
+            // share refuses even when the resolved target sits outside.
             let Some(log_resolved) =
                 crate::fsoverlap::resolve_grant_spelling(&canonical.to_string_lossy())
             else {
@@ -920,13 +923,22 @@ async fn run_image_inner(
             if let Some(runner) = &options.runner_binary {
                 sensitive.push(runner.clone());
             }
+            // The resolved runner's host source is trusted executable
+            // input a later launch re-reads — spelled via
+            // --runner-binary, selected by MCP_SECURE_RUNNER_PATH, or
+            // discovered in the CLI-adjacent `runners/` dir. A writable
+            // share covering it (or the running CLI's own image, which
+            // auto-resolution also consults) would let the workload
+            // substitute the bytes the *next* launch trusts.
+            if let Some(runner) = &mounted_runner {
+                sensitive.push(runner.artifact.source.clone());
+            }
+            push_current_exe(
+                &mut sensitive,
+                std::env::current_exe(), // nosemgrep: rust.lang.security.current-exe.current-exe
+            )?;
             for artifact in &sensitive {
-                let artifact_resolved =
-                    crate::fsoverlap::resolve_grant_spelling(&artifact.to_string_lossy())
-                        .unwrap_or_else(|| artifact.clone());
-                if crate::fsoverlap::path_covers(&log_resolved, &artifact_resolved)
-                    || crate::fsoverlap::path_covers(&artifact_resolved, &log_resolved)
-                {
+                if log_share_conflicts_artifact(&log_resolved, artifact) {
                     return Err(format!(
                         "refusing --log-dir '{}': it overlaps launch artifact '{}'",
                         canonical.display(),
@@ -1320,6 +1332,48 @@ async fn run_image_inner(
     }
 
     Ok(code)
+}
+
+/// One entry of the `--log-dir` overlap set: `true` when the canonical
+/// share root `log_resolved` and `artifact` overlap — in either
+/// direction, and in either spelling of the artifact. The resolved
+/// comparison alone misses a configured spelling that reaches its
+/// object through a symlinked ancestor *inside* the share: it resolves
+/// outside today, yet the workload can repoint the link and seize the
+/// location the next launch reads through that same spelling.
+/// `runner.artifact.source`, `--runner-binary`, and `--report` all keep
+/// their configured forms here — each spelled ancestor is resolved
+/// separately so the check holds however the share itself was spelled.
+fn log_share_conflicts_artifact(log_resolved: &Path, artifact: &Path) -> bool {
+    // The artifact encloses the share — real objects only.
+    let resolved = crate::fsoverlap::resolve_grant_spelling(&artifact.to_string_lossy())
+        .unwrap_or_else(|| artifact.to_path_buf());
+    if crate::fsoverlap::path_covers(&resolved, log_resolved) {
+        return true;
+    }
+    // The share reaches the artifact — the resolved object, or any
+    // ancestor of the spelled path resolving inside it.
+    crate::fsoverlap::absolutize_lexical(artifact)
+        .ancestors()
+        .any(|a| {
+            let real = crate::fsoverlap::resolve_grant_spelling(&a.to_string_lossy())
+                .unwrap_or_else(|| a.to_path_buf());
+            crate::fsoverlap::path_covers(log_resolved, &real)
+        })
+}
+
+/// The running CLI's own image joins `sensitive` — runner
+/// auto-resolution consults `runners/` beside it, so a share covering
+/// it would let the workload substitute bytes a later launch trusts.
+/// A `current_exe` failure aborts the launch: omitting the entry would
+/// silently skip its overlap check.
+fn push_current_exe(
+    sensitive: &mut Vec<PathBuf>,
+    exe: std::io::Result<PathBuf>,
+) -> Result<(), String> {
+    let exe = exe.map_err(|e| format!("cannot establish the running executable's path: {e}"))?;
+    sensitive.push(exe);
+    Ok(())
 }
 
 /// The CLI that drives the launch's substrate: a `--engine` container

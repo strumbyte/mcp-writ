@@ -94,6 +94,17 @@ pub(super) fn parse_gen_policy_args(
         .take(&mut raw)
         .is_present();
 
+    let unsafe_discovery_best_effort_lifetime =
+        noargs::flag("unsafe-discovery-best-effort-lifetime")
+            .doc(
+                "Run tools/list discovery inside the sandbox but without requiring a \
+                 kernel descendant-lifetime boundary — for hosts (macOS, cgroup-less \
+                 Linux) that cannot provide one; child cleanup falls back to \
+                 best-effort (implies --live-discovery)",
+            )
+            .take(&mut raw)
+            .is_present();
+
     let self_test = noargs::flag("self-test")
         .doc(
             "After drafting, spawn the server via Warden (restricted TMPDIR, 8s) and collect \
@@ -102,14 +113,25 @@ pub(super) fn parse_gen_policy_args(
         .take(&mut raw)
         .is_present();
 
-    if static_only_flag && (live_discovery || unsafe_unsandboxed_discovery) {
+    if static_only_flag
+        && (live_discovery || unsafe_unsandboxed_discovery || unsafe_discovery_best_effort_lifetime)
+    {
         return Err(CliError::Parse(
-            "--static-only cannot be combined with --live-discovery or --unsafe-unsandboxed-discovery"
+            "--static-only cannot be combined with --live-discovery, \
+             --unsafe-unsandboxed-discovery, or --unsafe-discovery-best-effort-lifetime"
+                .to_string(),
+        ));
+    }
+    if unsafe_unsandboxed_discovery && unsafe_discovery_best_effort_lifetime {
+        return Err(CliError::Parse(
+            "--unsafe-unsandboxed-discovery cannot be combined with \
+             --unsafe-discovery-best-effort-lifetime"
                 .to_string(),
         ));
     }
 
-    let static_only = !live_discovery && !unsafe_unsandboxed_discovery;
+    let static_only =
+        !live_discovery && !unsafe_unsandboxed_discovery && !unsafe_discovery_best_effort_lifetime;
 
     // Help-only positional for `-- <command> [args...]`: `parse_from`
     // splits the trailing argv off before noargs sees it, so this entry
@@ -141,6 +163,7 @@ pub(super) fn parse_gen_policy_args(
         policy_version,
         static_only,
         unsafe_unsandboxed_discovery,
+        unsafe_discovery_best_effort_lifetime,
         self_test,
         project_dir,
         command,

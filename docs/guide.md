@@ -649,6 +649,7 @@ mcp-writ generate-policy [OPTIONS] -- <mcp-server-command> [args...]
 | `--verbose` | `-v` | off | Increase log verbosity |
 | `--live-discovery` | | off | Execute the MCP server inside the Warden sandbox (restricted environment, deny-all egress, private TMPDIR) to discover tools (not the default) |
 | `--unsafe-unsandboxed-discovery` | | off | Live discovery without the OS sandbox, in the ambient environment — the explicit downgrade |
+| `--unsafe-discovery-best-effort-lifetime` | | off | Live discovery inside the Warden sandbox but without the kernel descendant-lifetime boundary — descendants can outlive the run and are reaped only best-effort. For macOS / Linux without writable cgroup v2. Conflicts with `--static-only` and `--unsafe-unsandboxed-discovery` |
 | `--static-only` | | **on** | Do not execute the server; inspect the binary only |
 | `--project <dir>` | | *(none)* | Analyze a project directory for permission hints (explicit dir or script parent only; no CWD fallback) |
 | `--self-test` | | off | After drafting, spawn the server **via Warden** (restricted env + private TMPDIR, 8s) and collect Auditor / Warden evidence. Auditor probes are `checker::check_request` (not a live proxy). Warden `pass` is Linux SIGSYS only. Spawn failure is `inconclusive`, not `skipped`. Reports a `probe-policy:` overlay distinct from the original draft. Draft aid only — does not auto-apply. Never uses `--unsafe-unsandboxed-discovery` |
@@ -1925,7 +1926,10 @@ mcp-writ check --policy policy.kdl
 # private TMPDIR; `MCP_WRIT_SKIP_SANDBOX=1` takes the same documented
 # downgrade here — the OS sandbox and descendant teardown step aside
 # while the restricted environment and private TMPDIR stay — so an
-# unreviewed server still belongs inside a throwaway VM or container)
+# unreviewed server still belongs inside a throwaway VM or container;
+# `--unsafe-discovery-best-effort-lifetime` is the narrower opt-out
+# that keeps the sandbox but waives only the descendant-lifetime
+# boundary — needed on macOS / Linux without writable cgroup v2)
 # for a fresh tools/list, and the argv also
 # re-checks that binary-hash/entrypoint-hash targets still bind the launch
 mcp-writ check --policy policy.kdl -- python server.py
