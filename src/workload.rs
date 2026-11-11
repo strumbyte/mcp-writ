@@ -242,6 +242,21 @@ fn expand_shebang_launch(argv0: &str, script: PathBuf) -> io::Result<LaunchResol
             ),
         ));
     }
+    // The interpreter's own arguments must leave the leaf as the
+    // executed payload — an eval flag, a shell option that reads
+    // commands from stdin, or an operand naming a different file runs
+    // outside the pinned boundary the same way a delegating launcher
+    // does, with the launch argv already carrying the redirection.
+    if let Err(e) = interpreter_args_keep_leaf(&argv0_spelling, &extra, &exe) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "shebang interpreter '{}' in '{}': {e}",
+                exe.display(),
+                script.display()
+            ),
+        ));
+    }
     // The interpreter must be the terminal exec image: if it carries its
     // own `#!` line the kernel selects yet another interpreter at exec
     // time — one this resolution never hashed or pinned, and the `#!`
@@ -373,12 +388,15 @@ pub(crate) fn env_command_spelling(arg: &str) -> Result<(String, Vec<String>), S
     }) {
         // GNU `env -S` processes quotes and escapes inside the string
         // before splitting — `'x y'`, `"x y"`, `\ ` and `\x` sequences
-        // join or alter the words a whitespace split produces. The
-        // parsing cannot be reproduced here, so a spelling carrying a
-        // quote or escape refuses rather than tokenize differently
-        // from what `env` would run.
-        if rest.contains(['\'', '"', '\\']) {
-            return Err("'env -S' with quotes or escapes cannot be modeled safely".to_string());
+        // join or alter the words a whitespace split produces — and an
+        // unquoted `#` starts a comment, so text past it never reaches
+        // argv at all. The parsing cannot be reproduced here, so a
+        // spelling carrying a quote, escape, or comment refuses rather
+        // than tokenize differently from what `env` would run.
+        if rest.contains(['\'', '"', '\\', '#']) {
+            return Err(
+                "'env -S' with quotes, escapes, or a comment cannot be modeled safely".to_string(),
+            );
         }
         let mut words = rest.split_whitespace();
         let Some(name) = words.next() else {
@@ -840,6 +858,88 @@ fn shell_cluster_is_eval(arg: &str) -> bool {
         }
     }
     false
+}
+
+/// A `-`-cluster carrying `s` or `i` before an operand letter makes the
+/// shell read commands from stdin instead of the file argv names — `-s`
+/// selects stdin as the command source, `-i` an interactive shell that
+/// reads it. Same cluster grammar as [`shell_cluster_is_eval`]:
+/// `-o`/`-O` absorb the token tail as their option operand and a
+/// non-option byte ends the run. `+` spellings *disable* the matching
+/// `-` option so they never reach here, and a bare `-` already fails
+/// the payload scan on its own.
+#[cfg(unix)]
+fn shell_cluster_reads_stdin(arg: &str, argv0: &str) -> bool {
+    if !is_shell_command(argv0) {
+        return false;
+    }
+    let Some(body) = arg.strip_prefix('-') else {
+        return false;
+    };
+    if body.is_empty() || body.starts_with('-') {
+        return false;
+    }
+    for ch in body.chars() {
+        match ch {
+            's' | 'i' => return true,
+            'o' | 'O' => return false,
+            _ if ch.is_ascii_alphabetic() => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Prove the interpreter's own arguments — a shebang's ONE optional
+/// argument, or the `env -S` words after the selected command — keep
+/// the leaf as the executed payload. They sit between the interpreter
+/// and the leaf in the argv the kernel builds, so an option that moves
+/// the command source executes something the launch never bound: an
+/// inline-eval flag runs argv text, a shell `-s`/`-i`/bare-`-` reads
+/// commands from stdin, an operand-position word names a different
+/// file, and an option spelling whose payload boundary cannot be
+/// resolved fails closed. `resolved` participates as the second
+/// grammar spelling the same way the launch model applies it —
+/// flags like `-e` that still run the leaf are preserved.
+#[cfg(unix)]
+pub(crate) fn interpreter_args_keep_leaf(
+    argv0: &str,
+    args: &[String],
+    resolved: &Path,
+) -> Result<(), String> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    let mut argv = Vec::with_capacity(args.len() + 2);
+    argv.push(argv0.to_string());
+    argv.extend(args.iter().cloned());
+    // Only the leaf's position matters to the boundary comparison —
+    // its spelling never reaches the option grammars.
+    argv.push(String::new());
+    let names = command_names(&argv, Some(resolved));
+    for a in args {
+        if names.is_inline_eval(a) {
+            return Err(format!(
+                "interpreter option '{a}' evaluates an argument string \
+                 instead of running the leaf"
+            ));
+        }
+        if names.any_is(|sp| shell_cluster_reads_stdin(a, sp)) {
+            return Err(format!(
+                "interpreter option '{a}' reads commands from stdin \
+                 instead of running the leaf"
+            ));
+        }
+    }
+    if let Some(flag) = payload_boundary_blocker_with_exe(&argv, Some(resolved)) {
+        return Err(format!(
+            "interpreter option '{flag}' leaves the executed target unresolvable"
+        ));
+    }
+    match first_payload_arg_index_with_exe(&argv, Some(resolved)) {
+        Some(i) if i == argv.len() - 1 => Ok(()),
+        _ => Err("interpreter arguments would run a different file than the leaf".to_string()),
+    }
 }
 
 /// Result of scanning argv for the payload boundary.

@@ -871,6 +871,24 @@ async fn run_image_inner(
         rec.guest_state = GuestReportState::Missing;
     }
 
+    // The Windows-guest CRT redistributables bind before the log-share
+    // overlap check: the lookup's eligible directories join the
+    // sensitive set below, and the staging step uses these already-bound
+    // bytes rather than re-reading a path the share could have
+    // rewritten in the meantime.
+    let crt_dlls = match &mounted_runner {
+        Some(runner) if layout.guest_os == TargetOs::Windows => {
+            crate::container::common::stage_crt_dlls(
+                layout,
+                &runner.analysis,
+                &rec.target.workload_arch,
+                &[],
+            )
+            .map_err(|e| e.to_string())?
+        }
+        _ => Vec::new(),
+    };
+
     // 3. Resolve optional log directory. The directory is pinned by an
     //    open handle plus platform identity — the path mounted into the
     //    guest must still name the verified object at launch, and its
@@ -933,6 +951,14 @@ async fn run_image_inner(
             if let Some(runner) = &mounted_runner {
                 sensitive.push(runner.artifact.source.clone());
             }
+            // Every eligible CRT lookup directory — present or not —
+            // is trusted input a later Windows-guest launch binds
+            // app-local: a writable share covering one plants DLLs a
+            // future runner stages, including names only that runner
+            // imports. The bound artifacts' sources name the bytes this
+            // launch itself approved.
+            sensitive.extend(crate::container::common::crt_lookup_dirs());
+            sensitive.extend(crt_dlls.iter().map(|dll| dll.source.clone()));
             push_current_exe(
                 &mut sensitive,
                 std::env::current_exe(), // nosemgrep: rust.lang.security.current-exe.current-exe
@@ -1011,14 +1037,7 @@ async fn run_image_inner(
             .stage_to(&stage.join(guest_name), true)
             .map_err(|e| format!("failed to stage validated runner: {e}"))?;
         if layout.guest_os == TargetOs::Windows {
-            for dll in crate::container::common::stage_crt_dlls(
-                layout,
-                &runner.analysis,
-                &rec.target.workload_arch,
-                &[],
-            )
-            .map_err(|e| e.to_string())?
-            {
+            for dll in &crt_dlls {
                 let name = dll.file_name();
                 if name.is_empty() {
                     return Err(format!("bad CRT DLL path '{}'", dll.source.display()).into());

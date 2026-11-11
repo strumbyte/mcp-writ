@@ -233,16 +233,29 @@ fn check_shebang_interpreter(
                  it selects what it execs at run time"
             )));
         }
-        if let Ok(canon_interp) = Path::new(interp).canonicalize()
-            && let Some((_, launcher)) =
-                crate::workload::delegating_launcher(&canon_interp.to_string_lossy())
+        let canon_interp = Path::new(interp).canonicalize().ok();
+        if let Some(ci) = &canon_interp
+            && let Some((_, launcher)) = crate::workload::delegating_launcher(&ci.to_string_lossy())
         {
             return Err(bad(format!(
                 "interpreter '{interp}' resolves to the '{launcher}' \
                  launcher ('{}') — it selects what it execs at run time",
-                canon_interp.display()
+                ci.display()
             )));
         }
+        // The kernel hands the interpreter its ONE optional argument
+        // between the interpreter and the leaf — it must leave the leaf
+        // as the executed payload: `sh -e` still runs it, while `sh -s`
+        // reads commands from the driver's stdin (null on availability
+        // probes, whatever the launch carries on real spawns) and an
+        // operand names a different file entirely.
+        let args: Vec<String> = opt_arg.iter().cloned().collect();
+        crate::workload::interpreter_args_keep_leaf(
+            interp,
+            &args,
+            canon_interp.as_deref().unwrap_or_else(|| Path::new(interp)),
+        )
+        .map_err(bad)?;
         return check_interpreter_path(canon, Path::new(interp), trust);
     }
     // `env` itself runs pre-containment — validate it — and then
@@ -279,16 +292,11 @@ fn check_shebang_interpreter(
         )));
     }
     // `env -S` words after the command reach the interpreter as argv
-    // before the leaf — `env -S sh /tmp/x` would have `sh` interpret
-    // an unvalidated file instead of the driver leaf. Options and
-    // operands cannot be told apart per interpreter, so any extra
-    // word refuses.
-    if !extra.is_empty() {
-        return Err(bad(format!(
-            "'env -S' arguments after '{name}' would reach the \
-             interpreter ahead of the validated leaf"
-        )));
-    }
+    // before the leaf — they must leave the leaf as the executed
+    // payload: `env -S sh -e` still runs it, while `env -S sh -s` reads
+    // commands from the driver's stdin and `env -S sh /tmp/x` has `sh`
+    // interpret an unvalidated file instead of the driver leaf.
+    crate::workload::interpreter_args_keep_leaf(&name, &extra, &resolved).map_err(bad)?;
     // A bare command name reaches `env` through PATH at check time and
     // reaches it through the child's PATH again at exec — the child's
     // PATH may select a different file than the one just validated.
@@ -1390,6 +1398,51 @@ mod tests {
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         let err = validate_driver_path(&exe).unwrap_err();
         assert!(err.contains("arguments"), "{err}");
+    }
+
+    /// A shell option that moves the command source off the leaf
+    /// refuses — `sh -s` reads commands from the driver's stdin (null
+    /// on availability probes, launch data on real spawns) and the
+    /// same `-S` shape through `env` must fail identically. Options
+    /// that still run the leaf (`-e`) stay valid on both paths.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_stdin_reading_option_refuses() {
+        let Some(sh) = crate::workload::search_path("sh") else {
+            return; // no `sh` on PATH here — nothing to assert
+        };
+        if crate::workload::shebang_line(&sh).is_some() {
+            return; // this host's `sh` is a script — refusals stay correct
+        }
+        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for line in [
+            format!("#!{} -s\n", sh.display()),
+            format!("#!/usr/bin/env -S {} -s\n", sh.display()),
+            format!("#!/usr/bin/env -S {} -si\n", sh.display()),
+            format!("#!/usr/bin/env -S {} /tmp/x\n", sh.display()),
+        ] {
+            let exe = dir.path().join("tool");
+            std::fs::write(&exe, line.as_bytes()).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let err = validate_driver_path(&exe).unwrap_err();
+            assert!(
+                err.contains("stdin") || err.contains("different file"),
+                "shebang '{line}' must refuse an option moving the command source: {err}"
+            );
+        }
+        for line in [
+            format!("#!{} -e\n", sh.display()),
+            format!("#!/usr/bin/env -S {} -e\n", sh.display()),
+        ] {
+            let exe = dir.path().join("tool");
+            std::fs::write(&exe, line.as_bytes()).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                validate_driver_path(&exe).is_ok(),
+                "shebang '{line}' keeps the leaf as the executed target and must validate"
+            );
+        }
     }
 
     /// `env` execs a command spelling containing a separator against

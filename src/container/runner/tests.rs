@@ -437,6 +437,67 @@ fn log_share_refuses_artifact_spelling_dotdot_across_link() {
     assert!(!log_share_conflicts_artifact(&log_resolved, &runner));
 }
 
+/// Windows spelling of the chained-share-link refusal: the canonical
+/// share root carries the `\\?\` verbatim prefix while `read_link`
+/// hands the traversal the target's stored — plain — spelling, so
+/// containment must compare normalized forms rather than the stored
+/// prefixes. (Win32 collapses `..` lexically before following links,
+/// so the `..` traversal shape from the unix tests does not exist
+/// here.) Directory symlinks need privilege; the test skips honestly
+/// when the host cannot create them.
+#[cfg(windows)]
+#[test]
+fn log_share_refuses_artifact_through_plain_spelled_share_link() {
+    use std::os::windows::fs::symlink_dir;
+    let dir = tempfile::tempdir().unwrap();
+    let share = dir.path().join("share");
+    let aparent = dir.path().join("aparent");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&aparent).unwrap();
+    std::fs::create_dir_all(&real).unwrap();
+    let runner = real.join("mcp-secure-runner");
+    std::fs::write(&runner, b"MZ").unwrap();
+    let log_resolved = std::fs::canonicalize(&share).unwrap();
+    // Canonical-but-plain spellings for the link targets — the spelled
+    // `dir.path()` may carry short names the canonical root does not,
+    // so the fixture spells the canonical components without the
+    // `\\?\` prefix: exactly the plain-vs-verbatim mismatch the
+    // containment fold must normalize.
+    let plain = |p: &std::path::Path| {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{rest}"));
+        }
+        std::path::PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+    };
+    let plain_share = plain(&log_resolved);
+    let plain_real = plain(&std::fs::canonicalize(&real).unwrap());
+    // `a_link` lands on a share-local link whose own target resolves
+    // outside — `read_link` returns the *plain* `C:\…` spelling the
+    // link was created with, under a `\\?\`-prefixed share root.
+    if symlink_dir(&plain_real, plain_share.join("L2")).is_err()
+        || symlink_dir(plain_share.join("L2"), aparent.join("a_link")).is_err()
+    {
+        eprintln!(
+            "skipping: directory symlink creation needs privilege \
+             (developer mode or SeCreateSymbolicLinkPrivilege)"
+        );
+        return;
+    }
+    let spelled = aparent.join("a_link").join("mcp-secure-runner");
+
+    // Sanity: the spelled path resolves outside the share — yet the
+    // traversal touched the repointable `share\L2` hop to get there.
+    let resolved = std::fs::canonicalize(&spelled).unwrap();
+    assert!(!resolved.starts_with(&log_resolved));
+    assert!(
+        log_share_conflicts_artifact(&log_resolved, &spelled),
+        "a traversal through a share-local link must conflict"
+    );
+    assert!(!log_share_conflicts_artifact(&log_resolved, &runner));
+}
+
 /// The plain overlap directions still hold: an artifact inside the
 /// share refuses, an unrelated path stays clean, and a share inside a
 /// sensitive ancestor refuses.
