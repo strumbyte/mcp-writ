@@ -554,6 +554,13 @@ async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
     std::fs::copy(project_dir.join("Cargo.lock"), temp_dir.join("Cargo.lock"))
         .map_err(|e| format!("copy Cargo.lock: {e}"))?;
 
+    // The root manifest lists `fuzz` as a workspace member, so its
+    // manifest (and the target sources it points at) must exist in the
+    // context or cargo fails workspace resolution before compiling.
+    let fuzz_dir = temp_dir.join("fuzz");
+    std::fs::create_dir_all(&fuzz_dir).map_err(|e| format!("mkdir fuzz: {e}"))?;
+    copy_dir_recursive(&project_dir.join("fuzz"), &fuzz_dir)?;
+
     // Write Dockerfile — `+crt-static` on the GNU target produces a
     // statically linked (static-pie) runner, which the guest launch path
     // (`analyze_runner_binary`) requires of `--runner-binary`. musl is
@@ -563,6 +570,7 @@ WORKDIR /build
 COPY vendor/ /vendor/
 COPY src/ src/
 COPY examples/ examples/
+COPY fuzz/ fuzz/
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p .cargo && \
     printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "/vendor"\n' > .cargo/config.toml && \
