@@ -68,7 +68,8 @@ for discovery, retries, and `inputResponses` handling.
 ## Supported targets
 
 The CLI itself builds and runs on Windows, Linux, and macOS on x86-64 and
-ARM64; the release workflow builds archives for all six combinations.
+ARM64; the release workflow ships archives for five combinations — macOS
+arm64 only (x86-64 macOS builds from source).
 Sandbox enforcement is OS-specific — see
 [Security boundaries](#security-boundaries).
 

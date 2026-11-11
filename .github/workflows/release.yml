@@ -255,9 +255,12 @@ jobs:
             target/x86_64-pc-windows-msvc/release/mcp-writ-wsb-relay.exe
 
   # ---------------------------------------------------------------------------
-  # Build mcp-writ CLI for all 6 platforms
+  # Build mcp-writ CLI for all 5 platforms
   # Linux-specific deps (landlock, seccompiler) are behind #[cfg(target_os = "linux")]
   # so they are only compiled for Linux targets.
+  # darwin-amd64 was dropped when GitHub retired the last Intel macOS
+  # runner image (macos-14, 2026-11-02): the CLI still builds and runs on
+  # x86-64 macOS, but x86-64 macOS users build from source.
   # ---------------------------------------------------------------------------
   build-writ:
     needs: [version-check, release-gate, verify, platform-tests, container-tests, go-runtime]
@@ -273,11 +276,6 @@ jobs:
             arch: arm64
             runner: macos-latest
             target: aarch64-apple-darwin
-            use_cross: false
-          - os: darwin
-            arch: amd64
-            runner: macos-14
-            target: x86_64-apple-darwin
             use_cross: false
           - os: linux
             arch: amd64
@@ -325,13 +323,6 @@ jobs:
       - name: Build (cross)
         if: matrix.use_cross
         run: cross build --locked --release --bin mcp-writ --target ${{ matrix.target }}
-
-      - name: Verify macOS x86_64 artifact
-        if: matrix.os == 'darwin' && matrix.arch == 'amd64'
-        shell: bash
-        run: |
-          file "target/${{ matrix.target }}/release/mcp-writ"
-          arch -x86_64 "target/${{ matrix.target }}/release/mcp-writ" --help
 
       - name: Determine binary name
         id: binary
@@ -425,7 +416,6 @@ jobs:
           }
 
           package darwin-arm64  mcp-writ     arm64 tar.gz
-          package darwin-amd64  mcp-writ     amd64 tar.gz
           package linux-arm64   mcp-writ     arm64 tar.gz
           package linux-amd64   mcp-writ     amd64 tar.gz
           package windows-arm64 mcp-writ.exe arm64 zip
@@ -454,7 +444,6 @@ jobs:
           generate_release_notes: true
           files: |
             mcp-writ-darwin-arm64.tar.gz
-            mcp-writ-darwin-amd64.tar.gz
             mcp-writ-linux-arm64.tar.gz
             mcp-writ-linux-amd64.tar.gz
             mcp-writ-windows-arm64.zip
