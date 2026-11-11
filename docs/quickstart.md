@@ -84,10 +84,14 @@ stays fail-closed until you add `allow` entries for your own data root
 sandbox — restricted environment, deny-all egress, private TMPDIR,
 command-tree filesystem grants, secret overlay — queries `tools/list`,
 and writes a standalone draft policy carrying the discovered
-`tools-list-hash` — it does not read `policy.kdl`. Two explicit
+`tools-list-hash` — it does not read `policy.kdl`. Three explicit
 downgrades exist: `--unsafe-unsandboxed-discovery` runs the server with
 the ambient environment (keep unreviewed servers inside a throwaway VM
-or container there), and `MCP_WRIT_SKIP_SANDBOX` drops the OS sandbox
+or container there), `--unsafe-discovery-best-effort-lifetime` keeps
+the sandbox but waives only the kernel descendant-lifetime boundary —
+descendants may outlive the discovery run and their cleanup is only
+best-effort — the narrower opt-out for macOS / Linux without writable
+cgroup v2 — and `MCP_WRIT_SKIP_SANDBOX` drops the OS sandbox
 and the Warden's descendant teardown while keeping the restricted
 environment and private TMPDIR — surviving descendant processes are
 not cleaned up, so do not rely on this downgrade to reap them:

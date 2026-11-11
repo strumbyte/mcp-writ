@@ -286,6 +286,263 @@ async fn default_container_isolation_passes_the_gate() {
     );
 }
 
+/// The resolved runner source sits outside the log share when its
+/// configured spelling traverses a share-local symlink — the spelled
+/// comparison must still refuse, since the workload can repoint the
+/// link and seize the location the next launch resolves.
+#[cfg(unix)]
+#[test]
+fn log_share_refuses_runner_spelled_through_share_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let share = dir.path().join("share");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&real).unwrap();
+    let runner = real.join("mcp-secure-runner");
+    std::fs::write(&runner, b"#!").unwrap();
+    std::os::unix::fs::symlink(&real, share.join("runner-parent")).unwrap();
+    let spelled = share.join("runner-parent").join("mcp-secure-runner");
+    let log_resolved = std::fs::canonicalize(&share).unwrap();
+
+    // Sanity: the spelled path resolves outside the share — only the
+    // spelled-chain comparison catches the overlap.
+    let resolved = std::fs::canonicalize(&spelled).unwrap();
+    assert!(!resolved.starts_with(&log_resolved));
+    assert!(
+        log_share_conflicts_artifact(&log_resolved, &spelled),
+        "a runner spelled through a share-local symlink must conflict"
+    );
+    // The real object itself is honestly outside the share — clean.
+    assert!(!log_share_conflicts_artifact(&log_resolved, &runner));
+}
+
+/// A two-link chain — `outside/alias` → `share/runner-parent` →
+/// `real` — hides the share-local hop behind an outside spelling: the
+/// final object and every lexical ancestor sit outside the share, so
+/// only the intermediate-hop comparison catches that resolution
+/// traverses a link the workload can repoint.
+#[cfg(unix)]
+#[test]
+fn log_share_refuses_artifact_resolved_through_chained_share_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let share = dir.path().join("share");
+    let outside = dir.path().join("outside");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(&real).unwrap();
+    let runner = real.join("mcp-secure-runner");
+    std::fs::write(&runner, b"#!").unwrap();
+    let log_resolved = std::fs::canonicalize(&share).unwrap();
+    // The chain is spelled through the *resolved* share so the hop
+    // location comparison holds wherever the tempdir itself is linked.
+    std::os::unix::fs::symlink(&real, log_resolved.join("runner-parent")).unwrap();
+    std::os::unix::fs::symlink(log_resolved.join("runner-parent"), outside.join("alias")).unwrap();
+    let spelled = outside.join("alias").join("mcp-secure-runner");
+
+    // Sanity: the spelled path resolves outside the share and names no
+    // share path lexically — the traversed hop is the only tell.
+    let resolved = std::fs::canonicalize(&spelled).unwrap();
+    assert!(!resolved.starts_with(&log_resolved));
+    assert!(
+        log_share_conflicts_artifact(&log_resolved, &spelled),
+        "an artifact whose resolution traverses a share-local link must conflict"
+    );
+    assert!(!log_share_conflicts_artifact(&log_resolved, &runner));
+}
+
+/// A hop target's own parent hides the share traversal: the alias
+/// points at `mid/runner-parent`, and `mid` resolves through the
+/// share-local link `x`. Resolving the hop's parent to its final
+/// object misses the intermediate — only walking each hop component's
+/// own link chain sees the repointable link the workload controls.
+#[cfg(unix)]
+#[test]
+fn log_share_refuses_artifact_whose_hop_parent_chains_through_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let share = dir.path().join("share");
+    let outside = dir.path().join("outside");
+    let mid_parent = dir.path().join("mid-parent");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(&mid_parent).unwrap();
+    std::fs::create_dir_all(real.join("runner-parent")).unwrap();
+    let runner = real.join("runner-parent").join("mcp-secure-runner");
+    std::fs::write(&runner, b"#!").unwrap();
+    let log_resolved = std::fs::canonicalize(&share).unwrap();
+    // `mid` is an outside-spelled link whose target is a *link inside
+    // the share*: the hop's parent path traverses a chain the workload
+    // can repoint while every fully-resolved comparison lands outside.
+    std::os::unix::fs::symlink(&real, log_resolved.join("x")).unwrap();
+    std::os::unix::fs::symlink(log_resolved.join("x"), mid_parent.join("mid")).unwrap();
+    std::os::unix::fs::symlink(
+        mid_parent.join("mid").join("runner-parent"),
+        outside.join("alias"),
+    )
+    .unwrap();
+    let spelled = outside.join("alias").join("mcp-secure-runner");
+
+    // Sanity: the spelled path resolves outside the share and names no
+    // share path lexically — the hop's ancestor chain is the only tell.
+    let resolved = std::fs::canonicalize(&spelled).unwrap();
+    assert!(!resolved.starts_with(&log_resolved));
+    assert!(
+        log_share_conflicts_artifact(&log_resolved, &spelled),
+        "an artifact whose hop parent traverses a share-local link must conflict"
+    );
+    assert!(!log_share_conflicts_artifact(&log_resolved, &runner));
+}
+
+/// A `..` component is applied to the *resolved* prefix, not the
+/// spelled one: `a_link/../x` collapses to `x` lexically and drops the
+/// link from the spelled path entirely, but the filesystem resolves
+/// `a_link` first — through a share-local link — so the traversal
+/// still crosses a hop the workload can repoint.
+#[cfg(unix)]
+#[test]
+fn log_share_refuses_artifact_spelling_dotdot_across_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let share = dir.path().join("share");
+    let aparent = dir.path().join("aparent");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&aparent).unwrap();
+    std::fs::create_dir_all(real.join("y")).unwrap();
+    std::fs::create_dir_all(real.join("x")).unwrap();
+    let runner = real.join("x").join("mcp-secure-runner");
+    std::fs::write(&runner, b"#!").unwrap();
+    let log_resolved = std::fs::canonicalize(&share).unwrap();
+    // `a_link` resolves through the share-local link `L2` to `real/y`;
+    // the spelled `..` then pops `y`, landing the artifact in `real/x`
+    // — outside — while the traversal touched `share/L2` all along.
+    std::os::unix::fs::symlink(real.join("y"), log_resolved.join("L2")).unwrap();
+    std::os::unix::fs::symlink(log_resolved.join("L2"), aparent.join("a_link")).unwrap();
+    let spelled = aparent
+        .join("a_link")
+        .join("..")
+        .join("x")
+        .join("mcp-secure-runner");
+
+    // Sanity: the spelled path resolves outside the share, and its
+    // lexical collapse drops every share-bearing component.
+    let resolved = std::fs::canonicalize(&spelled).unwrap();
+    assert!(!resolved.starts_with(&log_resolved));
+    let collapsed = crate::fsoverlap::absolutize_lexical(&spelled);
+    assert!(!collapsed.starts_with(&log_resolved));
+    assert!(
+        log_share_conflicts_artifact(&log_resolved, &spelled),
+        "a `..` traversal through a share-local link must conflict"
+    );
+    assert!(!log_share_conflicts_artifact(&log_resolved, &runner));
+}
+
+/// Windows spelling of the chained-share-link refusal: the canonical
+/// share root carries the `\\?\` verbatim prefix while `read_link`
+/// hands the traversal the target's stored — plain — spelling, so
+/// containment must compare normalized forms rather than the stored
+/// prefixes. (Win32 collapses `..` lexically before following links,
+/// so the `..` traversal shape from the unix tests does not exist
+/// here.) Directory symlinks need privilege; the test skips honestly
+/// when the host cannot create them.
+#[cfg(windows)]
+#[test]
+fn log_share_refuses_artifact_through_plain_spelled_share_link() {
+    use std::os::windows::fs::symlink_dir;
+    let dir = tempfile::tempdir().unwrap();
+    let share = dir.path().join("share");
+    let aparent = dir.path().join("aparent");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&aparent).unwrap();
+    std::fs::create_dir_all(&real).unwrap();
+    let runner = real.join("mcp-secure-runner");
+    std::fs::write(&runner, b"MZ").unwrap();
+    let log_resolved = std::fs::canonicalize(&share).unwrap();
+    // Canonical-but-plain spellings for the link targets — the spelled
+    // `dir.path()` may carry short names the canonical root does not,
+    // so the fixture spells the canonical components without the
+    // `\\?\` prefix: exactly the plain-vs-verbatim mismatch the
+    // containment fold must normalize.
+    let plain = |p: &std::path::Path| {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{rest}"));
+        }
+        std::path::PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+    };
+    let plain_share = plain(&log_resolved);
+    let plain_real = plain(&std::fs::canonicalize(&real).unwrap());
+    // `a_link` lands on a share-local link whose own target resolves
+    // outside — `read_link` returns the *plain* `C:\…` spelling the
+    // link was created with, under a `\\?\`-prefixed share root.
+    if symlink_dir(&plain_real, plain_share.join("L2")).is_err()
+        || symlink_dir(plain_share.join("L2"), aparent.join("a_link")).is_err()
+    {
+        eprintln!(
+            "skipping: directory symlink creation needs privilege \
+             (developer mode or SeCreateSymbolicLinkPrivilege)"
+        );
+        return;
+    }
+    let spelled = aparent.join("a_link").join("mcp-secure-runner");
+
+    // Sanity: the spelled path resolves outside the share — yet the
+    // traversal touched the repointable `share\L2` hop to get there.
+    let resolved = std::fs::canonicalize(&spelled).unwrap();
+    assert!(!resolved.starts_with(&log_resolved));
+    assert!(
+        log_share_conflicts_artifact(&log_resolved, &spelled),
+        "a traversal through a share-local link must conflict"
+    );
+    assert!(!log_share_conflicts_artifact(&log_resolved, &runner));
+}
+
+/// The plain overlap directions still hold: an artifact inside the
+/// share refuses, an unrelated path stays clean, and a share inside a
+/// sensitive ancestor refuses.
+#[test]
+fn log_share_overlap_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let share = dir.path().join("share");
+    std::fs::create_dir_all(&share).unwrap();
+    let log_resolved = std::fs::canonicalize(&share).unwrap();
+
+    assert!(log_share_conflicts_artifact(
+        &log_resolved,
+        &share.join("policy.kdl")
+    ));
+    assert!(log_share_conflicts_artifact(&log_resolved, dir.path()));
+    assert!(!log_share_conflicts_artifact(
+        &log_resolved,
+        &dir.path().join("elsewhere")
+    ));
+}
+
+/// An unavailable `current_exe` (`/proc/self/exe` unreadable, a
+/// renamed-away image) must abort the launch — the overlap check
+/// cannot prove the running image is outside the share.
+#[test]
+fn current_exe_failure_aborts_launch() {
+    let mut sensitive = Vec::new();
+    let err = push_current_exe(
+        &mut sensitive,
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no /proc/self/exe",
+        )),
+    )
+    .expect_err("an unavailable executable path must abort");
+    assert!(err.contains("cannot establish"), "{err}");
+    assert!(sensitive.is_empty());
+
+    // The success path keeps the resolved image in the sensitive set —
+    // any `Ok` path exercises it; the host executable's own location
+    // is not what is under test.
+    push_current_exe(&mut sensitive, Ok(PathBuf::from("mcp-writ"))).unwrap();
+    assert_eq!(sensitive.len(), 1);
+}
+
 #[test]
 fn test_image_ref_is_digest_pinned() {
     assert!(image_ref_is_digest_pinned(

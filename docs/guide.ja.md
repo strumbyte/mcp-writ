@@ -497,6 +497,7 @@ mcp-writ generate-policy [OPTIONS] -- <mcp-server-command> [args...]
 | `--verbose` | `-v` | off | ログの詳細レベルを上げる |
 | `--live-discovery` | | off | MCP サーバーを Warden サンドボックス内で実行してツールを検出する（制限環境・deny-all egress・private TMPDIR。デフォルトではない） |
 | `--unsafe-unsandboxed-discovery` | | off | OS サンドボックス無し・周囲の環境のままライブ検出する — 明示的なダウングレード |
+| `--unsafe-discovery-best-effort-lifetime` | | off | Warden サンドボックス内でライブ検出するが、カーネルの子孫プロセス寿命境界だけを外す — 子孫が残存し得る（回収は best-effort）。macOS / writable cgroup v2 の無い Linux 向けの中間ダウングレード。`--static-only`・`--unsafe-unsandboxed-discovery` とは併用不可 |
 | `--static-only` | | **on** | サーバーを実行せず、バイナリ検査のみ |
 | `--project <dir>` | | *（なし）* | 権限ヒントのためにプロジェクトディレクトリを解析する（明示ディレクトリまたはスクリプトの親のみ。CWD フォールバックなし） |
 | `--self-test` | | off | 草案のあと、サーバーを **Warden 経由**で起動し（制限付き環境と専用 TMPDIR、8 秒）、Auditor / Warden の証拠を集める。Auditor プローブは `checker::check_request`（実プロキシではない）。Warden `pass` は Linux の SIGSYS のみ。起動失敗は `inconclusive` であり `skipped` ではない。`probe-policy:` で診断用 overlay と元ドラフトを区別する。ドラフト補助のみ — ポリシーは自動適用しない。`--unsafe-unsandboxed-discovery` は使わない |
@@ -1019,7 +1020,9 @@ mcp-writ check --policy policy.kdl
 # `MCP_WRIT_SKIP_SANDBOX=1` は同じダウングレードを取り、OS
 # サンドボックスと子孫プロセスの寿命管理が外れて制限環境と専用
 # TMPDIR は残る — 未レビューのサーバーは使い捨ての VM やコンテナ
-# の中で扱うこと）で spawn
+# の中で扱うこと。`--unsafe-discovery-best-effort-lifetime` は
+# サンドボックスを維持したまま寿命境界だけを外す、より狭い
+# opt-out — macOS / writable cgroup v2 の無い Linux で必要）で spawn
 # して新しい tools/list を pin と照合し、さらに binary-hash /
 # entrypoint-hash の target がその起動を束縛するかも再検査する
 mcp-writ check --policy policy.kdl -- python server.py
@@ -1997,7 +2000,7 @@ capability matrix にはまだ `adopted` でない opt-in の egress 経路が 3
 - **`plan`／`report`／JSONL の一致。** `plan`、起動 `--report`、監査ストリームが同じ起動について同じ制御を記述すること — 制御 id は capability-matrix 行と一致し、`not_applied` は主張せず開示する。
 - **限界の文書化開示。** `capability-matrix.json` の `deficiencies`/`select`/`refuse` 行が残存する開口部をすべて挙げていること — レビューで再発見されるものを残さない。
 
-現時点（v0.5.1）の充足状況:
+現時点（v0.5.2）の充足状況:
 
 | 経路 | matrix | 記録済み範囲 | 境界ファジング | `adopted` に欠けるもの |
 |---|---|---|---|---|

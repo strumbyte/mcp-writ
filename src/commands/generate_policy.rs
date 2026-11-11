@@ -34,11 +34,14 @@ pub async fn run_generate_policy(args: GenPolicyArgs) {
             "WARNING: generate-policy executes the MCP server to discover tools. \
              The server runs inside the Warden sandbox (restricted environment, \
              deny-all egress, private TMPDIR). Use --static-only to skip execution, \
-             or --unsafe-unsandboxed-discovery to run it without the sandbox and \
-             inherit the ambient environment."
+             --unsafe-discovery-best-effort-lifetime to keep the sandbox but waive \
+             the kernel descendant-lifetime boundary on hosts that cannot provide \
+             one, or --unsafe-unsandboxed-discovery to run it without the sandbox \
+             and inherit the ambient environment."
         );
         let opts = crate::legislator::tools_list::DiscoveryOptions {
             restrict_environment: !args.unsafe_unsandboxed_discovery,
+            allow_best_effort_lifetime: args.unsafe_discovery_best_effort_lifetime,
         };
         Some(
             crate::legislator::tools_list::fetch_tools_list_detailed_with(
@@ -120,8 +123,9 @@ pub async fn run_generate_policy(args: GenPolicyArgs) {
     }
 
     // Self-test is opt-in. Spawn is always Warden-backed with a restricted
-    // environment. Discovery's --unsafe-unsandboxed-discovery is never reused.
+    // environment. Discovery's unsafe opt-outs are never reused.
     let _ = args.unsafe_unsandboxed_discovery;
+    let _ = args.unsafe_discovery_best_effort_lifetime;
     match crate::legislator::self_test::run_self_test(
         &policy_kdl,
         &args.command,

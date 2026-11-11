@@ -14,13 +14,29 @@ use std::path::{Component, Path, PathBuf};
 /// True when `grant` is `target` or an ancestor of it — a write grant
 /// on `grant` reaches `target`. Component-wise comparison, so
 /// `/var/log/audit` never covers `/var/log/audit.jsonl`; on Windows the
-/// fold is case-insensitive (the filesystem is).
+/// fold is case-insensitive (the filesystem is) and normalizes a
+/// leading `\\?\`/`\\?\UNC\` verbatim prefix — a canonicalized path and
+/// its plain spelling name the same object, so comparing only the
+/// stored form would miss containment whenever one side is verbatim
+/// and the other is not.
 pub fn path_covers(grant: &Path, target: &Path) -> bool {
     #[cfg(target_os = "windows")]
     {
         let fold = |p: &Path| {
             p.components()
-                .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                .enumerate()
+                .map(|(i, c)| {
+                    let s = c.as_os_str().to_string_lossy().to_lowercase();
+                    if i == 0 {
+                        // `\\?\UNC\srv\shr` ≡ `\\srv\shr`, `\\?\C:` ≡ `C:`.
+                        if let Some(rest) = s.strip_prefix(r"\\?\unc\") {
+                            return format!(r"\\{rest}");
+                        }
+                        s.strip_prefix(r"\\?\").map(String::from).unwrap_or(s)
+                    } else {
+                        s
+                    }
+                })
                 .collect::<Vec<_>>()
         };
         let g = fold(grant);

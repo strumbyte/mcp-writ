@@ -230,11 +230,21 @@ async fn check_tools_list_match_and_mismatch() {
         return;
     }
     let argv = common::python3_script_argv("tests/fixtures/mcp_servers/mcp_2025_11_25.py");
-    let fetched = mcp_writ::legislator::tools_list::fetch_tools_list(&argv, None)
-        .await
-        .expect("fixture tools/list fetch");
-    let digest =
-        mcp_writ::verifier::tools_diff::hash_tools_list(&fetched).expect("hash fetched tools list");
+    // Fixture fetches waive the descendant-lifetime boundary so hosts
+    // without a writable cgroup v2 hierarchy (or macOS) still exercise
+    // the fetch — the production default stays strict.
+    let fetched = mcp_writ::legislator::tools_list::fetch_tools_list_detailed_with(
+        &argv,
+        None,
+        &mcp_writ::legislator::tools_list::DiscoveryOptions {
+            allow_best_effort_lifetime: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("fixture tools/list fetch");
+    let digest = mcp_writ::verifier::tools_diff::hash_tools_list(&fetched.tools)
+        .expect("hash fetched tools list");
 
     let dir = common::real_tempdir();
     let policy = write_policy(
@@ -242,7 +252,12 @@ async fn check_tools_list_match_and_mismatch() {
         &format!("server \"svc\" {{\n    tool \"probe\"\n    tools-list-hash \"{digest}\"\n}}\n"),
     );
     // check options first, then `-- <command>` as the tools/list source.
-    let mut args = vec!["--policy".into(), policy_arg(&policy), "--".into()];
+    let mut args = vec![
+        "--policy".into(),
+        policy_arg(&policy),
+        "--unsafe-discovery-best-effort-lifetime".into(),
+        "--".into(),
+    ];
     args.extend(argv.iter().cloned());
 
     let out = run_check(&args).await;
@@ -260,7 +275,12 @@ async fn check_tools_list_match_and_mismatch() {
             "f".repeat(64)
         ),
     );
-    let mut args = vec!["--policy".into(), policy_arg(&bad), "--".into()];
+    let mut args = vec![
+        "--policy".into(),
+        policy_arg(&bad),
+        "--unsafe-discovery-best-effort-lifetime".into(),
+        "--".into(),
+    ];
     args.extend(argv.iter().cloned());
     let out = run_check(&args).await;
     assert_eq!(out.status.code(), Some(1));

@@ -93,6 +93,19 @@ pub(super) fn parse_check_args(
         missing_value.get_or_insert_with(|| "--report requires a file path".to_string());
     }
 
+    // --unsafe-discovery-best-effort-lifetime: the tools/list respawn
+    // stays sandboxed but need not carry a kernel descendant-lifetime
+    // boundary — for hosts (macOS, cgroup-less Linux) that cannot
+    // provide one.
+    args.unsafe_discovery_best_effort_lifetime =
+        noargs::flag("unsafe-discovery-best-effort-lifetime")
+            .doc(
+                "Run the tools/list respawn inside the sandbox but without requiring \
+                 a kernel descendant-lifetime boundary (best-effort child cleanup)",
+            )
+            .take(&mut raw)
+            .is_present();
+
     // -v / --verbose
     args.verbose = if noargs::flag("verbose")
         .short('v')

@@ -174,6 +174,12 @@ pub struct CheckArgs {
     /// `--report <path>` — write the check result JSON here instead of
     /// stdout. A write failure is the `error` status (exit 1).
     pub report: Option<PathBuf>,
+    /// `--unsafe-discovery-best-effort-lifetime` — the `-- <command>`
+    /// respawn stays inside the Warden sandbox but is not required to
+    /// carry a kernel descendant-lifetime boundary; on hosts that
+    /// cannot provide one the fetch runs with best-effort child
+    /// cleanup instead of refusing.
+    pub unsafe_discovery_best_effort_lifetime: bool,
     pub verbose: u8,
     /// Trailing `-- <command>` — the server's launch argv. The server
     /// is spawned exactly like `generate-policy` live discovery —
@@ -275,6 +281,13 @@ pub struct GenPolicyArgs {
     pub policy_version: u32,
     pub static_only: bool,
     pub unsafe_unsandboxed_discovery: bool,
+    /// `--unsafe-discovery-best-effort-lifetime` — tools/list discovery
+    /// stays inside the Warden sandbox (restricted environment,
+    /// deny-all egress, confined fs surface, private TMPDIR) but the
+    /// spawn is not required to carry a kernel descendant-lifetime
+    /// boundary; on macOS or cgroup-less Linux the probe runs with
+    /// best-effort child cleanup. Implies `--live-discovery`.
+    pub unsafe_discovery_best_effort_lifetime: bool,
     pub self_test: bool,
     pub project_dir: Option<PathBuf>,
     pub command: Vec<String>,

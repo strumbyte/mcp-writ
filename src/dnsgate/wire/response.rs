@@ -732,7 +732,15 @@ pub(crate) fn parse_response(buf: &[u8], forwarded_name: &str) -> ParsedResponse
             // the caller SERVFAILs rather than relay a partial read.
             RRTYPE_CNAME => match decode_name(buf, rr.rdata_off, true) {
                 Some((target, end)) if end <= rr.rdata_off + rr.rdata_len => {
-                    cnames.push((owner, canonical_name(&target), rr.ttl));
+                    let target = canonical_name(&target);
+                    // The relay ships this record whether or not the
+                    // chain walk reaches its owner — an unrelated
+                    // owner's alias still names a destination the name
+                    // policy never sees. Feed both ends through the
+                    // deny sets so it cannot smuggle a denied target.
+                    out.extra_names.push(owner.clone());
+                    out.extra_names.push(target.clone());
+                    cnames.push((owner, target, rr.ttl));
                 }
                 _ => {
                     decoded = false;
@@ -741,7 +749,10 @@ pub(crate) fn parse_response(buf: &[u8], forwarded_name: &str) -> ParsedResponse
             },
             RRTYPE_DNAME => match decode_name(buf, rr.rdata_off, true) {
                 Some((target, end)) if end <= rr.rdata_off + rr.rdata_len => {
-                    dnames.push((owner, canonical_name(&target), rr.ttl));
+                    let target = canonical_name(&target);
+                    out.extra_names.push(owner.clone());
+                    out.extra_names.push(target.clone());
+                    dnames.push((owner, target, rr.ttl));
                 }
                 _ => {
                     decoded = false;
@@ -849,6 +860,30 @@ pub(crate) fn parse_response(buf: &[u8], forwarded_name: &str) -> ParsedResponse
                 break;
             }
             _ => {}
+        }
+    }
+
+    // One owner carrying two *different* alias targets is malformed
+    // wire data — an owner may hold exactly one CNAME and one
+    // applicable DNAME — and following only the first would relay the
+    // rest unjudged while a downstream resolver might pick either.
+    // Fail closed like every other undecodable shape. Identical
+    // duplicate targets are tolerated (some upstreams emit them);
+    // two same-owner DNAMEs with different targets are refused too,
+    // while DNAMEs at different owners stay the RFC-longest-match
+    // selection `dname_target` performs.
+    if decoded {
+        for aliases in [&cnames, &dnames] {
+            let mut selected: std::collections::HashMap<&str, &str> =
+                std::collections::HashMap::new();
+            for (owner, target, _) in aliases {
+                if selected
+                    .insert(owner.as_str(), target.as_str())
+                    .is_some_and(|prev| prev != target.as_str())
+                {
+                    decoded = false;
+                }
+            }
         }
     }
 

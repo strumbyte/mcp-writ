@@ -252,12 +252,29 @@ pub struct DiscoveryOptions {
     /// downgrade: ambient environment, no OS sandbox. It is a
     /// documented trust decision, not a silent fallback.
     pub restrict_environment: bool,
+    /// `false` (default) — the sandboxed spawn must carry a kernel
+    /// descendant-lifetime boundary (a private cgroup on Linux, the
+    /// Job Object on Windows); a host that cannot provide one — macOS,
+    /// or a Linux launch without a writable cgroup v2 hierarchy —
+    /// refuses rather than run unbounded.
+    ///
+    /// `true` — the explicit `--unsafe-discovery-best-effort-lifetime`
+    /// downgrade: discovery still runs inside the Warden (restricted
+    /// environment, deny-all egress, confined fs surface, private
+    /// TMPDIR) but the spawn is not required to carry the boundary.
+    /// Descendant cleanup then relies on `RunningChild`'s best-effort
+    /// process-tree sweep, which a `clone`/`setsid`/reparent sequence
+    /// escapes. A documented trust decision, never a silent fallback —
+    /// and meaningless with `restrict_environment: false`, where no
+    /// boundary exists at all.
+    pub allow_best_effort_lifetime: bool,
 }
 
 impl Default for DiscoveryOptions {
     fn default() -> Self {
         Self {
             restrict_environment: true,
+            allow_best_effort_lifetime: false,
         }
     }
 }
@@ -505,7 +522,7 @@ async fn spawn_server(
             return spawn_server_plain_restricted(command, inherit_stderr)
                 .map(|(c, t)| (DiscoveryChild::Plain(Box::new(c)), t));
         }
-        return spawn_server_sandboxed(command)
+        return spawn_server_sandboxed(command, opts.allow_best_effort_lifetime)
             .await
             .map(|(c, t)| (DiscoveryChild::Sandboxed(Box::new(c)), Some(t)));
     }
@@ -547,6 +564,7 @@ fn env_skip_sandbox() -> bool {
 fn discovery_policy(
     command: &[String],
     tmpdir: &Path,
+    allow_best_effort_lifetime: bool,
 ) -> Result<crate::policy::Policy, ToolsListError> {
     let mut policy = crate::legislator::self_test_warden::prepare_warden_probe_policy(
         &crate::policy::Policy::default(),
@@ -557,11 +575,18 @@ fn discovery_policy(
     // `prepare_warden_probe_policy` waives the secrets overlay for the
     // self-test control file — a discovery server gets no such pass.
     policy.fs.secret_overlay = true;
-    // macOS carries no kernel descendant-lifetime boundary, and the
-    // launch host may have no writable cgroup — discovery accepts the
-    // RunningChild's best-effort process-tree sweep rather than
-    // refusing outright.
-    policy.sandbox.require_lifetime_boundary = false;
+    // The default-on lifetime boundary stays required unless the
+    // caller explicitly armed the best-effort downgrade: a discovery
+    // server is untrusted code and a kernel descendant boundary
+    // (private cgroup on Linux, the Job Object on Windows) is what
+    // guarantees no orphaned child outlives the probe.
+    // `allow_best_effort_lifetime` is the documented
+    // `--unsafe-discovery-best-effort-lifetime` opt-out — the spawn
+    // then relies on `RunningChild`'s best-effort tree sweep, which a
+    // `clone`/`setsid`/reparent sequence escapes. Unarmed, hosts that
+    // cannot provide the boundary (macOS, or a Linux launch without a
+    // writable cgroup v2) refuse rather than downgrade silently.
+    policy.sandbox.require_lifetime_boundary = !allow_best_effort_lifetime;
     Ok(policy)
 }
 
@@ -1338,9 +1363,26 @@ fn create_discovery_tmpdir() -> Result<PathBuf, ToolsListError> {
 /// The Warden-isolated spawn. Fail closed: when the sandbox cannot be
 /// established (unsupported mechanism, unbuildable ruleset), discovery
 /// errors rather than run the server outside it.
+/// `allow_best_effort_lifetime` is the explicit
+/// `--unsafe-discovery-best-effort-lifetime` downgrade — the spawn is
+/// still Warden-backed but need not carry a kernel
+/// descendant-lifetime boundary, and the opt-in is announced once per
+/// process so the waived guarantee is never silent.
 async fn spawn_server_sandboxed(
     command: &[String],
+    allow_best_effort_lifetime: bool,
 ) -> Result<(crate::warden::RunningChild, PathBuf), ToolsListError> {
+    if allow_best_effort_lifetime {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "WARNING: --unsafe-discovery-best-effort-lifetime is set — tools/list \
+                 discovery runs inside the Warden sandbox but WITHOUT a kernel \
+                 descendant-lifetime boundary; a forking server can orphan \
+                 descendants past the probe"
+            );
+        }
+    }
     let tmp = create_discovery_tmpdir()?;
     // The secret-scan carve is synchronous filesystem traversal — a
     // large command tree would stall the Tokio worker, so the policy
@@ -1349,7 +1391,7 @@ async fn spawn_server_sandboxed(
     let policy = match tokio::task::spawn_blocking({
         let command = command.to_vec();
         let tmp = tmp.clone();
-        move || discovery_policy(&command, &tmp)
+        move || discovery_policy(&command, &tmp, allow_best_effort_lifetime)
     })
     .await
     {
@@ -1423,9 +1465,27 @@ async fn spawn_server_sandboxed(
         Err(e) => {
             let _ = std::fs::remove_dir_all(&tmp);
             Err(ToolsListError::ProcessSpawn(io::Error::other(format!(
-                "sandboxed discovery spawn failed: {e}"
+                "sandboxed discovery spawn failed: {e}{}",
+                lifetime_boundary_hint(&e.to_string(), allow_best_effort_lifetime)
             ))))
         }
+    }
+}
+
+/// The hint appended to a discovery spawn refusal: the boundary
+/// messages name the `sandbox.require_lifetime_boundary` dial, but
+/// the discovery policy is built internally — the caller's
+/// `policy.kdl` cannot reach it — so the explicit
+/// `--unsafe-discovery-best-effort-lifetime` opt-out is the only
+/// lever a refused host (macOS, cgroup-less Linux) has. Other
+/// refusals, and spawns already running under the downgrade, get no
+/// hint.
+fn lifetime_boundary_hint(detail: &str, best_effort_armed: bool) -> &'static str {
+    if !best_effort_armed && detail.contains("require_lifetime_boundary") {
+        " — pass --unsafe-discovery-best-effort-lifetime to keep the \
+         sandbox and run with best-effort child cleanup"
+    } else {
+        ""
     }
 }
 
@@ -2098,7 +2158,7 @@ mod tests {
             "definitely-not-a-resolvable-tool".to_string(),
             work.to_string_lossy().into_owned(),
         ];
-        let policy = discovery_policy(&command, dir.path()).unwrap();
+        let policy = discovery_policy(&command, dir.path(), false).unwrap();
         let env = env.canonicalize().unwrap();
         let covered = policy
             .fs
@@ -2115,6 +2175,40 @@ mod tests {
                 policy.fs.denied_paths
             );
         }
+    }
+
+    /// The descendant-lifetime boundary stays required by default and
+    /// is waived only by the explicitly armed downgrade — the silent
+    /// `require_lifetime_boundary=false` of the old discovery policy
+    /// is exactly the gap this flag exists to close.
+    #[test]
+    fn discovery_policy_lifetime_boundary_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = vec!["definitely-not-a-resolvable-tool".to_string()];
+        let strict = discovery_policy(&command, dir.path(), false).unwrap();
+        assert!(
+            strict.sandbox.require_lifetime_boundary,
+            "restricted discovery must require a kernel lifetime boundary by default"
+        );
+        let waived = discovery_policy(&command, dir.path(), true).unwrap();
+        assert!(
+            !waived.sandbox.require_lifetime_boundary,
+            "the armed best-effort downgrade waives the boundary explicitly"
+        );
+    }
+
+    /// The boundary refusal names a `sandbox.*` dial the caller's
+    /// policy cannot reach — the hint must point at the explicit
+    /// opt-out flag, appear only for boundary refusals, and never
+    /// repeat under the already-armed downgrade.
+    #[test]
+    fn lifetime_boundary_hint_points_at_the_flag() {
+        let boundary = "sandbox.require_lifetime_boundary: macOS provides no \
+                        kernel-enforced descendant-lifetime boundary";
+        let hint = lifetime_boundary_hint(boundary, false);
+        assert!(hint.contains("--unsafe-discovery-best-effort-lifetime"));
+        assert!(lifetime_boundary_hint(boundary, true).is_empty());
+        assert!(lifetime_boundary_hint("spawn failed: ENOENT", false).is_empty());
     }
 
     /// A bare argument names a file beside the process — the carve
@@ -2371,9 +2465,24 @@ mod tests {
         #[cfg(not(windows))]
         let cmd = vec!["sleep".to_string(), "60".to_string()];
 
-        let result = fetch_tools_list(&cmd, Some(Duration::from_millis(100))).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        // The timeout path is what is under test — it must reach the
+        // spawn on hosts that cannot provide a kernel descendant
+        // boundary (macOS, cgroup-less Linux), so the probe opts into
+        // best-effort cleanup rather than relying on the secure
+        // default refusing at the policy stage.
+        let result = fetch_tools_list_detailed_with(
+            &cmd,
+            Some(Duration::from_millis(100)),
+            &DiscoveryOptions {
+                restrict_environment: true,
+                allow_best_effort_lifetime: true,
+            },
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a 100ms deadline against a sleeping server must error"),
+        };
         assert!(
             matches!(err, ToolsListError::Timeout { .. }),
             "expected Timeout, got {err:?}"

@@ -527,6 +527,27 @@ fn bind_crt_dll(path: &Path, guest_arch: &TargetArch) -> Result<BoundArtifact, C
     }
 }
 
+/// The directories [`find_crt_dll`] consults, in order — every
+/// eligible CRT lookup location, existing or not: the packaged
+/// `runners/crt/` drop beside the CLI and, on Windows, the host
+/// `System32`. A writable share covering any of them plants bytes a
+/// later launch binds, so callers protecting trusted input (the
+/// `--log-dir` overlap check) name the directories themselves —
+/// absent candidates and DLLs only a later runner imports stay
+/// covered.
+pub(crate) fn crt_lookup_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() // nosemgrep: rust.lang.security.current-exe.current-exe
+        && let Some(dir) = exe.parent()
+    {
+        dirs.push(dir.join("runners").join("crt"));
+    }
+    if cfg!(windows) {
+        dirs.push(PathBuf::from(r"C:\Windows\System32"));
+    }
+    dirs
+}
+
 /// Locate one redistributable DLL by name: `explicit` first, then the
 /// packaged `runners/crt/` drop, then the host's `System32`. Explicit
 /// candidates that fail binding or PE validation are hard errors;
@@ -545,16 +566,7 @@ fn find_crt_dll(
             return bind_crt_dll(p, guest_arch).map(Some);
         }
     }
-    let mut discovered: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() // nosemgrep: rust.lang.security.current-exe.current-exe
-        && let Some(dir) = exe.parent()
-    {
-        discovered.push(dir.join("runners").join("crt").join(name));
-    }
-    if cfg!(windows) {
-        discovered.push(Path::new(r"C:\Windows\System32").join(name));
-    }
-    for p in discovered {
+    for p in crt_lookup_dirs().iter().map(|d| d.join(name)) {
         if p.is_file()
             && let Ok(bound) = bind_crt_dll(&p, guest_arch)
         {
