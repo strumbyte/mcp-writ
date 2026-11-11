@@ -177,7 +177,10 @@ fn shebang_line_via(file: Option<&std::fs::File>, path: &Path) -> Result<Option<
         }),
     }
     .map_err(|e| format!("'{}' cannot be probed: {e}", path.display()))?;
-    crate::workload::shebang_from_head(&buf[..n], path)
+    // The kernel will exec the interpreter from this line itself, so
+    // the strict CR policy applies — the `\r` is part of the name the
+    // kernel would run.
+    crate::workload::shebang_from_head(&buf[..n], path, true)
 }
 
 /// A `#!` driver leaf delegates its exec to the interpreter the
@@ -200,17 +203,10 @@ fn check_shebang_interpreter(
     let Some(line) = line else {
         return Ok(());
     };
-    // Same grammar the workload resolver applies: the kernel skips
-    // blanks after `#!`, takes the first token as the interpreter,
-    // and hands the rest of the line over as ONE optional argument.
-    let body = line.trim_start();
-    let (interp, opt_arg) = match body.split_once(char::is_whitespace) {
-        Some((i, rest)) => (i, {
-            let rest = rest.trim();
-            (!rest.is_empty()).then(|| rest.to_string())
-        }),
-        None => (body, None),
-    };
+    // The same kernel `#!` grammar the workload resolver applies —
+    // `shebang_body_parts` keeps the two reads identical so validating
+    // here and resolving there cannot diverge.
+    let (interp, opt_arg) = crate::workload::shebang_body_parts(&line);
     if interp.is_empty() {
         return Err(bad("interpreter is empty".to_string()));
     }
@@ -228,25 +224,11 @@ fn check_shebang_interpreter(
     }
     // `env` itself runs pre-containment — validate it — and then
     // re-resolves its command through the child's PATH, which is the
-    // parent's here. Emulate only the spellings the workload resolver
-    // models exactly (a bare name, or -S/--split-string) and refuse
-    // everything else rather than guess which file `env` would pick.
+    // parent's here. `env_command_spelling` is the same model the
+    // workload resolver launches by, so validation and expansion
+    // cannot diverge.
     let arg = opt_arg.ok_or_else(|| bad("'env' lacks a command name".to_string()))?;
-    let name = if let Some(rest) = arg
-        .strip_prefix("-S")
-        .or_else(|| arg.strip_prefix("--split-string"))
-    {
-        rest.split_whitespace()
-            .next()
-            .ok_or_else(|| bad("'env -S' lacks a command name".to_string()))?
-            .to_string()
-    } else if arg.contains(char::is_whitespace) {
-        return Err(bad(format!("'env' command '{arg}' cannot be resolved")));
-    } else if arg.starts_with('-') {
-        return Err(bad(format!("uses unsupported 'env' option '{arg}'")));
-    } else {
-        arg
-    };
+    let (name, _) = crate::workload::env_command_spelling(&arg).map_err(bad)?;
     check_interpreter_path(canon, Path::new(interp), trust)?;
     // `env` resolves its command exactly like `env_command_path`: bare
     // names through PATH, absolute spellings directly, and a relative
@@ -1409,6 +1391,26 @@ mod tests {
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o111)).unwrap();
         let err = validate_driver_path(&exe).unwrap_err();
         assert!(err.contains("cannot be probed"), "{err}");
+    }
+
+    /// A `\r` *inside* the interpreter token is not a line ending —
+    /// the kernel's `#!` separators are space and tab only — so
+    /// `#!{i}\rarg` execs the single file `{i}\rarg`, never `{i}` with
+    /// argument `arg`. Splitting on full Unicode whitespace would
+    /// validate `{i}` while the kernel execs a different image; the
+    /// token must stay whole and fail to resolve here instead.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_interior_cr_is_not_a_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("interp");
+        write_executable(&shim);
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, format!("#!{}\rarg\n", shim.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = validate_driver_path(&exe).unwrap_err();
+        assert!(err.contains("cannot be resolved"), "{err}");
     }
 
     /// The identity binding: a driver renamed away and recreated after

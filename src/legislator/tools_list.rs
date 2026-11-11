@@ -1465,9 +1465,27 @@ async fn spawn_server_sandboxed(
         Err(e) => {
             let _ = std::fs::remove_dir_all(&tmp);
             Err(ToolsListError::ProcessSpawn(io::Error::other(format!(
-                "sandboxed discovery spawn failed: {e}"
+                "sandboxed discovery spawn failed: {e}{}",
+                lifetime_boundary_hint(&e.to_string(), allow_best_effort_lifetime)
             ))))
         }
+    }
+}
+
+/// The hint appended to a discovery spawn refusal: the boundary
+/// messages name the `sandbox.require_lifetime_boundary` dial, but
+/// the discovery policy is built internally — the caller's
+/// `policy.kdl` cannot reach it — so the explicit
+/// `--unsafe-discovery-best-effort-lifetime` opt-out is the only
+/// lever a refused host (macOS, cgroup-less Linux) has. Other
+/// refusals, and spawns already running under the downgrade, get no
+/// hint.
+fn lifetime_boundary_hint(detail: &str, best_effort_armed: bool) -> &'static str {
+    if !best_effort_armed && detail.contains("require_lifetime_boundary") {
+        " — pass --unsafe-discovery-best-effort-lifetime to keep the \
+         sandbox and run with best-effort child cleanup"
+    } else {
+        ""
     }
 }
 
@@ -2177,6 +2195,20 @@ mod tests {
             !waived.sandbox.require_lifetime_boundary,
             "the armed best-effort downgrade waives the boundary explicitly"
         );
+    }
+
+    /// The boundary refusal names a `sandbox.*` dial the caller's
+    /// policy cannot reach — the hint must point at the explicit
+    /// opt-out flag, appear only for boundary refusals, and never
+    /// repeat under the already-armed downgrade.
+    #[test]
+    fn lifetime_boundary_hint_points_at_the_flag() {
+        let boundary = "sandbox.require_lifetime_boundary: macOS provides no \
+                        kernel-enforced descendant-lifetime boundary";
+        let hint = lifetime_boundary_hint(boundary, false);
+        assert!(hint.contains("--unsafe-discovery-best-effort-lifetime"));
+        assert!(lifetime_boundary_hint(boundary, true).is_empty());
+        assert!(lifetime_boundary_hint("spawn failed: ENOENT", false).is_empty());
     }
 
     /// A bare argument names a file beside the process — the carve

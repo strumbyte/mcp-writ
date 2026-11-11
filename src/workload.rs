@@ -155,9 +155,9 @@ pub fn resolve_launch(argv0: &str, expand_shebang: bool) -> io::Result<LaunchRes
     expand_shebang_launch(argv0, exe)
 }
 
-/// Unix `#!` expansion for [`resolve_launch`]. The kernel skips blanks
-/// after `#!`, takes the first token as the interpreter path, and
-/// passes the rest of the line as ONE optional argument before the
+/// Unix `#!` expansion for [`resolve_launch`]. The kernel skips spaces
+/// and tabs after `#!`, takes the first token as the interpreter path,
+/// and passes the rest of the line as ONE optional argument before the
 /// script path. `env` is special-cased: it would re-resolve its command
 /// through the child's PATH at run time, which is a second unverified
 /// selection — so the resolution emulates `env name` and `env -S`
@@ -165,20 +165,18 @@ pub fn resolve_launch(argv0: &str, expand_shebang: bool) -> io::Result<LaunchRes
 /// `env` option spellings it cannot model exactly.
 #[cfg(unix)]
 fn expand_shebang_launch(argv0: &str, script: PathBuf) -> io::Result<LaunchResolution> {
-    let Some(line) = shebang_line(&script) else {
+    let line = leaf_shebang_line(&script)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let Some(line) = line else {
         return Ok(LaunchResolution {
             exe: script,
             argv_head: vec![argv0.to_string()],
         });
     };
-    let body = line.trim_start();
-    let (interp, opt_arg) = match body.split_once(char::is_whitespace) {
-        Some((i, rest)) => (i, {
-            let rest = rest.trim();
-            (!rest.is_empty()).then(|| rest.to_string())
-        }),
-        None => (body, None),
-    };
+    // Kernel `#!` grammar — interpreter token, then ONE optional
+    // argument — shared with the driver's shebang check so both read
+    // the line exactly the way the kernel would.
+    let (interp, opt_arg) = shebang_body_parts(&line);
     let not_found = |what: &str| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -197,27 +195,7 @@ fn expand_shebang_launch(argv0: &str, script: PathBuf) -> io::Result<LaunchResol
         // spelling changes the launch in ways this resolver does not
         // model (-i/-u/-C), so it fails closed.
         let arg = opt_arg.ok_or_else(|| not_found("'env' lacks a command name"))?;
-        if let Some(rest) = arg
-            .strip_prefix("-S")
-            .or_else(|| arg.strip_prefix("--split-string"))
-        {
-            let mut words = rest.split_whitespace();
-            let Some(name) = words.next() else {
-                return Err(not_found("'env -S' lacks a command name"));
-            };
-            (
-                name.to_string(),
-                words.map(str::to_string).collect::<Vec<_>>(),
-            )
-        } else if arg.contains(char::is_whitespace) {
-            // Without -S the whole token is the command name — env
-            // itself cannot resolve it either.
-            return Err(not_found(&format!("'env' command '{arg}'")));
-        } else if arg.starts_with('-') {
-            return Err(not_found(&format!("uses unsupported 'env' option '{arg}'")));
-        } else {
-            (arg, Vec::new())
-        }
+        env_command_spelling(&arg).map_err(|e| not_found(&e))?
     } else {
         (interp.to_string(), opt_arg.into_iter().collect::<Vec<_>>())
     };
@@ -248,7 +226,7 @@ fn expand_shebang_launch(argv0: &str, script: PathBuf) -> io::Result<LaunchResol
     // refuses rather than certify a hash boundary the kernel will step
     // past. (`expand_shebang=false` launches are unpinned by contract —
     // the kernel resolves the whole chain at run time there.)
-    let probe = shebang_probe(&exe).map_err(|e| {
+    let probe = shebang_probe(&exe, true).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -345,6 +323,47 @@ fn is_executable_file(_path: &Path) -> bool {
     true
 }
 
+/// The command token an `env <arg>` delegation would run, under the
+/// spellings this resolver models exactly — `env name`, `env -S …`,
+/// `env -Sname`, `env --split-string[=]…` — refusing what `env`
+/// parses but the launch model cannot bind: another `env` option
+/// (`-i`/`-u`/`-C`), or a command spelling carrying whitespace
+/// (`env` itself cannot resolve a space-carrying command either).
+/// `Ok((command, extra_argv))` — `extra_argv` carries the remaining
+/// split words of a `-S` form. The long option matches only in its
+/// exact spelling like env's own getopt — `--split-string=S` or end
+/// of input. A space- or tab-separated value is NOT an option here:
+/// the kernel hands `env` one argv element, so `--split-string foo`
+/// reaches getopt as the unknown option name `split-string foo` and
+/// `env` errors — it falls through to the unsupported-option refusal
+/// like `--split-stringfoo` does.
+#[cfg(unix)]
+pub(crate) fn env_command_spelling(arg: &str) -> Result<(String, Vec<String>), String> {
+    if let Some(rest) = arg.strip_prefix("-S").or_else(|| {
+        arg.strip_prefix("--split-string").and_then(|r| {
+            match r.chars().next() {
+                None => Some(r),
+                Some('=') => Some(&r[1..]),
+                _ => None,
+            }
+        })
+    }) {
+        let mut words = rest.split_whitespace();
+        let Some(name) = words.next() else {
+            return Err("'env -S' lacks a command name".to_string());
+        };
+        Ok((name.to_string(), words.map(str::to_string).collect()))
+    } else if arg.starts_with('-') {
+        Err(format!("uses unsupported 'env' option '{arg}'"))
+    } else if arg.contains(char::is_whitespace) {
+        // Without -S the whole token is the command name — env
+        // itself cannot resolve a space-carrying one either.
+        Err(format!("'env' command '{arg}' cannot be resolved"))
+    } else {
+        Ok((arg.to_string(), Vec::new()))
+    }
+}
+
 /// The exec image `env <name>` would select, resolved the way `env`
 /// resolves it — so the file validated here is the file `env` runs.
 /// A bare command name goes through PATH (the lookup `env` itself
@@ -360,7 +379,12 @@ pub(crate) fn env_command_path(name: &str) -> Result<PathBuf, String> {
         return std::fs::canonicalize(spelled)
             .map_err(|e| format!("'env' command '{name}' cannot be resolved: {e}"));
     }
-    if name.contains('/') || name.contains('\\') {
+    // `/` is the only separator on Unix — `env` would exec a
+    // separator-carrying spelling against the child's cwd, an object
+    // this resolution cannot bind, while a PATH join would validate a
+    // different file entirely. (`\\` is an ordinary filename byte for
+    // `env`, so a backslashed name stays a plain PATH lookup.)
+    if name.contains('/') {
         return Err(format!(
             "'env' command '{name}' is not a plain command name"
         ));
@@ -1371,9 +1395,10 @@ pub(crate) fn shebang_line(path: &Path) -> Option<String> {
 /// [`shebang_line`] does — with the failure modes kept distinct:
 /// `Ok(None)` only when the file reads *without* a `#!` prefix; a `#!`
 /// that cannot be parsed and a read failure are both `Err`, never
-/// "no shebang".
+/// "no shebang". `strict_cr` selects the CR policy [`shebang_from_head`]
+/// applies — `true` when the kernel itself will exec from the line.
 #[cfg(unix)]
-pub(crate) fn shebang_probe(path: &Path) -> Result<Option<String>, String> {
+pub(crate) fn shebang_probe(path: &Path, strict_cr: bool) -> Result<Option<String>, String> {
     let mut buf = [0u8; 256];
     let n = std::fs::File::open(path)
         .and_then(|mut f| {
@@ -1381,24 +1406,30 @@ pub(crate) fn shebang_probe(path: &Path) -> Result<Option<String>, String> {
             f.read(&mut buf)
         })
         .map_err(|e| format!("'{}' cannot be probed: {e}", path.display()))?;
-    shebang_from_head(&buf[..n], path)
+    shebang_from_head(&buf[..n], path, strict_cr)
 }
 
 /// The `#!`-prefix-aware line check shared by [`shebang_probe`] and
 /// handle-read callers: `Ok(None)` only when `head` does not begin
 /// with `#!` — a `#!` that cannot be parsed is a refusal, not
-/// "no shebang". A CR-terminated line refuses too: the kernel ends the
-/// shebang only at `\n`, so the `\r` is part of the interpreter name it
-/// would exec — validating the stripped spelling names a different
-/// file than the kernel runs. (Lenient callers keep their `\r`
-/// stripping in [`shebang_line_from_bytes`].)
+/// "no shebang". Under `strict_cr` a CR-terminated line refuses too:
+/// the kernel ends the shebang only at `\n`, so the `\r` is part of
+/// the interpreter name it would exec — validating the stripped
+/// spelling names a different file than the kernel runs. `false` is
+/// for callers that perform the `#!` expansion themselves — the
+/// stripped spelling *is* the image they run — which keep the
+/// lenient `\r` stripping in [`shebang_line_from_bytes`].
 #[cfg(unix)]
-pub(crate) fn shebang_from_head(head: &[u8], path: &Path) -> Result<Option<String>, String> {
+pub(crate) fn shebang_from_head(
+    head: &[u8],
+    path: &Path,
+    strict_cr: bool,
+) -> Result<Option<String>, String> {
     if !head.starts_with(b"#!") {
         return Ok(None);
     }
     let end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
-    if head[..end].ends_with(b"\r") {
+    if strict_cr && head[..end].ends_with(b"\r") {
         return Err(format!(
             "'{}' shebang line is CR-terminated — the kernel would exec \
              a different interpreter than the stripped spelling",
@@ -1413,12 +1444,50 @@ pub(crate) fn shebang_from_head(head: &[u8], path: &Path) -> Result<Option<Strin
 /// The `#!` line parse shared by [`shebang_line`] and handle-read
 /// callers: only the first line can be a shebang — invalid UTF-8
 /// further into the buffer must not hide it, and a CRLF ending loses
-/// its `\r`.
+/// its `\r`. The blanks trimmed around the body are the kernel's set
+/// — space and tab only: wider Unicode whitespace is part of the
+/// interpreter token the kernel would exec, never a separator.
 pub(crate) fn shebang_line_from_bytes(head: &[u8]) -> Option<String> {
     let end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
     let line = head[..end].strip_suffix(b"\r").unwrap_or(&head[..end]);
     let first = std::str::from_utf8(line).ok()?;
-    first.strip_prefix("#!").map(|s| s.trim().to_string())
+    first
+        .strip_prefix("#!")
+        .map(|s| s.trim_matches([' ', '\t']).to_string())
+}
+
+/// Kernel `#!` grammar shared by [`expand_shebang_launch`] and the
+/// driver check in `trusted_path`: leading spaces and tabs are
+/// skipped, the first token is the interpreter path, and the rest of
+/// the line is ONE optional argument. Space and tab are the only
+/// separators the kernel knows — any other byte stays inside the
+/// interpreter token it would exec, so neither consumer may widen
+/// the split to Unicode whitespace.
+#[cfg(unix)]
+pub(crate) fn shebang_body_parts(line: &str) -> (&str, Option<String>) {
+    let body = line.trim_start_matches([' ', '\t']);
+    match body.split_once([' ', '\t']) {
+        Some((i, rest)) => (i, {
+            let rest = rest.trim();
+            (!rest.is_empty()).then(|| rest.to_string())
+        }),
+        None => (body, None),
+    }
+}
+
+/// The launch leaf's `#!` line for [`expand_shebang_launch`] — the
+/// [`shebang_probe`] read with the CR policy relaxed (`strict_cr =
+/// false`): `Ok(None)` only when the leaf reads *without* a `#!`
+/// prefix; a `#!` whose first line cannot be parsed (invalid UTF-8)
+/// and a leaf that cannot be read at all are both refusals — never
+/// "no shebang" — because the kernel parses the raw `#!` bytes at
+/// exec whatever UTF-8 says, and would select an interpreter this
+/// resolution never hashed or pinned. CR endings stay lenient here
+/// by contract — the launcher performs the `#!` expansion itself, so
+/// the stripped spelling *is* the exec image it pins.
+#[cfg(unix)]
+fn leaf_shebang_line(path: &Path) -> Result<Option<String>, String> {
+    shebang_probe(path, false)
 }
 
 /// Repository portion of an image reference (tag and digest stripped).
@@ -2293,9 +2362,54 @@ mod tests {
             res.exe.display()
         );
 
+        // `--split-string=S` carries its value after `=` like env's
+        // own getopt, then the string splits into command + argv.
+        std::fs::write(&script, "#!/usr/bin/env --split-string=python3 -V\nprint(1)\n")
+            .expect("write");
+        let res = resolve_launch(&script.to_string_lossy(), true).expect("resolve");
+        let argv = res.into_argv(&[script.to_string_lossy().into_owned()]);
+        assert_eq!(argv[0], "python3");
+        assert_eq!(argv[1], "-V");
+        assert!(
+            res.exe
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("python3")),
+            "exe must be the env-selected interpreter, got {}",
+            res.exe.display()
+        );
+
+        // A separate token after `--split-string` is NOT the `=` form:
+        // the kernel hands `env` one argv element, so getopt sees the
+        // unknown option `split-string python3` and `env` errors — the
+        // resolver fails closed the same way.
+        std::fs::write(&script, "#!/usr/bin/env --split-string python3\nprint(1)\n")
+            .expect("write");
+        let err = match resolve_launch(&script.to_string_lossy(), true) {
+            Err(e) => e,
+            Ok(_) => panic!("a space-separated `--split-string` value must refuse"),
+        };
+        assert!(
+            err.to_string().contains("unsupported 'env' option"),
+            "unexpected refusal reason: {err}"
+        );
+
         // An env option spelling the resolver cannot model fails closed.
         std::fs::write(&script, "#!/usr/bin/env -i python3\nprint(1)\n").expect("write");
         assert!(resolve_launch(&script.to_string_lossy(), true).is_err());
+
+        // A longer name sharing the option's prefix is not the option —
+        // getopt rejects it outright, so the resolver fails closed too.
+        std::fs::write(&script, "#!/usr/bin/env --split-stringfoo\nprint(1)\n")
+            .expect("write");
+        let err = match resolve_launch(&script.to_string_lossy(), true) {
+            Err(e) => e,
+            Ok(_) => panic!("a `--split-stringfoo` spelling must refuse"),
+        };
+        assert!(
+            err.to_string().contains("unsupported 'env' option"),
+            "unexpected refusal reason: {err}"
+        );
     }
 
     /// `env <name>` resolves like `env` itself resolves it: a bare name
@@ -2471,6 +2585,93 @@ mod tests {
         };
         assert!(
             err.to_string().contains("cannot be probed"),
+            "unexpected refusal reason: {err}"
+        );
+    }
+
+    /// A leaf whose `#!` line cannot be parsed (invalid UTF-8 in the
+    /// first line) is a script the resolver cannot model — the kernel
+    /// parses the raw `#!` bytes at exec whatever UTF-8 says and would
+    /// select an interpreter this resolution never hashed or pinned,
+    /// so the launch refuses rather than fall through to "no shebang"
+    /// and exec the script directly.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_launch_refuses_unparseable_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("entry");
+        std::fs::write(&script, b"#!\xff\xfe\n").expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        let err = match resolve_launch(&script.to_string_lossy(), true) {
+            Err(e) => e,
+            Ok(_) => panic!("a leaf with an unparseable `#!` line must refuse"),
+        };
+        assert!(
+            err.to_string().contains("cannot be parsed"),
+            "unexpected refusal reason: {err}"
+        );
+    }
+
+    /// A leaf that cannot be read cannot be proven shebang-free — the
+    /// kernel parses `#!` from bytes the launcher could not see, so
+    /// the probe failure refuses rather than resolving a native exec.
+    /// (The pin would fail hashing it anyway; the early refusal is the
+    /// honest reason. Root reads through permission bits, so the leg
+    /// only holds for a real user.)
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_launch_refuses_unreadable_leaf() {
+        if crate::fspriv::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("entry");
+        std::fs::write(&script, b"#!/bin/sh\n").expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o111))
+            .expect("chmod script");
+
+        let err = match resolve_launch(&script.to_string_lossy(), true) {
+            Err(e) => e,
+            Ok(_) => panic!("an unreadable leaf must refuse"),
+        };
+        assert!(
+            err.to_string().contains("cannot be probed"),
+            "unexpected refusal reason: {err}"
+        );
+    }
+
+    /// The kernel's `#!` separators are space and tab only — any other
+    /// byte stays inside the interpreter token. `#!{i}\u{a0}x` execs a
+    /// single file named `i x`, never `i` with argument `x`, so the
+    /// resolver must not subdivide it into an interp it can validate
+    /// while the kernel execs a different image.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_launch_nonblank_separator_stays_in_token() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(sh) = search_path("sh") else {
+            return; // no `sh` on PATH here — nothing to assert
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("entry");
+        // NBSP is `char::is_whitespace` but not a kernel separator:
+        // the interpreter token is the whole `{sh}\u{a0}x` spelling,
+        // which cannot resolve.
+        std::fs::write(&script, format!("#!{}\u{a0}x\n", sh.display()))
+            .expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        let err = match resolve_launch(&script.to_string_lossy(), true) {
+            Err(e) => e,
+            Ok(_) => panic!("a nonblank separator must keep the interpreter token whole"),
+        };
+        assert!(
+            err.to_string().contains("cannot be resolved"),
             "unexpected refusal reason: {err}"
         );
     }
