@@ -13,6 +13,8 @@ Start with the [project overview and quick start](../README.md), or the
 | Existing installations / 既存環境からの移行 | [Migration](archive/migration.md) / [移行ガイド](archive/migration.ja.md) |
 | Development and verification / 開発・検証手順 | [Development](development.md) |
 | Test workflow ownership and evidence format / テスト実行担当と証跡様式 | [Test matrix](test-matrix.md) |
+| Refactoring scope, priorities, and acceptance / リファクタリングの対象・優先順位・採否 | [リファクタリング計画](refactoring-plan-2026-11.ja.md) |
+| Refactoring tasks, verification, and handoff / リファクタリングの実装・検証・引継ぎ手順 | [PR別実装手順書](refactoring-pr-guide-2026-11.ja.md) |
 | stdio hardening after public review (archived) / 公開後レビューを受けた stdio 運用強化（保管） | [作業計画](archive/stdio-hardening-plan.ja.md) / [作業手順書](archive/stdio-hardening-runbook.ja.md) / [作業記録](archive/stdio-hardening-results.ja.md) |
 | ARM64 analysis and operational improvements (archived) / ARM64解析対応と運用改善（保管） | [作業計画](archive/arm64-security-plan.ja.md) / [作業手順書](archive/arm64-security-runbook.ja.md) / [作業記録](archive/arm64-security-results.ja.md) |
 | Reporting a vulnerability / 脆弱性の報告 | [Security policy](../SECURITY.md) |
