@@ -218,6 +218,8 @@ pub(super) struct NoncanonicalSpelling {
 
 /// Filesystem targets from `arguments` and `inputResponses` for deputy checks.
 pub fn extract_fs_targets(line: &str) -> Vec<String> {
+    #[cfg(feature = "measure")]
+    crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
     let Ok(json) = nojson::RawJson::parse(line) else {
         return Vec::new();
     };
@@ -266,6 +268,8 @@ fn extract_deputy_use_targets_as<S: TargetString>(
     rules: &[DeputyRule],
     opaque_fields: &[OpaqueField],
 ) -> Result<Vec<S>, String> {
+    #[cfg(feature = "measure")]
+    crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
     let json =
         nojson::RawJson::parse(line).map_err(|e| format!("request is not valid JSON: {e}"))?;
     let mut out: Vec<S> = Vec::new();
@@ -387,6 +391,8 @@ fn extract_deputy_use_targets_as<S: TargetString>(
 ///
 /// Reused by trajectory `deny-next="network"` (same walk as side_effect enforcement).
 pub fn request_has_host_or_url(line: &str) -> bool {
+    #[cfg(feature = "measure")]
+    crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
     let Ok(json) = nojson::RawJson::parse(line) else {
         return false;
     };

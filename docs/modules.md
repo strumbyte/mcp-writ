@@ -56,7 +56,7 @@ may reference another.
 | 3 | `auditor`, `warden` |
 | 2 | `dnsgate`, `verifier`, `inspector` |
 | 1 | `policy` |
-| 0 | `error`, `termutil`, `pathutil`, `fspriv`, `tool_def`, `framing`, `protocol`, `audit_log`, `secret_paths`, `workload`, `execution`, `enforcement`, `fsoverlap`, `schema_spec` |
+| 0 | `error`, `termutil`, `pathutil`, `fspriv`, `tool_def`, `framing`, `protocol`, `audit_log`, `secret_paths`, `workload`, `execution`, `enforcement`, `fsoverlap`, `schema_spec`, `measure` (internal-counter façade — `#[cfg(feature = "measure")]`, compiled only for the sibling `bench/` package; every instrumented site is feature-gated so the default build is unaffected) |
 
 `tests/module_layering.rs` enforces the rule: it scans `src/` for
 `crate::<module>` and `mcp_writ::<module>` references (including grouped and

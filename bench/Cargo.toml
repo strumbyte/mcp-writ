@@ -1,0 +1,45 @@
+[package]
+name = "mcp-writ-bench"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "RF00 refactoring-baseline measurement targets for mcp-writ — a workspace member excluded from default-members so normal builds skip it"
+
+[dependencies]
+# `measure` exposes the `mcp_writ::measure` internal-counter façade —
+# off by default, so shipped binaries never compile it or its
+# instrumented sites. `fuzzing` adds the `mcp_writ::fuzz` boundary
+# façade the framing-stage drive reuses.
+mcp-writ = { workspace = true, features = ["measure", "fuzzing"] }
+# The audit-writer target needs a runtime; the dependency set stays
+# inside the crates mcp-writ already builds.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# Same minimal feature set as the product's dep (no const-oid).
+sha2 = { version = "0.11", default-features = false }
+# AuditEvent correlation ids.
+uuid = { version = "1.26.1", features = ["v4", "v7"] }
+
+# One binary per measurement target — plain `cargo run --release` /
+# `cargo build` targets, so no nightly toolchain and no libtest harness.
+[[bin]]
+name = "m1_check_request"
+path = "bench_targets/m1_check_request.rs"
+
+[[bin]]
+name = "m3_audit"
+path = "bench_targets/m3_audit.rs"
+
+[[bin]]
+name = "m4_allowlist"
+path = "bench_targets/m4_allowlist.rs"
+
+[[bin]]
+name = "m5_launch"
+path = "bench_targets/m5_launch.rs"
+
+# A/A and A/B comparison driver: alternates two already-built
+# measurement binaries and reports both sides' distributions.
+[[bin]]
+name = "ab_run"
+path = "bench_targets/ab_run.rs"

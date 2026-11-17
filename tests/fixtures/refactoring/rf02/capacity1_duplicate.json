@@ -1,0 +1,41 @@
+{
+  "_comment": "RF02 reproduction input — DynamicAllowList at max_grants=2 holding one live grant; two independent staging tokens reserve the SAME key (name+addr+quals). Headroom exists for the shared key (live 1 + 1 new key = 2, at capacity), so a refusal can only come from counting the staged key once per token: current capacity accounting totals live + staged distinct keys and refuses the second token's reservation even though committing it merges into a single live entry. A DISTINCT third key under the same capacity stays denied — the overflow path this case must not weaken. Executed verbatim by bench target m4_allowlist's `rf02` block; the regression test lands in RF02's PR.",
+  "target": "mcp_writ::dnsgate::DynamicAllowList",
+  "capacity": 2,
+  "setup": {
+    "live": [
+      {"name": "live.example", "addr": "192.0.2.1", "quals": ["tcp:*"], "ttl_secs": 60}
+    ]
+  },
+  "staged": [
+    {"token": "s1", "name": "x.example", "addr": "192.0.2.2", "quals": ["tcp:*"], "ttl_secs": 60},
+    {"token": "s2", "name": "x.example", "addr": "192.0.2.2", "quals": ["tcp:*"], "ttl_secs": 60}
+  ],
+  "order": ["register_staged:s1", "register_staged:s2", "commit_staged:s1", "drop_staged:s2"],
+  "observed_before_fix": {
+    "staged_same_key": [true, false],
+    "live_before_commit": 1,
+    "live_after_commit1": 2,
+    "allowed_after_commit1": true,
+    "live_after_drop2": 2,
+    "allowed_after_drop2": true,
+    "source": "m4_allowlist rf02 block, run-2026-11-17-01 rerun, parent+candidate identical"
+  },
+  "expected_after_fix": {
+    "staged_same_key": [true, true],
+    "live_before_commit": 1,
+    "live_after_commit1": 2,
+    "allowed_after_commit1": true,
+    "live_after_drop2": 2,
+    "allowed_after_drop2": true,
+    "note": "commit:s1 merges the shared key once; drop:s2 removes only s2's hold. Distinct-key overflow under the same capacity must still fail."
+  },
+  "related_cases_for_rf02_tests": [
+    "drop s2 then commit s1 (reverse order)",
+    "commit s1 then commit s2 (reverse order — second commit is a no-op on the same key)",
+    "staged update of the EXISTING live key under full capacity",
+    "staged reservation of a DISTINCT key under full capacity — must stay denied",
+    "same addr, different name — distinct key, distinct capacity",
+    "TTL/scope update semantics unchanged; uncommitted reservations invisible to is_allowed/snapshot_json/export_to"
+  ]
+}

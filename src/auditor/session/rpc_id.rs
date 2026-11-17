@@ -89,6 +89,8 @@ impl RpcId {
     }
 
     pub fn from_line(line: &str) -> Option<Self> {
+        #[cfg(feature = "measure")]
+        crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
         let json = nojson::RawJson::parse(line).ok()?;
         let id = json.value().to_member("id").ok()?.optional()?;
         Self::parse_from_json(id)

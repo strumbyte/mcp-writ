@@ -16,6 +16,9 @@ pub mod fspriv;
 pub mod fuzz;
 pub mod inspector;
 pub mod legislator;
+#[cfg(feature = "measure")]
+#[doc(hidden)]
+pub mod measure;
 pub mod pathutil;
 pub mod policy;
 pub mod protocol;

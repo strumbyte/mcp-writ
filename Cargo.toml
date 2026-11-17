@@ -23,6 +23,8 @@ exclude = [
     # the published crate so `cargo package`/`publish` never tries to
     # absorb its manifest.
     "/fuzz/**",
+    # Same for the measurement package (refactoring baseline targets).
+    "/bench/**",
 ]
 
 [[bin]]
@@ -142,14 +144,20 @@ tempfile = "3.27"
 # sibling fuzz package and feature-enabled test runs, keeping it out
 # of shipped builds and the documented public API.
 fuzzing = []
+# `src/measure.rs` — the internal-counter façade — compiles only for
+# the sibling bench package. Every instrumented site is cfg-gated, so
+# the default build's API, behavior, and performance are unchanged.
+measure = []
 
 # The fuzz package is a member for dependency centralization only:
 # `default-members` keeps plain `cargo build`/`test`/`clippy` scoped to
 # this package, so the fuzz targets stay opt-in (`--manifest-path
 # fuzz/Cargo.toml`) and never ride normal builds — the same isolation
 # cargo-fuzz's non-member layout provides, with one shared lockfile.
+# `bench` is the same kind of opt-in member for the refactoring
+# baseline measurement targets.
 [workspace]
-members = ["fuzz"]
+members = ["fuzz", "bench"]
 default-members = ["."]
 
 [workspace.package]
