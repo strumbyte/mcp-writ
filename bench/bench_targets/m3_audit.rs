@@ -67,7 +67,7 @@ fn reopen_marker(_: Option<String>) -> AuditEvent {
 fn private_sink_dir() -> std::path::PathBuf {
     use std::path::PathBuf;
     let mut candidates = vec![
-        std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        std::env::temp_dir(), // nosemgrep: rust.lang.security.temp-dir.temp-dir
     ];
     for var in ["USERPROFILE", "HOME"] {
         if let Some(home) = std::env::var_os(var).map(PathBuf::from)
