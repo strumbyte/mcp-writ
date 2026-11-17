@@ -27,6 +27,42 @@ fn sync_audit_dir(dir: Option<&std::fs::File>) -> std::io::Result<()> {
     dir.sync_all()
 }
 
+/// `file.sync_all()` with the `measure` feature's count / duration
+/// sampling — plain `sync_all` when the feature is off.
+fn file_sync_all(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(feature = "measure")]
+    {
+        let now = std::time::Instant::now();
+        crate::measure::incr(&crate::measure::AUDIT_SYNC_COUNT, 1);
+        let result = file.sync_all();
+        crate::measure::observe(
+            &crate::measure::AUDIT_SYNC_NS,
+            now.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        );
+        result
+    }
+    #[cfg(not(feature = "measure"))]
+    file.sync_all()
+}
+
+/// `writer.flush()` with the `measure` feature's count / duration
+/// sampling — plain `flush` when the feature is off.
+fn buf_flush(writer: &mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()> {
+    #[cfg(feature = "measure")]
+    {
+        crate::measure::incr(&crate::measure::AUDIT_FLUSH_COUNT, 1);
+        let start = std::time::Instant::now();
+        let result = writer.flush();
+        crate::measure::observe(
+            &crate::measure::AUDIT_FLUSH_NS,
+            start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        );
+        result
+    }
+    #[cfg(not(feature = "measure"))]
+    writer.flush()
+}
+
 /// The pinned parent handle + leaf name the sink's visible-entry
 /// proof re-resolves under — carried alongside the writer so commit
 /// acknowledgments and shutdown can still verify the entry names the
@@ -71,8 +107,8 @@ fn reopen_sink(
     anchor: &mut SinkAnchor,
     dir_synced: &mut bool,
 ) -> std::io::Result<()> {
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
+    buf_flush(writer)?;
+    file_sync_all(writer.get_ref())?;
     // A launch-created log whose directory entry is still unsynced is
     // synced before the swap — after the handle is released the entry
     // must already be durable, or a crash could lose the rotated file
@@ -139,6 +175,8 @@ pub(super) async fn file_writer_task(
             event = rx.recv() => {
                 match event {
                     Some((evt, ack, _permit)) => {
+                        #[cfg(feature = "measure")]
+                        crate::measure::incr(&crate::measure::AUDIT_EVENTS_DEQUEUED, 1);
                         // A record skips the buffered tail when a caller
                         // waits on its durability (the fail-closed ack),
                         // when `--audit-sync` syncs every record, or when
@@ -173,13 +211,13 @@ pub(super) async fn file_writer_task(
                             // the file, then — for a freshly created log
                             // — fsync the parent so the directory entry
                             // survives a crash too.
-                            if let Err(e) = writer.flush() {
+                            if let Err(e) = buf_flush(&mut writer) {
                                 tracing::error!("Audit log sync flush failed: {e}");
                                 writer_failed.set();
                                 ok = false;
                             }
                             events_since_flush = 0;
-                            if ok && let Err(e) = writer.get_ref().sync_all() {
+                            if ok && let Err(e) = file_sync_all(writer.get_ref()) {
                                 tracing::error!("Audit log sync fsync failed: {e}");
                                 writer_failed.set();
                                 ok = false;
@@ -225,7 +263,7 @@ pub(super) async fn file_writer_task(
                                 let _ = ack.send(());
                             }
                         } else if events_since_flush >= FLUSH_EVENT_THRESHOLD {
-                            if let Err(e) = writer.flush() {
+                            if let Err(e) = buf_flush(&mut writer) {
                                 tracing::error!("Audit log flush failed: {e}");
                                 writer_failed.set();
                             }
@@ -233,11 +271,11 @@ pub(super) async fn file_writer_task(
                         }
                     }
                     None => {
-                        if let Err(e) = writer.flush() {
+                        if let Err(e) = buf_flush(&mut writer) {
                             tracing::error!("Audit log final flush failed: {e}");
                             writer_failed.set();
                         }
-                        if let Err(e) = writer.get_ref().sync_all() {
+                        if let Err(e) = file_sync_all(writer.get_ref()) {
                             tracing::error!("Audit log final sync failed: {e}");
                             writer_failed.set();
                         }
@@ -272,6 +310,9 @@ pub(super) async fn file_writer_task(
             req = reopen_rx.recv(), if reopen_open => {
                 match req {
                     Some(ReopenRequest { reply, marker }) => {
+                        #[cfg(feature = "measure")]
+                        let _reopen_timer =
+                            crate::measure::Timer::new(&crate::measure::AUDIT_REOPEN_NS);
                         let result = reopen_sink(
                             &mut writer,
                             &audit_path,
@@ -310,14 +351,14 @@ pub(super) async fn file_writer_task(
                         }
                         events_since_flush = 0;
                         if marker_result.is_ok()
-                            && let Err(e) = writer.flush()
+                            && let Err(e) = buf_flush(&mut writer)
                         {
                             tracing::error!("Audit log reopen marker flush failed: {e}");
                             writer_failed.set();
                             marker_result = Err(e);
                         }
                         if marker_result.is_ok()
-                            && let Err(e) = writer.get_ref().sync_all()
+                            && let Err(e) = file_sync_all(writer.get_ref())
                         {
                             tracing::error!("Audit log reopen marker fsync failed: {e}");
                             writer_failed.set();
@@ -367,15 +408,28 @@ pub(super) async fn file_writer_task(
             }
             _ = flush_interval.tick() => {
                 if events_since_flush > 0 {
-                    if let Err(e) = writer.flush() {
+                    if let Err(e) = buf_flush(&mut writer) {
                         tracing::error!("Audit log periodic flush failed: {e}");
                         writer_failed.set();
                     }
                     events_since_flush = 0;
                 }
             }
-            _ = fsync_interval.tick() => {
-                if let Err(e) = writer.get_ref().sync_all() {
+            tick = fsync_interval.tick() => {
+                let _ = tick;
+                // `tick` is the instant this arm was *scheduled* to
+                // run — `elapsed()` is how late the biased loop
+                // actually got to it, the periodic-sync start delay
+                // that is the RF03 starvation signal. Recorded only
+                // here, so syncs caused by a reopen, a shutdown drain,
+                // or a record's own durable path never count as an
+                // overdue timer.
+                #[cfg(feature = "measure")]
+                crate::measure::observe(
+                    &crate::measure::AUDIT_SYNC_START_DELAY_NS,
+                    tick.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                if let Err(e) = file_sync_all(writer.get_ref()) {
                     tracing::error!("Audit log fsync failed: {e}");
                     writer_failed.set();
                 }

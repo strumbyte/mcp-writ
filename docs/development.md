@@ -72,6 +72,27 @@ cargo doc --locked --no-deps
 Markdown encoding, local-link and anchor checks run as part of `cargo test`
 (`tests/docs_check.rs`).
 
+### Refactoring measurement targets
+
+The `bench/` workspace member (excluded from `default-members`, so the
+commands above never build it) holds the RF00 comparison targets —
+`m1_check_request`, `m3_audit`, `m4_allowlist`, `m5_launch`, `ab_run`.
+They are `[[bin]]` targets on the stable toolchain, not `[[bench]]` or
+`[[test]]`, so `cargo test --locked` stays the standard gate. Build and
+run them explicitly:
+
+```sh
+cargo build --release --locked --manifest-path bench/Cargo.toml
+target/release/m1_check_request --iterations 20 --out report.json
+```
+
+The package depends on `mcp-writ` with `features = ["measure", "fuzzing"]`:
+`src/measure.rs` compiles only under `measure` and every instrumented
+site is `#[cfg]`-gated, so default builds keep their API, behavior, and
+performance. Comparison procedure, fixed inputs, and evidence layout are
+defined in `docs/refactoring-pr-guide-2026-11.ja.md` §1.4/RF00; run
+evidence lives under `.local/refactoring/RF00/<run>/` (gitignored).
+
 CI also treats rustdoc warnings as errors (`RUSTDOCFLAGS="-D warnings"`).
 When modifying platform-specific code, run the relevant tests on that OS;
 cross-target `cargo check` does not execute its sandbox implementation.

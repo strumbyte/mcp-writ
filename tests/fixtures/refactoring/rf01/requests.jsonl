@@ -1,0 +1,11 @@
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"tree/allowed/ok.txt"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"tree/../escape.txt"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"tree/path traversal report/x.txt"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"tree/it's.txt"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"tree/x') denied by tool fs sub-policy"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"tree/y') not in tool fs allowed paths"}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"secrets/key.pem"}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"../escape/passwd"}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"read_file","arguments":{"path":42}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"unknown_tool","arguments":{}}}
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"tree/allowed/w.txt","content":"x"}}}

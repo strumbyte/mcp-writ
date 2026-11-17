@@ -42,6 +42,10 @@ const LAYERS: &[(&str, u8)] = &[
     ("enforcement", 0),
     ("fsoverlap", 0),
     ("schema_spec", 0),
+    // Measurement façade (`measure` feature): leaf counters every
+    // instrumented site may reference — sits with the other shared
+    // leaves, like `testutil`.
+    ("measure", 0),
     ("policy", 1),
     ("dnsgate", 2),
     ("verifier", 2),

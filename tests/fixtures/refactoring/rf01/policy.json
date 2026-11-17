@@ -1,0 +1,25 @@
+{
+  "_comment": "RF01 reproduction policy — the RF01 regression test prepares a write-restricted root, canonicalizes it as ROOT, substitutes ${ROOT}, and feeds requests.jsonl lines through checker::check_request with cwd=ROOT so the relative 'tree/…' spellings resolve under it. Patterns are resolved-path prefixes (path_matches_lexical), mirroring FsToolPolicy::new(allowed_paths, denied_paths).",
+  "tools": [
+    {
+      "name": "read_file",
+      "allowed": true,
+      "args_schema": "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}",
+      "fs": {
+        "allowed_paths": ["${ROOT}/tree/allowed"],
+        "denied_paths": ["${ROOT}/secrets", "${ROOT}/tree/secrets"],
+        "allow_specified": true
+      }
+    },
+    {"name": "write_file", "allowed": false},
+    {"name": "fetch", "allowed": true}
+  ],
+  "fs": {
+    "read_only": ["${ROOT}"],
+    "read_write": [],
+    "denied_paths": [],
+    "allow_specified": true,
+    "secret_overlay": false
+  },
+  "outbound": {"allowed_hosts": ["allowed.example"]}
+}

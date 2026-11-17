@@ -89,6 +89,8 @@ where
                 // Structural gate: invalid JSON or duplicate keys never
                 // reach the decision layer — the client gets an error and
                 // nothing is forwarded.
+                #[cfg(feature = "measure")]
+                crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
                 let parsed = nojson::RawJson::parse(line.trim());
                 let Ok(json) = parsed else {
                     deny_malformed(&shared, None, "invalid JSON").await?;
@@ -186,6 +188,8 @@ where
         let Ok(Some(BoundedFrame::Line(line))) = read else {
             break;
         };
+        #[cfg(feature = "measure")]
+        crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
         let Ok(json) = nojson::RawJson::parse(line.trim()) else {
             continue;
         };

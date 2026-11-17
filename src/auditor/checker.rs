@@ -133,6 +133,8 @@ pub const MAX_JSON_NESTING: u32 = 64;
 pub(crate) fn check_duplicate_keys_recursively(
     val: nojson::RawJsonValue<'_, '_>,
 ) -> Result<(), PolicyViolation> {
+    #[cfg(feature = "measure")]
+    crate::measure::incr(&crate::measure::DUPKEY_SCAN_CALLS, 1);
     check_duplicate_keys_at_depth(val, 0)
 }
 
@@ -148,6 +150,8 @@ fn check_duplicate_keys_at_depth(
     }
     match val.kind() {
         nojson::JsonValueKind::Object => {
+            #[cfg(feature = "measure")]
+            crate::measure::incr(&crate::measure::DUPKEY_OBJECT_NODES, 1);
             let mut seen = std::collections::HashSet::new();
             let obj_iter = val.to_object().map_err(|e| PolicyViolation {
                 tool_name: "<unknown>".to_string(),
@@ -210,6 +214,8 @@ pub fn tool_is_allowed(policy: &Policy, name: &str) -> bool {
 ///   denies when `args_schema` is configured).
 /// - Unknown tools (not in policy) are denied (fail-secure default deny).
 pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyViolation> {
+    #[cfg(feature = "measure")]
+    crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
     let json = match nojson::RawJson::parse(line) {
         Ok(j) => j,
         Err(e) => {
@@ -347,6 +353,8 @@ pub enum RequestProtocolVersion {
 
 /// Classify a client→server line without mutating it.
 pub fn classify_request_protocol_version(line: &str) -> RequestProtocolVersion {
+    #[cfg(feature = "measure")]
+    crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
     let Ok(json) = nojson::RawJson::parse(line) else {
         return RequestProtocolVersion::Unspecified;
     };
@@ -422,6 +430,8 @@ fn check_request_state(
 /// The generic request path applies the cap to methods `check_request`
 /// never sees (MRTR retries on `resources/read` / `prompts/get`, …).
 pub(crate) fn request_state_over_cap(line: &str) -> Option<usize> {
+    #[cfg(feature = "measure")]
+    crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
     let json = nojson::RawJson::parse(line.trim()).ok()?;
     let size = request_state_byte_len(params_member(&json, "requestState")?);
     (size > REQUEST_STATE_MAX_BYTES).then_some(size)
@@ -488,6 +498,8 @@ pub fn check_trajectory(
     if !policy.trajectory {
         return Ok(());
     }
+    #[cfg(feature = "measure")]
+    crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
     let json = match nojson::RawJson::parse(line) {
         Ok(j) => j,
         Err(e) => {

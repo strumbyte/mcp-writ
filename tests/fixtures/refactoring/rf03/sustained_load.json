@@ -1,0 +1,22 @@
+{
+  "_comment": "RF03 reproduction input — sustained event load through the PRODUCT audit writer path (AuditLogger::log_ordered → writer task → file sink), not the minimal select! model. Under continuous enqueue the writer's biased select polls the event arm first, so the periodic fsync arm starts late: audit.sync.start_delay.ns records the scheduled→actual delay of each periodic tick (~0 when punctual, seconds when starved). The m3_audit load phase holds the channel busy at least --busy-secs (default 7 s, past the 5 s deadline) — events is a per-producer floor, not the total. Executed by bench target m3_audit; observed values recorded under .local/refactoring/RF00/run-2026-11-17-01/.",
+  "target": "mcp_writ::audit_log::AuditLogger (file sink, product writer task)",
+  "workload": {
+    "events_floor_per_run": 20000,
+    "producers": 4,
+    "busy_secs": 7,
+    "sync_mode": "buffered",
+    "submit": "log_ordered (fail-closed backpressure; log() drops under this burst shape, log_committed serializes per record)",
+    "event": {"type": "ToolCallAllowed", "severity": "Info", "target_tool": "read_file"}
+  },
+  "observe": [
+    "audit.sync.start_delay.ns (count/sum/max) — starvation signal: scheduled→actual delay of each periodic fsync tick",
+    "audit.sync.count / audit.sync.ns",
+    "audit.flush.count / audit.flush.ns",
+    "audit.events.dequeued, audit.queue.bytes",
+    "enqueue_ns / drain_ns / reopen_ns, sent, dropped, writer_failed",
+    "sync_start_delay_load_ns / sync_start_delay_load_complete — bounded-confirmation load-window stat; null+false when an overdue tick was never serviced"
+  ],
+  "acceptance_after_fix": "sync start is not starved: after the flush deadline the writer starts a sync at the next bounded processing boundary, so audit.sync.start_delay.ns max stays near zero under the same load",
+  "run_evidence": ".local/refactoring/RF00/run-2026-11-17-01/m3_sustained_candidate.json"
+}

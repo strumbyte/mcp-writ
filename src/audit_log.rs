@@ -212,6 +212,9 @@ impl AuditLogger {
             reopen_rx,
             session_id.clone(),
         ));
+        let bytes_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET));
+        #[cfg(feature = "measure")]
+        crate::measure::register_queue_budget(QUEUE_BYTE_BUDGET as u64, &bytes_budget);
         Ok(Self {
             inner: std::sync::Arc::new(AuditLoggerInner {
                 tx: std::sync::Mutex::new(Some(tx)),
@@ -221,7 +224,7 @@ impl AuditLogger {
                 fail_closed,
                 dropped: AtomicU64::new(0),
                 writer_failed,
-                bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET)),
+                bytes_budget,
             }),
         })
     }
@@ -240,6 +243,9 @@ impl AuditLogger {
         // stderr delivery cannot prove a durable write — a fail-closed
         // logger's completion waiters must not be acknowledged here.
         let writer_handle = tokio::spawn(tracing_writer_task(rx, !fail_closed, session_id.clone()));
+        let bytes_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET));
+        #[cfg(feature = "measure")]
+        crate::measure::register_queue_budget(QUEUE_BYTE_BUDGET as u64, &bytes_budget);
         Self {
             inner: std::sync::Arc::new(AuditLoggerInner {
                 tx: std::sync::Mutex::new(Some(tx)),
@@ -249,7 +255,7 @@ impl AuditLogger {
                 fail_closed,
                 dropped: AtomicU64::new(0),
                 writer_failed,
-                bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET)),
+                bytes_budget,
             }),
         }
     }

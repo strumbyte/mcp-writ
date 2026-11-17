@@ -118,6 +118,8 @@ impl DynamicAllowList {
             return false;
         }
         let mut inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
         inner.grants.retain(|_, e| e.expires > Instant::now());
         let key = GrantKey {
             addr,
@@ -184,6 +186,8 @@ impl DynamicAllowList {
             return false;
         }
         let mut inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
         inner.grants.retain(|_, e| e.expires > Instant::now());
         let key = GrantKey {
             addr,
@@ -208,7 +212,11 @@ impl DynamicAllowList {
                 .staged
                 .values()
                 .flatten()
-                .map(|(k, _)| k)
+                .map(|(k, _)| {
+                    #[cfg(feature = "measure")]
+                    crate::measure::incr(&crate::measure::DNS_STAGED_SCAN_ENTRIES, 1);
+                    k
+                })
                 .filter(|k| !inner.grants.contains_key(*k))
                 .collect();
             if inner.grants.len() + staged_new.len() >= self.max_grants {
@@ -232,6 +240,8 @@ impl DynamicAllowList {
     /// vended it.
     pub fn commit_staged(&self, staging: GrantStaging) {
         let mut inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
         if let Some(entries) = inner.staged.remove(&staging.0) {
             for (key, entry) in entries {
                 inner.grants.insert(key, entry);
@@ -245,6 +255,8 @@ impl DynamicAllowList {
     /// committed it.
     pub fn drop_staged(&self, staging: GrantStaging) {
         let mut inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
         inner.staged.remove(&staging.0);
     }
 
@@ -256,6 +268,8 @@ impl DynamicAllowList {
     /// direction — every consumer denies while `is_failed` stands.
     pub fn revoke(&self, name: &str, addr: IpAddr) {
         let mut inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
         inner.grants.remove(&GrantKey {
             addr,
             name: name.to_string(),
@@ -277,7 +291,11 @@ impl DynamicAllowList {
         now: Instant,
     ) -> bool {
         let inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
         inner.grants.iter().any(|(k, e)| {
+            #[cfg(feature = "measure")]
+            crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
             k.addr == *addr && e.expires > now && e.quals.iter().any(|q| q.covers(proto, port))
         })
     }
@@ -287,10 +305,16 @@ impl DynamicAllowList {
     pub fn names_for(&self, addr: &IpAddr) -> Vec<String> {
         let now = Instant::now();
         let inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
         let mut names: Vec<String> = inner
             .grants
             .iter()
-            .filter(|(k, e)| k.addr == *addr && e.expires > now)
+            .filter(|(k, e)| {
+                #[cfg(feature = "measure")]
+                crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
+                k.addr == *addr && e.expires > now
+            })
             .map(|(k, _)| k.name.clone())
             .collect();
         names.sort();
@@ -303,10 +327,16 @@ impl DynamicAllowList {
     pub fn quals_for(&self, addr: &IpAddr) -> Vec<crate::policy::GrantQual> {
         let now = Instant::now();
         let inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
         let mut quals: Vec<crate::policy::GrantQual> = inner
             .grants
             .iter()
-            .filter(|(k, e)| k.addr == *addr && e.expires > now)
+            .filter(|(k, e)| {
+                #[cfg(feature = "measure")]
+                crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
+                k.addr == *addr && e.expires > now
+            })
             .flat_map(|(_, e)| e.quals.iter().copied())
             .collect();
         quals.sort();
@@ -318,7 +348,17 @@ impl DynamicAllowList {
     pub fn live_len(&self) -> usize {
         let now = Instant::now();
         let inner = self.inner.lock().unwrap();
-        inner.grants.values().filter(|e| e.expires > now).count()
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        inner
+            .grants
+            .values()
+            .filter(|e| {
+                #[cfg(feature = "measure")]
+                crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
+                e.expires > now
+            })
+            .count()
     }
 
     /// Serialize the live grants to the JSON snapshot contract:
@@ -333,6 +373,8 @@ impl DynamicAllowList {
         let now = Instant::now();
         let now_wall = SystemTime::now();
         let inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
         nojson::object(|o| -> std::fmt::Result {
             o.member("schema_version", "1.1")?;
             o.member("generated_at_unix_secs", unix_secs(now_wall))?;

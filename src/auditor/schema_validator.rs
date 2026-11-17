@@ -99,6 +99,8 @@ pub fn resolve_schema(schema_ref: &str) -> Result<String, String> {
 /// Returns `Ok(())` if the arguments satisfy the schema, or `Err` with a
 /// human-readable description of the first violation found.
 pub fn validate_arguments(arguments: RawJsonValue<'_, '_>, schema_str: &str) -> Result<(), String> {
+    #[cfg(feature = "measure")]
+    crate::measure::incr(&crate::measure::SCHEMA_PARSE_CALLS, 1);
     let schema_json =
         RawJson::parse(schema_str).map_err(|e| format!("invalid args_schema JSON: {e}"))?;
     let mut eval = Eval {
@@ -828,6 +830,8 @@ fn check_string_constraints(
     }
     if let Some(pat_val) = member_opt(schema, "pattern") {
         let pat_s = str_val(pat_val).map_err(EvalError::fatal)?;
+        #[cfg(feature = "measure")]
+        crate::measure::incr(&crate::measure::SCHEMA_REGEX_BUILDS, 1);
         let re = regex_lite::Regex::new(&pat_s).map_err(|e| {
             EvalError::Fatal(format!(
                 "at '{field}': invalid regex pattern '{pat_s}': {e}"

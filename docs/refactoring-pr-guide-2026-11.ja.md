@@ -242,15 +242,15 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 
 **タスク**
 
-- [ ] `git status`・HEAD・toolchain・Cargo.lock・OS・CPU・features・build引数を記録し、ユーザーの既存差分と今回の変更を分離する。初期基準`23d8e82764d3428e5f4bf719b3eba822c582cba1`と、着手PRの親commitの両方を特定する。
-- [ ] 第1節のM1〜M8から当該PRの主指標と代表入力を選ぶ。正常・拒否・上限近傍を含め、入力hash、乱数seed、並列度、成功／拒否／timeout／dropの集計方法を固定する。
-- [ ] M項目ごとに基準hostを固定して記録する。Unix専用のreopen（M3）、kernel連携を含む経路（M4）、OS別の起動（M5）はWindows機だけでは取得できないため、対象OSのhostを指定する。hostを用意できないM項目は未測定として残し、別hostの値で代用しない。
-- [ ] 安定版Rustで動く`harness = false`の計測target等を用意する。`[[test]]`として登録すると[開発方針](development.md)の標準検証`cargo test --locked`で毎回実行されるため、`[[bench]]`にするか、fuzz packageと同様に`default-members`外のworkspace memberにする。まず`std::time::Instant`、`std::hint::black_box`と既存依存で構成し、必要になった計測ライブラリだけ追加評価する。計測のためだけに製品の公開APIを広げたりunsafeを追加したりしない。
-- [ ] 内部計数（parse・重複キー検査・regex構築の回数、走査件数、lock保持時間、同期開始遅延等）の取得手段を、計測targetの実装前に決めて記録する。候補は、`cfg(test)`に限定した計数器と、既存の`fuzzing` featureと同じ形で非default featureの背後に置く計測用façadeである。どちらの場合も既定buildの公開API・挙動・性能を変えず、`module_layering`を満たす。取得手段を決められない指標は未測定として残す。
-- [ ] 第1節のA/A・A/B手順に従い、親候補別のcheckoutとbuild出力先で実行する。実際に追加して動かしたコマンドを文書化し、存在しないbench名を既存手順として記載しない。
-- [ ] RF01の監査分類、RF02の容量1の重複予約、RF03の継続負荷について再現入力を保管する。RF03は最小モデルだけでなく製品writerの経路を対象にする。恒常的に失敗するテストをRF00へ入れず、製品回帰テストと修正は各RFの同じPRに含める。
-- [ ] RF-T00のtarget・登録名・実行条件・保証対応表を作り、M8のcompile／link・warm実行・fixtureビルド回数を取得する。`--list`を実行成功として数えない。
-- [ ] `.local/refactoring/<RF番号>/<run>/`等に元データ、環境、fixture、集計、比較判定、失敗・skip理由を保存する。共有する証跡の置き場とCI artifactの保持方法を決める。
+- [x] `git status`・HEAD・toolchain・Cargo.lock・OS・CPU・features・build引数を記録し、ユーザーの既存差分と今回の変更を分離する。初期基準`23d8e82764d3428e5f4bf719b3eba822c582cba1`と、着手PRの親commitの両方を特定する。 → `.local/refactoring/RF00/run-2026-11-17-01/env.md`（着手時 `git status` は空、`23d8e82` と親 `05f10bf` を特定）
+- [x] 第1節のM1〜M8から当該PRの主指標と代表入力を選ぶ。正常・拒否・上限近傍を含め、入力hash、乱数seed、並列度、成功／拒否／timeout／dropの集計方法を固定する。 → `aggregation.md`（主指標 = M1 verdict・内部計数、M3、M4、M5；入力hash・seed `0x5eed_0001`・集計ルールを固定）
+- [x] M項目ごとに基準hostを固定して記録する。Unix専用のreopen（M3）、kernel連携を含む経路（M4）、OS別の起動（M5）はWindows機だけでは取得できないため、対象OSのhostを指定する。hostを用意できないM項目は未測定として残し、別hostの値で代用しない。 → `env.md` の host 表、`aggregation.md` の未測定項目
+- [x] 安定版Rustで動く`harness = false`の計測target等を用意する。`[[test]]`として登録すると[開発方針](development.md)の標準検証`cargo test --locked`で毎回実行されるため、`[[bench]]`にするか、fuzz packageと同様に`default-members`外のworkspace memberにする。まず`std::time::Instant`、`std::hint::black_box`と既存依存で構成し、必要になった計測ライブラリだけ追加評価する。計測のためだけに製品の公開APIを広げたりunsafeを追加したりしない。 → `bench/` package（default-members 外・`[[bin]]`×5・既存依存のみ）
+- [x] 内部計数（parse・重複キー検査・regex構築の回数、走査件数、lock保持時間、同期開始遅延等）の取得手段を、計測targetの実装前に決めて記録する。候補は、`cfg(test)`に限定した計数器と、既存の`fuzzing` featureと同じ形で非default featureの背後に置く計測用façadeである。どちらの場合も既定buildの公開API・挙動・性能を変えず、`module_layering`を満たす。取得手段を決められない指標は未測定として残す。 → 非default feature `measure` + `src/measure.rs` façade を選択し `env.md` に記録
+- [x] 第1節のA/A・A/B手順に従い、親候補別のcheckoutとbuild出力先で実行する。実際に追加して動かしたコマンドを文書化し、存在しないbench名を既存手順として記載しない。 → `commands.md`（親 checkout `.local/refactoring/RF00/parent/`・分離 target dir）
+- [x] RF01の監査分類、RF02の容量1の重複予約、RF03の継続負荷について再現入力を保管する。RF03は最小モデルだけでなく製品writerの経路を対象にする。恒常的に失敗するテストをRF00へ入れず、製品回帰テストと修正は各RFの同じPRに含める。 → `tests/fixtures/refactoring/rf01|rf02|rf03/`
+- [x] RF-T00のtarget・登録名・実行条件・保証対応表を作り、M8のcompile／link・warm実行・fixtureビルド回数を取得する。`--list`を実行成功として数えない。 → `.local/refactoring/RF-T00/run-2026-11-17-01/inventory.md`
+- [x] `.local/refactoring/<RF番号>/<run>/`等に元データ、環境、fixture、集計、比較判定、失敗・skip理由を保存する。共有する証跡の置き場とCI artifactの保持方法を決める。 → 本 run dir；共有証跡は PR 添付用の集計（`aggregation.md` 抜粋）と CI artifact は workflow の `*-evidence` upload 慣行に従う
 
 **検証・計測:** T-BASEと追加した計測target。M1〜M8は対象PRに必要な項目から取得する。前回レビューのWindows 2,681件成功、一覧取得の3,253登録、過去資料の測定値は今回の基準値に転用しない。
 

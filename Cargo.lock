@@ -473,6 +473,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-writ-bench"
+version = "0.0.0"
+dependencies = [
+ "mcp-writ",
+ "sha2",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "mcp-writ-fuzz"
 version = "0.0.0"
 dependencies = [
