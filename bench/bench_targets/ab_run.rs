@@ -80,11 +80,17 @@ fn main() {
         extra,
         ..
     } = parse_args("ab_run", 10);
+    // The first `--` inside `extra` separates driver options from the
+    // child's argv — `--a`/`--b`/`--keep` are recognized only ahead of
+    // it; everything after it forwards verbatim, later `--` tokens and
+    // option-looking strings included (they are the child's own).
+    let split = extra.iter().position(|a| a == "--").unwrap_or(extra.len());
+    let (driver_args, child_rest) = extra.split_at(split);
     let get = |name: &str| -> Option<String> {
-        extra
+        driver_args
             .iter()
             .position(|a| a == name)
-            .and_then(|i| extra.get(i + 1))
+            .and_then(|i| driver_args.get(i + 1))
             .cloned()
     };
     let (a, b) = (get("--a"), get("--b"));
@@ -94,24 +100,24 @@ fn main() {
         );
         std::process::exit(2);
     };
-    // Everything after a second `--` inside `extra` belongs to the
-    // child; `--a`/`--b` and `--keep` themselves sit in `extra`, so
-    // strip the driver flags out of the forwarded set.
+    // Strip the recognized driver flags out of the forwarded set; a
+    // stray non-option arg in the driver head still reaches the child,
+    // ahead of the separator's tail — same order as on the command line.
     let mut keep = false;
     let mut child_args: Vec<String> = Vec::new();
     let mut skip = 0usize;
-    for a in &extra {
+    for a in driver_args {
         if skip > 0 {
             skip -= 1;
             continue;
         }
         match a.as_str() {
             "--a" | "--b" => skip = 1,
-            "--" => {}
             "--keep" => keep = true,
             _ => child_args.push(a.clone()),
         }
     }
+    child_args.extend(child_rest.iter().skip(1).cloned());
     let a = std::path::PathBuf::from(a);
     let b = std::path::PathBuf::from(b);
     for exe in [&a, &b] {

@@ -95,7 +95,6 @@ fn main() {
         .collect();
     let policy = policy();
 
-    mcp_writ::measure::reset();
     // The framing drain runs inside every measured pass — the bounded
     // read the relay's C2S arm performs before `check_request` sees a
     // line is part of wall_ns, not a one-off prelude.
@@ -110,6 +109,9 @@ fn main() {
         ));
         black_box(run_once(&lines, &policy));
     }
+    // Counter window == timing window: the prelude drain and the warmup
+    // passes stay out of the `measure` block the report compares.
+    mcp_writ::measure::reset();
     let mut wall_ns = Vec::with_capacity(iterations);
     let mut last = None;
     for _ in 0..iterations {

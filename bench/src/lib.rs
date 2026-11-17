@@ -15,14 +15,35 @@ pub fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/refactoring")
 }
 
-/// Workspace-root `target/<profile>` — where `cargo build` puts the
-/// product binaries this package's `m5_launch` spawns.
+/// `<target-dir>/<profile>` holding the product binaries this package's
+/// `m5_launch` spawns. Any standard `cargo build`/`run` lands the bench
+/// binary in that same directory, so `current_exe`'s parent is the
+/// answer wherever the workspace root, the caller's CWD, or a relative
+/// `CARGO_TARGET_DIR` happens to point — an explicit `--exe` /
+/// `MCP_WRIT_EXE` at the call site still overrides. The env var stays
+/// honored when the running binary cannot be located (a relative value
+/// anchors on the workspace root, not the caller's CWD), and the
+/// workspace `target/` is the last-resort default.
 pub fn target_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() // nosemgrep: rust.lang.security.current-exe.current-exe
+        && let Some(dir) = exe.parent()
+    {
+        return dir.to_path_buf();
+    }
     let profile = if cfg!(debug_assertions) {
         "debug"
     } else {
         "release"
     };
+    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        let dir = PathBuf::from(dir);
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(dir)
+        };
+        return dir.join(profile);
+    }
     Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../target/{profile}"))
 }
 
@@ -60,7 +81,7 @@ pub fn parse_args(target: &str, default_iterations: usize) -> Args {
         seed: 0x5eed_0001,
         extra: Vec::new(),
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = std::env::args().skip(1); // nosemgrep: rust.lang.security.args.args
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--" => {

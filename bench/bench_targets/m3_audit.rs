@@ -66,7 +66,9 @@ fn reopen_marker(_: Option<String>) -> AuditEvent {
 /// then the user's profile dir — owner-locked on both OS families).
 fn private_sink_dir() -> std::path::PathBuf {
     use std::path::PathBuf;
-    let mut candidates = vec![std::env::temp_dir()];
+    let mut candidates = vec![
+        std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+    ];
     for var in ["USERPROFILE", "HOME"] {
         if let Some(home) = std::env::var_os(var).map(PathBuf::from)
             && !candidates.contains(&home)
@@ -95,9 +97,17 @@ fn private_sink_dir() -> std::path::PathBuf {
     // No write-restricted root on this host (e.g. volume roots granting
     // Authenticated Users Modify). The operator opt-out keeps the
     // measurement runnable — the report records that the sink's
-    // anti-substitution guarantee was waived for it.
+    // anti-substitution guarantee was waived for it. The opt-out waives
+    // the *ancestry* check, not the leaf's own lock-down, so prefer the
+    // product helper's unpredictable owner-only tempdir; only a
+    // filesystem that cannot carry the restriction at all (an ACL-less
+    // %TEMP%) gets the plain per-process dir.
     if mcp_writ::fspriv::replaceable_paths_permitted() {
-        let dir = std::env::temp_dir().join(format!("rf00-m3-{}", std::process::id()));
+        if let Ok(dir) = mcp_writ::fspriv::create_private_tempdir("m3") {
+            return dir;
+        }
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+            .join(format!("rf00-m3-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("fallback sink dir");
         return dir;
     }
