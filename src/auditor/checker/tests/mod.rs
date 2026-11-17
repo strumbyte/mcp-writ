@@ -401,6 +401,7 @@ fn schema_policy() -> Policy {
 }
 
 mod decoy;
+mod denial_kind;
 mod helpers;
 mod mrtr;
 mod opaque;

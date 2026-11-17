@@ -363,43 +363,90 @@ pub fn is_secret_path_pre_normalized(normalized: &str) -> bool {
     is_secret_path_normalized(normalized, normalized)
 }
 
+/// Why [`overlay_denies`] refused a filesystem argument. The
+/// reserved-set hit is its own variant — it is the only overlay
+/// refusal that names a denied *target* (a wider allow could grant
+/// it); the rest reject the *spelling* itself and must never reach
+/// `correction_candidates.denied_targets`. `EmptyOrNul` shares its
+/// message with the generic path gate and carries no overlay
+/// attribution.
+#[derive(Debug)]
+pub enum OverlayDenial {
+    /// Reserved-set match — beats an explicit allow.
+    ReservedMatch(String),
+    /// The spelling was refused during overlay evaluation: a
+    /// normalize failure, invisible Unicode, a dirty URI scheme, or
+    /// an opaque `file:` URI.
+    Rejected(String),
+    /// Empty or NUL-containing — the generic path refusal.
+    EmptyOrNul(String),
+}
+
+impl OverlayDenial {
+    /// The refusal text as audit records and the wire spell it.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::ReservedMatch(r) | Self::Rejected(r) | Self::EmptyOrNul(r) => r,
+        }
+    }
+
+    /// Consume the error into its refusal text.
+    pub fn into_reason(self) -> String {
+        match self {
+            Self::ReservedMatch(r) | Self::Rejected(r) | Self::EmptyOrNul(r) => r,
+        }
+    }
+}
+
+impl std::fmt::Display for OverlayDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl std::error::Error for OverlayDenial {}
+
 /// Overlay evaluation for one extracted filesystem argument.
 ///
 /// Returns `Err(reason)` when the path is NUL, contains invisible Unicode, or
 /// matches the reserved set. Percent-decode and `file:` URI conversion happen
 /// here (Auditor-time). Does not claim to close TOCTOU.
-pub fn overlay_denies(path: &str) -> Result<(), String> {
+pub fn overlay_denies(path: &str) -> Result<(), OverlayDenial> {
     if path.is_empty() || path.contains('\0') {
-        return Err("empty or NUL-containing path".to_string());
+        return Err(OverlayDenial::EmptyOrNul(
+            "empty or NUL-containing path".to_string(),
+        ));
     }
     let normalized = match pathutil::normalize_fs_argument(path) {
         Ok(n) => n,
         Err(e) => {
-            return Err(format!("path '{path}' rejected by secret-overlay ({e})"));
+            return Err(OverlayDenial::Rejected(format!(
+                "path '{path}' rejected by secret-overlay ({e})"
+            )));
         }
     };
     if path_has_invisible_unicode(path) || path_has_invisible_unicode(&normalized) {
-        return Err(format!(
+        return Err(OverlayDenial::Rejected(format!(
             "path '{path}' contains invisible Unicode and is rejected by secret-overlay"
-        ));
+        )));
     }
     if is_secret_path_normalized(path, &normalized) {
-        return Err(format!(
+        return Err(OverlayDenial::ReservedMatch(format!(
             "path '{path}' matches the secret-path overlay (beats explicit allow)"
-        ));
+        )));
     }
     // Confusable / non-ASCII scheme slot (`fіle://`, VS in scheme, …):
     // fail-closed. Do not ALLOW as a URL that skips overlay.
     if pathutil::uri_scheme_slot_is_dirty(path) || pathutil::uri_scheme_slot_is_dirty(&normalized) {
-        return Err(format!(
+        return Err(OverlayDenial::Rejected(format!(
             "path '{path}' has a non-ASCII or invalid URI scheme and is rejected by secret-overlay"
-        ));
+        )));
     }
     // Opaque `file:etc/passwd` (no //, not already /… or drive): fail-closed.
     if pathutil::is_opaque_file_uri(path) || pathutil::is_opaque_file_uri(&normalized) {
-        return Err(format!(
+        return Err(OverlayDenial::Rejected(format!(
             "path '{path}' is an opaque file: URI and is rejected by the secret-path overlay"
-        ));
+        )));
     }
     Ok(())
 }
@@ -507,13 +554,13 @@ mod tests {
     #[test]
     fn invisible_unicode_is_denied() {
         let err = overlay_denies("/workspace/notes\u{200B}.txt").unwrap_err();
-        assert!(err.contains("invisible Unicode"), "got: {err}");
+        assert!(err.reason().contains("invisible Unicode"), "got: {err}");
     }
 
     #[test]
     fn nul_is_denied() {
         let err = overlay_denies("/workspace/a\0b").unwrap_err();
-        assert!(err.contains("NUL"), "got: {err}");
+        assert!(err.reason().contains("NUL"), "got: {err}");
     }
 
     #[test]

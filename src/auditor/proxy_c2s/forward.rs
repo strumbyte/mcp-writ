@@ -1004,10 +1004,11 @@ where
             // linger toward the cap. The caller's deny path releases it
             // too; a still-forwarded dry-run deny must not seed either.
             state.take_pending_list(id);
-            return Err(checker::PolicyViolation {
-                tool_name: tool.unwrap_or_else(|| "<unknown>".into()),
-                reason: format!("trajectory: {reason}"),
-            });
+            return Err(checker::PolicyViolation::new(
+                tool.unwrap_or_else(|| "<unknown>".into()),
+                checker::DenialKind::Session,
+                format!("trajectory: {reason}"),
+            ));
         }
     }
     Ok(check_pass)
@@ -1050,18 +1051,20 @@ pub(super) fn apply_confused_deputy_c2s(
     match crate::policy::deputy::deputy_binding(policy, tool_name) {
         crate::policy::deputy::DeputyBinding::Discover(rules) => {
             if matches!(envelope_id, Some(&RpcId::Null)) {
-                return Err(checker::PolicyViolation {
-                    tool_name: tool_name.to_string(),
-                    reason: "confused deputy: JSON-RPC id must not be null".to_string(),
-                });
+                return Err(checker::PolicyViolation::new(
+                    tool_name,
+                    checker::DenialKind::Session,
+                    "confused deputy: JSON-RPC id must not be null",
+                ));
             }
             if let Some(id) = envelope_id
                 && let Err(reason) = state.record_pending_list(id.clone(), tool_name, rules)
             {
-                return Err(checker::PolicyViolation {
-                    tool_name: tool_name.to_string(),
-                    reason: format!("confused deputy: {reason}"),
-                });
+                return Err(checker::PolicyViolation::new(
+                    tool_name,
+                    checker::DenialKind::Session,
+                    format!("confused deputy: {reason}"),
+                ));
             }
             Ok(())
         }
@@ -1077,24 +1080,41 @@ pub(super) fn apply_confused_deputy_c2s(
                 .map(|t| t.opaque_fields.as_slice())
                 .unwrap_or(&[]);
             let paths = checker::extract_deputy_use_targets_rc(line, rules, opaque_fields)
-                .map_err(|reason| checker::PolicyViolation {
-                    tool_name: tool_name.to_string(),
-                    reason: format!("confused deputy: {reason}"),
+                .map_err(|reason| {
+                    checker::PolicyViolation::new(
+                        tool_name,
+                        checker::DenialKind::Session,
+                        format!("confused deputy: {reason}"),
+                    )
                 })?;
             if paths.is_empty() {
-                return Err(checker::PolicyViolation {
-                    tool_name: tool_name.to_string(),
-                    reason: format!(
+                return Err(checker::PolicyViolation::new(
+                    tool_name,
+                    checker::DenialKind::Session,
+                    format!(
                         "confused deputy: tool '{tool_name}' is missing a resolvable path target"
                     ),
-                });
+                ));
             }
             for path in &paths {
-                if let Err(reason) = state.check_access(path) {
-                    return Err(checker::PolicyViolation {
-                        tool_name: tool_name.to_string(),
-                        reason: format!("confused deputy: {reason}"),
-                    });
+                if let Err(denial) = state.check_access(path) {
+                    // A `..` escape found by the session gate is a real
+                    // traversal attempt — the `validation.path_traversal`
+                    // audit event applies even wrapped in the deputy
+                    // reason. Everything else is a session-state refusal.
+                    let kind = match &denial {
+                        crate::auditor::session::AccessDenial::PathTraversal(_) => {
+                            checker::DenialKind::Validation(checker::ValidationKind::PathTraversal)
+                        }
+                        crate::auditor::session::AccessDenial::NotDiscovered(_) => {
+                            checker::DenialKind::Session
+                        }
+                    };
+                    return Err(checker::PolicyViolation::new(
+                        tool_name,
+                        kind,
+                        format!("confused deputy: {}", denial.reason()),
+                    ));
                 }
             }
             Ok(())
@@ -1549,5 +1569,43 @@ mod tests {
         .unwrap();
         assert!(!armed);
         assert!(shared.held_client_list.lock().await.is_none());
+    }
+
+    /// The deputy gate's `AccessDenial` carries the refusal kind: a
+    /// `..` escape keeps earning the `validation.path_traversal` audit
+    /// event while an ordinary undiscovered path stays a session-state
+    /// refusal — neither lands in the widening candidates. The
+    /// classification reads the typed error, never the wrapped reason
+    /// text.
+    #[test]
+    fn deputy_gate_denials_carry_typed_kind() {
+        let policy = Policy {
+            confused_deputy_protection: true,
+            ..Default::default()
+        };
+        let mut state = SessionState::new();
+        // `read_file` binds the compat use-role (FsTargets) — every
+        // extracted path must already be in `known_paths`, and a `..`
+        // spelling is refused outright.
+        let traversal = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/../secret"}}}"#;
+        let err =
+            apply_confused_deputy_c2s(&policy, &mut state, traversal, None, Some("read_file"))
+                .unwrap_err();
+        assert_eq!(
+            err.validation_kind(),
+            Some(EventType::ValidationPathTraversal),
+            "{}",
+            err.reason
+        );
+        assert!(err.reason.contains("path traversal"), "{}", err.reason);
+        assert!(!err.is_denied_target());
+
+        let undiscovered = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/undiscovered.txt"}}}"#;
+        let err =
+            apply_confused_deputy_c2s(&policy, &mut state, undiscovered, None, Some("read_file"))
+                .unwrap_err();
+        assert!(err.validation_kind().is_none(), "{}", err.reason);
+        assert!(!err.is_denied_target());
+        assert!(err.reason.contains("confused deputy"), "{}", err.reason);
     }
 }

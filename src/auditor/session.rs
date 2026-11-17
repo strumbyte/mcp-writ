@@ -10,6 +10,36 @@ pub use extract::{extract_paths_for_pending, extract_paths_from_response};
 pub use rpc_id::RpcId;
 pub(crate) use rpc_id::{MAX_RPC_ID_BYTES, internal_id_str, rpc_id_bytes};
 
+/// Why [`SessionState::check_access`] refused a path. The traversal
+/// forms are one variant so the deputy gate can tag the audit
+/// classification `validation.path_traversal` without re-reading the
+/// reason text.
+#[derive(Debug)]
+pub enum AccessDenial {
+    /// A `..` segment in the literal, once-, or twice-percent-encoded
+    /// spelling. Carries the refusal text.
+    PathTraversal(String),
+    /// Not in `known_paths` — no discovery-role call discovered it.
+    NotDiscovered(String),
+}
+
+impl AccessDenial {
+    /// The refusal text as audit records and the wire spell it.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::PathTraversal(r) | Self::NotDiscovered(r) => r,
+        }
+    }
+}
+
+impl std::fmt::Display for AccessDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl std::error::Error for AccessDenial {}
+
 /// Tracks file paths discovered during a **process-local** Confused Deputy check.
 ///
 /// Opt-in (`confused_deputy_protection`, default off). Which tools count as
@@ -231,9 +261,11 @@ impl SessionState {
     /// Returns `Err` with a reason if blocked:
     /// - Path traversal (`../`) is always rejected.
     /// - Paths not in the known set are rejected.
-    pub fn check_access(&self, path: &str) -> Result<(), String> {
+    pub fn check_access(&self, path: &str) -> Result<(), AccessDenial> {
         if path.contains("../") || path.contains("..\\") {
-            return Err(format!("path traversal detected in '{path}'",));
+            return Err(AccessDenial::PathTraversal(format!(
+                "path traversal detected in '{path}'",
+            )));
         }
 
         // Detect URL-encoded path traversal.
@@ -244,24 +276,26 @@ impl SessionState {
         if lower.contains('%') {
             let decoded_once = percent_decode_once(&lower);
             if decoded_once.contains("../") || decoded_once.contains("..\\") {
-                return Err(format!("URL-encoded path traversal detected in '{path}'",));
+                return Err(AccessDenial::PathTraversal(format!(
+                    "URL-encoded path traversal detected in '{path}'",
+                )));
             }
 
             // Double-encoding: decode a second time and re-check.
             if decoded_once.contains('%') {
                 let decoded_twice = percent_decode_once(&decoded_once);
                 if decoded_twice.contains("../") || decoded_twice.contains("..\\") {
-                    return Err(format!(
+                    return Err(AccessDenial::PathTraversal(format!(
                         "double URL-encoded path traversal detected in '{path}'",
-                    ));
+                    )));
                 }
             }
         }
 
         if !self.known_paths.contains(path) {
-            return Err(format!(
+            return Err(AccessDenial::NotDiscovered(format!(
                 "path '{path}' was not discovered by a discovery-role tool call",
-            ));
+            )));
         }
 
         Ok(())

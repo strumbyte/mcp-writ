@@ -86,15 +86,15 @@ fn test_unknown_path_blocked() {
     let mut state = SessionState::new();
     state.record_paths(&["/workspace/file1.txt".to_string()]);
     let err = state.check_access("/etc/passwd").unwrap_err();
-    assert!(err.contains("not discovered"));
-    assert!(err.contains("/etc/passwd"));
+    assert!(err.reason().contains("not discovered"));
+    assert!(err.reason().contains("/etc/passwd"));
 }
 
 #[test]
 fn test_empty_known_paths_blocks_all() {
     let state = SessionState::new();
     let err = state.check_access("/workspace/file.txt").unwrap_err();
-    assert!(err.contains("not discovered"));
+    assert!(err.reason().contains("not discovered"));
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn test_path_traversal_forward_slash() {
     let err = state
         .check_access("/workspace/../../etc/passwd")
         .unwrap_err();
-    assert!(err.contains("path traversal"));
+    assert!(err.reason().contains("path traversal"));
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn test_path_traversal_backslash() {
     let err = state
         .check_access("C:\\workspace\\..\\..\\etc\\passwd")
         .unwrap_err();
-    assert!(err.contains("path traversal"));
+    assert!(err.reason().contains("path traversal"));
 }
 
 #[test]
@@ -122,7 +122,7 @@ fn test_path_traversal_detected_even_when_known() {
     // Even if ../path is somehow in known_paths, traversal is blocked
     state.known_paths.insert("/workspace/../secret".to_string());
     let err = state.check_access("/workspace/../secret").unwrap_err();
-    assert!(err.contains("path traversal"));
+    assert!(err.reason().contains("path traversal"));
 }
 
 #[test]
@@ -170,9 +170,9 @@ fn test_record_paths_normalized_traversal_still_denies() {
     let mut state = SessionState::new();
     state.record_paths(&["/workspace/%2e%2e/secret".to_string()]);
     let err = state.check_access("/workspace/../secret").unwrap_err();
-    assert!(err.contains("path traversal"));
+    assert!(err.reason().contains("path traversal"));
     let err = state.check_access("/workspace/%2e%2e/secret").unwrap_err();
-    assert!(err.contains("URL-encoded path traversal"));
+    assert!(err.reason().contains("URL-encoded path traversal"));
 }
 
 // --- pending list requests ---
@@ -348,7 +348,7 @@ fn test_path_traversal_url_encoded_lowercase() {
     let err = state
         .check_access("/workspace/%2e%2e/etc/passwd")
         .unwrap_err();
-    assert!(err.contains("URL-encoded path traversal"));
+    assert!(err.reason().contains("URL-encoded path traversal"));
 }
 
 #[test]
@@ -357,7 +357,7 @@ fn test_path_traversal_url_encoded_uppercase() {
     let err = state
         .check_access("/workspace/%2E%2E/etc/passwd")
         .unwrap_err();
-    assert!(err.contains("URL-encoded path traversal"));
+    assert!(err.reason().contains("URL-encoded path traversal"));
 }
 
 #[test]
@@ -366,7 +366,7 @@ fn test_path_traversal_url_encoded_mixed_case() {
     let err = state
         .check_access("/workspace/%2e%2E/etc/passwd")
         .unwrap_err();
-    assert!(err.contains("URL-encoded path traversal"));
+    assert!(err.reason().contains("URL-encoded path traversal"));
 }
 
 #[test]
@@ -375,7 +375,7 @@ fn test_path_traversal_url_encoded_mixed_case_2() {
     let err = state
         .check_access("/workspace/%2E%2e/etc/passwd")
         .unwrap_err();
-    assert!(err.contains("URL-encoded path traversal"));
+    assert!(err.reason().contains("URL-encoded path traversal"));
 }
 
 // --- Partial URL-encoded path traversal ---
@@ -387,7 +387,10 @@ fn test_path_traversal_first_dot_encoded() {
     let err = state
         .check_access("/workspace/%2e./etc/passwd")
         .unwrap_err();
-    assert!(err.contains("URL-encoded path traversal"), "got: {err}");
+    assert!(
+        err.reason().contains("URL-encoded path traversal"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -397,7 +400,10 @@ fn test_path_traversal_second_dot_encoded() {
     let err = state
         .check_access("/workspace/.%2e/etc/passwd")
         .unwrap_err();
-    assert!(err.contains("URL-encoded path traversal"), "got: {err}");
+    assert!(
+        err.reason().contains("URL-encoded path traversal"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -407,7 +413,10 @@ fn test_path_traversal_dots_encoded_slash_literal() {
     let err = state
         .check_access("/workspace/%2e%2e/etc/passwd")
         .unwrap_err();
-    assert!(err.contains("URL-encoded path traversal"), "got: {err}");
+    assert!(
+        err.reason().contains("URL-encoded path traversal"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -417,7 +426,10 @@ fn test_path_traversal_backslash_partial_encoded() {
     let err = state
         .check_access("C:\\workspace\\.%2e\\secret")
         .unwrap_err();
-    assert!(err.contains("URL-encoded path traversal"), "got: {err}");
+    assert!(
+        err.reason().contains("URL-encoded path traversal"),
+        "got: {err}"
+    );
 }
 
 // --- Double URL-encoded path traversal ---
@@ -428,7 +440,7 @@ fn test_path_traversal_double_url_encoded() {
     let err = state
         .check_access("/workspace/%252e%252e/etc/passwd")
         .unwrap_err();
-    assert!(err.contains("double URL-encoded path traversal"));
+    assert!(err.reason().contains("double URL-encoded path traversal"));
 }
 
 #[test]
@@ -437,7 +449,7 @@ fn test_path_traversal_double_url_encoded_uppercase() {
     let err = state
         .check_access("/workspace/%252E%252E/etc/passwd")
         .unwrap_err();
-    assert!(err.contains("double URL-encoded path traversal"));
+    assert!(err.reason().contains("double URL-encoded path traversal"));
 }
 
 #[test]
@@ -446,7 +458,7 @@ fn test_path_traversal_double_url_encoded_mixed() {
     let err = state
         .check_access("/workspace/%252e%252E/etc/passwd")
         .unwrap_err();
-    assert!(err.contains("double URL-encoded path traversal"));
+    assert!(err.reason().contains("double URL-encoded path traversal"));
 }
 
 #[test]
@@ -456,7 +468,7 @@ fn test_path_traversal_double_url_encoded_with_slash() {
     let err = state
         .check_access("/workspace/%252e%252e%252fetc/passwd")
         .unwrap_err();
-    assert!(err.contains("double URL-encoded path traversal"));
+    assert!(err.reason().contains("double URL-encoded path traversal"));
 }
 
 #[test]
@@ -467,8 +479,8 @@ fn test_path_traversal_double_partial_encoded() {
         .check_access("/workspace/%252e./etc/passwd")
         .unwrap_err();
     assert!(
-        err.contains("URL-encoded path traversal")
-            || err.contains("double URL-encoded path traversal"),
+        err.reason().contains("URL-encoded path traversal")
+            || err.reason().contains("double URL-encoded path traversal"),
         "got: {err}"
     );
 }

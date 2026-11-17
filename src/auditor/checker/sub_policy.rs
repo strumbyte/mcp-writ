@@ -6,8 +6,8 @@ use crate::policy::host::extract_host_from_url;
 use crate::policy::opaque::OpaqueMatcher;
 use crate::policy::{EgressDest, EgressProto, Policy, ToolPolicy};
 
-use super::PolicyViolation;
 use super::targets::{ExtractedTargets, collect_argument_targets_opaque};
+use super::{DenialKind, PolicyViolation};
 
 /// A request-side network destination: the canonical host plus the
 /// `port=`/`proto=` qualifiers the argument spelling pinned. Bare host
@@ -69,10 +69,24 @@ fn egress_dest_matches(dest: &EgressDest, target: &NetTarget) -> bool {
 fn reject_if_secret_overlay(tool: &ToolPolicy, path: &str) -> Result<(), PolicyViolation> {
     match crate::secret_paths::overlay_denies(path) {
         Ok(()) => Ok(()),
-        Err(reason) => Err(PolicyViolation {
-            tool_name: tool.name.clone(),
-            reason,
-        }),
+        Err(denial) => {
+            let kind = match &denial {
+                crate::secret_paths::OverlayDenial::ReservedMatch(_) => DenialKind::SecretOverlay {
+                    reserved_match: true,
+                },
+                crate::secret_paths::OverlayDenial::Rejected(_) => DenialKind::SecretOverlay {
+                    reserved_match: false,
+                },
+                // The generic empty/NUL path refusal shares its message
+                // with non-overlay producers — no overlay attribution.
+                crate::secret_paths::OverlayDenial::EmptyOrNul(_) => DenialKind::Other,
+            };
+            Err(PolicyViolation::new(
+                tool.name.clone(),
+                kind,
+                denial.into_reason(),
+            ))
+        }
     }
 }
 
@@ -138,10 +152,11 @@ pub(super) fn check_tool_sub_policy(
         .ok()
         == Some(crate::policy::SideEffect::ReadOnly);
     if read_only && (!extracted.hosts.is_empty() || !extracted.urls.is_empty()) {
-        return Err(PolicyViolation {
-            tool_name: tool.name.clone(),
-            reason: "side_effect=\"read_only\" forbids host/URL arguments".to_string(),
-        });
+        return Err(PolicyViolation::new(
+            tool.name.clone(),
+            DenialKind::Other,
+            "side_effect=\"read_only\" forbids host/URL arguments",
+        ));
     }
 
     // The decoy-argument hole (F66/F11/F12): a string under a key
@@ -167,10 +182,11 @@ pub(super) fn check_tool_sub_policy(
     // selector is: the retained targets are a strict prefix, so a
     // restricted contract denies rather than authorize a partial set.
     if (fs_restricted || net_contract) && extracted.truncated {
-        return Err(PolicyViolation {
-            tool_name: tool.name.clone(),
-            reason: "argument target extraction exceeded the work budget".to_string(),
-        });
+        return Err(PolicyViolation::new(
+            tool.name.clone(),
+            DenialKind::Other,
+            "argument target extraction exceeded the work budget",
+        ));
     }
     if (fs_restricted || net_contract)
         && let Some(bad) = extracted
@@ -178,25 +194,26 @@ pub(super) fn check_tool_sub_policy(
             .iter()
             .find(|v| crate::pathutil::selector_plausible(v))
     {
-        return Err(PolicyViolation {
-            tool_name: tool.name.clone(),
-            reason: format!(
+        return Err(PolicyViolation::new(
+            tool.name.clone(),
+            DenialKind::Other,
+            format!(
                 "unrecognized argument '{bad}' may carry an undeclared resource \
                  selector — restricted tools accept only declared fields"
             ),
-        });
+        ));
     }
 
     if let Some(ref fs_policy) = tool.fs {
         has_sub = true;
         if fs_restricted {
             if extracted.paths.is_empty() && !fs_policy.allows_pathless_call() {
-                return Err(PolicyViolation {
-                    tool_name: tool.name.clone(),
-                    reason: "filesystem-restricted tool is missing a path target \
-                             (checked path/file/uri and nested string fields)"
-                        .to_string(),
-                });
+                return Err(PolicyViolation::new(
+                    tool.name.clone(),
+                    DenialKind::Other,
+                    "filesystem-restricted tool is missing a path target \
+                     (checked path/file/uri and nested string fields)",
+                ));
             }
             // The policy side is fixed for the whole request — resolve
             // its patterns once instead of canonicalizing per target.
@@ -228,13 +245,14 @@ pub(super) fn check_tool_sub_policy(
     // canonical spelling itself.
     if !extracted.noncanonical.is_empty() && fs_restricted {
         let nc = &extracted.noncanonical[0];
-        return Err(PolicyViolation {
-            tool_name: tool.name.clone(),
-            reason: format!(
+        return Err(PolicyViolation::new(
+            tool.name.clone(),
+            DenialKind::Other,
+            format!(
                 "path argument '{}' is not in canonical form; resend the canonical spelling '{}'",
                 nc.raw, nc.normalized
             ),
-        });
+        ));
     }
 
     // Build qualified destinations: bare host/socket arguments carry the
@@ -269,12 +287,11 @@ pub(super) fn check_tool_sub_policy(
                     || !policy.network.outbound.allowed.is_empty()
                     || !policy.network.outbound.allowed_cidrs.is_empty()
                 {
-                    return Err(PolicyViolation {
-                        tool_name: tool.name.clone(),
-                        reason: format!(
-                            "invalid or unparseable URL '{url}' in network-restricted tool"
-                        ),
-                    });
+                    return Err(PolicyViolation::new(
+                        tool.name.clone(),
+                        DenialKind::Other,
+                        format!("invalid or unparseable URL '{url}' in network-restricted tool"),
+                    ));
                 }
             }
         }
@@ -285,10 +302,11 @@ pub(super) fn check_tool_sub_policy(
         let host = &target.host;
         for denied in &policy.network.outbound.denied_hosts {
             if host_matches(host, denied) {
-                return Err(PolicyViolation {
-                    tool_name: tool.name.clone(),
-                    reason: format!("host '{host}' denied by global network policy"),
-                });
+                return Err(PolicyViolation::new(
+                    tool.name.clone(),
+                    DenialKind::DeniedTarget,
+                    format!("host '{host}' denied by global network policy"),
+                ));
             }
         }
         // IP layer: a literal-IP argument is also evaluated against the
@@ -301,12 +319,11 @@ pub(super) fn check_tool_sub_policy(
         if let Some(ip) = ip {
             for denied in &policy.network.outbound.denied_cidrs {
                 if crate::policy::host::cidr_contains(denied, &ip) {
-                    return Err(PolicyViolation {
-                        tool_name: tool.name.clone(),
-                        reason: format!(
-                            "host '{host}' denied by global network cidr rule '{denied}'"
-                        ),
-                    });
+                    return Err(PolicyViolation::new(
+                        tool.name.clone(),
+                        DenialKind::DeniedTarget,
+                        format!("host '{host}' denied by global network cidr rule '{denied}'"),
+                    ));
                 }
             }
         }
@@ -330,10 +347,11 @@ pub(super) fn check_tool_sub_policy(
                         .any(|c| crate::policy::host::cidr_contains(c, &ip))
                 });
             if !allowed {
-                return Err(PolicyViolation {
-                    tool_name: tool.name.clone(),
-                    reason: format!("host '{host}' not in global outbound allow list"),
-                });
+                return Err(PolicyViolation::new(
+                    tool.name.clone(),
+                    DenialKind::DeniedTarget,
+                    format!("host '{host}' not in global outbound allow list"),
+                ));
             }
         }
     }
@@ -352,12 +370,12 @@ pub(super) fn check_tool_sub_policy(
             || !net_policy.denied_cidrs.is_empty()
             || !net_policy.egress_rules.is_empty();
         if requires_host_target && targets.is_empty() {
-            return Err(PolicyViolation {
-                tool_name: tool.name.clone(),
-                reason: "network-restricted tool is missing a url/host target \
-                         (checked url/host/uri and nested string fields)"
-                    .to_string(),
-            });
+            return Err(PolicyViolation::new(
+                tool.name.clone(),
+                DenialKind::Other,
+                "network-restricted tool is missing a url/host target \
+                 (checked url/host/uri and nested string fields)",
+            ));
         }
         // Declared `proto=`/`port=` qualifiers are part of the contract:
         // when the block carried structured egress rules, destination
@@ -370,10 +388,11 @@ pub(super) fn check_tool_sub_policy(
             let host = &target.host;
             for denied in &net_policy.denied_hosts {
                 if host_matches(host, denied) {
-                    return Err(PolicyViolation {
-                        tool_name: tool.name.clone(),
-                        reason: format!("host '{host}' denied by tool network sub-policy"),
-                    });
+                    return Err(PolicyViolation::new(
+                        tool.name.clone(),
+                        DenialKind::DeniedTarget,
+                        format!("host '{host}' denied by tool network sub-policy"),
+                    ));
                 }
             }
             let ip = crate::policy::host::normalize_policy_host(host)
@@ -382,12 +401,11 @@ pub(super) fn check_tool_sub_policy(
             if let Some(ip) = ip {
                 for denied in &net_policy.denied_cidrs {
                     if crate::policy::host::cidr_contains(denied, &ip) {
-                        return Err(PolicyViolation {
-                            tool_name: tool.name.clone(),
-                            reason: format!(
-                                "host '{host}' denied by tool network cidr rule '{denied}'"
-                            ),
-                        });
+                        return Err(PolicyViolation::new(
+                            tool.name.clone(),
+                            DenialKind::DeniedTarget,
+                            format!("host '{host}' denied by tool network cidr rule '{denied}'"),
+                        ));
                     }
                 }
             }
@@ -402,12 +420,11 @@ pub(super) fn check_tool_sub_policy(
                             || rule.port == target.port)
                 });
                 if denied_qualified {
-                    return Err(PolicyViolation {
-                        tool_name: tool.name.clone(),
-                        reason: format!(
-                            "destination '{host}' denied by qualified tool egress rule"
-                        ),
-                    });
+                    return Err(PolicyViolation::new(
+                        tool.name.clone(),
+                        DenialKind::DeniedTarget,
+                        format!("destination '{host}' denied by qualified tool egress rule"),
+                    ));
                 }
                 let allowed_qualified = qualified.iter().filter(|r| r.allow).any(|rule| {
                     egress_dest_matches(&rule.dest, target)
@@ -415,13 +432,14 @@ pub(super) fn check_tool_sub_policy(
                         && rule.port.is_none_or(|p| target.port == Some(p))
                 });
                 if !allowed_qualified {
-                    return Err(PolicyViolation {
-                        tool_name: tool.name.clone(),
-                        reason: format!(
+                    return Err(PolicyViolation::new(
+                        tool.name.clone(),
+                        DenialKind::DeniedTarget,
+                        format!(
                             "destination '{host}' not covered by tool egress rules \
                              (proto/port qualifiers apply)"
                         ),
-                    });
+                    ));
                 }
             } else if net_policy.allow_specified
                 || !net_policy.allowed_hosts.is_empty()
@@ -438,10 +456,11 @@ pub(super) fn check_tool_sub_policy(
                             .any(|c| crate::policy::host::cidr_contains(c, &ip))
                     });
                 if !allowed {
-                    return Err(PolicyViolation {
-                        tool_name: tool.name.clone(),
-                        reason: format!("host '{host}' not in tool network allowed hosts"),
-                    });
+                    return Err(PolicyViolation::new(
+                        tool.name.clone(),
+                        DenialKind::DeniedTarget,
+                        format!("host '{host}' not in tool network allowed hosts"),
+                    ));
                 }
             }
         }
@@ -475,9 +494,12 @@ fn resolve_fs_patterns(
     fs_policy: &crate::policy::FsToolPolicy,
 ) -> Result<ResolvedFsPatterns, PolicyViolation> {
     let resolve = |pattern: &String| -> Result<String, PolicyViolation> {
-        crate::pathutil::resolve_policy_pattern(pattern).map_err(|e| PolicyViolation {
-            tool_name: tool.name.clone(),
-            reason: format!("policy path '{pattern}' could not be resolved: {e}"),
+        crate::pathutil::resolve_policy_pattern(pattern).map_err(|e| {
+            PolicyViolation::new(
+                tool.name.clone(),
+                DenialKind::Other,
+                format!("policy path '{pattern}' could not be resolved: {e}"),
+            )
         })
     };
     Ok(ResolvedFsPatterns {
@@ -503,28 +525,30 @@ fn authorize_one_path_prepared(
     let effective = match crate::pathutil::normalize_fs_argument(path) {
         Ok(normalized) => normalized,
         Err(e) => {
-            return Err(PolicyViolation {
-                tool_name: tool.name.clone(),
-                reason: format!("path '{path}' could not be normalized: {e}"),
-            });
+            return Err(PolicyViolation::new(
+                tool.name.clone(),
+                DenialKind::Other,
+                format!("path '{path}' could not be normalized: {e}"),
+            ));
         }
     };
-    let resolved =
-        crate::pathutil::resolve_for_authorization(&effective).map_err(|e| PolicyViolation {
-            tool_name: tool.name.clone(),
-            reason: format!("path '{path}' could not be resolved: {e}"),
-        })?;
+    let resolved = crate::pathutil::resolve_for_authorization(&effective).map_err(|e| {
+        PolicyViolation::new(
+            tool.name.clone(),
+            DenialKind::Other,
+            format!("path '{path}' could not be resolved: {e}"),
+        )
+    })?;
 
     let matches_pattern = |pattern: &str| crate::pathutil::path_matches_lexical(&resolved, pattern);
 
     for denied in &patterns.denied {
         if matches_pattern(denied) {
-            return Err(PolicyViolation {
-                tool_name: tool.name.clone(),
-                reason: format!(
-                    "path '{path}' (resolved '{resolved}') denied by tool fs sub-policy"
-                ),
-            });
+            return Err(PolicyViolation::new(
+                tool.name.clone(),
+                DenialKind::DeniedTarget,
+                format!("path '{path}' (resolved '{resolved}') denied by tool fs sub-policy"),
+            ));
         }
     }
     if fs_policy.allow_specified || !fs_policy.allowed_paths.is_empty() {
@@ -536,12 +560,11 @@ fn authorize_one_path_prepared(
             }
         }
         if !allowed {
-            return Err(PolicyViolation {
-                tool_name: tool.name.clone(),
-                reason: format!(
-                    "path '{path}' (resolved '{resolved}') not in tool fs allowed paths"
-                ),
-            });
+            return Err(PolicyViolation::new(
+                tool.name.clone(),
+                DenialKind::DeniedTarget,
+                format!("path '{path}' (resolved '{resolved}') not in tool fs allowed paths"),
+            ));
         }
     }
     Ok(())
