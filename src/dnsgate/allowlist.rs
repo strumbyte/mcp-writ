@@ -95,6 +95,11 @@ impl DynamicAllowList {
     /// is zero, or `quals` is empty — a zero-TTL grant expires before
     /// it can be used and a qualifier-less grant authorizes nothing,
     /// so neither is recorded (and the response is still relayed).
+    ///
+    /// Capacity counts live grants only; a direct registration never
+    /// consults the staged set. Callers must not mix the two modes on
+    /// one list — the gate mints only through `*_staged`, while the
+    /// macOS CONNECT proxy registers directly on its own table.
     pub fn register(
         &self,
         name: &str,
@@ -154,6 +159,14 @@ impl DynamicAllowList {
     /// not be usable by an IP-layer consumer before the resolution's
     /// audit record is durable. On commit failure [`Self::drop_staged`]
     /// discards the staged set without touching live grants.
+    ///
+    /// Outstanding tokens are the caller's bound — the gate holds one
+    /// per in-flight query under its `MAX_INFLIGHT_QUERIES` semaphore —
+    /// and each staged entry keeps its reservation until commit or
+    /// drop; nothing reaps staged entries, so a cancelled query still
+    /// settles its token (the gate's `StagingGuard`). Capacity counts
+    /// *unique* keys only, so reservations another token already holds
+    /// never widen the staged footprint.
     pub fn begin_staging(&self) -> GrantStaging {
         GrantStaging(self.next_staging.fetch_add(1, Ordering::Relaxed))
     }
@@ -204,9 +217,12 @@ impl DynamicAllowList {
             e.quals = quals.to_vec();
             return true;
         }
-        // Capacity counts live grants plus staged entries that would
-        // add a *new* key on commit — a staged refresh of a live key
-        // adds nothing, and two tokens staging the same key count once.
+        // Capacity counts live grants plus staged keys that would add
+        // a *new* key on commit — a staged refresh of a live key adds
+        // nothing, and two tokens staging the same key share one
+        // reservation: re-staging a key another token already holds
+        // merges into that reservation on commit, so it consumes no
+        // further headroom and must not be refused by a full table.
         if !inner.grants.contains_key(&key) {
             let staged_new: HashSet<&GrantKey> = inner
                 .staged
@@ -219,7 +235,9 @@ impl DynamicAllowList {
                 })
                 .filter(|k| !inner.grants.contains_key(*k))
                 .collect();
-            if inner.grants.len() + staged_new.len() >= self.max_grants {
+            if !staged_new.contains(&key)
+                && inner.grants.len() + staged_new.len() >= self.max_grants
+            {
                 return false;
             }
         }
@@ -255,6 +273,21 @@ impl DynamicAllowList {
     /// committed it.
     pub fn drop_staged(&self, staging: GrantStaging) {
         let mut inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        inner.staged.remove(&staging.0);
+    }
+
+    /// [`Self::drop_staged`] for unwinding paths — the same removal,
+    /// but proceeds through a poisoned lock instead of panicking:
+    /// discarding a bucket is memory-safe on any state, and a `Drop`
+    /// running during unwind must not introduce a second panic (that
+    /// aborts the process). Only the gate's `StagingGuard` calls this.
+    pub(crate) fn drop_staged_unwind_safe(&self, staging: GrantStaging) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
         inner.staged.remove(&staging.0);
@@ -543,6 +576,307 @@ mod tests {
         // s1's drop removes its own staged copy only.
         al.drop_staged(s1);
         assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+    }
+
+    /// Two resolutions racing the same name→addr under a full table
+    /// must both stage: the second token re-reserves the key the first
+    /// already holds — the reservation merges into one live grant on
+    /// commit, so it consumes no new capacity.
+    #[test]
+    fn staged_same_key_two_tokens_at_capacity() {
+        let al = DynamicAllowList::new(1);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let s1 = al.begin_staging();
+        let s2 = al.begin_staging();
+        assert!(al.register_staged_at(
+            s1,
+            "dup.example",
+            a,
+            &[TCP_ANY],
+            Instant::now() + Duration::from_secs(60)
+        ));
+        assert!(al.register_staged_at(
+            s2,
+            "dup.example",
+            a,
+            &[TCP_ANY],
+            Instant::now() + Duration::from_secs(90)
+        ));
+        // Neither reservation is visible before commit.
+        assert!(!al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert!(al.names_for(&a).is_empty());
+        assert_eq!(al.live_len(), 0);
+        assert!(!al.snapshot_json().contains("dup.example"));
+
+        al.commit_staged(s1);
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert_eq!(al.live_len(), 1);
+        // s2's leftover staged copy drops without touching the grant
+        // s1 committed.
+        al.drop_staged(s2);
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert_eq!(al.live_len(), 1);
+    }
+
+    /// The stored RF02 reproducer's shape — capacity 2 holding one
+    /// live grant: both tokens reserve the shared key, `commit:s1`
+    /// publishes it once, `drop:s2` removes only s2's hold
+    /// (tests/fixtures/refactoring/rf02/capacity1_duplicate.json).
+    #[test]
+    fn staged_same_key_two_tokens_one_live() {
+        let al = DynamicAllowList::new(2);
+        let live = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let staged_addr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        assert!(al.register("live.example", live, &[TCP_ANY], Duration::from_secs(60)));
+        let s1 = al.begin_staging();
+        let s2 = al.begin_staging();
+        assert!(al.register_staged(
+            s1,
+            "x.example",
+            staged_addr,
+            &[TCP_ANY],
+            Duration::from_secs(60)
+        ));
+        assert!(al.register_staged(
+            s2,
+            "x.example",
+            staged_addr,
+            &[TCP_ANY],
+            Duration::from_secs(60)
+        ));
+        assert_eq!(al.live_len(), 1);
+        al.commit_staged(s1);
+        assert_eq!(al.live_len(), 2);
+        assert!(al.is_allowed(&staged_addr, crate::policy::EgressProto::Tcp, 443));
+        al.drop_staged(s2);
+        assert_eq!(al.live_len(), 2);
+        assert!(al.is_allowed(&staged_addr, crate::policy::EgressProto::Tcp, 443));
+    }
+
+    /// Either drop/commit order publishes the shared key once — a
+    /// token's cancellation never removes a reservation another token
+    /// still holds, and a second commit on the same key is a refresh.
+    #[test]
+    fn staged_same_key_drop_then_commit_and_reverse_commit() {
+        // Drop the first stager, then commit the second.
+        let al = DynamicAllowList::new(1);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+        let s1 = al.begin_staging();
+        let s2 = al.begin_staging();
+        assert!(al.register_staged(s1, "ord.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        assert!(al.register_staged(s2, "ord.example", a, &[TCP_ANY], Duration::from_secs(90)));
+        al.drop_staged(s1);
+        al.commit_staged(s2);
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert_eq!(al.live_len(), 1);
+
+        // Commit in reverse registration order — the second commit
+        // refreshes the same key (TTL/scope update), still one grant.
+        let al = DynamicAllowList::new(1);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12));
+        let s1 = al.begin_staging();
+        let s2 = al.begin_staging();
+        assert!(al.register_staged(s1, "ord.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        assert!(al.register_staged(s2, "ord.example", a, &[TCP_ANY], Duration::from_secs(90)));
+        al.commit_staged(s2);
+        al.commit_staged(s1);
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert_eq!(al.live_len(), 1);
+    }
+
+    /// A staged refresh of a *live* key never needs headroom — at
+    /// capacity 1 the refresh stages and its commit replaces expiry
+    /// and scope, the same update `register` performs in place.
+    #[test]
+    fn staged_refresh_of_live_key_at_capacity() {
+        let al = DynamicAllowList::new(1);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
+        let udp53 = crate::policy::GrantQual {
+            proto: crate::policy::EgressProto::Udp,
+            port: Some(53),
+        };
+        assert!(al.register("svc.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        let s = al.begin_staging();
+        assert!(al.register_staged(s, "svc.example", a, &[udp53], Duration::from_secs(120)));
+        // The refresh is invisible until commit — the live grant still
+        // carries its original scope.
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert!(!al.is_allowed(&a, crate::policy::EgressProto::Udp, 53));
+        al.commit_staged(s);
+        assert!(!al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Udp, 53));
+        assert_eq!(al.quals_for(&a), vec![udp53]);
+        assert_eq!(al.live_len(), 1);
+    }
+
+    /// Move every entry staged under `token` into the past — the
+    /// resolution's answer aged out between mint and audit commit.
+    /// Registration still needs a future deadline (`register_staged_at`
+    /// refuses an already-lapsed one), so the expiry is rewound after
+    /// the fact instead of racing the real clock.
+    fn expire_staged(al: &DynamicAllowList, token: GrantStaging) {
+        let mut inner = al.inner.lock().unwrap();
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        for (_, e) in inner.staged.get_mut(&token.0).unwrap() {
+            e.expires = past;
+        }
+    }
+
+    /// A reservation that expires while staged commits as the
+    /// resolver's newer truth — landing the lapsed expiry closes the
+    /// key rather than letting stale authority linger.
+    #[test]
+    fn staged_entry_expiring_before_commit() {
+        let al = DynamicAllowList::new(16);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 30));
+        // An unexpired reservation commits normally.
+        let s = al.begin_staging();
+        assert!(al.register_staged_at(
+            s,
+            "ttl.example",
+            a,
+            &[TCP_ANY],
+            Instant::now() + Duration::from_secs(60)
+        ));
+        al.commit_staged(s);
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        // A reservation whose answer lapsed before commit lands the
+        // newer truth — the expired entry overwrites the live grant.
+        let s = al.begin_staging();
+        assert!(al.register_staged_at(
+            s,
+            "ttl.example",
+            a,
+            &[TCP_ANY],
+            Instant::now() + Duration::from_secs(60)
+        ));
+        expire_staged(&al, s);
+        al.commit_staged(s);
+        assert!(!al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert_eq!(al.live_len(), 0);
+
+        // The same overwrite applies to a staged refresh of a live
+        // key: an unexpired refresh renews the grant, an expired one
+        // closes it.
+        let b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 31));
+        assert!(al.register("live.example", b, &[TCP_ANY], Duration::from_secs(300)));
+        let s = al.begin_staging();
+        assert!(al.register_staged_at(
+            s,
+            "live.example",
+            b,
+            &[TCP_ANY],
+            Instant::now() + Duration::from_secs(120)
+        ));
+        al.commit_staged(s);
+        assert!(al.is_allowed(&b, crate::policy::EgressProto::Tcp, 443));
+        let s = al.begin_staging();
+        assert!(al.register_staged_at(
+            s,
+            "live.example",
+            b,
+            &[TCP_ANY],
+            Instant::now() + Duration::from_secs(120)
+        ));
+        expire_staged(&al, s);
+        al.commit_staged(s);
+        assert!(!al.is_allowed(&b, crate::policy::EgressProto::Tcp, 443));
+        assert_eq!(al.live_len(), 0);
+    }
+
+    /// Shared-key reservations share one reservation; *distinct* keys
+    /// still count separately — a different name on the same address
+    /// or a different address under the same name must be refused
+    /// once every unique key is spoken for.
+    #[test]
+    fn staged_distinct_key_at_capacity_refused() {
+        let al = DynamicAllowList::new(1);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 40));
+        let b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 41));
+        let s1 = al.begin_staging();
+        let s2 = al.begin_staging();
+        assert!(al.register_staged(s1, "n.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        // Same key again from s2 — shares s1's reservation.
+        assert!(al.register_staged(s2, "n.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        // A different name on the same address is a different key.
+        assert!(!al.register_staged(s2, "m.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        // A different address under the same name is a different key.
+        assert!(!al.register_staged(s2, "n.example", b, &[TCP_ANY], Duration::from_secs(60)));
+        // The refusals stage nothing: s2 commits only its shared copy.
+        al.commit_staged(s2);
+        assert_eq!(al.live_len(), 1);
+        assert_eq!(al.names_for(&a), vec!["n.example"]);
+        al.drop_staged(s1);
+    }
+
+    /// Uncommitted reservations stay invisible to the exported
+    /// snapshot too — `export_to` serializes the same live-only view
+    /// `snapshot_json` produces.
+    #[test]
+    fn staged_grants_absent_from_export() {
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+            .join("mcp_writ_test")
+            .join(format!("export_staged_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("allowlist.json");
+        let al = DynamicAllowList::new(16);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50));
+        al.register("live.example", a, &[TCP_ANY], Duration::from_secs(60));
+        let s = al.begin_staging();
+        assert!(al.register_staged(
+            s,
+            "pending.example",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 51)),
+            &[TCP_ANY],
+            Duration::from_secs(60)
+        ));
+        al.export_to(&dest).unwrap();
+        let body = std::fs::read_to_string(&dest).unwrap();
+        assert!(body.contains("live.example"));
+        assert!(!body.contains("pending.example"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Direct registration counts live grants only — it never
+    /// consults the staged set. Callers do not mix the two modes on
+    /// one list (the gate stages, the CONNECT proxy registers), so
+    /// this overlap is a contract pin, not a production path.
+    #[test]
+    fn register_ignores_staged_capacity() {
+        let al = DynamicAllowList::new(1);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 60));
+        let b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 61));
+        let s = al.begin_staging();
+        assert!(al.register_staged(s, "staged.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        assert!(al.register("direct.example", b, &[TCP_ANY], Duration::from_secs(60)));
+        assert_eq!(al.live_len(), 1);
+        al.drop_staged(s);
+    }
+
+    /// `drop_staged_unwind_safe` must not panic on a poisoned lock —
+    /// `StagingGuard` runs it inside `Drop`, where a second panic
+    /// during unwind would abort the process. The bucket discard is
+    /// memory-safe even on possibly-inconsistent state.
+    #[test]
+    fn drop_staged_unwind_safe_tolerates_a_poisoned_lock() {
+        let al = std::sync::Arc::new(DynamicAllowList::new(4));
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 70));
+        let s = al.begin_staging();
+        assert!(al.register_staged(s, "p.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        // Poison the lock: a thread panics while holding it.
+        let al2 = al.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = al2.inner.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(al.inner.lock().is_err(), "lock must be poisoned");
+        // No panic — and the stranded bucket is still discarded.
+        al.drop_staged_unwind_safe(s);
+        let inner = al.inner.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(inner.staged.is_empty());
     }
 
     /// Rollback for the fail-closed ordering contract: a grant minted
