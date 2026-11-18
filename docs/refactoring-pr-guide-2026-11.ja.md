@@ -322,12 +322,12 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 
 **タスク**
 
-- [ ] 現行の受付・enqueue・永続化ACK・reopen・shutdownの順序を整理し、「受理済みイベント」と容量待ち／dropされたイベントを区別する。回転要求がどこまでの受理済みイベントを待つかを先に定義する。
-- [ ] イベントと回転・終了要求の受付順を一箇所で確定し、回転位置を順序上のbarrierとして表す。有界の制御容量を確保して、イベント容量が埋まっても制御要求を永久に投入待ちにしない。待機中のcancelや送信失敗で処理不能な順序の穴を作らず、queue容量・byte permitの解放を確認する。
-- [ ] writerが一定件数を処理した時点または期限到達時に時計を確認するようにする。受信queueが空になることを同期開始の条件にしない。処理区切りの上限とflush／fsync期限の扱いをコードとテストで明確にする。
-- [ ] successful reopenはbarrier前の記録を旧sinkへ確定し、新sinkのmarkerと後続イベントの順序を保つ。reopen失敗・marker書込失敗・新旧sinkの同期失敗を区別し、既存のエラー優先順位と失敗ラッチを保つ。
-- [ ] テスト用の時計・sinkで連続投入、飽和、複数回転、回転中shutdownを決定的に再現する。時計とsinkの注入はランタイム非依存にし、`tokio::time`の一時停止等に依存させない。RF06で専用スレッドへ移した後も同じ回帰試験を使うためである。現行writerは`BufWriter<File>`と`tokio::time::interval`に直結し、`sink_entry_visible`はファイルと名前の一致を検査する。テスト用sinkで扱う範囲と、実ファイルのケースへ委ねる範囲を先に決める。単なるsleep後の件数検査ではなく、同期開始、barrier位置、marker、ACK、制御受付を観測する。
-- [ ] 実ファイルの回転、disk full、書込失敗、名前差替え、親ディレクトリ同期、終了時drainを確認する。永続化ACKは書込・必要な同期・可視性確認のすべてが成功した後にだけ返す。
+- [x] 現行の受付・enqueue・永続化ACK・reopen・shutdownの順序を整理し、「受理済みイベント」と容量待ち／dropされたイベントを区別する。回転要求がどこまでの受理済みイベントを待つかを先に定義する。 → 受理=queue投入成功のみ（`log`はcounted drop、`log_ordered`/`log_committed`はbackpressure）と定義し、reopenは自アイテムのqueue位置より前に受理された全記録を旧sinkへ確定する。
+- [x] イベントと回転・終了要求の受付順を一箇所で確定し、回転位置を順序上のbarrierとして表す。有界の制御容量を確保して、イベント容量が埋まっても制御要求を永久に投入待ちにしない。待機中のcancelや送信失敗で処理不能な順序の穴を作らず、queue容量・byte permitの解放を確認する。 → 単一`WriterItem`キュー、`event_slots`(4096)と`control_slots`(4)の独立枠。アイテムはsend完了時のみ存在し、permitはdequeue時(byte)／処理完了時(slot)に解放。
+- [x] writerが一定件数を処理した時点または期限到達時に時計を確認するようにする。受信queueが空になることを同期開始の条件にしない。処理区切りの上限とflush／fsync期限の扱いをコードとテストで明確にする。 → `CLOCK_CHECK_RECORDS=32`件ごとの境界確認＋アイドル時のみ`sleep_until`起床。M3で継続投入下の同期開始遅延max 14.9µs（busy=12s変種max 6.5µs）を確認。
+- [x] successful reopenはbarrier前の記録を旧sinkへ確定し、新sinkのmarkerと後続イベントの順序を保つ。reopen失敗・marker書込失敗・新旧sinkの同期失敗を区別し、既存のエラー優先順位と失敗ラッチを保つ。 → `FileSink::reopen`が旧世代flush+fsync+dir fsync→交換→新世代entry fsyncを一括実施。ErrBeforeSwap／ErrAfterSwap／marker失敗を`result.and(marker_result)`で区別（reopen側優先）。
+- [x] テスト用の時計・sinkで連続投入、飽和、複数回転、回転中shutdownを決定的に再現する。時計とsinkの注入はランタイム非依存にし、`tokio::time`の一時停止等に依存させない。RF06で専用スレッドへ移した後も同じ回帰試験を使うためである。現行writerは`BufWriter<File>`と`tokio::time::interval`に直結し、`sink_entry_visible`はファイルと名前の一致を検査する。テスト用sinkで扱う範囲と、実ファイルのケースへ委ねる範囲を先に決める。単なるsleep後の件数検査ではなく、同期開始、barrier位置、marker、ACK、制御受付を観測する。 → `AuditClock`/`AuditSink` trait注入（製品=`TokioClock`+`FileSink`、試験=`ManualClock`+`FakeSink`）。`tests/fairness.rs` 17件でop列・世代・ACK・制御枠を決定的に観測。
+- [x] 実ファイルの回転、disk full、書込失敗、名前差替え、親ディレクトリ同期、終了時drainを確認する。永続化ACKは書込・必要な同期・可視性確認のすべてが成功した後にだけ返す。 → `audit_reopen_e2e`（WSL、SIGUSR1・rename差替え・dir fsync）3/3、`audit_durability_e2e`（disk full latch・drain）4/4、sink/logger lib試験で実ファイル回転を確認。
 
 **維持する条件:** 件数・byte上限、best-effort／fail-closed、Buffered／EveryEvent、High記録、失敗ラッチ、ファイルと名前の一致を維持する。受入条件は「期限到達後、次の有限な処理区切りで同期を開始する」であり、OS I/O停止中も5秒以内に同期が完了する保証ではない。workerの専用スレッド化や同期回数削減は本PRへ混ぜない。
 
