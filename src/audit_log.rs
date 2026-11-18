@@ -623,11 +623,12 @@ impl AuditLogger {
             return Ok(false);
         }
         let queued_at = std::time::Instant::now();
-        let tx = self.inner.tx.lock().unwrap().clone();
-        let Some(tx) = tx else { return Ok(false) };
         // The control share of the queue — the request always finds
         // submission space ahead of its service, no matter how
-        // saturated the record stream is.
+        // saturated the record stream is. Acquired before the sender
+        // check so a request parked here holds no sender clone that
+        // would keep the channel — and a rotation — alive across a
+        // shutdown.
         let slot = match self.inner.control_slots.clone().acquire_owned().await {
             Ok(s) => s,
             Err(_) => {
@@ -638,22 +639,48 @@ impl AuditLogger {
             }
         };
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        // A dead writer can neither take the request nor hold the sink
-        // — the same unavailability a closed record channel reports.
-        if tx
-            .send(WriterItem::Control(ControlRequest::Reopen(ReopenRequest {
-                reply: ack_tx,
-                marker,
-                queued_at,
-                slot,
-            })))
-            .await
-            .is_err()
-        {
-            self.inner.writer_failed.set();
-            return Err(crate::error::AuditorError::AuditUnavailable(
-                "audit writer stopped".into(),
-            ));
+        // The sender check and the enqueue run under the same lock
+        // `shutdown()` takes the sender through: a shutdown that
+        // already began means no live sink, so the request answers
+        // `false` instead of queueing a rotation the drain would
+        // service afterwards. `try_send` suffices — a request holding
+        // its control permit always fits the queue's control share —
+        // and keeps the check-and-enqueue atomic under the lock.
+        let send = {
+            let guard = self.inner.tx.lock().unwrap();
+            match guard.as_ref() {
+                Some(tx) => tx.try_send(WriterItem::Control(ControlRequest::Reopen(
+                    ReopenRequest {
+                        reply: ack_tx,
+                        marker,
+                        queued_at,
+                        slot,
+                    },
+                ))),
+                None => return Ok(false),
+            }
+        };
+        match send {
+            Ok(()) => {}
+            // A control item holding its slot permit always fits the
+            // queue's control share — unreachable while the accounting
+            // holds; keep the latch parity with a closed channel
+            // regardless.
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.inner.writer_failed.set();
+                return Err(crate::error::AuditorError::AuditUnavailable(
+                    "audit queue full".into(),
+                ));
+            }
+            // A dead writer can neither take the request nor hold the
+            // sink — the same unavailability a closed record channel
+            // reports.
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.inner.writer_failed.set();
+                return Err(crate::error::AuditorError::AuditUnavailable(
+                    "audit writer stopped".into(),
+                ));
+            }
         }
         match ack_rx.await {
             Ok(Ok(())) => Ok(true),

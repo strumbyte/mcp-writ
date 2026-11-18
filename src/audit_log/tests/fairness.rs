@@ -135,10 +135,11 @@ enum ReopenPlan {
 /// The scripted sink: every durable step lands in `ops` tagged with
 /// the generation it ran on — `RefCell` so `entry_visible`'s `&self`
 /// can record too. Faults are per-kind flags plus a one-shot write
-/// index; the optional single-use gates park the first `write_record`
-/// or `reopen` mid-call so a test can close the queue during a write
-/// or a rotation. `mirror` streams ops to a task-level test that
-/// cannot reach `ops` while the task owns the sink.
+/// index; the optional single-use gates park the first `write_record`,
+/// `sync_file`, `reopen`, or `entry_visible` mid-call so a test can
+/// close the queue during a write, an fsync, a rotation, or the
+/// visible-entry proof. `mirror` streams ops to a task-level test
+/// that cannot reach `ops` while the task owns the sink.
 struct FakeSink {
     ops: RefCell<Vec<(usize, SinkOp)>>,
     mirror: Option<std::sync::mpsc::Sender<(usize, SinkOp)>>,
@@ -156,6 +157,10 @@ struct FakeSink {
     reopen_plan: ReopenPlan,
     reopen_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     write_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    sync_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    /// `entry_visible` is a `&self` call — its single-use gate lives
+    /// behind interior mutability like `ops`.
+    visible_gate: RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl Default for FakeSink {
@@ -181,6 +186,8 @@ impl Default for FakeSink {
             reopen_plan: ReopenPlan::Ok,
             reopen_gate: None,
             write_gate: None,
+            sync_gate: None,
+            visible_gate: RefCell::new(None),
         }
     }
 }
@@ -229,6 +236,10 @@ impl AuditSink for FakeSink {
     }
 
     fn sync_file(&mut self) -> std::io::Result<()> {
+        if let Some((entered, proceed)) = self.sync_gate.take() {
+            let _ = entered.send(());
+            let _ = proceed.recv();
+        }
         self.record(SinkOp::SyncFile);
         if self.fail_sync {
             return Err(Self::err("sync failed"));
@@ -250,6 +261,10 @@ impl AuditSink for FakeSink {
     }
 
     fn entry_visible(&self, _path: &Path) -> bool {
+        if let Some((entered, proceed)) = self.visible_gate.borrow_mut().take() {
+            let _ = entered.send(());
+            let _ = proceed.recv();
+        }
         self.record(SinkOp::EntryVisible);
         self.visible
     }
@@ -300,7 +315,19 @@ const TEST_PATH: &str = "audit.jsonl";
 /// `lifecycle::audit_reopened_event`, kept local so writer-level tests
 /// stay in this module.
 fn marker_ok() -> ReopenMarker {
-    Box::new(|err| {
+    marker_with_details("signal=sigusr1")
+}
+
+/// A marker tagged with its request's sequence id — FIFO tests give
+/// each reopen request a distinct marker so the emitted marker order
+/// proves the queue's service order, not just the rotation count.
+fn marker_seq(id: usize) -> ReopenMarker {
+    marker_with_details(&format!("signal=sigusr1 seq={id}"))
+}
+
+fn marker_with_details(details: &str) -> ReopenMarker {
+    let details = details.to_owned();
+    Box::new(move |err| {
         let mut evt = AuditEvent::new(
             Uuid::now_v7(),
             EventType::AuditReopened,
@@ -313,8 +340,8 @@ fn marker_ok() -> ReopenMarker {
             Action::Observed,
         );
         evt.details = Some(match err {
-            Some(e) => format!("signal=sigusr1 error={e}"),
-            None => "signal=sigusr1".to_string(),
+            Some(e) => format!("{details} error={e}"),
+            None => details.clone(),
         });
         evt
     })
@@ -347,6 +374,32 @@ async fn wait_until(cond: impl Fn() -> bool, what: &str) {
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+/// Wait for a FakeSink gate's entered signal on the blocking pool —
+/// bounded, so a writer that never reaches the gate fails the test
+/// instead of hanging it.
+async fn gate_entered(rx: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || {
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the writer must enter the FakeSink gate")
+    })
+    .await
+    .unwrap();
+}
+
+/// Free space in the writer's intake queue — one fewer free slot is
+/// how a test observes a control item's *admission* without waiting
+/// on the request's reply.
+fn queue_free(logger: &AuditLogger) -> usize {
+    logger
+        .inner
+        .tx
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("the writer sender is live")
+        .capacity()
 }
 
 fn test_core(sink: FakeSink, clock: ManualClock) -> WriterCore<FakeSink, ManualClock> {
@@ -560,10 +613,7 @@ async fn test_reopen_barrier_orders_generations() {
     // Park the writer inside the rotation — the barrier's queue
     // position is consumed and fixed, so what follows is post-barrier
     // by construction.
-    tokio::task::spawn_blocking(move || entered_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    gate_entered(entered_rx).await;
     // These land behind the control item — post-barrier records.
     for _ in 0..2 {
         logger.log(make_test_event());
@@ -616,12 +666,29 @@ async fn test_reopen_barrier_orders_generations() {
 /// A saturated record stream cannot starve a control request of
 /// submission space: records fill their own bounded share, one drops
 /// (the counted drop), and the rotation still submits, is serviced in
-/// FIFO order, and is acknowledged.
-#[tokio::test]
+/// FIFO order, and is acknowledged. The receiver stays parked inside
+/// the first record's write until the control item is provably *in*
+/// the queue — admission ahead of any dequeue is what the control
+/// reserve exists to guarantee.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_control_accepted_while_record_share_full() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let (op_tx, op_rx) = std::sync::mpsc::channel();
-    let logger = fake_logger(FakeSink::mirrored(op_tx), ManualClock::new(), 8, false);
-    for _ in 0..8 {
+    let sink = FakeSink {
+        mirror: Some(op_tx),
+        // The writer parks inside the first record's write, holding
+        // that record's slot in-flight — so all eight record slots
+        // fill while the receiver cannot dequeue anything.
+        write_gate: Some((entered_tx, release_rx)),
+        ..FakeSink::default()
+    };
+    let logger = fake_logger(sink, ManualClock::new(), 8, false);
+    logger.log(make_test_event());
+    gate_entered(entered_rx).await;
+    // Seven more records fill the remaining record slots — one
+    // in-flight plus seven queued.
+    for _ in 0..7 {
         logger.log(make_test_event());
     }
     // The ninth record finds no record slot — a counted drop, not a
@@ -629,8 +696,17 @@ async fn test_control_accepted_while_record_share_full() {
     logger.log(make_test_event());
     assert_eq!(logger.dropped_count(), 1);
     // The control request still submits — its own bounded capacity.
+    // One fewer free queue slot is its admission proof: the item is
+    // in the queue before the receiver is allowed to dequeue again.
+    let free = queue_free(&logger);
     let l = logger.clone();
     let reopened = tokio::spawn(async move { l.reopen(marker_ok()).await });
+    wait_until(
+        || queue_free(&logger) == free - 1,
+        "the control item's admission behind the saturated record share",
+    )
+    .await;
+    release_tx.send(()).unwrap();
     assert!(
         reopened.await.unwrap().unwrap(),
         "the rotation must be accepted and serviced behind the saturated stream"
@@ -672,42 +748,58 @@ async fn test_control_capacity_is_bounded_and_fifo() {
     // The first reopen parks the writer inside the rotation — the
     // queue behind it still accepts control requests.
     let l = logger.clone();
-    let first = tokio::spawn(async move { l.reopen(marker_ok()).await });
-    tokio::task::spawn_blocking(move || entered_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    // The remaining control capacity accepts three more requests —
-    // each holds its permit from submission through service, so the
-    // reserve is exhausted once all three have queued.
+    let first = tokio::spawn(async move { l.reopen(marker_seq(1)).await });
+    gate_entered(entered_rx).await;
+    // The remaining control capacity accepts three more requests.
+    // Each request's marker carries its id, and each spawn waits for
+    // the previous request's queue position to exist — one fewer free
+    // slot — so the ids give the requests a known admission order
+    // while the writer is still gated.
     let mut pending = Vec::new();
-    for _ in 0..3 {
+    for id in 2..=4usize {
+        let free = queue_free(&logger);
         let l = logger.clone();
-        pending.push(tokio::spawn(async move { l.reopen(marker_ok()).await }));
+        pending.push(tokio::spawn(async move { l.reopen(marker_seq(id)).await }));
+        wait_until(
+            || queue_free(&logger) == free - 1,
+            "a queued control request's queue position",
+        )
+        .await;
     }
-    wait_until(
-        || logger.inner.control_slots.available_permits() == 0,
-        "the three queued control requests to hold the reserve",
-    )
-    .await;
+    // Each request holds its permit from submission through service,
+    // so the reserve is exhausted once all three have queued.
     assert_eq!(logger.inner.control_slots.available_permits(), 0);
     // The fifth must wait for a dequeue — bounded control capacity —
-    // never for record space. The started signal proves the task is
-    // live inside `reopen()` before the check, so `!is_finished`
-    // means "parked on the full reserve", not "never scheduled".
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    // never for record space. The parked signal fires only after the
+    // request's first poll suspended — with the reserve exhausted the
+    // only pending point is the control-slot acquire — so
+    // `!is_finished` and the unchanged queue occupancy read as
+    // "parked on the full reserve", never "never polled" or "queued".
+    let free = queue_free(&logger);
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
     let l = logger.clone();
     let fifth = tokio::spawn(async move {
-        let _ = started_tx.send(());
-        l.reopen(marker_ok()).await
+        let mut fut = std::pin::pin!(l.reopen(marker_seq(5)));
+        std::future::poll_fn(|cx| {
+            assert!(
+                fut.as_mut().poll(cx).is_pending(),
+                "the fifth request must park on the full control reserve"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        let _ = parked_tx.send(());
+        fut.await
     });
-    started_rx.await.unwrap();
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
+    parked_rx.await.unwrap();
     assert!(
         !fifth.is_finished(),
         "control capacity is bounded — the fifth waits"
+    );
+    assert_eq!(
+        queue_free(&logger),
+        free,
+        "the fifth request is parked on the reserve — it never entered the queue"
     );
     release_tx.send(()).unwrap();
     assert!(first.await.unwrap().unwrap());
@@ -723,14 +815,17 @@ async fn test_control_capacity_is_bounded_and_fifo() {
         reopens, 5,
         "every accepted rotation runs, in order: {ops:?}"
     );
-    // Each rotation's marker is the first write of its new generation.
+    // Each rotation's marker is the first write of its new generation
+    // — and carries its request's id, so the marker sequence across
+    // generations is the queue's service order: it must equal the
+    // admission order established above.
     for g in 1..=5usize {
         let first_write = ops
             .iter()
             .find(|(gg, op)| *gg == g && matches!(op, SinkOp::Write(_)));
         assert!(
-            matches!(first_write, Some((_, SinkOp::Write(l))) if l.contains("audit.reopened")),
-            "generation {g}'s first record must be the marker: {ops:?}"
+            matches!(first_write, Some((_, SinkOp::Write(l))) if l.contains("audit.reopened") && l.contains(&format!("seq={g}"))),
+            "generation {g}'s first record must be request {g}'s marker — the queue serves control items FIFO: {ops:?}"
         );
     }
 }
@@ -802,10 +897,7 @@ async fn test_shutdown_drains_in_acceptance_order() {
     // Park the writer inside the rotation — the two records below are
     // post-barrier by construction, and the shutdown's queue-end
     // position lands behind them all.
-    tokio::task::spawn_blocking(move || entered_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    gate_entered(entered_rx).await;
     for _ in 0..2 {
         logger.log(make_test_event());
     }
@@ -858,10 +950,7 @@ async fn test_shutdown_while_rotation_in_flight() {
     let l = logger.clone();
     let reopened = tokio::spawn(async move { l.reopen(marker_ok()).await });
     // Park the writer inside the rotation — deterministically.
-    tokio::task::spawn_blocking(move || entered_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    gate_entered(entered_rx).await;
     // The post-barrier record and the shutdown both land while the
     // rotation is mid-flight.
     logger.log(make_test_event());
@@ -919,11 +1008,66 @@ async fn test_shutdown_while_rotation_in_flight() {
 
 /// The committed record's ack fires only after the whole durable path
 /// — write, buffer flush, file fsync, and the visible-entry proof.
-#[tokio::test]
+/// Parked mid-fsync, then again inside the visibility proof, the
+/// acknowledgment is still pending; a failed durability step closes
+/// the sender without a value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_commit_ack_after_full_durable_path() {
+    let (sync_entered_tx, sync_entered_rx) = std::sync::mpsc::channel();
+    let (sync_release_tx, sync_release_rx) = std::sync::mpsc::channel();
+    let (vis_entered_tx, vis_entered_rx) = std::sync::mpsc::channel();
+    let (vis_release_tx, vis_release_rx) = std::sync::mpsc::channel();
     let (op_tx, op_rx) = std::sync::mpsc::channel();
-    let logger = fake_logger(FakeSink::mirrored(op_tx), ManualClock::new(), 8, true);
-    logger.log_committed(make_test_event()).await.unwrap();
+    let logger = fake_logger(
+        FakeSink {
+            mirror: Some(op_tx),
+            // Two mid-path windows: the fsync, then the visible-entry
+            // proof — each is its own acknowledgment boundary.
+            sync_gate: Some((sync_entered_tx, sync_release_rx)),
+            visible_gate: RefCell::new(Some((vis_entered_tx, vis_release_rx))),
+            ..FakeSink::default()
+        },
+        ManualClock::new(),
+        8,
+        true,
+    );
+    let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+    // The cloned sender is dropped right after the send — the
+    // shutdown below must still see the channel close.
+    let tx = logger.inner.tx.lock().unwrap().clone().unwrap();
+    tx.send(WriterItem::Record(Box::new(test_item(
+        make_test_event(),
+        Some(ack_tx),
+    ))))
+    .await
+    .unwrap();
+    drop(tx);
+    gate_entered(sync_entered_rx).await;
+    assert!(
+        matches!(
+            ack_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the acknowledgment stays pending mid-durable-path"
+    );
+    sync_release_tx.send(()).unwrap();
+    // The fsync completed — the writer is now parked inside the
+    // visibility proof — and the acknowledgment is still pending.
+    gate_entered(vis_entered_rx).await;
+    assert!(
+        matches!(
+            ack_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the fsync alone never acknowledges — the proof must still run"
+    );
+    vis_release_tx.send(()).unwrap();
+    // A retained sender would hang the waiter — a timeout here is a
+    // test failure, not an outcome.
+    tokio::time::timeout(Duration::from_secs(10), ack_rx)
+        .await
+        .expect("the ack must arrive promptly once the proof passes")
+        .expect("the durable path completes — the ack fires");
     // The await resolving means every step below already ran.
     let ops: Vec<(usize, SinkOp)> = op_rx.try_iter().collect();
     assert_eq!(
@@ -936,10 +1080,66 @@ async fn test_commit_ack_after_full_durable_path() {
     assert_eq!(ops[2].1, SinkOp::SyncFile);
     assert_eq!(ops[3].1, SinkOp::EntryVisible);
     let _ = logger.shutdown().await;
+
+    // The same gate with the fsync failing: the sender closes without
+    // a value — the durable path never reports an acknowledgment.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (op_tx, op_rx) = std::sync::mpsc::channel();
+    let logger = fake_logger(
+        FakeSink {
+            mirror: Some(op_tx),
+            fail_sync: true,
+            sync_gate: Some((entered_tx, release_rx)),
+            ..FakeSink::default()
+        },
+        ManualClock::new(),
+        8,
+        true,
+    );
+    let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+    // The cloned sender is dropped right after the send — the
+    // shutdown below must still see the channel close.
+    let tx = logger.inner.tx.lock().unwrap().clone().unwrap();
+    tx.send(WriterItem::Record(Box::new(test_item(
+        make_test_event(),
+        Some(ack_tx),
+    ))))
+    .await
+    .unwrap();
+    drop(tx);
+    gate_entered(entered_rx).await;
+    assert!(
+        matches!(
+            ack_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the acknowledgment stays pending mid-durable-path"
+    );
+    release_tx.send(()).unwrap();
+    // A retained (never-sent, never-dropped) sender would hang this
+    // await — a timeout is a test failure, not evidence of a close.
+    let closed = tokio::time::timeout(Duration::from_secs(10), ack_rx)
+        .await
+        .expect("the sender must close promptly");
+    assert!(
+        closed.is_err(),
+        "a failed durability step closes the sender without a value"
+    );
+    let ops: Vec<(usize, SinkOp)> = op_rx.try_iter().collect();
+    assert!(
+        ops.iter().any(|(_, op)| *op == SinkOp::SyncFile)
+            && !ops.iter().any(|(_, op)| *op == SinkOp::EntryVisible),
+        "the fsync ran and failed — the visibility proof never did: {ops:?}"
+    );
+    let _ = logger.shutdown().await;
 }
 
 /// A directory entry that no longer names the sink is an audit fault,
 /// not an ack — the commit waiter fails closed and the latch sets.
+/// The error is the dropped-sender report ("before durable write"),
+/// not `ensure_available`'s latched-failure refusal — the two failure
+/// surfaces are never conflated.
 #[tokio::test]
 async fn test_commit_fails_when_entry_hidden() {
     let (op_tx, _op_rx) = std::sync::mpsc::channel();
@@ -954,10 +1154,14 @@ async fn test_commit_fails_when_entry_hidden() {
         true,
     );
     let err = logger.log_committed(make_test_event()).await.unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::AuditorError::AuditUnavailable(_)
-    ));
+    match &err {
+        crate::error::AuditorError::AuditUnavailable(msg) => assert!(
+            msg.contains("before durable write"),
+            "the withheld ack surfaces as the dropped-sender report, \
+             not a failure-latch refusal: {err:?}"
+        ),
+        e => panic!("expected AuditUnavailable, got {e:?}"),
+    }
     assert!(logger.is_failed(), "a hidden entry must latch the fault");
     let _ = logger.shutdown().await;
 }
@@ -1139,10 +1343,12 @@ async fn test_post_swap_failure_keeps_new_generation() {
         err,
         crate::error::AuditorError::AuditUnavailable(_)
     ));
-    logger.log(make_test_event());
-    let _ = logger.shutdown().await;
 
-    let ops: Vec<(usize, SinkOp)> = op_rx.iter().collect();
+    // The reply resolves only after the marker's durable path
+    // completes — snapshot now, before another record or the shutdown
+    // drain can contribute ops, so the dir-sync count below is the
+    // marker path's own retry.
+    let ops: Vec<(usize, SinkOp)> = op_rx.try_iter().collect();
     let barrier = ops
         .iter()
         .position(|(_, op)| *op == SinkOp::Reopen)
@@ -1160,6 +1366,17 @@ async fn test_post_swap_failure_keeps_new_generation() {
     assert!(
         dir_syncs_after >= 2,
         "post-swap dir sync attempt plus the marker path's retry: {ops:?}"
+    );
+
+    // A record logged after the failed rotation still lands on the
+    // live new generation — the swap survived the post-swap failure.
+    logger.log(make_test_event());
+    let _ = logger.shutdown().await;
+    let ops: Vec<(usize, SinkOp)> = op_rx.iter().collect();
+    assert!(
+        ops.iter().any(|(g, op)| *g == 1
+            && matches!(op, SinkOp::Write(l) if !l.contains("audit.reopened"))),
+        "the post-rotation record lands on generation 1: {ops:?}"
     );
 }
 
@@ -1223,10 +1440,7 @@ async fn test_cancelled_wait_releases_its_permits() {
     // A single record slot — the in-flight record occupies it.
     let logger = fake_logger(sink, ManualClock::new(), 1, true);
     logger.log_ordered(make_test_event()).await.unwrap();
-    tokio::task::spawn_blocking(move || entered_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    gate_entered(entered_rx).await;
     // A second ordered record waits on the record slot — bounded
     // backpressure, not a drop.
     let l = logger.clone();

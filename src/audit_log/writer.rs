@@ -280,13 +280,21 @@ impl AuditSink for FileSink {
     /// records keep reaching the correctly named file.
     fn reopen(&mut self, path: &Path) -> std::io::Result<()> {
         self.flush_buffer()?;
-        self.sync_file()?;
+        // Each sync error carries the phase it failed in: a pre-swap
+        // fsync refusal and a post-swap entry-sync failure both report
+        // `Err` but leave different generations live — the tag lets
+        // the caller, and the in-band failure marker that embeds this
+        // message, tell which side of the swap failed.
+        self.sync_file()
+            .map_err(|e| std::io::Error::new(e.kind(), format!("pre-swap file sync: {e}")))?;
         // A launch-created log whose directory entry is still unsynced
         // is synced before the swap — after the handle is released the
         // entry must already be durable, or a crash could lose the
         // rotated file the reopen was meant to preserve.
         if !self.dir_synced {
-            self.sync_dir()?;
+            self.sync_dir().map_err(|e| {
+                std::io::Error::new(e.kind(), format!("pre-swap directory sync: {e}"))
+            })?;
         }
         let sink_open::OpenedSink { file, dir, leaf } = sink_open::open_audit_sink(path)?;
         self.writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
@@ -307,7 +315,10 @@ impl AuditSink for FileSink {
             }
             Err(e) => {
                 self.dir_synced = false;
-                Err(e)
+                Err(std::io::Error::new(
+                    e.kind(),
+                    format!("post-swap directory sync: {e}"),
+                ))
             }
         }
     }
