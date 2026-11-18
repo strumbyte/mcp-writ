@@ -631,12 +631,10 @@ impl AuditLogger {
         // shutdown.
         let slot = match self.inner.control_slots.clone().acquire_owned().await {
             Ok(s) => s,
-            Err(_) => {
-                self.inner.writer_failed.set();
-                return Err(crate::error::AuditorError::AuditUnavailable(
-                    "audit writer stopped".into(),
-                ));
-            }
+            // The reserve closes only from `shutdown()` — a failed
+            // acquire is a post-shutdown request finding no live
+            // sink, not a writer fault.
+            Err(_) => return Ok(false),
         };
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         // The sender check and the enqueue run under the same lock
@@ -649,14 +647,14 @@ impl AuditLogger {
         let send = {
             let guard = self.inner.tx.lock().unwrap();
             match guard.as_ref() {
-                Some(tx) => tx.try_send(WriterItem::Control(ControlRequest::Reopen(
-                    ReopenRequest {
+                Some(tx) => {
+                    tx.try_send(WriterItem::Control(ControlRequest::Reopen(ReopenRequest {
                         reply: ack_tx,
                         marker,
                         queued_at,
                         slot,
-                    },
-                ))),
+                    })))
+                }
                 None => return Ok(false),
             }
         };
@@ -784,6 +782,11 @@ impl AuditLogger {
             let mut tx_lock = self.inner.tx.lock().unwrap();
             tx_lock.take();
         }
+        // Reopen calls parked on the control reserve wake to a failed
+        // acquire — `reopen()` reports it as no live sink (`Ok(false)`),
+        // the same answer the locked sender check gives requests that
+        // already hold a permit.
+        self.inner.control_slots.close();
 
         // Wait for the writer task to complete
         let mut join_err = false;

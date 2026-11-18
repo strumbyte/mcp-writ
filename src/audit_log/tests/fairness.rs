@@ -1374,8 +1374,9 @@ async fn test_post_swap_failure_keeps_new_generation() {
     let _ = logger.shutdown().await;
     let ops: Vec<(usize, SinkOp)> = op_rx.iter().collect();
     assert!(
-        ops.iter().any(|(g, op)| *g == 1
-            && matches!(op, SinkOp::Write(l) if !l.contains("audit.reopened"))),
+        ops.iter()
+            .any(|(g, op)| *g == 1
+                && matches!(op, SinkOp::Write(l) if !l.contains("audit.reopened"))),
         "the post-rotation record lands on generation 1: {ops:?}"
     );
 }
