@@ -30,6 +30,13 @@ impl AccessDenial {
             Self::PathTraversal(r) | Self::NotDiscovered(r) => r,
         }
     }
+
+    /// Consume the error into its refusal text.
+    pub fn into_reason(self) -> String {
+        match self {
+            Self::PathTraversal(r) | Self::NotDiscovered(r) => r,
+        }
+    }
 }
 
 impl std::fmt::Display for AccessDenial {

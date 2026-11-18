@@ -472,6 +472,20 @@ pub async fn stop_gate(gate: GateHandle) -> Vec<String> {
         .collect()
 }
 
+/// `sandbox.network_resolved` details restricted to `result=ok`
+/// records: a retried query can leave an upstream-error record
+/// (`result=upstream-timeout`, `…-mismatch`, `…-io-error`) behind
+/// from a starved attempt, and verdict assertions count only the
+/// resolution that actually relayed. The match is a complete
+/// whitespace-delimited field — `result=ok` counts wherever the
+/// formatter places it, a `name=` value can never collide.
+pub fn resolved_ok(lines: &[String]) -> Vec<String> {
+    details_for(lines, "sandbox.network_resolved")
+        .into_iter()
+        .filter(|d| d.split_whitespace().any(|f| f == "result=ok"))
+        .collect()
+}
+
 /// Event details for every emitted record of .
 pub fn details_for(lines: &[String], event_type: &str) -> Vec<String> {
     lines
@@ -501,7 +515,26 @@ pub fn details_for(lines: &[String], event_type: &str) -> Vec<String> {
 
 // ─── Client helpers ─────────────────────────────────────────────────
 
+/// Re-ask budget after a SERVFAIL verdict. Under full-suite CPU
+/// starvation the gate's fixed 5s upstream budget can elapse before
+/// the (always-answering) mock replies — an environmental flake, not
+/// a verdict. Retries ride it out; a deterministic SERVFAIL (silent
+/// upstream, dead audit sink, gate-side refusal) returns unchanged.
+/// Tests asserting SERVFAIL itself take the `_once` variants so the
+/// fixed upstream budget is paid a single time.
+const SERVFAIL_RETRY_ATTEMPTS: usize = 3;
+
 pub async fn udp_query(listen: SocketAddr, pkt: &[u8]) -> Option<Vec<u8>> {
+    for attempt in 0..SERVFAIL_RETRY_ATTEMPTS {
+        let resp = udp_query_once(listen, pkt).await?;
+        if rcode(&resp) != 2 || attempt + 1 == SERVFAIL_RETRY_ATTEMPTS {
+            return Some(resp);
+        }
+    }
+    unreachable!()
+}
+
+pub async fn udp_query_once(listen: SocketAddr, pkt: &[u8]) -> Option<Vec<u8>> {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     // connect() pins the peer so a stray datagram recycled onto this
     // ephemeral port cannot be mistaken for our answer; matching the
@@ -523,6 +556,16 @@ pub async fn udp_query(listen: SocketAddr, pkt: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub async fn tcp_query(listen: SocketAddr, pkt: &[u8]) -> Option<Vec<u8>> {
+    for attempt in 0..SERVFAIL_RETRY_ATTEMPTS {
+        let resp = tcp_query_once(listen, pkt).await?;
+        if rcode(&resp) != 2 || attempt + 1 == SERVFAIL_RETRY_ATTEMPTS {
+            return Some(resp);
+        }
+    }
+    unreachable!()
+}
+
+pub async fn tcp_query_once(listen: SocketAddr, pkt: &[u8]) -> Option<Vec<u8>> {
     let mut s = TcpStream::connect(listen).await.ok()?;
     s.write_all(&(pkt.len() as u16).to_be_bytes()).await.ok()?;
     s.write_all(pkt).await.ok()?;

@@ -153,7 +153,7 @@ async fn protected_addr_mints_no_grant() {
         );
     }
     let lines = stop_gate(gate).await;
-    let resolved = details_for(&lines, "sandbox.network_resolved");
+    let resolved = resolved_ok(&lines);
     for r in &resolved {
         assert!(r.contains("protected_refused=1"), "{r}");
         assert!(r.contains("grants=0") || !r.contains("grants="), "{r}");
@@ -225,7 +225,7 @@ async fn protected_addr_opt_in_mints_grant() {
         443
     ));
     let lines = stop_gate(gate).await;
-    let resolved = details_for(&lines, "sandbox.network_resolved");
+    let resolved = resolved_ok(&lines);
     assert!(
         resolved
             .iter()

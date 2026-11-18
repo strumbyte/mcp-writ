@@ -88,10 +88,7 @@ fn probe_secret_path(policy: &Policy) -> AuditorProbe {
         let line = build_tools_call(3, &tool.name, &args);
         match checker::check_request(&line, policy) {
             Err(v) => {
-                if matches!(
-                    v.kind,
-                    checker::DenialKind::SecretOverlay { reserved_match: _ }
-                ) {
+                if matches!(v.kind, checker::DenialKind::SecretOverlay { .. }) {
                     return expect_policy_error("secret-path", &line, policy);
                 }
             }

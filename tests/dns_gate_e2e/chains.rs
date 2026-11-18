@@ -101,7 +101,7 @@ async fn cname_chain_fully_allowed_mints_grants() {
     );
 
     let lines = stop_gate(gate).await;
-    let resolved = details_for(&lines, "sandbox.network_resolved");
+    let resolved = resolved_ok(&lines);
     assert_eq!(resolved.len(), 1);
     let r = &resolved[0];
     assert!(r.contains("chain=edge.allowed.example"), "{r}");
@@ -179,7 +179,7 @@ async fn cname_target_denied_refuses_and_mints_nothing() {
             && d.contains("chain-target=edge.denied.example")),
         "denial must name the denied chain target: {denied:?}"
     );
-    let resolved = details_for(&lines, "sandbox.network_resolved");
+    let resolved = resolved_ok(&lines);
     assert!(
         resolved.is_empty(),
         "a refused chain emits no resolution record: {resolved:?}"
@@ -364,6 +364,9 @@ async fn overlong_alias_chain_is_servfail() {
         return;
     };
 
+    // The retrying `udp_query` (not `_once`) — the chain-truncated
+    // verdict needs a *successful* upstream exchange, so a starved
+    // attempt's SERVFAIL is exactly the flake to ride out.
     let resp = udp_query(gate.listen, &dns_query(1, "allowed.example", 1))
         .await
         .expect("servfail");
