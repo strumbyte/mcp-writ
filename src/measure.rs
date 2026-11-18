@@ -194,6 +194,11 @@ pub static AUDIT_FLUSH_NS: Timing = Timing::new("audit.flush.ns");
 /// rotation wait the requesting side sees as `reopen()` latency.
 pub static AUDIT_REOPEN_NS: Timing = Timing::new("audit.reopen.ns");
 
+/// Wait between a control request's queue admission and the writer
+/// starting its service — M3's control-wait figure, kept separate
+/// from the service time `audit.reopen.ns` measures.
+pub static AUDIT_CONTROL_WAIT_NS: Timing = Timing::new("audit.control_wait.ns");
+
 /// All timings, for [`snapshot`].
 static TIMINGS: &[&Timing] = &[
     &DNS_LOCK_NS,
@@ -201,6 +206,7 @@ static TIMINGS: &[&Timing] = &[
     &AUDIT_SYNC_START_DELAY_NS,
     &AUDIT_FLUSH_NS,
     &AUDIT_REOPEN_NS,
+    &AUDIT_CONTROL_WAIT_NS,
 ];
 
 // ---------------------------------------------------------------------

@@ -10,76 +10,45 @@ use uuid::Uuid;
 
 // ─── AuditLogger integration tests ──────────────────────────────────────
 
-/// Assemble an `AuditLogger` from parts the test controls — the
-/// writer-level tests drive the channel ends and writer task directly
-/// instead of going through `to_file`, so fail-closed mode, channel
-/// capacity, and the byte budget stay test-tunable. The logger's own
-/// `reopen_tx` stays empty: these fixtures never expose a live reopen
-/// sink to `AuditLogger::reopen`.
-fn assemble_logger(
-    tx: mpsc::Sender<AuditItem>,
-    writer_handle: tokio::task::JoinHandle<()>,
-    fail_closed: bool,
-    byte_budget: usize,
-    writer_failed: FailureFlag,
-    session_id: String,
-) -> AuditLogger {
-    AuditLogger {
-        inner: std::sync::Arc::new(AuditLoggerInner {
-            tx: std::sync::Mutex::new(Some(tx)),
-            reopen_tx: std::sync::Mutex::new(None),
-            session_id,
-            writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
-            fail_closed,
-            dropped: AtomicU64::new(0),
-            writer_failed,
-            bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(byte_budget)),
-        }),
-    }
-}
-
 /// A file-sink fixture: a real file at `path` drained by a spawned
-/// `file_writer_task`, behind a record channel of `channel_capacity`.
-/// Returns the logger plus the reopen sender — held by the test so the
-/// writer's reopen arm stays live for the test's scope.
-fn file_sink_logger(
-    path: &Path,
-    channel_capacity: usize,
-    fail_closed: bool,
-) -> (AuditLogger, mpsc::Sender<ReopenRequest>) {
+/// `file_writer_task` over a `FileSink`/`TokioClock` core, behind an
+/// intake queue with `event_capacity` record slots. The logger is a
+/// real file-sink logger — `reopen()` routes through the same queue.
+fn file_sink_logger(path: &Path, event_capacity: usize, fail_closed: bool) -> AuditLogger {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .unwrap();
     let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
-    let (tx, rx) = mpsc::channel(channel_capacity);
-    let (reopen_tx, reopen_rx) = mpsc::channel(REOPEN_QUEUE_CAPACITY);
+    let (tx, rx) = mpsc::channel(event_capacity + CONTROL_QUEUE_CAPACITY);
     let writer_failed = FailureFlag::new();
     let session_id = generate_session_id();
-    let writer_handle = tokio::spawn(file_writer_task(
-        rx,
+    let sink = FileSink::new(
         writer,
-        writer_failed.clone(),
         SinkAnchor {
             dir: None,
             leaf: None,
         },
+    );
+    let core = WriterCore::new(
+        sink,
+        TokioClock,
+        writer_failed.clone(),
         AuditSyncMode::Buffered,
-        path.to_path_buf(),
-        reopen_rx,
         session_id.clone(),
-    ));
-    (
-        assemble_logger(
-            tx,
-            writer_handle,
-            fail_closed,
-            QUEUE_BYTE_BUDGET,
-            writer_failed,
-            session_id,
-        ),
-        reopen_tx,
+        path.to_path_buf(),
+    );
+    let writer_handle = tokio::spawn(file_writer_task(rx, core));
+    super::assemble_logger(
+        tx,
+        writer_handle,
+        fail_closed,
+        event_capacity,
+        QUEUE_BYTE_BUDGET,
+        true,
+        writer_failed,
+        session_id,
     )
 }
 
@@ -349,7 +318,7 @@ async fn test_logger_backpressure_channel_full() {
     };
     let path = dir.join("bp.jsonl");
 
-    let (logger, _reopen_tx) = file_sink_logger(&path, 2, true);
+    let logger = file_sink_logger(&path, 2, true);
 
     for _ in 0..64 {
         logger.log(make_test_event());
@@ -372,7 +341,7 @@ async fn test_logger_channel_full_best_effort_stays_available() {
     };
     let path = dir.join("bp.jsonl");
 
-    let (logger, _reopen_tx) = file_sink_logger(&path, 2, false);
+    let logger = file_sink_logger(&path, 2, false);
 
     for _ in 0..64 {
         logger.log(make_test_event());
@@ -470,7 +439,7 @@ async fn test_logger_shutdown_reports_writer_failure() {
     };
     let path = dir.join("err.jsonl");
 
-    let (logger, _reopen_tx) = file_sink_logger(&path, 2, true);
+    let logger = file_sink_logger(&path, 2, true);
 
     // Drop the sender — a subsequent log attempt latches the writer
     // fault deterministically (no saturation race).
@@ -547,18 +516,20 @@ async fn test_logger_byte_budget_fail_closed() {
         return;
     };
 
-    let (tx, rx) = mpsc::channel(64);
+    let (tx, rx) = mpsc::channel::<WriterItem>(64);
     let writer_failed = FailureFlag::new();
     // Park the receiver so the budget stays consumed — the byte
     // accounting is queue-side, so no writer task is needed.
     let rx = Some(rx);
     let writer_handle = tokio::spawn(async move {});
     // One record (~300 wire bytes) fits the 600 budget; a second cannot.
-    let logger = assemble_logger(
+    let logger = super::assemble_logger(
         tx,
         writer_handle,
         true,
+        64,
         600,
+        true,
         writer_failed,
         generate_session_id(),
     );

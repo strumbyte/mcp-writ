@@ -20,18 +20,21 @@ pub use sink_guard::{
     audit_sink_write_conflict, policy_source_write_conflict, report_write_conflict,
     snapshot_write_conflict,
 };
-use writer::{SinkAnchor, file_writer_task, tracing_writer_task};
+use writer::{FileSink, SinkAnchor, TokioClock, WriterCore, file_writer_task, tracing_writer_task};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // AuditLogger (mpsc channel + dedicated writer task)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const CHANNEL_CAPACITY: usize = 4096;
+/// Record slots in the writer's bounded queue — enforced by the
+/// `event_slots` semaphore instead of the channel bound itself, so
+/// control requests get their own reserve on the same queue.
+const EVENT_QUEUE_CAPACITY: usize = 4096;
 const BUF_WRITER_CAPACITY: usize = 65536; // 64KB
 const FLUSH_EVENT_THRESHOLD: u32 = 100;
 
 /// Aggregate byte ceiling for records sitting in the queue. The count
-/// bound (`CHANNEL_CAPACITY`) alone cannot hold memory: each queued
+/// bound (`EVENT_QUEUE_CAPACITY`) alone cannot hold memory: each queued
 /// event's size is whatever the wire offered — a denied `tools/call`
 /// can carry megabytes of attacker arguments. A producer hitting the
 /// byte budget is treated exactly like a full channel: counted drop in
@@ -70,19 +73,51 @@ pub enum AuditSyncMode {
     EveryEvent,
 }
 
+/// Control requests — reopen today — own this many slots of the
+/// unified queue: the same 4 the dedicated reopen channel held.
+/// Because records are separately capped by `event_slots`, a saturated
+/// record stream can never starve control submission of queue space.
+const CONTROL_QUEUE_CAPACITY: usize = 4;
+
+/// Total bounded capacity of the writer's intake queue — records plus
+/// the control reserve.
+const QUEUE_CAPACITY: usize = EVENT_QUEUE_CAPACITY + CONTROL_QUEUE_CAPACITY;
+
 /// One queued audit record. The oneshot half is set only by
 /// [`AuditLogger::log_committed`]: the writer signals it after the
 /// record is durably persisted — flushed through the `BufWriter` and
 /// `sync_all`'d to storage — so a fail-closed path forwards protected
 /// traffic only after the record exists on disk, not merely after the
-/// queue accepted it. The semaphore permit pins the record's byte
-/// share of [`QUEUE_BYTE_BUDGET`] until the writer consumes it —
-/// dropping the item releases the budget.
-type AuditItem = (
-    AuditEvent,
-    Option<tokio::sync::oneshot::Sender<()>>,
-    Option<tokio::sync::OwnedSemaphorePermit>,
-);
+/// queue accepted it. The permits pin the record's byte share of
+/// [`QUEUE_BYTE_BUDGET`] and one of [`EVENT_QUEUE_CAPACITY`] record
+/// slots until the writer consumes the item — dropping the item (a
+/// failed or cancelled send) releases both.
+struct AuditItem {
+    event: AuditEvent,
+    ack: Option<tokio::sync::oneshot::Sender<()>>,
+    bytes_permit: tokio::sync::OwnedSemaphorePermit,
+    slot_permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Everything the writer consumes, on one FIFO — the single place the
+/// acceptance order of records and control requests is fixed. A
+/// `Control` item's queue position is an ordering barrier: a reopen
+/// commits every record dequeued ahead of it to the still-live sink
+/// before swapping, then writes its marker ahead of all records that
+/// follow. Channel close — every sender dropped — is the shutdown
+/// request's position in the same order: the writer drains what is
+/// queued and performs its final durable commit.
+enum WriterItem {
+    // `AuditItem` is the wire event plus its permits — boxing keeps
+    // `WriterItem` small enough that a queued `Control` never pays for
+    // the record variant's size.
+    Record(Box<AuditItem>),
+    Control(ControlRequest),
+}
+
+enum ControlRequest {
+    Reopen(ReopenRequest),
+}
 
 /// Builds the `audit.reopened` record inside the writer task — the
 /// argument is `Some(error)` on a failed reopen and `None` on success,
@@ -95,14 +130,16 @@ pub type ReopenMarker = Box<dyn FnOnce(Option<String>) -> AuditEvent + Send>;
 /// A reopen request pairs the oneshot its result is reported through
 /// with the rotation-marker factory: the writer flushes + fsyncs the
 /// live sink, re-resolves the audit path through `open_audit_sink`,
-/// swaps handles, and records the marker before acknowledging. The
-/// queue is deliberately tiny: a pending request already holds the
-/// whole reopen intent — coalescing further signals would produce the
-/// same single flush+open sequence.
-const REOPEN_QUEUE_CAPACITY: usize = 4;
+/// swaps handles, and records the marker before acknowledging.
+/// `queued_at` feeds the `audit.control_wait.ns` measure — the
+/// submission-to-service wait; `slot` is the request's
+/// [`CONTROL_QUEUE_CAPACITY`] share, released when the writer dequeues
+/// it.
 struct ReopenRequest {
     reply: tokio::sync::oneshot::Sender<std::io::Result<()>>,
     marker: ReopenMarker,
+    queued_at: std::time::Instant,
+    slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Writer-failure flag fused with its wake notification: setting the
@@ -147,11 +184,13 @@ pub struct AuditLogger {
 }
 
 struct AuditLoggerInner {
-    tx: std::sync::Mutex<Option<mpsc::Sender<AuditItem>>>,
-    /// Reopen channel into the file writer — `None` for a non-file
-    /// sink, and taken on `shutdown()` like `tx` so a post-shutdown
-    /// [`AuditLogger::reopen`] finds no live sink.
-    reopen_tx: std::sync::Mutex<Option<mpsc::Sender<ReopenRequest>>>,
+    tx: std::sync::Mutex<Option<mpsc::Sender<WriterItem>>>,
+    /// `true` while this logger drives a live file sink — the only
+    /// sink [`AuditLogger::reopen`] can act on. `false` for the
+    /// tracing sink; combined with a taken `tx` (post-shutdown) a
+    /// reopen finds no live sink, matching the old dedicated-channel
+    /// `None`.
+    file_sink: bool,
     session_id: String,
     writer_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     fail_closed: bool,
@@ -161,6 +200,14 @@ struct AuditLoggerInner {
     /// inside the `AuditItem`, so the writer consuming a record frees
     /// its share automatically.
     bytes_budget: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Record slots — the [`EVENT_QUEUE_CAPACITY`] bound on the record
+    /// share of the unified queue. Held inside each `AuditItem` until
+    /// the writer dequeues it.
+    event_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Control slots — the [`CONTROL_QUEUE_CAPACITY`] reserve keeping
+    /// control submission bounded and unblocked under record
+    /// saturation.
+    control_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl AuditLogger {
@@ -198,33 +245,36 @@ impl AuditLogger {
         // the opened object before committing acknowledgments.
         let sink_open::OpenedSink { file, dir, leaf } = sink_open::open_audit_sink(path)?;
         let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let (reopen_tx, reopen_rx) = mpsc::channel(REOPEN_QUEUE_CAPACITY);
+        let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
         let session_id = generate_session_id();
         let writer_failed = FailureFlag::new();
-        let writer_handle = tokio::spawn(file_writer_task(
-            rx,
-            writer,
+        let sink = FileSink::new(writer, SinkAnchor { dir, leaf });
+        let core = WriterCore::new(
+            sink,
+            TokioClock,
             writer_failed.clone(),
-            SinkAnchor { dir, leaf },
             sync_mode,
-            path.to_path_buf(),
-            reopen_rx,
             session_id.clone(),
-        ));
+            path.to_path_buf(),
+        );
+        let writer_handle = tokio::spawn(file_writer_task(rx, core));
         let bytes_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET));
         #[cfg(feature = "measure")]
         crate::measure::register_queue_budget(QUEUE_BYTE_BUDGET as u64, &bytes_budget);
         Ok(Self {
             inner: std::sync::Arc::new(AuditLoggerInner {
                 tx: std::sync::Mutex::new(Some(tx)),
-                reopen_tx: std::sync::Mutex::new(Some(reopen_tx)),
+                file_sink: true,
                 session_id,
                 writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
                 fail_closed,
                 dropped: AtomicU64::new(0),
                 writer_failed,
                 bytes_budget,
+                event_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(EVENT_QUEUE_CAPACITY)),
+                control_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    CONTROL_QUEUE_CAPACITY,
+                )),
             }),
         })
     }
@@ -237,7 +287,7 @@ impl AuditLogger {
 
     /// Tracing/stderr logger. `fail_closed` makes a full channel abort the session.
     pub fn to_tracing_with_fail_closed(fail_closed: bool) -> Self {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
         let session_id = generate_session_id();
         let writer_failed = FailureFlag::new();
         // stderr delivery cannot prove a durable write — a fail-closed
@@ -249,13 +299,17 @@ impl AuditLogger {
         Self {
             inner: std::sync::Arc::new(AuditLoggerInner {
                 tx: std::sync::Mutex::new(Some(tx)),
-                reopen_tx: std::sync::Mutex::new(None),
+                file_sink: false,
                 session_id,
                 writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
                 fail_closed,
                 dropped: AtomicU64::new(0),
                 writer_failed,
                 bytes_budget,
+                event_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(EVENT_QUEUE_CAPACITY)),
+                control_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    CONTROL_QUEUE_CAPACITY,
+                )),
             }),
         }
     }
@@ -284,8 +338,8 @@ impl AuditLogger {
     /// silently discarding the event.
     pub fn log(&self, mut event: AuditEvent) {
         let need = Self::prepare(&mut event, &self.inner.session_id);
-        let permit = match self.inner.bytes_budget.clone().try_acquire_many_owned(need) {
-            Ok(p) => Some(p),
+        let bytes_permit = match self.inner.bytes_budget.clone().try_acquire_many_owned(need) {
+            Ok(p) => p,
             Err(_) => {
                 self.inner.dropped.fetch_add(1, Ordering::Relaxed);
                 if self.inner.fail_closed {
@@ -300,32 +354,57 @@ impl AuditLogger {
                 return;
             }
         };
+        let slot_permit = match self.inner.event_slots.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+                // Saturation is a counted drop in best-effort mode —
+                // the writer itself is still healthy, so only a
+                // fail-closed session treats a full channel as a
+                // writer fault.
+                if self.inner.fail_closed {
+                    self.inner.writer_failed.set();
+                }
+                tracing::error!(
+                    event_type = event.event_type.as_str(),
+                    fail_closed = self.inner.fail_closed,
+                    "Audit log channel full"
+                );
+                return;
+            }
+        };
         let tx_opt = self.inner.tx.lock().unwrap();
         if let Some(tx) = tx_opt.as_ref() {
-            if let Err(e) = tx.try_send((event, None, permit)) {
+            if let Err(e) = tx.try_send(WriterItem::Record(Box::new(AuditItem {
+                event,
+                ack: None,
+                bytes_permit,
+                slot_permit,
+            }))) {
                 match e {
-                    mpsc::error::TrySendError::Full((evt, _, _)) => {
+                    // A record holding a slot permit always fits the
+                    // queue's record share — unreachable while the
+                    // accounting holds; keep the counted-drop/latch
+                    // parity regardless.
+                    mpsc::error::TrySendError::Full(WriterItem::Record(item)) => {
                         self.inner.dropped.fetch_add(1, Ordering::Relaxed);
-                        // Saturation is a counted drop in best-effort
-                        // mode — the writer itself is still healthy, so
-                        // only a fail-closed session treats a full
-                        // channel as a writer fault.
                         if self.inner.fail_closed {
                             self.inner.writer_failed.set();
                         }
                         tracing::error!(
-                            event_type = evt.event_type.as_str(),
+                            event_type = item.event.event_type.as_str(),
                             fail_closed = self.inner.fail_closed,
                             "Audit log channel full"
                         );
                     }
-                    mpsc::error::TrySendError::Closed((evt, _, _)) => {
+                    mpsc::error::TrySendError::Closed(WriterItem::Record(item)) => {
                         self.inner.writer_failed.set();
                         tracing::error!(
-                            event_type = evt.event_type.as_str(),
+                            event_type = item.event.event_type.as_str(),
                             "Audit log channel closed"
                         );
                     }
+                    _ => {}
                 }
             }
         } else {
@@ -359,16 +438,28 @@ impl AuditLogger {
             return Ok(());
         }
         let need = Self::prepare(&mut event, &self.inner.session_id);
-        // Bounded backpressure: wait for byte budget before queueing —
-        // saturation slows the producer instead of dropping the record.
-        let permit = match self
+        // Bounded backpressure: wait for byte budget, then a record
+        // slot, before queueing — saturation slows the producer instead
+        // of dropping the record. Cancelling the wait drops the
+        // permits and leaves no hole in the queue order: an item
+        // exists only once its send lands.
+        let bytes_permit = match self
             .inner
             .bytes_budget
             .clone()
             .acquire_many_owned(need)
             .await
         {
-            Ok(p) => Some(p),
+            Ok(p) => p,
+            Err(_) => {
+                self.inner.writer_failed.set();
+                return Err(crate::error::AuditorError::AuditUnavailable(
+                    "audit queue closed".into(),
+                ));
+            }
+        };
+        let slot_permit = match self.inner.event_slots.clone().acquire_owned().await {
+            Ok(p) => p,
             Err(_) => {
                 self.inner.writer_failed.set();
                 return Err(crate::error::AuditorError::AuditUnavailable(
@@ -382,7 +473,16 @@ impl AuditLogger {
         };
         match tx {
             Some(tx) => {
-                if tx.send((event, None, permit)).await.is_err() {
+                if tx
+                    .send(WriterItem::Record(Box::new(AuditItem {
+                        event,
+                        ack: None,
+                        bytes_permit,
+                        slot_permit,
+                    })))
+                    .await
+                    .is_err()
+                {
                     self.inner.writer_failed.set();
                     return Err(crate::error::AuditorError::AuditUnavailable(
                         "audit log channel closed".into(),
@@ -420,14 +520,23 @@ impl AuditLogger {
             return self.ensure_available();
         }
         let need = Self::prepare(&mut event, &self.inner.session_id);
-        let permit = match self
+        let bytes_permit = match self
             .inner
             .bytes_budget
             .clone()
             .acquire_many_owned(need)
             .await
         {
-            Ok(p) => Some(p),
+            Ok(p) => p,
+            Err(_) => {
+                self.inner.writer_failed.set();
+                return Err(crate::error::AuditorError::AuditUnavailable(
+                    "audit queue closed".into(),
+                ));
+            }
+        };
+        let slot_permit = match self.inner.event_slots.clone().acquire_owned().await {
+            Ok(p) => p,
             Err(_) => {
                 self.inner.writer_failed.set();
                 return Err(crate::error::AuditorError::AuditUnavailable(
@@ -442,7 +551,16 @@ impl AuditLogger {
         match tx {
             Some(tx) => {
                 let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                if tx.send((event, Some(ack_tx), permit)).await.is_err() {
+                if tx
+                    .send(WriterItem::Record(Box::new(AuditItem {
+                        event,
+                        ack: Some(ack_tx),
+                        bytes_permit,
+                        slot_permit,
+                    })))
+                    .await
+                    .is_err()
+                {
                     self.inner.writer_failed.set();
                     return Err(crate::error::AuditorError::AuditUnavailable(
                         "audit log channel closed".into(),
@@ -469,9 +587,11 @@ impl AuditLogger {
 
     /// Re-resolve and swap the file sink at the launch's audit path —
     /// the logrotate coexistence path driven by SIGUSR1 on Unix. The
-    /// writer drains every record already queued to the *old* file
-    /// first (the channel arm is polled ahead of the reopen arm), then
-    /// flushes and fsyncs it before the handle is swapped; the path is
+    /// request enters the same queue the records use, so its position
+    /// is the ordering barrier: every record accepted ahead of it is
+    /// committed to the *old* file first — the writer flushes and
+    /// fsyncs that file before the handle is swapped — and every record
+    /// behind it lands in the new file after the marker. The path is
     /// re-opened through the same trust-boundary checks the launch
     /// used, so a link planted by a co-located actor — or a file a
     /// rotator recreated under a foreign uid — fails the reopen
@@ -482,7 +602,9 @@ impl AuditLogger {
     /// record on the surviving handle on error — so the operation's
     /// audit evidence is durable by the time the call resolves and can
     /// neither be overtaken by a queued record nor shed by a saturated
-    /// channel.
+    /// channel. The request's bounded wait is its queue position — a
+    /// saturated record stream slows the service, never the
+    /// submission: control requests hold slots records cannot take.
     ///
     /// `Ok(true)` means the sink now appends to a freshly opened handle
     /// at the path. `Ok(false)` means this logger has no live file sink
@@ -497,16 +619,34 @@ impl AuditLogger {
     /// handle live). When both fail, the reported error is the reopen's
     /// — it names why the path could not be re-opened.
     pub async fn reopen(&self, marker: ReopenMarker) -> Result<bool, crate::error::AuditorError> {
-        let tx = self.inner.reopen_tx.lock().unwrap().clone();
+        if !self.inner.file_sink {
+            return Ok(false);
+        }
+        let queued_at = std::time::Instant::now();
+        let tx = self.inner.tx.lock().unwrap().clone();
         let Some(tx) = tx else { return Ok(false) };
+        // The control share of the queue — the request always finds
+        // submission space ahead of its service, no matter how
+        // saturated the record stream is.
+        let slot = match self.inner.control_slots.clone().acquire_owned().await {
+            Ok(s) => s,
+            Err(_) => {
+                self.inner.writer_failed.set();
+                return Err(crate::error::AuditorError::AuditUnavailable(
+                    "audit writer stopped".into(),
+                ));
+            }
+        };
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         // A dead writer can neither take the request nor hold the sink
         // — the same unavailability a closed record channel reports.
         if tx
-            .send(ReopenRequest {
+            .send(WriterItem::Control(ControlRequest::Reopen(ReopenRequest {
                 reply: ack_tx,
                 marker,
-            })
+                queued_at,
+                slot,
+            })))
             .await
             .is_err()
         {
@@ -550,7 +690,7 @@ impl AuditLogger {
     /// listener that can only no-op. `false` after `shutdown()`,
     /// matching `reopen()`'s no-live-sink result.
     pub fn has_file_sink(&self) -> bool {
-        self.inner.reopen_tx.lock().unwrap().is_some()
+        self.inner.file_sink && self.inner.tx.lock().unwrap().is_some()
     }
 
     /// Events dropped because the writer channel was full. A
@@ -608,16 +748,14 @@ impl AuditLogger {
     /// fail-closed run paths fold the error into the command's
     /// outcome/exit status.
     pub async fn shutdown(&self) -> Result<(), crate::error::AuditorError> {
-        // Drop the sender to close the channel, signaling the writer task to flush and exit
+        // Drop the sender to close the queue — the shutdown request's
+        // position in the same acceptance order: everything already
+        // queued, records and control alike, is drained before the
+        // writer's final durable commit. A post-shutdown `reopen()`
+        // finds no live sink and never revives the writer.
         {
             let mut tx_lock = self.inner.tx.lock().unwrap();
             tx_lock.take();
-        }
-        // The reopen channel closes with it — a post-shutdown
-        // `reopen()` must find no live sink, never revive the writer.
-        {
-            let mut reopen_lock = self.inner.reopen_tx.lock().unwrap();
-            reopen_lock.take();
         }
 
         // Wait for the writer task to complete
