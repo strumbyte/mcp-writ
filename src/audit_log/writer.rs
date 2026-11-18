@@ -23,14 +23,15 @@
 //!
 //! ## Periodic sync
 //!
-//! The periodic flush/fsync deadlines are serviced inside the record
-//! path, not by `select!` arms that only run while the record channel
-//! is idle: after every [`CLOCK_CHECK_RECORDS`] processed records the
-//! writer consults its [`AuditClock`] and runs whatever deadlines have
-//! passed. The idle arm's `sleep_until` exists only to wake an *empty*
-//! queue on time. Starting a sync is therefore never conditioned on
-//! the queue draining — under sustained input the next bounded
-//! processing boundary is at most `CLOCK_CHECK_RECORDS` writes away.
+//! The periodic flush/fsync deadlines are serviced inside the item
+//! path, not by `select!` arms that only run while the receive queue
+//! is idle: after every [`CLOCK_CHECK_RECORDS`] processed records —
+//! and after each control item — the writer consults its
+//! [`AuditClock`] and runs whatever deadlines have passed. The idle
+//! arm's `sleep_until` exists only to wake an *empty* queue on time.
+//! Starting a sync is therefore never conditioned on the queue
+//! draining — under sustained input the next bounded processing
+//! boundary is at most `CLOCK_CHECK_RECORDS` writes away.
 //!
 //! The sink ([`AuditSink`]) and the clock are injected traits: the
 //! production pairing is `BufWriter<File>` plus [`TokioClock`];
@@ -422,9 +423,13 @@ impl<S: AuditSink, C: AuditClock> WriterCore<S, C> {
             // The durable path: flush the buffer, fsync the file,
             // then — for a freshly created log — fsync the parent so
             // the directory entry survives a crash too. A failed write
-            // gates every step: the record may never have reached the
-            // buffer, so a later successful flush must not be reported
-            // as its ack.
+            // gates *every* step, the flush included: the record may
+            // never have reached the buffer, so a later successful
+            // flush must not be reported as its ack — and retrying IO
+            // on a sink that just faulted buys the buffered tail
+            // nothing the periodic path won't retry anyway. (This
+            // tightens the pre-RF03 writer, which flushed
+            // unconditionally.)
             if ok && let Err(e) = self.sink.flush_buffer() {
                 tracing::error!("Audit log sync flush failed: {e}");
                 self.writer_failed.set();
@@ -468,8 +473,9 @@ impl<S: AuditSink, C: AuditClock> WriterCore<S, C> {
             if let Err(e) = self.sink.flush_buffer() {
                 tracing::error!("Audit log flush failed: {e}");
                 self.writer_failed.set();
+            } else {
+                self.events_since_flush = 0;
             }
-            self.events_since_flush = 0;
         }
 
         self.records_since_clock_check += 1;
@@ -483,7 +489,8 @@ impl<S: AuditSink, C: AuditClock> WriterCore<S, C> {
     /// belong to the sink generation still live here and get their
     /// durable commit before the swap; records dequeued after belong
     /// to the next generation — they appear after the marker in the
-    /// new file.
+    /// new file. Its dequeue is also a processing boundary — owed
+    /// periodic deadlines are settled once the request is serviced.
     pub(super) fn handle_control(&mut self, req: ControlRequest) {
         match req {
             ControlRequest::Reopen(ReopenRequest {
@@ -527,18 +534,28 @@ impl<S: AuditSink, C: AuditClock> WriterCore<S, C> {
                 let mut line = write_event_jsonl(&self.session_id, &evt);
                 line.push('\n');
                 let mut marker_result = Ok(());
+                // The marker joins the pending tail like any other
+                // record — count it before the write so a failed
+                // flush below leaves the tail pending for the
+                // periodic retry instead of clearing the state.
+                self.events_since_flush += 1;
                 if let Err(e) = self.sink.write_record(line.as_bytes()) {
                     tracing::error!("Audit log reopen marker write failed: {e}");
                     self.writer_failed.set();
                     marker_result = Err(e);
                 }
-                self.events_since_flush = 0;
                 if marker_result.is_ok()
                     && let Err(e) = self.sink.flush_buffer()
                 {
                     tracing::error!("Audit log reopen marker flush failed: {e}");
                     self.writer_failed.set();
                     marker_result = Err(e);
+                }
+                // Cleared only once the marker actually crossed the
+                // buffer boundary — a failed flush keeps the pending
+                // count so the next deadline retries the tail.
+                if marker_result.is_ok() {
+                    self.events_since_flush = 0;
                 }
                 if marker_result.is_ok()
                     && let Err(e) = self.sink.sync_file()
@@ -576,6 +593,12 @@ impl<S: AuditSink, C: AuditClock> WriterCore<S, C> {
                 let _ = reply.send(result.and(marker_result));
             }
         }
+        // A control item is a processing boundary too — a long
+        // rotation's own syncs do not discharge the periodic
+        // schedule. Settle what is owed here so a passed deadline
+        // never waits on the next record or an empty queue.
+        self.records_since_clock_check = 0;
+        self.service_due_deadlines();
     }
 
     /// Channel closed: everything accepted has already dequeued —
@@ -625,8 +648,9 @@ impl<S: AuditSink, C: AuditClock> WriterCore<S, C> {
             if let Err(e) = self.sink.flush_buffer() {
                 tracing::error!("Audit log periodic flush failed: {e}");
                 self.writer_failed.set();
+            } else {
+                self.events_since_flush = 0;
             }
-            self.events_since_flush = 0;
         }
         // The periodic fsync's schedule: every due 5 s tick gets its
         // own sync — a stall settles each owed period individually
@@ -675,6 +699,14 @@ pub(super) async fn file_writer_task<S: AuditSink, C: AuditClock>(
     mut core: WriterCore<S, C>,
 ) {
     let clock = core.clock.clone();
+    // The idle wake: one armed sleep per deadline, re-armed only when
+    // the core's earliest deadline moves — after the arm's own service
+    // or a boundary service inside the record/control path. Under a
+    // busy queue it sits armed-but-unpolled (`biased` reaches it only
+    // when `recv` pends), so a sustained record stream costs no
+    // per-item sleep allocation either.
+    let mut sleep_deadline = core.next_deadline();
+    let mut sleep = clock.sleep_until(sleep_deadline);
     loop {
         tokio::select! {
             biased;
@@ -693,9 +725,18 @@ pub(super) async fn file_writer_task<S: AuditSink, C: AuditClock>(
             // `handle_record` every CLOCK_CHECK_RECORDS, so this arm
             // is what keeps an *empty* queue punctual — never what a
             // busy queue waits on.
-            _ = clock.sleep_until(core.next_deadline()) => {
+            _ = sleep.as_mut() => {
                 core.service_due_deadlines();
             }
+        }
+        // Re-arm the wake whenever the earliest deadline moved — a
+        // fired arm's service and a record/control boundary service
+        // both push it forward. `service_due_deadlines` always
+        // advances the schedule past `now`, so a completed arm always
+        // re-arms.
+        if core.next_deadline() != sleep_deadline {
+            sleep_deadline = core.next_deadline();
+            sleep = clock.sleep_until(sleep_deadline);
         }
     }
 }

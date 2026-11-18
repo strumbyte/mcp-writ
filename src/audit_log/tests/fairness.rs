@@ -15,7 +15,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use super::super::writer::{
-    AuditClock, AuditSink, CLOCK_CHECK_RECORDS, FSYNC_PERIOD, WriterCore, file_writer_task,
+    AuditClock, AuditSink, CLOCK_CHECK_RECORDS, FLUSH_PERIOD, FSYNC_PERIOD, WriterCore,
+    file_writer_task,
 };
 use super::super::*;
 use super::make_test_event;
@@ -148,6 +149,8 @@ struct FakeSink {
     fail_write_at: Option<usize>,
     writes_seen: usize,
     fail_flush: bool,
+    fail_flush_at: Option<usize>,
+    flushes_seen: usize,
     fail_sync: bool,
     fail_dir_sync: bool,
     reopen_plan: ReopenPlan,
@@ -171,6 +174,8 @@ impl Default for FakeSink {
             fail_write_at: None,
             writes_seen: 0,
             fail_flush: false,
+            fail_flush_at: None,
+            flushes_seen: 0,
             fail_sync: false,
             fail_dir_sync: false,
             reopen_plan: ReopenPlan::Ok,
@@ -215,8 +220,9 @@ impl AuditSink for FakeSink {
     }
 
     fn flush_buffer(&mut self) -> std::io::Result<()> {
+        self.flushes_seen += 1;
         self.record(SinkOp::Flush);
-        if self.fail_flush {
+        if self.fail_flush || self.fail_flush_at == Some(self.flushes_seen) {
             return Err(Self::err("flush failed"));
         }
         Ok(())
@@ -251,18 +257,20 @@ impl AuditSink for FakeSink {
     /// Mirrors `FileSink::reopen`'s internal sequence — old-generation
     /// flush + fsync (+ owed dir fsync), the swap point, then the new
     /// generation's entry sync — so generation accounting in the op
-    /// log stays faithful. The single-use gate parks the call before
-    /// the sequence runs: a mid-rotation test window.
+    /// log stays faithful. The pre-swap steps run through the same
+    /// fallible methods the writer calls, so a configured flush/fsync/
+    /// dir failure stops the rotation before the swap — exactly like
+    /// the real sink. The single-use gate parks the call before the
+    /// sequence runs: a mid-rotation test window.
     fn reopen(&mut self, _path: &Path) -> std::io::Result<()> {
         if let Some((entered, proceed)) = self.reopen_gate.take() {
             let _ = entered.send(());
             let _ = proceed.recv();
         }
-        self.record(SinkOp::Flush);
-        self.record(SinkOp::SyncFile);
+        self.flush_buffer()?;
+        self.sync_file()?;
         if self.needs_dir {
-            self.record(SinkOp::SyncDir);
-            self.needs_dir = false;
+            self.sync_dir()?;
         }
         self.record(SinkOp::Reopen);
         match self.reopen_plan {
@@ -472,6 +480,62 @@ fn test_missed_periods_each_service() {
     assert_eq!(syncs, 2, "each owed period is settled: {ops:?}");
 }
 
+/// A failed flush keeps the tail pending — the next due deadline
+/// retries it even though no new records arrived, and once the retry
+/// succeeds the pending state is really cleared.
+#[test]
+fn test_failed_flush_retries_at_next_deadline() {
+    let clock = ManualClock::new();
+    let mut core = test_core(
+        FakeSink {
+            // The first flush attempt fails; later ones recover.
+            fail_flush_at: Some(1),
+            ..FakeSink::default()
+        },
+        clock.clone(),
+    );
+    core.handle_record(test_item(make_test_event(), None));
+    clock.advance(FLUSH_PERIOD + Duration::from_secs(1));
+    core.service_due_deadlines();
+    assert_eq!(
+        core.sink()
+            .ops
+            .borrow()
+            .iter()
+            .filter(|(_, op)| *op == SinkOp::Flush)
+            .count(),
+        1,
+        "the due flush ran once and failed"
+    );
+    // No new records — the retained pending state must still make the
+    // next deadline flush again.
+    clock.advance(FLUSH_PERIOD);
+    core.service_due_deadlines();
+    assert_eq!(
+        core.sink()
+            .ops
+            .borrow()
+            .iter()
+            .filter(|(_, op)| *op == SinkOp::Flush)
+            .count(),
+        2,
+        "the next deadline retries the pending tail"
+    );
+    // The retry succeeded — a further due deadline flushes nothing.
+    clock.advance(FLUSH_PERIOD);
+    core.service_due_deadlines();
+    assert_eq!(
+        core.sink()
+            .ops
+            .borrow()
+            .iter()
+            .filter(|(_, op)| *op == SinkOp::Flush)
+            .count(),
+        2,
+        "a successful retry clears the pending state"
+    );
+}
+
 // ─── Rotation barrier ───────────────────────────────────────────────────
 
 /// The queue position is the barrier: records dequeued ahead of the
@@ -628,10 +692,19 @@ async fn test_control_capacity_is_bounded_and_fifo() {
     .await;
     assert_eq!(logger.inner.control_slots.available_permits(), 0);
     // The fifth must wait for a dequeue — bounded control capacity —
-    // never for record space.
+    // never for record space. The started signal proves the task is
+    // live inside `reopen()` before the check, so `!is_finished`
+    // means "parked on the full reserve", not "never scheduled".
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let l = logger.clone();
-    let fifth = tokio::spawn(async move { l.reopen(marker_ok()).await });
-    tokio::task::yield_now().await;
+    let fifth = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        l.reopen(marker_ok()).await
+    });
+    started_rx.await.unwrap();
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
     assert!(
         !fifth.is_finished(),
         "control capacity is bounded — the fifth waits"
@@ -947,6 +1020,56 @@ async fn test_write_and_sync_failures_latch() {
 }
 
 // ─── Reopen failure distinctions ────────────────────────────────────────
+
+/// An old-generation fsync failure stops the rotation before the
+/// swap: no `Reopen` op is recorded, every op stays on generation 0,
+/// and the failure marker still lands on the surviving handle.
+#[tokio::test]
+async fn test_preswap_sync_failure_stops_rotation() {
+    let (op_tx, op_rx) = std::sync::mpsc::channel();
+    let logger = fake_logger(
+        FakeSink {
+            mirror: Some(op_tx),
+            fail_sync: true,
+            ..FakeSink::default()
+        },
+        ManualClock::new(),
+        8,
+        true,
+    );
+    let err = logger.reopen(marker_ok()).await.unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::AuditorError::AuditUnavailable(_)
+    ));
+    assert!(
+        logger.is_failed(),
+        "a failed reopen latches the writer fault"
+    );
+    let _ = logger.shutdown().await;
+
+    let ops: Vec<(usize, SinkOp)> = op_rx.iter().collect();
+    assert!(
+        !ops.iter().any(|(_, op)| *op == SinkOp::Reopen),
+        "a pre-swap sync failure must stop the rotation before the swap: {ops:?}"
+    );
+    assert!(
+        ops.iter().all(|(g, _)| *g == 0),
+        "no swap — every op stays on generation 0: {ops:?}"
+    );
+    // The outcome=failure marker still records the refusal in-band.
+    let marker = ops
+        .iter()
+        .find(|(_, op)| matches!(op, SinkOp::Write(l) if l.contains("audit.reopened")))
+        .expect("the failure marker is still written");
+    let SinkOp::Write(line) = &marker.1 else {
+        unreachable!()
+    };
+    assert!(
+        line.contains("\"outcome\":\"failure\""),
+        "the marker records the failure: {line}"
+    );
+}
 
 /// A refused reopen leaves the old generation live: the failure marker
 /// lands on generation 0, later records keep appending there, and the

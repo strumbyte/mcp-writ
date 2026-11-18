@@ -383,7 +383,7 @@ impl AuditEvent {
     /// budget this record consumes while queued. Not a billing meter:
     /// the sum must track the string members so an oversized payload
     /// cannot slip past the aggregate bound that count-based
-    /// `CHANNEL_CAPACITY` misses.
+    /// `EVENT_QUEUE_CAPACITY` misses.
     pub(crate) fn wire_size(&self) -> usize {
         let mut n = 256usize; // fixed members, names, punctuation
         for field in [
