@@ -830,6 +830,74 @@ async fn test_control_capacity_is_bounded_and_fifo() {
     }
 }
 
+/// A `reopen()` parked on the exhausted control reserve when shutdown
+/// begins wakes to `Ok(false)` — the shutdown's close of the reserve
+/// resolves the permit wait as "no live sink", not a writer fault —
+/// while the four already-accepted requests still drain and complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_parked_reopen_resolves_false_at_shutdown() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let sink = FakeSink {
+        reopen_gate: Some((entered_tx, release_rx)),
+        ..FakeSink::default()
+    };
+    let logger = fake_logger(sink, ManualClock::new(), 8, true);
+    // The first reopen parks the writer inside the rotation — the
+    // queue behind it still accepts control requests.
+    let l = logger.clone();
+    let first = tokio::spawn(async move { l.reopen(marker_seq(1)).await });
+    gate_entered(entered_rx).await;
+    // Three more requests fill the rest of the control reserve.
+    let mut pending = Vec::new();
+    for id in 2..=4usize {
+        let l = logger.clone();
+        pending.push(tokio::spawn(async move { l.reopen(marker_seq(id)).await }));
+    }
+    wait_until(
+        || logger.inner.control_slots.available_permits() == 0,
+        "the three queued control requests to hold the reserve",
+    )
+    .await;
+    // The fifth parks on the permit wait — the parked signal fires
+    // only after the request's first poll suspended, which can only
+    // be the exhausted `control_slots` acquire.
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+    let l = logger.clone();
+    let fifth = tokio::spawn(async move {
+        let mut fut = std::pin::pin!(l.reopen(marker_seq(5)));
+        std::future::poll_fn(|cx| {
+            assert!(
+                fut.as_mut().poll(cx).is_pending(),
+                "the fifth request must park on the full control reserve"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        let _ = parked_tx.send(());
+        fut.await
+    });
+    parked_rx.await.unwrap();
+    // Shutdown begins while the writer is still gated and the fifth
+    // is still parked: the reserve close is what resolves its wait.
+    let l = logger.clone();
+    let shutdown = tokio::spawn(async move { l.shutdown().await });
+    assert!(
+        matches!(fifth.await.unwrap(), Ok(false)),
+        "a reopen parked on the closed reserve answers `Ok(false)`"
+    );
+    assert!(
+        !logger.writer_failed(),
+        "a shutdown-closed reserve is not a writer fault"
+    );
+    release_tx.send(()).unwrap();
+    assert!(first.await.unwrap().unwrap());
+    for h in pending {
+        assert!(h.await.unwrap().unwrap());
+    }
+    shutdown.await.unwrap().unwrap();
+}
+
 /// A rotation request whose caller went away still occupies its
 /// barrier position — an accepted request leaves no hole in the order,
 /// and a dropped reply is not a writer fault.
