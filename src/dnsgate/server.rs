@@ -574,7 +574,9 @@ impl Drop for StagingGuard<'_> {
     fn drop(&mut self) {
         // Already-settled buckets remove nothing (`remove` on an
         // absent token is empty); a stranded one is discarded here.
-        self.allowlist.drop_staged(self.token);
+        // The unwind-safe variant proceeds through a poisoned lock —
+        // a second panic inside `Drop` would abort the process.
+        self.allowlist.drop_staged_unwind_safe(self.token);
     }
 }
 

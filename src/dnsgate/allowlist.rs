@@ -278,6 +278,21 @@ impl DynamicAllowList {
         inner.staged.remove(&staging.0);
     }
 
+    /// [`Self::drop_staged`] for unwinding paths — the same removal,
+    /// but proceeds through a poisoned lock instead of panicking:
+    /// discarding a bucket is memory-safe on any state, and a `Drop`
+    /// running during unwind must not introduce a second panic (that
+    /// aborts the process). Only the gate's `StagingGuard` calls this.
+    pub(crate) fn drop_staged_unwind_safe(&self, staging: GrantStaging) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        inner.staged.remove(&staging.0);
+    }
+
     /// Remove the grant for exactly `(name, addr)` — the rollback half
     /// of register→commit ordering: an answer whose audit record could
     /// not be accepted must not leave name→address authority behind.
@@ -801,7 +816,7 @@ mod tests {
     /// `snapshot_json` produces.
     #[test]
     fn staged_grants_absent_from_export() {
-        let dir = std::env::temp_dir()
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
             .join("mcp_writ_test")
             .join(format!("export_staged_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -838,6 +853,30 @@ mod tests {
         assert!(al.register("direct.example", b, &[TCP_ANY], Duration::from_secs(60)));
         assert_eq!(al.live_len(), 1);
         al.drop_staged(s);
+    }
+
+    /// `drop_staged_unwind_safe` must not panic on a poisoned lock —
+    /// `StagingGuard` runs it inside `Drop`, where a second panic
+    /// during unwind would abort the process. The bucket discard is
+    /// memory-safe even on possibly-inconsistent state.
+    #[test]
+    fn drop_staged_unwind_safe_tolerates_a_poisoned_lock() {
+        let al = std::sync::Arc::new(DynamicAllowList::new(4));
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 70));
+        let s = al.begin_staging();
+        assert!(al.register_staged(s, "p.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        // Poison the lock: a thread panics while holding it.
+        let al2 = al.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = al2.inner.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(al.inner.lock().is_err(), "lock must be poisoned");
+        // No panic — and the stranded bucket is still discarded.
+        al.drop_staged_unwind_safe(s);
+        let inner = al.inner.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(inner.staged.is_empty());
     }
 
     /// Rollback for the fail-closed ordering contract: a grant minted
