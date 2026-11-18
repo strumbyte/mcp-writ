@@ -567,7 +567,7 @@ async fn write_frame(stream: &mut TcpStream, msg: &[u8]) -> std::io::Result<()> 
 /// permanently — nothing reaps staged entries.
 struct StagingGuard<'a> {
     allowlist: &'a DynamicAllowList,
-    token: GrantStaging,
+    staging: GrantStaging,
 }
 
 impl Drop for StagingGuard<'_> {
@@ -576,7 +576,7 @@ impl Drop for StagingGuard<'_> {
         // absent token is empty); a stranded one is discarded here.
         // The unwind-safe variant proceeds through a poisoned lock —
         // a second panic inside `Drop` would abort the process.
-        self.allowlist.drop_staged_unwind_safe(self.token);
+        self.allowlist.drop_staged_unwind_safe(self.staging);
     }
 }
 
@@ -895,7 +895,7 @@ async fn process_query(
     // must still be released, not orphaned against `max_grants`.
     let _staged = StagingGuard {
         allowlist: &core.allowlist,
-        token: staging,
+        staging,
     };
     if let Some(grant_ttl) = parsed.min_ttl.filter(|t| *t > 0) {
         for (addr, _) in &parsed.addrs {
