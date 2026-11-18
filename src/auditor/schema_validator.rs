@@ -49,46 +49,86 @@ const MAX_NODE_EVALS: usize = 1 << 24;
 /// (`1e1000000`) are rejected rather than materialized.
 const MAX_MULTIPLE_OF_COST: usize = 1 << 20;
 
+/// Why resolving an `args_schema` reference failed. The out-of-tree
+/// `@path` case is its own variant so the checker can label the audit
+/// event `validation.path_traversal` without re-reading the message —
+/// a schema-side answer, decided where the refusal is produced.
+#[derive(Debug)]
+pub enum SchemaRefError {
+    /// The `@path` canonicalized outside the working directory.
+    PathTraversal(String),
+    /// Missing file, read/I/O failure, non-UTF-8 content, or a
+    /// working-directory lookup failure.
+    Other(String),
+}
+
+impl SchemaRefError {
+    /// The refusal text as audit records and the wire spell it.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::PathTraversal(r) | Self::Other(r) => r,
+        }
+    }
+
+    /// Consume the error into its refusal text.
+    pub fn into_reason(self) -> String {
+        match self {
+            Self::PathTraversal(r) | Self::Other(r) => r,
+        }
+    }
+}
+
+impl std::fmt::Display for SchemaRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl std::error::Error for SchemaRefError {}
+
 /// Resolve an args_schema reference to a JSON schema string.
 ///
 /// - If the reference starts with `@`, the rest is treated as a file path.
 /// - Otherwise, it is treated as inline JSON.
-pub fn resolve_schema(schema_ref: &str) -> Result<String, String> {
+pub fn resolve_schema(schema_ref: &str) -> Result<String, SchemaRefError> {
     if let Some(path) = schema_ref.strip_prefix('@') {
         let path = path.trim();
 
         // Canonicalize the path to resolve symlinks and `..` components,
         // then verify the result lives under the current working directory.
         let canonical = std::fs::canonicalize(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+            SchemaRefError::Other(if e.kind() == std::io::ErrorKind::NotFound {
                 format!("failed to read schema file '{path}': {e}")
             } else {
                 format!("failed to resolve schema file path '{path}': {e}")
-            }
+            })
         })?;
-        let base_raw = std::env::current_dir()
-            .map_err(|e| format!("failed to determine working directory: {e}"))?;
+        let base_raw = std::env::current_dir().map_err(|e| {
+            SchemaRefError::Other(format!("failed to determine working directory: {e}"))
+        })?;
         let base = std::fs::canonicalize(&base_raw).unwrap_or(base_raw);
         if !canonical.starts_with(&base) {
-            return Err(format!(
+            return Err(SchemaRefError::PathTraversal(format!(
                 "path traversal: schema file '{}' resolves outside the working directory",
                 canonical.display(),
-            ));
+            )));
         }
 
         // Bind the read to the containment check: the opened handle is
         // the same object whose real path must stay under `base` — a
         // component swapped for a link after canonicalization fails the
         // handle-side proof instead of serving out-of-tree bytes.
-        let root = crate::fspriv::canonical_root(&base)
-            .map_err(|e| format!("failed to resolve schema file path '{path}': {e}"))?;
+        let root = crate::fspriv::canonical_root(&base).map_err(|e| {
+            SchemaRefError::Other(format!("failed to resolve schema file path '{path}': {e}"))
+        })?;
         let bytes = crate::fspriv::read_no_follow_bounded_in(
             &canonical,
             crate::policy::MAX_SCHEMA_FILE_BYTES,
             &root,
         )
-        .map_err(|e| format!("failed to read schema file '{path}': {e}"))?;
-        String::from_utf8(bytes).map_err(|e| format!("failed to read schema file '{path}': {e}"))
+        .map_err(|e| SchemaRefError::Other(format!("failed to read schema file '{path}': {e}")))?;
+        String::from_utf8(bytes)
+            .map_err(|e| SchemaRefError::Other(format!("failed to read schema file '{path}': {e}")))
     } else {
         Ok(schema_ref.to_string())
     }

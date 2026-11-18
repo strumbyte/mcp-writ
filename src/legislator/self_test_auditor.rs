@@ -58,7 +58,12 @@ fn probe_out_of_schema(policy: &Policy) -> Option<AuditorProbe> {
     for args in attempts {
         let line = build_tools_call(2, &tool.name, args);
         match checker::check_request(&line, policy) {
-            Err(PolicyViolation { reason, .. }) if reason.contains("schema validation failed") => {
+            Err(v)
+                if matches!(
+                    v.validation_kind(),
+                    Some(crate::audit_log::EventType::ValidationArgumentInvalid)
+                ) =>
+            {
                 return Some(expect_policy_error("out-of-schema", &line, policy));
             }
             Err(_) | Ok(_) => {}
@@ -82,8 +87,8 @@ fn probe_secret_path(policy: &Policy) -> AuditorProbe {
         let args = format!(r#"{{"{key}":"{secret}"}}"#);
         let line = build_tools_call(3, &tool.name, &args);
         match checker::check_request(&line, policy) {
-            Err(PolicyViolation { reason, .. }) => {
-                if reason.contains("secret-path overlay") || reason.contains("secret-overlay") {
+            Err(v) => {
+                if matches!(v.kind, checker::DenialKind::SecretOverlay { .. }) {
                     return expect_policy_error("secret-path", &line, policy);
                 }
             }

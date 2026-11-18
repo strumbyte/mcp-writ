@@ -52,6 +52,10 @@ fn test_trajectory_on_denies_network_after_successful_read_only() {
     let err = check_trajectory(&fetch, &policy, &session).unwrap_err();
     assert_eq!(err.tool_name, "fetch_url");
     assert!(err.reason.contains("trajectory"), "{}", err.reason);
+    // A session-state refusal: no validation event, never a
+    // policy-widening candidate.
+    assert!(err.validation_kind().is_none());
+    assert!(!err.is_denied_target());
 }
 
 #[test]

@@ -26,11 +26,81 @@ pub(crate) const REASON_TOOL_NOT_ALLOWED: &str = "tool is not allowed";
 /// all. Distinct in the audit record; identical on the wire.
 const REASON_TOOL_NOT_FOUND: &str = "tool not found in policy (default deny)";
 
+/// What a `PolicyViolation` refusal *is* — declared by the producer at
+/// construction and read by the classifiers, never re-derived from
+/// `reason`. A user-controlled path or host spelling that happens to
+/// contain a denial phrase (`path traversal`, an existing reason's
+/// suffix) must not steer the audit event type, the wire collapse, or
+/// the widening-candidate selection.
+///
+/// The variants cover the refusal families the checker produces:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenialKind {
+    /// Tool-level authorization refusal — the call names no allowed
+    /// tool. `listed` distinguishes the audit detail: `true` for a
+    /// listed-but-denied entry, `false` for a name the policy never
+    /// declared. The wire collapses both into
+    /// [`REASON_TOOL_NOT_ALLOWED`] so the client cannot probe which
+    /// tool names exist in the policy.
+    Authorization { listed: bool },
+    /// User-space validation refusal — a traversal attempt or an
+    /// `args_schema` rejection — earning a typed `validation.*` audit
+    /// event alongside the deny record.
+    Validation(ValidationKind),
+    /// A target the call's arguments name was refused by a policy
+    /// rule: the tool fs allow/deny sub-policy or the global/per-tool
+    /// network host/egress rules. `correction_candidates
+    /// .denied_targets` reports these as widening candidates.
+    DeniedTarget,
+    /// The secret-path overlay refused the argument.
+    /// `reserved_match` marks the reserved-set hit — the one overlay
+    /// refusal naming a denied *target* a wider allow could grant;
+    /// the other overlay refusals reject the *spelling* (normalize
+    /// failure, invisible Unicode, dirty URI scheme, opaque `file:`
+    /// URI) and are never widening candidates.
+    SecretOverlay { reserved_match: bool },
+    /// Session-state refusal (`trajectory:` / `confused deputy:`).
+    Session,
+    /// Request-shape, contract-shape, and target-*spelling* refusals
+    /// that name no denied target — JSON parse/shape errors,
+    /// `requestState` and `inputResponses` contract violations,
+    /// missing/non-canonical/unresolvable targets, extraction-budget
+    /// failures, and policy-side resolution errors.
+    Other,
+}
+
+/// Which `validation.*` audit event a [`DenialKind::Validation`]
+/// refusal earns — the two shapes `validation_kind` emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValidationKind {
+    /// `EventType::ValidationPathTraversal` — a `..` escape in a
+    /// use-side path or an `args_schema` file reference resolving
+    /// outside the working directory.
+    PathTraversal,
+    /// `EventType::ValidationArgumentInvalid` — the tool's
+    /// `args_schema` rejected the arguments.
+    ArgumentInvalid,
+}
+
+impl ValidationKind {
+    fn event_type(self) -> crate::audit_log::EventType {
+        match self {
+            Self::PathTraversal => crate::audit_log::EventType::ValidationPathTraversal,
+            Self::ArgumentInvalid => crate::audit_log::EventType::ValidationArgumentInvalid,
+        }
+    }
+}
+
 /// Represents a policy violation when a tool call is not allowed.
 #[derive(Debug)]
 pub struct PolicyViolation {
     pub tool_name: String,
+    /// Display/audit text — composed by the producer. No classifier
+    /// reads meaning back out of it; a refusal's semantics live in
+    /// `kind`.
     pub reason: String,
+    /// What the refusal *is*, decided where it is produced.
+    pub(crate) kind: DenialKind,
 }
 
 impl std::fmt::Display for PolicyViolation {
@@ -40,20 +110,30 @@ impl std::fmt::Display for PolicyViolation {
 }
 
 impl PolicyViolation {
+    /// `kind` is the refusal's declared meaning — the classifiers read
+    /// it; `reason` stays display/audit text only.
+    pub(crate) fn new(
+        tool_name: impl Into<String>,
+        kind: DenialKind,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            reason: reason.into(),
+            kind,
+        }
+    }
+
     /// The user-space validation category this violation belongs to, if
     /// the refusal came from input validation rather than a policy rule:
     /// `validation.path_traversal` for the session/schema path checks,
     /// `validation.argument_invalid` for `args_schema` rejections. The
-    /// classification keys on the reason prefixes this module and
-    /// [`super::schema_validator`] produce — it is a schema-side
-    /// labeling of our own strings, not a guess at upstream text.
+    /// producer declares the category through `DenialKind::Validation`;
+    /// nothing re-parses the reason text.
     pub fn validation_kind(&self) -> Option<crate::audit_log::EventType> {
-        if self.reason.contains("path traversal") {
-            Some(crate::audit_log::EventType::ValidationPathTraversal)
-        } else if self.reason.starts_with("schema validation failed:") {
-            Some(crate::audit_log::EventType::ValidationArgumentInvalid)
-        } else {
-            None
+        match self.kind {
+            DenialKind::Validation(v) => Some(v.event_type()),
+            _ => None,
         }
     }
 
@@ -63,9 +143,9 @@ impl PolicyViolation {
     /// errors into an oracle for hidden tool names. The distinguishing
     /// reason is preserved in `self.reason` for the audit record.
     pub fn client_reason(&self) -> &str {
-        match self.reason.as_str() {
-            REASON_TOOL_NOT_ALLOWED | REASON_TOOL_NOT_FOUND => REASON_TOOL_NOT_ALLOWED,
-            other => other,
+        match self.kind {
+            DenialKind::Authorization { .. } => REASON_TOOL_NOT_ALLOWED,
+            _ => &self.reason,
         }
     }
 
@@ -75,43 +155,32 @@ impl PolicyViolation {
     /// distinguish the two, so it never claims an allowed tool is
     /// prohibited when only the call was denied.
     pub fn is_authorization_denial(&self) -> bool {
-        matches!(
-            self.reason.as_str(),
-            REASON_TOOL_NOT_ALLOWED | REASON_TOOL_NOT_FOUND
-        )
+        matches!(self.kind, DenialKind::Authorization { .. })
     }
 
     /// Whether this refusal is a target-policy denial — a target the
     /// call's arguments name was refused by a policy rule: the tool
     /// fs allow/deny sub-policy, the secret-path overlay's reserved
-    /// match, and the global or per-tool network host/egress rules.
-    /// Their reasons name the refused target first — `host '…'`,
-    /// `destination '…'`, and for paths `path '…'` *with* the
-    /// rejection phrase the fs sub-policy or the overlay produces
-    /// (each clause matched as the producer's terminal text, so the
-    /// phrase inside a path spelling cannot spoof it) —
-    /// which is exactly what `correction_candidates.denied_targets`
-    /// reports as widening candidates. Everything else stays out:
-    /// tool-level authorization refusals, `args_schema` and
-    /// path-traversal validation failures, session-state refusals
-    /// (`trajectory:` / `confused deputy:`), contract-shape refusals
-    /// (`inputResponses denied …`, a missing path/URL target, a
-    /// non-canonical spelling, an extraction-budget or `requestState`
-    /// cap failure), and `path '…'` reasons that refuse the
-    /// *spelling* rather than the target — an unnormalizable or
-    /// unresolvable path, invisible Unicode, a dirty URI scheme, an
-    /// opaque `file:` URI — none names a denied target a wider grant
+    /// match, or the global/per-tool network host/egress rules — which
+    /// is exactly what `correction_candidates.denied_targets` reports
+    /// as widening candidates. Everything else stays out: tool-level
+    /// authorization refusals, `args_schema` and path-traversal
+    /// validation failures, session-state refusals (`trajectory:` /
+    /// `confused deputy:`), contract-shape refusals (`inputResponses
+    /// denied …`, a missing path/URL target, a non-canonical spelling,
+    /// an extraction-budget or `requestState` cap failure), and the
+    /// refusals of a *spelling* rather than a target — an
+    /// unnormalizable or unresolvable path and the non-reserved
+    /// overlay rejections — none names a denied target a wider grant
     /// could answer.
     pub fn is_denied_target(&self) -> bool {
-        if self.reason.starts_with("host '") || self.reason.starts_with("destination '") {
-            return true;
-        }
-        self.reason.starts_with("path '")
-            && (self.reason.ends_with("') denied by tool fs sub-policy")
-                || self.reason.ends_with("') not in tool fs allowed paths")
-                || self
-                    .reason
-                    .ends_with("' matches the secret-path overlay (beats explicit allow)"))
+        matches!(
+            self.kind,
+            DenialKind::DeniedTarget
+                | DenialKind::SecretOverlay {
+                    reserved_match: true
+                }
+        )
     }
 }
 
@@ -143,42 +212,53 @@ fn check_duplicate_keys_at_depth(
     depth: u32,
 ) -> Result<(), PolicyViolation> {
     if depth > MAX_JSON_NESTING {
-        return Err(PolicyViolation {
-            tool_name: "<unknown>".to_string(),
-            reason: format!("JSON nesting exceeds {MAX_JSON_NESTING} levels"),
-        });
+        return Err(PolicyViolation::new(
+            "<unknown>",
+            DenialKind::Other,
+            format!("JSON nesting exceeds {MAX_JSON_NESTING} levels"),
+        ));
     }
     match val.kind() {
         nojson::JsonValueKind::Object => {
             #[cfg(feature = "measure")]
             crate::measure::incr(&crate::measure::DUPKEY_OBJECT_NODES, 1);
             let mut seen = std::collections::HashSet::new();
-            let obj_iter = val.to_object().map_err(|e| PolicyViolation {
-                tool_name: "<unknown>".to_string(),
-                reason: format!("failed to parse JSON object members: {e}"),
+            let obj_iter = val.to_object().map_err(|e| {
+                PolicyViolation::new(
+                    "<unknown>",
+                    DenialKind::Other,
+                    format!("failed to parse JSON object members: {e}"),
+                )
             })?;
             for (k, v) in obj_iter {
                 let key = k
                     .to_unquoted_string_str()
-                    .map_err(|e| PolicyViolation {
-                        tool_name: "<unknown>".to_string(),
-                        reason: format!("invalid object key encoding: {e}"),
+                    .map_err(|e| {
+                        PolicyViolation::new(
+                            "<unknown>",
+                            DenialKind::Other,
+                            format!("invalid object key encoding: {e}"),
+                        )
                     })?
                     .into_owned();
 
                 if !seen.insert(key.clone()) {
-                    return Err(PolicyViolation {
-                        tool_name: "<unknown>".to_string(),
-                        reason: format!("duplicate key '{key}' in JSON-RPC request"),
-                    });
+                    return Err(PolicyViolation::new(
+                        "<unknown>",
+                        DenialKind::Other,
+                        format!("duplicate key '{key}' in JSON-RPC request"),
+                    ));
                 }
                 check_duplicate_keys_at_depth(v, depth + 1)?;
             }
         }
         nojson::JsonValueKind::Array => {
-            let arr_iter = val.to_array().map_err(|e| PolicyViolation {
-                tool_name: "<unknown>".to_string(),
-                reason: format!("failed to parse JSON array: {e}"),
+            let arr_iter = val.to_array().map_err(|e| {
+                PolicyViolation::new(
+                    "<unknown>",
+                    DenialKind::Other,
+                    format!("failed to parse JSON array: {e}"),
+                )
             })?;
             for elem in arr_iter {
                 check_duplicate_keys_at_depth(elem, depth + 1)?;
@@ -219,19 +299,21 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
     let json = match nojson::RawJson::parse(line) {
         Ok(j) => j,
         Err(e) => {
-            return Err(PolicyViolation {
-                tool_name: "<unknown>".to_string(),
-                reason: format!("invalid JSON: {e}"),
-            });
+            return Err(PolicyViolation::new(
+                "<unknown>",
+                DenialKind::Other,
+                format!("invalid JSON: {e}"),
+            ));
         }
     };
 
     // Envelope validation: Must be a JSON Object (reject batch requests / non-objects)
     if json.value().kind() != nojson::JsonValueKind::Object {
-        return Err(PolicyViolation {
-            tool_name: "<unknown>".to_string(),
-            reason: "request must be a JSON object (batch requests are not supported)".to_string(),
-        });
+        return Err(PolicyViolation::new(
+            "<unknown>",
+            DenialKind::Other,
+            "request must be a JSON object (batch requests are not supported)",
+        ));
     }
 
     // Check for duplicate keys in all nested objects across the entire JSON-RPC request
@@ -240,26 +322,35 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
     // Iterate through object members to extract method
     let mut method_opt: Option<String> = None;
 
-    let obj_iter = json.value().to_object().map_err(|e| PolicyViolation {
-        tool_name: "<unknown>".to_string(),
-        reason: format!("failed to parse JSON object members: {e}"),
+    let obj_iter = json.value().to_object().map_err(|e| {
+        PolicyViolation::new(
+            "<unknown>",
+            DenialKind::Other,
+            format!("failed to parse JSON object members: {e}"),
+        )
     })?;
 
     for (k_val, v_val) in obj_iter {
         let key = k_val
             .to_unquoted_string_str()
-            .map_err(|e| PolicyViolation {
-                tool_name: "<unknown>".to_string(),
-                reason: format!("invalid object key encoding: {e}"),
+            .map_err(|e| {
+                PolicyViolation::new(
+                    "<unknown>",
+                    DenialKind::Other,
+                    format!("invalid object key encoding: {e}"),
+                )
             })?
             .into_owned();
 
         if key == "method" {
             let m_str = v_val
                 .to_unquoted_string_str()
-                .map_err(|_| PolicyViolation {
-                    tool_name: "<unknown>".to_string(),
-                    reason: "'method' field must be a valid JSON string".to_string(),
+                .map_err(|_| {
+                    PolicyViolation::new(
+                        "<unknown>",
+                        DenialKind::Other,
+                        "'method' field must be a valid JSON string",
+                    )
                 })?
                 .into_owned();
             method_opt = Some(m_str);
@@ -283,15 +374,17 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
 
     // Step 3-6: Check against policy (including MRTR retries with a new JSON-RPC id)
     if !tool_is_allowed(policy, &tool_name) {
-        let reason = if policy.tools.iter().any(|t| t.name == tool_name) {
+        let listed = policy.tools.iter().any(|t| t.name == tool_name);
+        let reason = if listed {
             REASON_TOOL_NOT_ALLOWED
         } else {
             REASON_TOOL_NOT_FOUND
         };
-        return Err(PolicyViolation {
+        return Err(PolicyViolation::new(
             tool_name,
-            reason: reason.to_string(),
-        });
+            DenialKind::Authorization { listed },
+            reason,
+        ));
     }
 
     let tool = match policy
@@ -303,10 +396,11 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
         // Unreachable: `tool_is_allowed` just proved a listed, allowed entry
         // exists (duplicate tool names are rejected at policy load).
         None => {
-            return Err(PolicyViolation {
+            return Err(PolicyViolation::new(
                 tool_name,
-                reason: REASON_TOOL_NOT_FOUND.to_string(),
-            });
+                DenialKind::Authorization { listed: false },
+                REASON_TOOL_NOT_FOUND,
+            ));
         }
     };
 
@@ -413,12 +507,11 @@ fn check_request_state(
 
     let size = request_state_byte_len(value);
     if size > REQUEST_STATE_MAX_BYTES {
-        return Err(PolicyViolation {
-            tool_name: tool_name.to_string(),
-            reason: format!(
-                "requestState exceeds size cap ({size} > {REQUEST_STATE_MAX_BYTES} bytes)"
-            ),
-        });
+        return Err(PolicyViolation::new(
+            tool_name,
+            DenialKind::Other,
+            format!("requestState exceeds size cap ({size} > {REQUEST_STATE_MAX_BYTES} bytes)"),
+        ));
     }
 
     audit_notes.push(format!("requestState present ({size} bytes)"));
@@ -460,10 +553,11 @@ fn check_input_responses(
 
     let resolved = tool.input_responses.resolve(tool.has_security_contract());
     match resolved {
-        ResolvedInputResponses::Deny => Err(PolicyViolation {
-            tool_name: tool_name.to_string(),
-            reason: input_responses_denied_reason(tool.input_responses),
-        }),
+        ResolvedInputResponses::Deny => Err(PolicyViolation::new(
+            tool_name,
+            DenialKind::Other,
+            input_responses_denied_reason(tool.input_responses),
+        )),
         ResolvedInputResponses::Allow => Ok(()),
         ResolvedInputResponses::Inspect => {
             audit_notes.push("inputResponses present (inspect)".to_string());
@@ -503,10 +597,11 @@ pub fn check_trajectory(
     let json = match nojson::RawJson::parse(line) {
         Ok(j) => j,
         Err(e) => {
-            return Err(PolicyViolation {
-                tool_name: "<unknown>".to_string(),
-                reason: format!("invalid JSON: {e}"),
-            });
+            return Err(PolicyViolation::new(
+                "<unknown>",
+                DenialKind::Other,
+                format!("invalid JSON: {e}"),
+            ));
         }
     };
     let tool_name = extract_tool_name(&json)?;
@@ -524,7 +619,7 @@ pub fn check_trajectory(
             next_side_effect,
             has_host_or_url,
         )
-        .map_err(|reason| PolicyViolation { tool_name, reason })
+        .map_err(|reason| PolicyViolation::new(tool_name, DenialKind::Session, reason))
 }
 
 /// Look up a tool's documented `side_effect` for trajectory bookkeeping.
@@ -542,9 +637,14 @@ fn validate_tool_args(
     tool_name: &str,
     schema_ref: &str,
 ) -> Result<(), PolicyViolation> {
-    let schema_str = schema_validator::resolve_schema(schema_ref).map_err(|e| PolicyViolation {
-        tool_name: tool_name.to_string(),
-        reason: e,
+    let schema_str = schema_validator::resolve_schema(schema_ref).map_err(|e| {
+        let kind = match &e {
+            schema_validator::SchemaRefError::PathTraversal(_) => {
+                DenialKind::Validation(ValidationKind::PathTraversal)
+            }
+            _ => DenialKind::Other,
+        };
+        PolicyViolation::new(tool_name, kind, e.into_reason())
     })?;
 
     // MCP allows omitting `params.arguments` — the schema sees the empty
@@ -559,9 +659,12 @@ fn validate_tool_args(
         }
     };
 
-    schema_validator::validate_arguments(arguments, &schema_str).map_err(|e| PolicyViolation {
-        tool_name: tool_name.to_string(),
-        reason: format!("schema validation failed: {e}"),
+    schema_validator::validate_arguments(arguments, &schema_str).map_err(|e| {
+        PolicyViolation::new(
+            tool_name,
+            DenialKind::Validation(ValidationKind::ArgumentInvalid),
+            format!("schema validation failed: {e}"),
+        )
     })
 }
 
@@ -571,23 +674,28 @@ fn extract_tool_name(json: &nojson::RawJson<'_>) -> Result<String, PolicyViolati
         .to_member("params")
         .ok()
         .and_then(|m| m.optional())
-        .ok_or_else(|| PolicyViolation {
-            tool_name: "<unknown>".to_string(),
-            reason: "tools/call without params".to_string(),
+        .ok_or_else(|| {
+            PolicyViolation::new("<unknown>", DenialKind::Other, "tools/call without params")
         })?;
 
     let name_str = params
         .to_member("name")
         .ok()
         .and_then(|m| m.optional())
-        .ok_or_else(|| PolicyViolation {
-            tool_name: "<unknown>".to_string(),
-            reason: "tools/call without params.name".to_string(),
+        .ok_or_else(|| {
+            PolicyViolation::new(
+                "<unknown>",
+                DenialKind::Other,
+                "tools/call without params.name",
+            )
         })?
         .to_unquoted_string_str()
-        .map_err(|_| PolicyViolation {
-            tool_name: "<unknown>".to_string(),
-            reason: "params.name is not a string".to_string(),
+        .map_err(|_| {
+            PolicyViolation::new(
+                "<unknown>",
+                DenialKind::Other,
+                "params.name is not a string",
+            )
         })?;
 
     Ok(name_str.into_owned())

@@ -76,7 +76,7 @@ async fn denied_name_is_refused_and_audited() {
     assert!(d.contains("decision=not-allowed"), "{d}");
     assert!(d.contains("session_id="), "{d}");
 
-    let resolved = details_for(&lines, "sandbox.network_resolved");
+    let resolved = resolved_ok(&lines);
     assert_eq!(resolved.len(), 1, "one resolution record: {resolved:?}");
     let r = &resolved[0];
     assert!(r.contains("name=allowed.example"), "{r}");

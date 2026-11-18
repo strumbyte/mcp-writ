@@ -220,7 +220,8 @@ fn resolve_file_path_traversal_rejected() {
     let err = resolve_schema("@../../../etc/passwd").unwrap_err();
     // Either "failed to read" (if path doesn't exist) or "path traversal"
     assert!(
-        err.contains("path traversal") || err.contains("failed to read schema file"),
+        err.reason().contains("path traversal")
+            || err.reason().contains("failed to read schema file"),
         "got: {err}"
     );
 }
@@ -228,7 +229,10 @@ fn resolve_file_path_traversal_rejected() {
 #[test]
 fn resolve_file_nonexistent_rejected() {
     let err = resolve_schema("@/nonexistent/path/schema.json").unwrap_err();
-    assert!(err.contains("failed to read schema file"), "got: {err}");
+    assert!(
+        err.reason().contains("failed to read schema file"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -240,7 +244,7 @@ fn resolve_file_outside_cwd_rejected() {
     std::fs::write(&test_file, r#"{"type":"object"}"#).unwrap();
 
     let err = resolve_schema(&format!("@{}", test_file.display())).unwrap_err();
-    assert!(err.contains("path traversal"), "got: {err}");
+    assert!(err.reason().contains("path traversal"), "got: {err}");
 }
 
 #[test]

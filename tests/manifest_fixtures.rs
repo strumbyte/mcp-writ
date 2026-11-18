@@ -170,7 +170,7 @@ fn fixture_secret_path_call_denied_by_overlay() {
         "reserved path must match secret-overlay"
     );
     let deny = overlay_denies(&path).expect_err("secret path must be denied");
-    assert!(deny.contains("secret-path overlay"), "got: {deny}");
+    assert!(deny.reason().contains("secret-path overlay"), "got: {deny}");
 
     let err = check_request(
         &anchored_fixture("secret_path_call.json"),

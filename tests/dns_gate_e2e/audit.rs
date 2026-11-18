@@ -47,7 +47,8 @@ async fn fail_closed_audit_unavailable_refuses_allowed() {
     // Kill the sink: shutting the logger down makes the channel
     // unavailable; the next allowed query must fail closed.
     let _ = gate.logger.shutdown().await;
-    let resp = udp_query(gate.listen, &dns_query(1, "allowed.example", 1))
+    // `_once`: the fail-closed SERVFAIL *is* the verdict — no retry.
+    let resp = udp_query_once(gate.listen, &dns_query(1, "allowed.example", 1))
         .await
         .expect("servfail on dead audit sink");
     assert_eq!(

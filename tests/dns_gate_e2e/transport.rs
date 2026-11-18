@@ -126,7 +126,8 @@ async fn upstream_timeout_is_servfail() {
         return;
     };
 
-    let resp = udp_query(gate.listen, &dns_query(1, "slow.allowed.example", 1))
+    // `_once`: the SERVFAIL *is* the verdict — no retry to rescue.
+    let resp = udp_query_once(gate.listen, &dns_query(1, "slow.allowed.example", 1))
         .await
         .expect("servfail");
     assert_eq!(rcode(&resp), 2, "upstream timeout → SERVFAIL");
@@ -210,7 +211,8 @@ async fn upstream_mismatch_is_servfail() {
         return;
     };
 
-    let resp = tcp_query(gate.listen, &dns_query(1, "mismatch.allowed.example", 1))
+    // `_once`: the SERVFAIL *is* the verdict — no retry to rescue.
+    let resp = tcp_query_once(gate.listen, &dns_query(1, "mismatch.allowed.example", 1))
         .await
         .expect("servfail on mismatched upstream");
     assert_eq!(rcode(&resp), 2, "upstream mismatch → SERVFAIL");
