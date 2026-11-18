@@ -297,12 +297,12 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 
 **タスク**
 
-- [ ] `max_grants = 1`、同じ名前・IP、異なる2トークンで`register_staged_at`を呼ぶ回帰試験を追加する。両方の予約成功と、commit前にliveへ出ないことを検査する。
-- [ ] 現在の`GrantKey`の同一性に従って「既存live」「同じトークン」「別トークンに予約済み」「完全な新規キー」を区別し、新規容量の消費が必要な場合だけ上限判定する。protocol・portやTTLの更新意味は変えない。
-- [ ] 片方をdropして他方をcommitする順序、逆順commit、既存liveキーへの更新、予約後の期限切れを検査する。あるトークンの取消しが他方の予約やliveを消さないことを確認する。
-- [ ] 同じIPでも名前が異なるキーは別容量として扱い、新規キーの容量超過を拒否する。`is_allowed`、`snapshot_json`、`export_to`のいずれにも未commit予約が見えないことを確認する。
-- [ ] 呼出側が維持する同時問い合わせ・予約保持量の上限も確認し、ユニークキーだけを数える修正で無制限の予約保持を許さない。
-- [ ] 非stagedの`register_at`は容量判定でstagedを数えない。直接の`register`とstaged予約が同じ`DynamicAllowList`で混在しないことを呼出元の棚卸しで確認し、前提として記録する。混在する経路があれば、容量判定の扱いを本PRで決める。
+- [x] `max_grants = 1`、同じ名前・IP、異なる2トークンで`register_staged_at`を呼ぶ回帰試験を追加する。両方の予約成功と、commit前にliveへ出ないことを検査する。 → `allowlist::tests::staged_same_key_two_tokens_at_capacity`／`staged_same_key_two_tokens_one_live`
+- [x] 現在の`GrantKey`の同一性に従って「既存live」「同じトークン」「別トークンに予約済み」「完全な新規キー」を区別し、新規容量の消費が必要な場合だけ上限判定する。protocol・portやTTLの更新意味は変えない。 → `register_staged_at`：live含有・同token inplace refresh・`staged_new` に既出のキーは上限判定を skip、新規キーのみ `live + staged_new >= max` で拒否
+- [x] 片方をdropして他方をcommitする順序、逆順commit、既存liveキーへの更新、予約後の期限切れを検査する。あるトークンの取消しが他方の予約やliveを消さないことを確認する。 → `staged_same_key_drop_then_commit_and_reverse_commit`、`staged_refresh_of_live_key_at_capacity`、`staged_entry_expiring_before_commit`
+- [x] 同じIPでも名前が異なるキーは別容量として扱い、新規キーの容量超過を拒否する。`is_allowed`、`snapshot_json`、`export_to`のいずれにも未commit予約が見えないことを確認する。 → `staged_distinct_key_at_capacity_refused`、`staged_grants_absent_from_export`
+- [x] 呼出側が維持する同時問い合わせ・予約保持量の上限も確認し、ユニークキーだけを数える修正で無制限の予約保持を許さない。 → staged呼出元は`dnsgate::server::process_query`のみ、in-flightは`MAX_INFLIGHT_QUERIES=256`のsemaphore（namespaced経路は`GATE_INFLIGHT=64`）で上限、1tokenあたりのentry数は1応答のaddr数で有界、ユニーク非liveキーは`max_grants`以下を維持。`begin_staging` docに記録
+- [x] 非stagedの`register_at`は容量判定でstagedを数えない。直接の`register`とstaged予約が同じ`DynamicAllowList`で混在しないことを呼出元の棚卸しで確認し、前提として記録する。混在する経路があれば、容量判定の扱いを本PRで決める。 → 棚卸し: 直接`register`はmacos_proxy専用リストのみ（`proxy.rs`）、stagedはgateのリストのみで混在経路なし。`register` docと`register_ignores_staged_capacity`に前提を記録
 
 **検証・計測:** T-BASE、T-DNS。RF00で再現した容量1のケースが修正後に成功し、別キーの容量超過は失敗すること。M4の小規模登録経路で修正コストを記録するが、性能向上を採用条件にはしない。
 

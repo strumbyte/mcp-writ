@@ -43,7 +43,7 @@ use crate::audit_log::{
 };
 use crate::error::AuditorError;
 
-use super::allowlist::DynamicAllowList;
+use super::allowlist::{DynamicAllowList, GrantStaging};
 use super::name_policy::{self, Verdict};
 use super::upstream::{self, ForwardError};
 use super::wire;
@@ -558,6 +558,26 @@ async fn write_frame(stream: &mut TcpStream, msg: &[u8]) -> std::io::Result<()> 
     stream.write_all(msg).await
 }
 
+/// Settles `process_query`'s staging token on every exit — the
+/// audit-failure path drops it and the success path commits it
+/// explicitly, and this guard discards the staged set when the future
+/// itself is dropped mid-flight (TCP task abort on gate teardown, UDP
+/// task abandonment past the drain bound, proxy-side cancellation): a
+/// stranded bucket would hold its reservation against `max_grants`
+/// permanently — nothing reaps staged entries.
+struct StagingGuard<'a> {
+    allowlist: &'a DynamicAllowList,
+    token: GrantStaging,
+}
+
+impl Drop for StagingGuard<'_> {
+    fn drop(&mut self) {
+        // Already-settled buckets remove nothing (`remove` on an
+        // absent token is empty); a stranded one is discarded here.
+        self.allowlist.drop_staged(self.token);
+    }
+}
+
 /// The full per-query pipeline. Returns the answer bytes to send, or
 /// `None` when the packet was unanswerable (Drop) or the connection is
 /// better closed than answered.
@@ -868,6 +888,13 @@ async fn process_query(
     // commits — `commit_staged` publishes them on success,
     // `drop_staged` discards them on failure.
     let staging = core.allowlist.begin_staging();
+    // Cancellation safety: if this future is dropped before commit —
+    // an aborted task, a closed connection — the token's staged set
+    // must still be released, not orphaned against `max_grants`.
+    let _staged = StagingGuard {
+        allowlist: &core.allowlist,
+        token: staging,
+    };
     if let Some(grant_ttl) = parsed.min_ttl.filter(|t| *t > 0) {
         for (addr, _) in &parsed.addrs {
             let socket_ep = crate::policy::host::socket_endpoint(*addr);
