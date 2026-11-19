@@ -87,33 +87,38 @@ fn opposite(direction: MessageDirection) -> MessageDirection {
 
 /// Classification of one parsed JSON-RPC frame. The request /
 /// notification / response split drives which decision inputs apply.
+/// `method` / `raw_id` borrow the frame's text (unescaped methods
+/// allocate only through `Cow::Owned`) — a classified frame costs no
+/// intermediate `String` copies of fields the wire already stores.
 #[derive(Debug)]
-pub(crate) enum WireFrame {
+pub(crate) enum WireFrame<'a> {
     /// `method` + `id`.
     Request {
-        method: String,
+        method: std::borrow::Cow<'a, str>,
         id: RpcId,
-        raw_id: String,
+        raw_id: &'a str,
     },
     /// `method`, no `id`.
-    Notification { method: String },
+    Notification { method: std::borrow::Cow<'a, str> },
     /// `result`/`error` + `id`, no `method`.
-    Response { id: RpcId, raw_id: String },
+    Response { id: RpcId, raw_id: &'a str },
     /// Not a usable JSON-RPC envelope — never forwarded. `raw_id` echoes
     /// the `id` member when one was readable so request-shaped failures
     /// can still be answered.
     Malformed {
         reason: &'static str,
-        raw_id: Option<String>,
+        raw_id: Option<&'a str>,
     },
 }
 
 /// Member access: `Some` whenever the member exists — including a `null`
-/// value, which JSON-RPC distinguishes from an absent member.
-fn member<'a>(
-    value: nojson::RawJsonValue<'a, 'a>,
+/// value, which JSON-RPC distinguishes from an absent member. Both
+/// lifetimes are preserved so a caller can borrow member text (`method`,
+/// `id`) at the frame-text lifetime rather than the index borrow.
+fn member<'t, 'r>(
+    value: nojson::RawJsonValue<'t, 'r>,
     name: &str,
-) -> Option<nojson::RawJsonValue<'a, 'a>> {
+) -> Option<nojson::RawJsonValue<'t, 'r>> {
     value.to_member(name).ok().and_then(|m| m.optional())
 }
 
@@ -136,15 +141,15 @@ fn rpc_id_member(params: Option<nojson::RawJsonValue<'_, '_>>, name: &str) -> Op
 /// Classify a parsed frame. Anything that is not a well-formed
 /// request / notification / response envelope is `Malformed` — the caller
 /// fails closed rather than forwarding it.
-pub(crate) fn classify_frame(value: nojson::RawJsonValue<'_, '_>) -> WireFrame {
-    fn bad(reason: &'static str, raw_id: Option<String>) -> WireFrame {
+pub(crate) fn classify_frame<'a>(value: nojson::RawJsonValue<'a, '_>) -> WireFrame<'a> {
+    fn bad<'a>(reason: &'static str, raw_id: Option<&'a str>) -> WireFrame<'a> {
         WireFrame::Malformed { reason, raw_id }
     }
     if value.kind() != nojson::JsonValueKind::Object {
         return bad("frame is not a JSON object", None);
     }
     let id_value = member(value, "id");
-    let raw_id = id_value.map(|v| v.as_raw_str().to_string());
+    let raw_id = id_value.map(|v| v.as_raw_str());
     // `jsonrpc: "2.0"` is a required member on every frame.
     let jsonrpc_ok = member(value, "jsonrpc")
         .and_then(|v| v.as_string_str().ok())
@@ -172,16 +177,14 @@ pub(crate) fn classify_frame(value: nojson::RawJsonValue<'_, '_>) -> WireFrame {
         if id_value.is_some() {
             match rpc_id {
                 Some(id) => WireFrame::Request {
-                    method: method.into_owned(),
+                    method,
                     id,
-                    raw_id: raw_id.unwrap_or_else(|| "null".to_string()),
+                    raw_id: raw_id.unwrap_or("null"),
                 },
                 None => bad("request id must be a string, number, or null", raw_id),
             }
         } else {
-            WireFrame::Notification {
-                method: method.into_owned(),
-            }
+            WireFrame::Notification { method }
         }
     } else if has_result && has_error {
         // `result` and `error` are mutually exclusive in JSON-RPC — a
@@ -191,7 +194,7 @@ pub(crate) fn classify_frame(value: nojson::RawJsonValue<'_, '_>) -> WireFrame {
         match rpc_id {
             Some(id) => WireFrame::Response {
                 id,
-                raw_id: raw_id.unwrap_or_else(|| "null".to_string()),
+                raw_id: raw_id.unwrap_or("null"),
             },
             None => bad("response id missing or invalid", raw_id),
         }

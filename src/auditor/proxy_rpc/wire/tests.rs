@@ -176,7 +176,7 @@ fn oversized_request_id_is_unparseable() {
     assert!(RpcId::from_line(&line).is_some());
 }
 
-fn classify(line: &str) -> WireFrame {
+fn classify(line: &str) -> WireFrame<'_> {
     let json = nojson::RawJson::parse(line).expect("parse test frame");
     classify_frame(json.value())
 }

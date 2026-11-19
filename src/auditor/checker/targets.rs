@@ -248,30 +248,31 @@ pub fn extract_deputy_use_targets(
     rules: &[DeputyRule],
     opaque_fields: &[OpaqueField],
 ) -> Result<Vec<String>, String> {
-    extract_deputy_use_targets_as(line, rules, opaque_fields)
+    #[cfg(feature = "measure")]
+    crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
+    let json =
+        nojson::RawJson::parse(line).map_err(|e| format!("request is not valid JSON: {e}"))?;
+    extract_deputy_use_targets_as(&json, rules, opaque_fields)
 }
 
 /// [`extract_deputy_use_targets`] returning shared `Rc<str>` targets for
 /// the auditor's own deputy check. The public entry keeps `Vec<String>`
 /// so the external signature (and its `Send`/`Sync`) is unchanged; the
-/// shared-storage internals stay crate-internal.
+/// shared-storage internals stay crate-internal. The product path passes
+/// the C2S gate's shared `RawJson` — the frame is never reparsed here.
 pub(crate) fn extract_deputy_use_targets_rc(
-    line: &str,
+    json: &nojson::RawJson<'_>,
     rules: &[DeputyRule],
     opaque_fields: &[OpaqueField],
 ) -> Result<Vec<Rc<str>>, String> {
-    extract_deputy_use_targets_as(line, rules, opaque_fields)
+    extract_deputy_use_targets_as(json, rules, opaque_fields)
 }
 
 fn extract_deputy_use_targets_as<S: TargetString>(
-    line: &str,
+    json: &nojson::RawJson<'_>,
     rules: &[DeputyRule],
     opaque_fields: &[OpaqueField],
 ) -> Result<Vec<S>, String> {
-    #[cfg(feature = "measure")]
-    crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
-    let json =
-        nojson::RawJson::parse(line).map_err(|e| format!("request is not valid JSON: {e}"))?;
     let mut out: Vec<S> = Vec::new();
     // `shape "fs_targets"` already covers `params.inputResponses` through
     // the same classified walk — remember it ran so the retry channel is
@@ -297,7 +298,7 @@ fn extract_deputy_use_targets_as<S: TargetString>(
             DeputyRule::Shape(KnownShape::FsTargets) => {
                 input_responses_covered = true;
                 let targets: ExtractedTargets<S> =
-                    combined_classify(&json, &mut combined, opaque.as_ref());
+                    combined_classify(json, &mut combined, opaque.as_ref());
                 // A truncated classified walk leaves unchecked targets —
                 // a `use`-role call never passes on a partial path set.
                 if targets.truncated {
@@ -348,7 +349,7 @@ fn extract_deputy_use_targets_as<S: TargetString>(
     // `params.inputResponses` must clear the same discovery check even
     // when the configured rules name only `/params/arguments/...`.
     if !input_responses_covered {
-        let targets: ExtractedTargets<S> = input_response_targets_as(&json);
+        let targets: ExtractedTargets<S> = input_response_targets_as(json);
         if targets.truncated {
             return Err("inputResponses target extraction exceeded the work budget".to_string());
         }
@@ -362,7 +363,7 @@ fn extract_deputy_use_targets_as<S: TargetString>(
     // fields they cover, and the raw request is forwarded whole — a
     // plausible selector under an undeclared field is refused like an
     // extraction failure rather than reaching the child unchecked.
-    let classified: ExtractedTargets<S> = combined_classify(&json, &mut combined, opaque.as_ref());
+    let classified: ExtractedTargets<S> = combined_classify(json, &mut combined, opaque.as_ref());
     if classified.truncated {
         return Err("argument target extraction exceeded the work budget".to_string());
     }
@@ -396,7 +397,13 @@ pub fn request_has_host_or_url(line: &str) -> bool {
     let Ok(json) = nojson::RawJson::parse(line) else {
         return false;
     };
-    let extracted = collect_argument_targets(&json);
+    request_has_host_or_url_json(&json)
+}
+
+/// [`request_has_host_or_url`] on an already-parsed frame — the
+/// trajectory session gate shares the C2S gate's `RawJson`.
+pub(crate) fn request_has_host_or_url_json(json: &nojson::RawJson<'_>) -> bool {
+    let extracted = collect_argument_targets(json);
     // A truncated walk cannot prove the absence of a network target —
     // report one rather than let an over-budget tail slip a host past
     // the check.

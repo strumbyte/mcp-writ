@@ -82,8 +82,16 @@ pub(crate) fn extract_method(line: &str) -> Option<String> {
 }
 
 /// Extract the tool name (`params.name`) from a JSON-RPC tools/call request.
+#[cfg(test)]
 pub(crate) fn extract_tool_name_from_line(line: &str) -> Option<String> {
     let json = nojson::RawJson::parse(line).ok()?;
+    extract_tool_name_from_json(&json)
+}
+
+/// `extract_tool_name_from_line` on an already-parsed frame — the
+/// product paths reuse the gate's `RawJson` instead of reparsing the
+/// line for every tool-name lookup.
+pub(crate) fn extract_tool_name_from_json(json: &nojson::RawJson<'_>) -> Option<String> {
     let name = json
         .value()
         .to_member("params")
@@ -119,8 +127,15 @@ pub(crate) fn extract_argument_path(line: &str) -> Option<String> {
 
 /// Extract the raw JSON `id` field from a JSON-RPC message line.
 /// Returns the raw text representation (e.g. `1` for a number, `"abc"` for a string).
+#[cfg(test)]
 pub(crate) fn extract_raw_id(line: &str) -> Option<String> {
     let json = nojson::RawJson::parse(line).ok()?;
+    extract_raw_id_json(&json)
+}
+
+/// `extract_raw_id` on an already-parsed frame — same member lookup
+/// against the shared `RawJson`, no second parse.
+pub(crate) fn extract_raw_id_json(json: &nojson::RawJson<'_>) -> Option<String> {
     let id = json.value().to_member("id").ok()?.optional()?;
     Some(id.as_raw_str().to_string())
 }

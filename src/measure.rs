@@ -75,7 +75,76 @@ impl Gauge {
 /// Add `n` to `c`.
 pub fn incr(c: &'static Counter, n: u64) {
     c.value.fetch_add(n, Ordering::Relaxed);
+    record_in_count_window(c.name, n);
 }
+
+/// Per-thread counting window for tests. While a `CountWindow` is open
+/// on the current thread, [`incr`] also records into it — [`CountWindow::count`]
+/// then reads back only what *this thread* measured, so increments from
+/// parallel test threads or background tasks cannot inflate an
+/// exact-count assertion. Compiled only in `cfg(test)` builds; the
+/// instrumented sites' `incr` calls are unchanged either way.
+#[cfg(test)]
+pub struct CountWindow {
+    counts: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<&'static str, u64>>>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COUNT_WINDOW: std::cell::RefCell<
+        Option<std::rc::Rc<std::cell::RefCell<std::collections::HashMap<&'static str, u64>>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl CountWindow {
+    /// Install this window's recorder on the current thread until drop.
+    /// Nested windows are not supported — the previous `open` must drop
+    /// before another opens on the same thread.
+    pub fn open() -> Self {
+        let counts = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+        COUNT_WINDOW.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "a CountWindow is already open on this thread"
+            );
+            *slot.borrow_mut() = Some(counts.clone());
+        });
+        Self { counts }
+    }
+
+    /// What `incr(name, ·)` recorded on this thread since `open`.
+    pub fn count(&self, name: &str) -> u64 {
+        self.counts.borrow().get(name).copied().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+impl Drop for CountWindow {
+    fn drop(&mut self) {
+        COUNT_WINDOW.with(|slot| {
+            if slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|c| std::rc::Rc::ptr_eq(c, &self.counts))
+            {
+                *slot.borrow_mut() = None;
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+fn record_in_count_window(name: &'static str, n: u64) {
+    COUNT_WINDOW.with(|slot| {
+        if let Some(counts) = slot.borrow().as_ref() {
+            *counts.borrow_mut().entry(name).or_default() += n;
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn record_in_count_window(_name: &'static str, _n: u64) {}
 
 /// Record one duration sample in `t`.
 pub fn observe(t: &'static Timing, ns: u64) {
@@ -115,11 +184,14 @@ impl Drop for Timer {
 // ---------------------------------------------------------------------
 
 /// `nojson::RawJson::parse` calls on the request path.
-/// Sites: `auditor::proxy_c2s` structural gate,
+/// Sites: `checker::VerifiedFrame::parse_and_verify` (the C2S structural
+/// gate — the single product-path parse a forwarded frame gets),
+/// `auditor::proxy_c2s::answer_inflight_client_list`'s drain parse,
 /// `checker::check_request`, `checker::check_trajectory`,
 /// `checker::classify_request_protocol_version`,
-/// `checker::request_state_over_cap`, `session::rpc_id::RpcId::from_line`,
-/// `checker::targets::{extract_fs_targets, extract_deputy_use_targets_as,
+/// `checker::request_state_over_cap` (test-only line wrapper),
+/// `session::rpc_id::RpcId::from_line`,
+/// `checker::targets::{extract_fs_targets, extract_deputy_use_targets,
 /// request_has_host_or_url}`.
 pub static JSON_PARSE_CALLS: Counter = Counter::new("json.parse.calls");
 

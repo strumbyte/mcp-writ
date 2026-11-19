@@ -6,8 +6,8 @@ use crate::protocol::{MCP_VERSION_2025_11_25, MCP_VERSION_2026_07_28, META_PROTO
 mod sub_policy;
 mod targets;
 
-pub(crate) use targets::extract_deputy_use_targets_rc;
 pub use targets::{extract_deputy_use_targets, extract_fs_targets, request_has_host_or_url};
+pub(crate) use targets::{extract_deputy_use_targets_rc, request_has_host_or_url_json};
 
 /// Maximum accepted `params.requestState` UTF-8 byte length.
 ///
@@ -195,6 +195,79 @@ pub struct CheckPass {
     pub audit_notes: Vec<String>,
 }
 
+/// A client frame whose JSON was parsed and structurally verified once
+/// at the C2S gate — the type downstream consumers receive so the same
+/// request is never reparsed per consumer.
+///
+/// The only constructor is [`VerifiedFrame::parse_and_verify`]: the
+/// syntax parse and the duplicate-key / nesting-depth walk must both
+/// have run on *this* text, so no caller can build a view over
+/// unverified input. Functions that need the gate's guarantee take
+/// `&VerifiedFrame`; functions that only need the shared parse take
+/// [`nojson::RawJson`], which the view hands out.
+///
+/// `json` borrows `frame`'s text, so the view lives only as long as the
+/// frame buffer — the relay keeps that buffer for verbatim forwarding,
+/// and nothing retains the borrow across a session-lock acquisition
+/// longer than the synchronous check that uses it.
+#[derive(Debug)]
+pub(crate) struct VerifiedFrame<'text> {
+    /// The original frame text — what the relay forwards verbatim.
+    frame: &'text str,
+    /// The one parse of `frame.trim()` every downstream consumer shares.
+    json: nojson::RawJson<'text>,
+}
+
+/// Why a frame failed the structural gate. `Parse` carries nothing —
+/// invalid JSON has no members to echo; `Checked` keeps the parsed
+/// index so the denial can still recover the request's `id` member.
+#[derive(Debug)]
+pub(crate) enum FrameReject<'text> {
+    /// `RawJson::parse` failed — no usable structure at all.
+    Parse,
+    /// The duplicate-key / nesting-depth walk refused the frame.
+    Checked {
+        json: nojson::RawJson<'text>,
+        /// The checker-produced refusal text (client-facing).
+        reason: String,
+    },
+}
+
+impl<'text> VerifiedFrame<'text> {
+    /// The single construction site: parse `frame`, then run the
+    /// duplicate-key / depth walk over it. A `FrameReject` hands the
+    /// partial result back so the gate can still report the failure —
+    /// it is not a way to obtain the verified view.
+    pub(crate) fn parse_and_verify(frame: &'text str) -> Result<Self, FrameReject<'text>> {
+        #[cfg(feature = "measure")]
+        crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
+        let json = nojson::RawJson::parse(frame.trim()).map_err(|_| FrameReject::Parse)?;
+        match check_duplicate_keys_recursively(json.value()) {
+            Ok(()) => Ok(Self { frame, json }),
+            Err(v) => Err(FrameReject::Checked {
+                json,
+                reason: v.reason,
+            }),
+        }
+    }
+
+    /// The original frame text — forwarded verbatim on an allow.
+    pub(crate) fn frame(&self) -> &'text str {
+        self.frame
+    }
+
+    /// The shared parse of `frame.trim()` — every consumer reuses this
+    /// index rather than running `RawJson::parse` again.
+    pub(crate) fn json(&self) -> &nojson::RawJson<'text> {
+        &self.json
+    }
+
+    /// Root value of the shared parse.
+    pub(crate) fn value(&self) -> nojson::RawJsonValue<'text, '_> {
+        self.json.value()
+    }
+}
+
 /// Maximum JSON nesting depth accepted by the Auditor.
 pub const MAX_JSON_NESTING: u32 = 64;
 
@@ -319,6 +392,38 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
     // Check for duplicate keys in all nested objects across the entire JSON-RPC request
     check_duplicate_keys_recursively(json.value())?;
 
+    check_request_inner(&json, policy)
+}
+
+/// `check_request` on a frame the C2S gate already verified — the
+/// product path enters here so a request's parse and duplicate-key walk
+/// run once, not once per consumer. The `VerifiedFrame` type is proof
+/// the structural gate ran; standalone callers keep using
+/// [`check_request`], which performs its own checks.
+pub(crate) fn check_request_verified(
+    view: &VerifiedFrame<'_>,
+    policy: &Policy,
+) -> Result<CheckPass, PolicyViolation> {
+    // The gate verified structure (duplicate keys / nesting depth), not
+    // envelope kind — the object check stays part of this entry so a
+    // non-object view can never become a malformed `tools/call` denial.
+    if view.value().kind() != nojson::JsonValueKind::Object {
+        return Err(PolicyViolation::new(
+            "<unknown>",
+            DenialKind::Other,
+            "request must be a JSON object (batch requests are not supported)",
+        ));
+    }
+    check_request_inner(view.json(), policy)
+}
+
+/// The shared body of [`check_request`] / [`check_request_verified`] —
+/// everything downstream of parse, envelope-shape, and the duplicate-key
+/// walk, which each entry runs (or proves already ran) first.
+fn check_request_inner(
+    json: &nojson::RawJson<'_>,
+    policy: &Policy,
+) -> Result<CheckPass, PolicyViolation> {
     // Iterate through object members to extract method
     let mut method_opt: Option<String> = None;
 
@@ -357,7 +462,7 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
         }
     }
 
-    let mut audit_notes = protocol_version_audit_notes(&json);
+    let mut audit_notes = protocol_version_audit_notes(json);
 
     // Step 1: Check method field
     let is_tools_call = method_opt.as_deref() == Some("tools/call");
@@ -370,7 +475,7 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
     }
 
     // Step 2: Extract params.name as an owned String
-    let tool_name = extract_tool_name(&json)?;
+    let tool_name = extract_tool_name(json)?;
 
     // Step 3-6: Check against policy (including MRTR retries with a new JSON-RPC id)
     if !tool_is_allowed(policy, &tool_name) {
@@ -406,15 +511,15 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
 
     // Step 4: Schema validation (if args_schema is defined)
     if let Some(ref schema_ref) = tool.args_schema {
-        validate_tool_args(&json, &tool_name, schema_ref)?;
+        validate_tool_args(json, &tool_name, schema_ref)?;
     }
 
     // Step 5: MRTR siblings of `arguments` — never feed requestState to schema
-    check_request_state(&json, &tool_name, &mut audit_notes)?;
-    check_input_responses(&json, tool, &tool_name, &mut audit_notes)?;
+    check_request_state(json, &tool_name, &mut audit_notes)?;
+    check_input_responses(json, tool, &tool_name, &mut audit_notes)?;
 
     // Step 6: Tool-specific sub-policy checks (fs, network)
-    let outcome = sub_policy::check_tool_sub_policy(&json, tool, policy)?;
+    let outcome = sub_policy::check_tool_sub_policy(json, tool, policy)?;
     if outcome.opaque_fields > 0 {
         // How many of the tool's `arguments { opaque }` declared fields
         // carried a value past the unrecognized-argument refusal —
@@ -522,12 +627,22 @@ fn check_request_state(
 /// [`REQUEST_STATE_MAX_BYTES`]; `None` when absent or within the cap.
 /// The generic request path applies the cap to methods `check_request`
 /// never sees (MRTR retries on `resources/read` / `prompts/get`, …).
+/// The product path passes the gate's shared `RawJson` — the frame is
+/// never reparsed for this lookup.
+pub(crate) fn request_state_over_cap_json(json: &nojson::RawJson<'_>) -> Option<usize> {
+    let size = request_state_byte_len(params_member(json, "requestState")?);
+    (size > REQUEST_STATE_MAX_BYTES).then_some(size)
+}
+
+/// Line-parsing wrapper of [`request_state_over_cap_json`] for the
+/// standalone unit tests — an unparseable input reports `None`, as it
+/// always has.
+#[cfg(test)]
 pub(crate) fn request_state_over_cap(line: &str) -> Option<usize> {
     #[cfg(feature = "measure")]
     crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
     let json = nojson::RawJson::parse(line.trim()).ok()?;
-    let size = request_state_byte_len(params_member(&json, "requestState")?);
-    (size > REQUEST_STATE_MAX_BYTES).then_some(size)
+    request_state_over_cap_json(&json)
 }
 
 /// Byte length of a `requestState` member — the string content, or the
@@ -604,14 +719,29 @@ pub fn check_trajectory(
             ));
         }
     };
-    let tool_name = extract_tool_name(&json)?;
+    check_trajectory_json(&json, policy, session)
+}
+
+/// `check_trajectory` on an already-parsed frame — the product session
+/// gate shares the C2S gate's `RawJson` rather than reparsing the line.
+/// The `policy.trajectory` opt-out still short-circuits so a caller that
+/// did not pre-check it sees the same no-op contract as the wrapper.
+pub(crate) fn check_trajectory_json(
+    json: &nojson::RawJson<'_>,
+    policy: &Policy,
+    session: &SessionState,
+) -> Result<(), PolicyViolation> {
+    if !policy.trajectory {
+        return Ok(());
+    }
+    let tool_name = extract_tool_name(json)?;
     let next_side_effect = policy
         .tools
         .iter()
         .find(|t| t.name == tool_name)
         .and_then(|t| t.side_effect.as_deref())
         .and_then(|raw| SideEffect::parse(raw).ok());
-    let has_host_or_url = request_has_host_or_url(line);
+    let has_host_or_url = request_has_host_or_url_json(json);
     session
         .check_trajectory(
             &policy.trajectory_rules,

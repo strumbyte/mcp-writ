@@ -20,7 +20,7 @@ use super::proxy_rpc::{self, TrackedRequest, WireFrame, WireState};
 use super::proxy_state::{self, ProxyShared};
 use super::proxy_tools_list::{self, ListFlow, S2cFrame};
 use super::proxy_wire::{
-    build_jsonrpc_error, deny_explanation, extract_raw_id, frame_too_large_message,
+    build_jsonrpc_error, deny_explanation, extract_raw_id_json, frame_too_large_message,
     negotiated_version_value, oversize_extra, read_proxy_frame, recover_id_candidates,
     recover_method, rpc_id_from_raw_id, tools_call_result_succeeded, unsupported_version_message,
     write_child_frame, write_client_frame,
@@ -142,7 +142,7 @@ where
     // duplicate keys can parse differently downstream than it did here —
     // drop it rather than forward a disagreement.
     if let Err(violation) = checker::check_duplicate_keys_recursively(json.value()) {
-        let raw_id = extract_raw_id(line);
+        let raw_id = extract_raw_id_json(json);
         audit_malformed(shared, raw_id.as_deref(), &violation.reason).await?;
         return Ok(());
     }
@@ -195,14 +195,14 @@ where
                     state.take_pending_list(id);
                     state.release_pending_tool_call_unverified(id);
                 }
-                audit_malformed(shared, raw_id.as_deref(), reason).await?;
+                audit_malformed(shared, raw_id, reason).await?;
                 if entry.is_some() {
                     // Never raw-forward a malformed frame — even in
                     // dry-run the client gets the JSON-RPC error.
                     return write_client_frame(
                         &shared.client_out,
                         &build_jsonrpc_error(
-                            raw_id.as_deref().unwrap_or("null"),
+                            raw_id.unwrap_or("null"),
                             &format!("malformed response ({reason})"),
                         ),
                     )
@@ -210,17 +210,17 @@ where
                 }
                 return Ok(());
             }
-            audit_malformed(shared, raw_id.as_deref(), reason).await?;
+            audit_malformed(shared, raw_id, reason).await?;
             Ok(())
         }
         WireFrame::Notification { method } => {
             s2c_notification(shared, st, value, line, &method).await
         }
         WireFrame::Response { id, raw_id } => {
-            s2c_response(shared, st, value, line, &parsed, &id, &raw_id).await
+            s2c_response(shared, st, value, line, &parsed, &id, raw_id).await
         }
         WireFrame::Request { method, id, raw_id } => {
-            s2c_request(shared, value, line, &method, &id, &raw_id).await
+            s2c_request(shared, value, line, &method, &id, raw_id).await
         }
     }
 }
@@ -584,7 +584,7 @@ where
                 }
                 return result;
             }
-            apply_response_session_updates(shared, value, line, entry.as_ref()).await;
+            apply_response_session_updates(shared, value, id, entry.as_ref()).await;
             match write_client_frame(&shared.client_out, line).await {
                 Ok(()) => {
                     // When verification is enforced, open the initial
@@ -919,11 +919,14 @@ where
 }
 
 /// CDP path recording + trajectory completion for a forwarded response —
-/// only meaningful for tracked `tools/call` answers.
+/// only meaningful for tracked `tools/call` answers. `id` is the
+/// canonical id `classify_frame` already resolved for the frame — the
+/// consumed wire entry cannot re-derive it, and the line is never
+/// reparsed here.
 async fn apply_response_session_updates<W>(
     shared: &ProxyShared<W>,
     value: nojson::RawJsonValue<'_, '_>,
-    line: &str,
+    id: &RpcId,
     entry: Option<&TrackedRequest>,
 ) where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -935,10 +938,7 @@ async fn apply_response_session_updates<W>(
     if entry.method != "tools/call" {
         return;
     }
-    // The entry was consumed by `take`; the response id is re-derived.
-    let Some(id) = RpcId::from_line(line) else {
-        return;
-    };
+    // The entry was consumed by `take`; a null id never registered one.
     if matches!(id, RpcId::Null) {
         return;
     }
@@ -947,7 +947,7 @@ async fn apply_response_session_updates<W>(
     // results release the pending entry without recording a single path.
     let succeeded = tools_call_result_succeeded(value);
     let mut state = session.lock().await;
-    if let Some(pending) = state.take_pending_list(&id)
+    if let Some(pending) = state.take_pending_list(id)
         && succeeded
     {
         let paths = session::extract_paths_for_pending(value, pending.rules());
@@ -961,7 +961,7 @@ async fn apply_response_session_updates<W>(
         }
     }
     if shared.policy.trajectory {
-        state.complete_pending_tool_call(&id, succeeded);
+        state.complete_pending_tool_call(id, succeeded);
     }
 }
 

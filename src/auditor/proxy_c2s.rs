@@ -13,8 +13,8 @@ use super::checker;
 use super::proxy_rpc::{self, WireFrame, WireState};
 use super::proxy_state::ProxyShared;
 use super::proxy_wire::{
-    build_jsonrpc_error, build_tools_list_error_response, extract_raw_id,
-    extract_tool_name_from_line, frame_too_large_message, oversize_extra, read_proxy_frame,
+    build_jsonrpc_error, build_tools_list_error_response, extract_raw_id_json,
+    extract_tool_name_from_json, frame_too_large_message, oversize_extra, read_proxy_frame,
     recover_id_candidates, recover_method, rpc_id_from_raw_id, write_child_frame,
     write_client_frame,
 };
@@ -88,36 +88,35 @@ where
             Ok(Some(BoundedFrame::Line(line))) => {
                 // Structural gate: invalid JSON or duplicate keys never
                 // reach the decision layer — the client gets an error and
-                // nothing is forwarded.
-                #[cfg(feature = "measure")]
-                crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
-                let parsed = nojson::RawJson::parse(line.trim());
-                let Ok(json) = parsed else {
-                    deny_malformed(&shared, None, "invalid JSON").await?;
-                    continue;
-                };
-                if let Err(violation) = checker::check_duplicate_keys_recursively(json.value()) {
-                    deny_malformed(
-                        &shared,
-                        extract_raw_id(&line).or(Some("null".to_string())),
-                        &violation.reason,
-                    )
-                    .await?;
-                    continue;
-                }
-                match proxy_rpc::classify_frame(json.value()) {
-                    WireFrame::Malformed { reason, raw_id } => {
-                        deny_malformed(&shared, raw_id.or_else(|| extract_raw_id(&line)), reason)
+                // nothing is forwarded. `parse_and_verify` is the one
+                // parse this frame gets: classification, the policy
+                // checker, and the session gates all share its `RawJson`
+                // through the `VerifiedFrame` view instead of reparsing.
+                let view = match checker::VerifiedFrame::parse_and_verify(&line) {
+                    Ok(view) => view,
+                    Err(checker::FrameReject::Parse) => {
+                        deny_malformed(&shared, None, "invalid JSON").await?;
+                        continue;
+                    }
+                    Err(checker::FrameReject::Checked { json, reason }) => {
+                        let raw_id = extract_raw_id_json(&json);
+                        deny_malformed(&shared, raw_id.as_deref().or(Some("null")), &reason)
                             .await?;
+                        continue;
+                    }
+                };
+                match proxy_rpc::classify_frame(view.value()) {
+                    WireFrame::Malformed { reason, raw_id } => {
+                        deny_malformed(&shared, raw_id, reason).await?;
                     }
                     WireFrame::Notification { method } => {
-                        c2s_notification(&shared, json.value(), &line, &method).await?;
+                        c2s_notification(&shared, &view, &method).await?;
                     }
                     WireFrame::Response { id, raw_id } => {
-                        c2s_response(&shared, json.value(), &line, &id, &raw_id).await?;
+                        c2s_response(&shared, &view, &id, raw_id).await?;
                     }
                     WireFrame::Request { method, id, raw_id } => {
-                        c2s_request(&shared, json.value(), &line, &method, &id, &raw_id).await?;
+                        c2s_request(&shared, &view, &method, &id, raw_id).await?;
                     }
                 }
             }
@@ -196,7 +195,7 @@ where
         if let WireFrame::Request { method, raw_id, .. } = proxy_rpc::classify_frame(json.value())
             && method == "tools/list"
         {
-            let response = build_tools_list_error_response(&raw_id);
+            let response = build_tools_list_error_response(raw_id);
             write_client_frame(&shared.client_out, &response).await?;
             emitted = true;
         }
@@ -338,7 +337,7 @@ where
 /// readable) and a `mcp_message.denied` audit event — nothing forwards.
 async fn deny_malformed<W>(
     shared: &ProxyShared<W>,
-    raw_id: Option<String>,
+    raw_id: Option<&str>,
     reason: &str,
 ) -> Result<(), AuditorError>
 where
@@ -349,7 +348,7 @@ where
         C2S,
         "malformed",
         None,
-        raw_id.as_deref(),
+        raw_id,
         shared
             .wire
             .lock()
@@ -364,7 +363,7 @@ where
     write_client_frame(
         &shared.client_out,
         &build_jsonrpc_error(
-            raw_id.as_deref().unwrap_or("null"),
+            raw_id.unwrap_or("null"),
             &format!("malformed JSON-RPC frame ({reason})"),
         ),
     )
@@ -374,14 +373,13 @@ where
 /// One client-originated notification: decide, then forward or drop.
 async fn c2s_notification<W>(
     shared: &ProxyShared<W>,
-    value: nojson::RawJsonValue<'_, '_>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     method: &str,
 ) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let ext = proxy_rpc::extract_notification(value, method);
+    let ext = proxy_rpc::extract_notification(view.value(), method);
     let mut wire = shared.wire.lock().await;
     let version = wire.passive_version();
     // A `notifications/cancelled` naming the reserved internal-request
@@ -477,7 +475,7 @@ where
                 None,
             )
             .await?;
-            match write_child_frame(&shared.child_stdin, line).await {
+            match write_child_frame(&shared.child_stdin, view.frame()).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     proxy_rpc::audit_forward_failed(
@@ -626,15 +624,14 @@ async fn release_cancelled_bookkeeping<W>(
 /// client→server responses entirely).
 async fn c2s_response<W>(
     shared: &ProxyShared<W>,
-    value: nojson::RawJsonValue<'_, '_>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     id: &RpcId,
     raw_id: &str,
 ) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let ext = proxy_rpc::extract_response(value);
+    let ext = proxy_rpc::extract_response(view.value());
     let mut wire = shared.wire.lock().await;
     let answered = wire.answered(C2S, id);
     // The revision a response is judged under is the answered request's —
@@ -667,7 +664,7 @@ where
                 None,
             )
             .await?;
-            match write_child_frame(&shared.child_stdin, line).await {
+            match write_child_frame(&shared.child_stdin, view.frame()).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     proxy_rpc::audit_forward_failed(
@@ -734,8 +731,7 @@ where
 /// then method-specific legacy gates for `tools/call` and `tools/list`.
 async fn c2s_request<W>(
     shared: &ProxyShared<W>,
-    value: nojson::RawJsonValue<'_, '_>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     method: &str,
     id: &RpcId,
     raw_id: &str,
@@ -743,13 +739,13 @@ async fn c2s_request<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let ext = proxy_rpc::extract_request(value, method);
+    let ext = proxy_rpc::extract_request(view.value(), method);
 
     // A null id cannot be tracked — deny outright.
     if matches!(id, RpcId::Null) {
         return deny_request(
             shared,
-            line,
+            view,
             method,
             id,
             raw_id,
@@ -813,17 +809,17 @@ where
 
     match verdict {
         McpVerdict::Allow(_) => {
-            forward_allowed(shared, line, method, id, raw_id, version, verdict, ext).await
+            forward_allowed(shared, view, method, id, raw_id, version, verdict, ext).await
         }
         McpVerdict::Deny(_) => {
-            let message = match extract_tool_name_from_line(line) {
+            let message = match extract_tool_name_from_json(view.json()) {
                 Some(tool) if method == "tools/call" => {
                     format!("request '{method}' tool '{tool}' denied by MCP policy")
                 }
                 _ => format!("request '{method}' denied by MCP policy"),
             };
             deny_request(
-                shared, line, method, id, raw_id, version, &ext, verdict, &message,
+                shared, view, method, id, raw_id, version, &ext, verdict, &message,
             )
             .await
         }
@@ -831,7 +827,7 @@ where
         _ => {
             deny_request(
                 shared,
-                line,
+                view,
                 method,
                 id,
                 raw_id,

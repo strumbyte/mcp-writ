@@ -13,9 +13,8 @@ use crate::auditor::checker;
 use crate::auditor::proxy_rpc::{self, ExtractedRequest, TrackedRequest};
 use crate::auditor::proxy_state::{MAX_ORIGINAL_TOOLS_LIST_BYTES, ProxyShared};
 use crate::auditor::proxy_wire::{
-    build_error_response, build_jsonrpc_error, deny_explanation, extract_raw_id,
-    extract_tool_name_from_line, join_audit_details, write_child_frame, write_child_frame_epoch,
-    write_client_frame,
+    build_error_response, build_jsonrpc_error, deny_explanation, extract_tool_name_from_json,
+    join_audit_details, write_child_frame, write_child_frame_epoch, write_client_frame,
 };
 use crate::auditor::session::{RpcId, SessionState};
 use crate::error::AuditorError;
@@ -44,7 +43,7 @@ where
 #[expect(clippy::too_many_arguments)]
 pub(super) async fn deny_request<W>(
     shared: &ProxyShared<W>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     method: &str,
     id: &RpcId,
     raw_id: &str,
@@ -57,7 +56,7 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if method == "tools/call"
-        && let Some(tool) = extract_tool_name_from_line(line)
+        && let Some(tool) = extract_tool_name_from_json(view.json())
     {
         shared.tally.lock().unwrap().record_call(&tool);
     }
@@ -78,7 +77,7 @@ where
             request_extra(ext),
         )
         .await?;
-        match register_and_forward_denied(shared, line, method, id, raw_id, version, ext, None)
+        match register_and_forward_denied(shared, view, method, id, raw_id, version, ext, None)
             .await
         {
             Ok(true) => return Ok(()),
@@ -172,7 +171,7 @@ pub(super) fn request_extra(ext: &ExtractedRequest) -> Option<String> {
 #[expect(clippy::too_many_arguments)]
 pub(super) async fn forward_allowed<W>(
     shared: &ProxyShared<W>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     method: &str,
     id: &RpcId,
     raw_id: &str,
@@ -185,7 +184,7 @@ where
 {
     // ── tools/call legacy gates: list-busy, tool policy, session ──
     if method == "tools/call" {
-        let tool = extract_tool_name_from_line(line);
+        let tool = extract_tool_name_from_json(view.json());
         if let Some(tool) = tool.as_deref() {
             shared.tally.lock().unwrap().record_call(tool);
         }
@@ -208,7 +207,7 @@ where
                 deny_busy_tools_call(
                     shared,
                     raw_id,
-                    line,
+                    tool.as_deref(),
                     "no verified tools/list has been published yet",
                     None,
                     false,
@@ -224,7 +223,7 @@ where
             deny_busy_tools_call(
                 shared,
                 raw_id,
-                line,
+                tool.as_deref(),
                 "tools/list revalidation in progress",
                 None,
                 false,
@@ -247,7 +246,7 @@ where
         if let Err(reason) = eligibility {
             return deny_request(
                 shared,
-                line,
+                view,
                 method,
                 id,
                 raw_id,
@@ -258,8 +257,9 @@ where
             )
             .await;
         }
-        let check_result = checker::check_request(line, &shared.policy);
-        let check_result = apply_session_gates(shared, check_result, line, id).await;
+        let check_result = checker::check_request_verified(view, &shared.policy);
+        let check_result =
+            apply_session_gates(shared, check_result, view, id, tool.as_deref()).await;
         return match check_result {
             Ok(check_pass) => {
                 // F6: among calls the policy allows, only names the
@@ -288,7 +288,7 @@ where
                         deny_busy_tools_call(
                             shared,
                             raw_id,
-                            line,
+                            tool.as_deref(),
                             crate::auditor::checker::REASON_TOOL_NOT_ALLOWED,
                             Some(&format!(
                                 "tool '{}' is not advertised by the verified tools/list",
@@ -314,7 +314,7 @@ where
                 shared.audit.log_committed(event).await?;
                 match register_and_forward(
                     shared,
-                    line,
+                    view,
                     method,
                     id,
                     raw_id,
@@ -340,12 +340,15 @@ where
                 }
             }
             Err(violation) => {
-                let request_id = extract_raw_id(line);
+                // The classified `raw_id` is the request's `id` literal —
+                // no member re-extraction from the frame is needed.
+                let request_id = Some(raw_id.to_string());
                 // Dry-run observes the tool violation — except the one
                 // refusal that exists only to keep a blob off the wire:
                 // forwarding an over-cap requestState defeats the cap
                 // outright.
-                let observe = shared.dry_run && checker::request_state_over_cap(line).is_none();
+                let observe =
+                    shared.dry_run && checker::request_state_over_cap_json(view.json()).is_none();
                 if !observe {
                     // Session gates may have partially registered (the
                     // deputy pending list runs before the trajectory
@@ -426,7 +429,7 @@ where
                     );
                     register_and_forward_denied(
                         shared,
-                        line,
+                        view,
                         method,
                         id,
                         raw_id,
@@ -461,10 +464,10 @@ where
     // ── MRTR `params.requestState` cap — the tools/call checker enforces
     //    it on its own path; every other allowed request caps here so a
     //    retry blob stays bounded on any method. ──
-    if let Some(size) = checker::request_state_over_cap(line) {
+    if let Some(size) = checker::request_state_over_cap_json(view.json()) {
         return deny_request(
             shared,
-            line,
+            view,
             method,
             id,
             raw_id,
@@ -481,11 +484,11 @@ where
 
     // ── tools/list bookkeeping: bounded pending set + template capture ──
     if method == "tools/list" {
-        if !arm_tools_list(shared, line, id, raw_id, version).await? {
+        if !arm_tools_list(shared, view, id, raw_id, version).await? {
             return Ok(());
         }
         return match register_and_forward(
-            shared, line, method, id, raw_id, version, verdict, &ext, None,
+            shared, view, method, id, raw_id, version, verdict, &ext, None,
         )
         .await
         {
@@ -504,7 +507,7 @@ where
     }
 
     register_and_forward(
-        shared, line, method, id, raw_id, version, verdict, &ext, None,
+        shared, view, method, id, raw_id, version, verdict, &ext, None,
     )
     .await
     .map(|_| ())
@@ -518,7 +521,7 @@ where
 /// request is not forwarded either way.
 pub(super) async fn arm_tools_list<W>(
     shared: &ProxyShared<W>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     id: &RpcId,
     raw_id: &str,
     version: SupportedProtocolVersion,
@@ -614,13 +617,13 @@ where
             return Ok(false);
         }
     }
-    *shared.last_list_template.lock().await = line.to_string();
+    *shared.last_list_template.lock().await = view.frame().to_string();
     {
         // Keyed by canonical RpcId — a canonically-equal response id in
         // a different spelling (`1` vs `1.0`) still resolves the entry.
         let mut originals = shared.original_tools_list.lock().await;
         let retained: usize = originals.values().map(|v| v.len()).sum();
-        if retained.saturating_add(line.len()) > MAX_ORIGINAL_TOOLS_LIST_BYTES {
+        if retained.saturating_add(view.frame().len()) > MAX_ORIGINAL_TOOLS_LIST_BYTES {
             shared.pending_tools_list.lock().await.remove(id);
             shared.list_kick.notify_one();
             proxy_rpc::audit_decision(
@@ -643,7 +646,7 @@ where
             // `list_busy` stays raised; S2C's resume path releases it.
             return Ok(false);
         }
-        originals.insert(id.clone(), line.to_string());
+        originals.insert(id.clone(), view.frame().to_string());
     }
     Ok(true)
 }
@@ -703,7 +706,7 @@ where
 #[expect(clippy::too_many_arguments)]
 pub(super) async fn register_and_forward<W>(
     shared: &ProxyShared<W>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     method: &str,
     id: &RpcId,
     raw_id: &str,
@@ -717,7 +720,7 @@ where
 {
     register_and_forward_impl(
         shared,
-        line,
+        view,
         method,
         id,
         raw_id,
@@ -736,7 +739,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn register_and_forward_denied<W>(
     shared: &ProxyShared<W>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     method: &str,
     id: &RpcId,
     raw_id: &str,
@@ -749,7 +752,7 @@ where
 {
     register_and_forward_impl(
         shared,
-        line,
+        view,
         method,
         id,
         raw_id,
@@ -768,7 +771,7 @@ where
 #[expect(clippy::too_many_arguments)]
 pub(super) async fn register_and_forward_impl<W>(
     shared: &ProxyShared<W>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     method: &str,
     id: &RpcId,
     raw_id: &str,
@@ -871,10 +874,10 @@ where
             // the denial work below.
             None
         } else {
-            Some(write_child_frame_epoch(&shared.child_stdin, line).await)
+            Some(write_child_frame_epoch(&shared.child_stdin, view.frame()).await)
         }
     } else {
-        Some(write_child_frame(&shared.child_stdin, line).await)
+        Some(write_child_frame(&shared.child_stdin, view.frame()).await)
     };
     let Some(result) = dispatched else {
         shared.wire.lock().await.rollback_forwarded_request(undo);
@@ -940,7 +943,7 @@ where
 pub(super) async fn deny_busy_tools_call<W>(
     shared: &ProxyShared<W>,
     raw_id: &str,
-    line: &str,
+    tool: Option<&str>,
     reason: &str,
     audit_reason: Option<&str>,
     tool_denied: bool,
@@ -948,8 +951,8 @@ pub(super) async fn deny_busy_tools_call<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let tool = extract_tool_name_from_line(line).unwrap_or_else(|| "<unknown>".into());
-    let error_response = build_error_response(raw_id, &tool, reason, tool_denied);
+    let tool = tool.unwrap_or("<unknown>");
+    let error_response = build_error_response(raw_id, tool, reason, tool_denied);
     write_client_frame(&shared.client_out, &error_response).await?;
     let correlation_id = Uuid::now_v7();
     let mut event = AuditEvent::new(
@@ -959,7 +962,7 @@ where
         Outcome::Failure,
         Action::Denied,
     );
-    event.target_tool = Some(tool);
+    event.target_tool = Some(tool.to_string());
     event.request_id = Some(proxy_rpc::truncate_for_audit(raw_id));
     event.details = Some(audit_reason.unwrap_or(reason).to_string());
     shared.audit.log(event);
@@ -968,12 +971,16 @@ where
 
 /// The legacy per-session gates for an allowed `tools/call`: trajectory
 /// check, then the name-fixed Confused Deputy gate, then pending-call
-/// registration. Mirrors the pre-PR-10 ordering.
+/// registration. Mirrors the pre-PR-10 ordering. The session lock covers
+/// the checks only — the verified frame's `RawJson` is borrowed *into*
+/// the locked scope, never retained past it, so the borrow adds nothing
+/// to the lock's hold time.
 pub(super) async fn apply_session_gates<W>(
     shared: &ProxyShared<W>,
     check_result: Result<checker::CheckPass, checker::PolicyViolation>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     id: &RpcId,
+    tool: Option<&str>,
 ) -> Result<checker::CheckPass, checker::PolicyViolation>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -985,19 +992,16 @@ where
         return Ok(check_pass);
     };
     let mut state = session.lock().await;
-    let tool = extract_tool_name_from_line(line);
     if shared.policy.trajectory
-        && let Err(violation) = checker::check_trajectory(line, &shared.policy, &state)
+        && let Err(violation) = checker::check_trajectory_json(view.json(), &shared.policy, &state)
     {
         return Err(violation);
     }
-    apply_confused_deputy_c2s(&shared.policy, &mut state, line, Some(id), tool.as_deref())?;
+    apply_confused_deputy_c2s(&shared.policy, &mut state, view.json(), Some(id), tool)?;
     if shared.policy.trajectory {
-        let se = tool
-            .as_deref()
-            .and_then(|name| checker::tool_side_effect(&shared.policy, name));
+        let se = tool.and_then(|name| checker::tool_side_effect(&shared.policy, name));
         if let Err(reason) =
-            state.record_pending_tool_call(id.clone(), tool.as_deref().unwrap_or("<unknown>"), se)
+            state.record_pending_tool_call(id.clone(), tool.unwrap_or("<unknown>"), se)
         {
             // A discover-role gate above may have registered a pending
             // list under this id — roll it back here so the entry cannot
@@ -1005,7 +1009,7 @@ where
             // too; a still-forwarded dry-run deny must not seed either.
             state.take_pending_list(id);
             return Err(checker::PolicyViolation::new(
-                tool.unwrap_or_else(|| "<unknown>".into()),
+                tool.unwrap_or("<unknown>"),
                 checker::DenialKind::Session,
                 format!("trajectory: {reason}"),
             ));
@@ -1038,7 +1042,7 @@ where
 pub(super) fn apply_confused_deputy_c2s(
     policy: &Policy,
     state: &mut SessionState,
-    line: &str,
+    json: &nojson::RawJson<'_>,
     envelope_id: Option<&RpcId>,
     tool: Option<&str>,
 ) -> Result<(), checker::PolicyViolation> {
@@ -1079,7 +1083,7 @@ pub(super) fn apply_confused_deputy_c2s(
                 .find(|t| t.name == tool_name)
                 .map(|t| t.opaque_fields.as_slice())
                 .unwrap_or(&[]);
-            let paths = checker::extract_deputy_use_targets_rc(line, rules, opaque_fields)
+            let paths = checker::extract_deputy_use_targets_rc(json, rules, opaque_fields)
                 .map_err(|reason| {
                     checker::PolicyViolation::new(
                         tool_name,
@@ -1183,6 +1187,79 @@ mod tests {
     const CALL_LINE: &str =
         r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"t","arguments":{}}}"#;
 
+    /// The verified view the production path hands the forward machinery —
+    /// tests enter below the structural gate, so they build the same
+    /// shared-parse view the relay would.
+    fn verified(line: &str) -> checker::VerifiedFrame<'_> {
+        checker::VerifiedFrame::parse_and_verify(line).unwrap()
+    }
+
+    /// RF04 measurement: building the `VerifiedFrame` plus running
+    /// `forward_allowed` costs exactly one parse and one duplicate-key
+    /// scan — both inside `parse_and_verify`. Tool extraction,
+    /// `check_request`, id handling, and the session gates (a session
+    /// with trajectory enabled is attached here so they actually run)
+    /// all share the gate's `RawJson` through the view instead of
+    /// reparsing the frame per consumer.
+    ///
+    /// Scope: the test enters below the C2S loop at `forward_allowed` —
+    /// `classify_frame` and the `c2s_*` dispatch are upstream of it, so
+    /// this does not measure the loop's own frame-boundary work. The
+    /// per-thread `CountWindow` reads back only this thread's
+    /// increments: the process-wide counters keep counting whatever
+    /// parallel tests parse, so an exact global count would race.
+    #[cfg(feature = "measure")]
+    #[tokio::test]
+    async fn allowed_tools_call_runs_one_parse_and_one_dupkey_scan() {
+        let (mut shared, _rx, mut child_read) = shared_for_test();
+        shared
+            .policy
+            .tools
+            .push(crate::policy::ToolPolicy::named("t", true));
+        // Trajectory on + a session so `apply_session_gates` exercises
+        // the shared-`RawJson` checks (`check_trajectory_json`,
+        // `request_has_host_or_url_json`) rather than early-returning.
+        shared.policy.trajectory = true;
+        shared.session = Some(Arc::new(Mutex::new(SessionState::new())));
+        let window = crate::measure::CountWindow::open();
+        let view = verified(CALL_LINE);
+        let id = RpcId::from_u64(7);
+        forward_allowed(
+            &shared,
+            &view,
+            "tools/call",
+            &id,
+            "7",
+            SupportedProtocolVersion::Mcp2025November25,
+            McpVerdict::Allow(AllowReason::RuleAllow),
+            ExtractedRequest::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            window.count("json.parse.calls"),
+            1,
+            "the gate's parse must be the only parse through `forward_allowed`"
+        );
+        assert_eq!(
+            window.count("json.dupkey.scan.calls"),
+            1,
+            "the gate's duplicate-key walk must be the only scan"
+        );
+        // The forwarded bytes are the original frame verbatim — a passing
+        // `forward_allowed` alone does not prove the child write happened.
+        let expected = format!("{CALL_LINE}\n");
+        let mut buf = vec![0u8; expected.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_exact(&mut child_read, &mut buf),
+        )
+        .await
+        .expect("the forwarded frame must arrive within the bound")
+        .expect("the child read must complete");
+        assert_eq!(buf, expected.as_bytes());
+    }
+
     /// Publish a verified generation the way `verify_and_emit_list` does:
     /// the name set and counter move together under the mutex, and the
     /// atomic mirror follows.
@@ -1211,7 +1288,7 @@ mod tests {
         let ext = ExtractedRequest::default();
         let forwarded = register_and_forward_impl(
             &shared,
-            CALL_LINE,
+            &verified(CALL_LINE),
             "tools/call",
             &id,
             "7",
@@ -1242,7 +1319,7 @@ mod tests {
         let ext = ExtractedRequest::default();
         let forwarded = register_and_forward_impl(
             &shared,
-            CALL_LINE,
+            &verified(CALL_LINE),
             "tools/call",
             &id,
             "7",
@@ -1278,7 +1355,7 @@ mod tests {
             let ext = ExtractedRequest::default();
             register_and_forward_impl(
                 &shared_dispatch,
-                CALL_LINE,
+                &verified(CALL_LINE),
                 "tools/call",
                 &id,
                 "7",
@@ -1348,7 +1425,7 @@ mod tests {
             let ext = ExtractedRequest::default();
             register_and_forward_impl(
                 &shared_dispatch,
-                CALL_LINE,
+                &verified(CALL_LINE),
                 "tools/call",
                 &id,
                 "7",
@@ -1401,7 +1478,7 @@ mod tests {
         let ext = ExtractedRequest::default();
         let forwarded = register_and_forward_impl(
             &shared,
-            CALL_LINE,
+            &verified(CALL_LINE),
             "tools/call",
             &id,
             "7",
@@ -1433,7 +1510,7 @@ mod tests {
         let id = RpcId::from_u64(7);
         forward_allowed(
             &shared,
-            CALL_LINE,
+            &verified(CALL_LINE),
             "tools/call",
             &id,
             "7",
@@ -1467,7 +1544,7 @@ mod tests {
         let id = RpcId::from_u64(7);
         forward_allowed(
             &shared,
-            CALL_LINE,
+            &verified(CALL_LINE),
             "tools/call",
             &id,
             "7",
@@ -1497,7 +1574,7 @@ mod tests {
         let ext = ExtractedRequest::default();
         let forwarded = register_and_forward_impl(
             &shared,
-            CALL_LINE,
+            &verified(CALL_LINE),
             "tools/call",
             &id,
             "7",
@@ -1525,7 +1602,7 @@ mod tests {
         let id = RpcId::from_u64(0);
         let armed = arm_tools_list(
             &shared,
-            r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#,
+            &verified(r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#),
             &id,
             "0",
             SupportedProtocolVersion::Mcp2025November25,
@@ -1560,7 +1637,7 @@ mod tests {
         let id = RpcId::from_u64(0);
         let armed = arm_tools_list(
             &shared,
-            r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#,
+            &verified(r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#),
             &id,
             "0",
             SupportedProtocolVersion::Mcp2025November25,
@@ -1588,9 +1665,15 @@ mod tests {
         // extracted path must already be in `known_paths`, and a `..`
         // spelling is refused outright.
         let traversal = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/../secret"}}}"#;
-        let err =
-            apply_confused_deputy_c2s(&policy, &mut state, traversal, None, Some("read_file"))
-                .unwrap_err();
+        let traversal_json = nojson::RawJson::parse(traversal).unwrap();
+        let err = apply_confused_deputy_c2s(
+            &policy,
+            &mut state,
+            &traversal_json,
+            None,
+            Some("read_file"),
+        )
+        .unwrap_err();
         assert_eq!(
             err.validation_kind(),
             Some(EventType::ValidationPathTraversal),
@@ -1601,9 +1684,15 @@ mod tests {
         assert!(!err.is_denied_target());
 
         let undiscovered = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/undiscovered.txt"}}}"#;
-        let err =
-            apply_confused_deputy_c2s(&policy, &mut state, undiscovered, None, Some("read_file"))
-                .unwrap_err();
+        let undiscovered_json = nojson::RawJson::parse(undiscovered).unwrap();
+        let err = apply_confused_deputy_c2s(
+            &policy,
+            &mut state,
+            &undiscovered_json,
+            None,
+            Some("read_file"),
+        )
+        .unwrap_err();
         assert!(err.validation_kind().is_none(), "{}", err.reason);
         assert!(!err.is_denied_target());
         assert!(err.reason.contains("confused deputy"), "{}", err.reason);
