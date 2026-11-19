@@ -166,6 +166,23 @@ fn test_empty_line_rejected() {
     assert!(err.reason.contains("invalid JSON"));
 }
 
+#[test]
+fn verified_frame_accepts_json_whitespace_rejects_unicode_space() {
+    // Ordinary JSON whitespace around the frame is insignificant.
+    assert!(VerifiedFrame::parse_and_verify("  {\"jsonrpc\":\"2.0\"}\t").is_ok());
+    // U+00A0 is not JSON whitespace: str::trim would silently strip it
+    // and forward text the peer's parser may refuse — the gate must
+    // reject it instead.
+    assert!(matches!(
+        VerifiedFrame::parse_and_verify("\u{a0}{\"jsonrpc\":\"2.0\"}"),
+        Err(FrameReject::Parse)
+    ));
+    assert!(matches!(
+        VerifiedFrame::parse_and_verify("{\"jsonrpc\":\"2.0\"}\u{a0}"),
+        Err(FrameReject::Parse)
+    ));
+}
+
 use crate::policy::{FsToolPolicy, ToolNetworkPolicy, ToolSyscallPolicy};
 
 /// A workspace root spelling that resolves on any host: a directory

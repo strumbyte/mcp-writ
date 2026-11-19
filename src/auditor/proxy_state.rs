@@ -199,7 +199,8 @@ pub(crate) struct ProxyShared<W> {
     /// in-flight requests in both directions.
     pub(crate) wire: Arc<Mutex<WireState>>,
     pub(crate) pending_tools_list: Arc<Mutex<PendingToolsList>>,
-    pub(crate) client_out: Arc<Mutex<tokio::io::Stdout>>,
+    /// Client-facing writer, boxed so tests can capture emitted frames.
+    pub(crate) client_out: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
     /// Both relay directions can write (internal tools/list requests use S2C).
     /// `Option` lets client EOF close the actual pipe even while the other
     /// direction holds an `Arc`.

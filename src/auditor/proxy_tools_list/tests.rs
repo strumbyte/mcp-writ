@@ -30,7 +30,9 @@ fn shared_for_test_with(
         session: None,
         wire: Arc::new(Mutex::new(proxy_rpc::WireState::new())),
         pending_tools_list: Arc::new(Mutex::new(PendingToolsList::new())),
-        client_out: Arc::new(Mutex::new(tokio::io::stdout())),
+        client_out: Arc::new(Mutex::new(
+            Box::new(tokio::io::stdout()) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>
+        )),
         child_stdin: Arc::new(Mutex::new(Some(child_write))),
         original_tools_list: Arc::new(Mutex::new(std::collections::HashMap::new())),
         list_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),

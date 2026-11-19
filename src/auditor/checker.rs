@@ -214,7 +214,7 @@ pub struct CheckPass {
 pub(crate) struct VerifiedFrame<'text> {
     /// The original frame text — what the relay forwards verbatim.
     frame: &'text str,
-    /// The one parse of `frame.trim()` every downstream consumer shares.
+    /// The one parse of `frame` every downstream consumer shares.
     json: nojson::RawJson<'text>,
 }
 
@@ -241,7 +241,10 @@ impl<'text> VerifiedFrame<'text> {
     pub(crate) fn parse_and_verify(frame: &'text str) -> Result<Self, FrameReject<'text>> {
         #[cfg(feature = "measure")]
         crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
-        let json = nojson::RawJson::parse(frame.trim()).map_err(|_| FrameReject::Parse)?;
+        // Parse the original text — `RawJson` skips only the four JSON
+        // whitespace characters, so a Unicode "space" like U+00A0 around
+        // the frame is a parse rejection, not a silent normalization.
+        let json = nojson::RawJson::parse(frame).map_err(|_| FrameReject::Parse)?;
         match check_duplicate_keys_recursively(json.value()) {
             Ok(()) => Ok(Self { frame, json }),
             Err(v) => Err(FrameReject::Checked {
@@ -256,7 +259,7 @@ impl<'text> VerifiedFrame<'text> {
         self.frame
     }
 
-    /// The shared parse of `frame.trim()` — every consumer reuses this
+    /// The shared parse of `frame` — every consumer reuses this
     /// index rather than running `RawJson::parse` again.
     pub(crate) fn json(&self) -> &nojson::RawJson<'text> {
         &self.json
