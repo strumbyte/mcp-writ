@@ -643,18 +643,20 @@ fn deputy_gate_denials_carry_typed_kind() {
 }
 
 /// MRTR retry at the request handler: a retry is a NEW JSON-RPC id
-/// carrying `requestState`/`inputResponses` ? the deputy gate still
+/// carrying `requestState`/`inputResponses` — the deputy gate still
 /// extracts the use-side path from `params.arguments` and checks it
 /// against `known_paths`. The retry envelope is opaque to the gate.
 #[test]
 fn mrtr_retry_still_passes_the_deputy_gate() {
-    let mut policy = Policy::default();
-    policy.confused_deputy_protection = true;
+    let policy = Policy {
+        confused_deputy_protection: true,
+        ..Default::default()
+    };
     let mut state = SessionState::new();
     state.record_paths(&["/workspace/a.txt".to_string()]);
 
     // The retry: new id + requestState + inputResponses for the
-    // discovered path ? allowed.
+    // discovered path — allowed.
     let retry_known = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/a.txt"},"requestState":"eyJzIjoxfQ","inputResponses":{"k":{"x":1}}}}"#;
     let json = nojson::RawJson::parse(retry_known).unwrap();
     apply_confused_deputy_c2s(
@@ -683,7 +685,7 @@ fn mrtr_retry_still_passes_the_deputy_gate() {
 }
 
 /// The request handler runs the trajectory check on the retry path
-/// itself: `requestState` passing through must not skip it ? after a
+/// itself: `requestState` passing through must not skip it — after a
 /// verified ReadOnly, a Network retry under a new id still fails.
 #[test]
 fn mrtr_retry_still_runs_the_trajectory_gate() {
@@ -702,7 +704,7 @@ fn mrtr_retry_still_runs_the_trajectory_gate() {
     state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
 
     // A retry carrying requestState: the handler must still consult
-    // trajectory ? skipping the check is the failure this asserts.
+    // trajectory — skipping the check is the failure this asserts.
     let retry = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fetch_url","arguments":{},"requestState":"eyJzIjoxfQ"}}"#;
     let json = nojson::RawJson::parse(retry).unwrap();
     let err = checker::check_trajectory_json(&json, &policy, &state)

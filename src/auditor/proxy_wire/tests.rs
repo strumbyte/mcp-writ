@@ -79,13 +79,8 @@ async fn epoch_timeout_closes_ahead_of_queued_writer() {
     // Drive the queued write's own future against the held
     // `child_stdin` lock — a Pending poll is direct proof of mutex
     // contention, not a guess from an unscheduled task.
-    struct NoopWake;
-    impl std::task::Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
     let mut queued = std::pin::pin!(write_child_frame(&shared, "{}"));
-    let waker = std::task::Waker::from(Arc::new(NoopWake));
-    let mut cx = std::task::Context::from_waker(&waker);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(
         std::future::Future::poll(queued.as_mut(), &mut cx).is_pending(),
         "the queued writer must park on the held child_stdin"
