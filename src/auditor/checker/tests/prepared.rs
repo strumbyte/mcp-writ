@@ -162,3 +162,112 @@ fn prepared_index_answers_trajectory_and_side_effect_the_same() {
     let indexed = check_trajectory_json(&json, &prepared, &state);
     assert_eq!(linear.unwrap_err().reason, indexed.unwrap_err().reason);
 }
+
+/// RF05b: a tool's `args_schema` rides the prepared view — the
+/// shared document answers the same verdicts and reasons as the
+/// per-request parse the bare `Policy` path still runs.
+#[test]
+fn prepared_inline_schema_answers_like_the_per_request_path() {
+    let mut policy = Policy::default();
+    policy.tools.push({
+        let mut t = ToolPolicy::named("memo", true);
+        t.args_schema = Some(
+            r##"{"$defs":{"s":{"type":"string","minLength":1,"pattern":"^[a-z]+$"}},
+                 "type":"object",
+                 "properties":{"name":{"$ref":"#/$defs/s"},"n":{"type":"integer"}},
+                 "required":["name"],"additionalProperties":false}"##
+                .to_string(),
+        );
+        t
+    });
+    policy.tools.push(ToolPolicy::named("unschemaed", true));
+    let prepared = PreparedPolicy::new(policy.clone());
+    let call = |args: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memo","arguments":{args}}}}}"#
+        )
+    };
+    for line in [
+        call(r#"{"name":"ok","n":3}"#),
+        call(r#"{"name":"OK!"}"#),              // pattern mismatch
+        call(r#"{"name":"a","extra":1}"#),      // additional property
+        call(r#"{"name":""}"#),                 // $ref'd minLength
+        call(r#"{"n":1}"#),                     // missing required
+        call("1"),                              // non-object arguments
+        call("\"x\""),                          // string where object expected
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memo"}}"#.to_string(), // missing arguments → {}
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"unschemaed","arguments":{}}}"#.to_string(),
+    ] {
+        assert_same_verdict(&line, &policy, &prepared);
+    }
+}
+
+/// RF05b: a `@file` spelling that reaches a prepared view still
+/// resolves per request — same content reuses one plan, a rewrite is
+/// visible on the very next call, and every step agrees with the bare
+/// `Policy` path's uncached resolution.
+#[test]
+fn prepared_file_schema_resolves_per_request_on_resolved_bytes() {
+    // A unique scratch dir under the CWD (the `@file` read is
+    // cwd-scoped) — `TempDir` removes itself on drop, panic or pass.
+    let base = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join("mcp_writ_test_prepared_schema");
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("run_")
+        .tempdir_in(&base)
+        .unwrap();
+    let path = dir.path().join("schema.json");
+    let write = |content: &str| std::fs::write(&path, content).unwrap();
+    write(r#"{"type":"object","required":["a"]}"#);
+
+    let mut policy = Policy::default();
+    policy.tools.push({
+        let mut t = ToolPolicy::named("file_tool", true);
+        t.args_schema = Some(format!("@{}", path.display()));
+        t
+    });
+    let prepared = PreparedPolicy::new(policy.clone());
+    let call = |args: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"file_tool","arguments":{args}}}}}"#
+        )
+    };
+    // The prepared-path verdict alone, for the explicit assertions
+    // `assert_same_verdict` leaves implicit.
+    let indexed = |line: &str| {
+        let view = VerifiedFrame::parse_and_verify(line).expect("test line verifies");
+        check_request_verified(&view, &prepared)
+    };
+
+    // Original content: "a" required — the schema accepts {"a":1} and
+    // rejects a request missing it.
+    assert_same_verdict(&call(r#"{"a":1}"#), &policy, &prepared);
+    assert_same_verdict(&call(r#"{}"#), &policy, &prepared);
+    assert!(indexed(&call(r#"{"a":1}"#)).is_ok());
+    // Rewrite → the next request evaluates the new schema on both
+    // paths (the cache keys on bytes, so identical text would still
+    // have hit).
+    write(r#"{"type":"object","required":["b"]}"#);
+    assert_same_verdict(&call(r#"{"b":1}"#), &policy, &prepared);
+    assert_same_verdict(&call(r#"{"a":1}"#), &policy, &prepared);
+    assert!(indexed(&call(r#"{"b":1}"#)).is_ok());
+    let err = indexed(&call(r#"{"a":1}"#)).unwrap_err();
+    assert!(
+        err.reason.contains("at 'b': missing required field"),
+        "the rewritten schema must name its missing 'b': {}",
+        err.reason
+    );
+    // Invalid schema text fails at evaluation, per call, with the
+    // same message both paths produce.
+    write("not json");
+    assert_same_verdict(&call(r#"{"a":1}"#), &policy, &prepared);
+    let err = indexed(&call(r#"{"a":1}"#)).unwrap_err();
+    assert!(
+        err.reason.contains("invalid args_schema JSON"),
+        "unparseable schema text must surface its parse error: {}",
+        err.reason
+    );
+}

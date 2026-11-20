@@ -32,6 +32,14 @@ path = "bench_targets/m1_check_request.rs"
 name = "m2_policy"
 path = "bench_targets/m2_policy.rs"
 
+# RF05b's schema axis: per case (none / small / array-pattern /
+# local-ref / branches / invalid) the prep cost and resident growth
+# PreparedSchema adds, the prepared-vs-bare request split, and a
+# concurrent first-request burst for the lazy builders' dedup.
+[[bin]]
+name = "m2_schema"
+path = "bench_targets/m2_schema.rs"
+
 [[bin]]
 name = "m3_audit"
 path = "bench_targets/m3_audit.rs"

@@ -23,114 +23,20 @@
 //! outside the counted window — nothing the harness allocates is
 //! counted and then subtracted back out.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use mcp_writ::policy::opaque::OpaqueField;
 use mcp_writ::policy::prepared::PreparedPolicy;
 use mcp_writ::policy::{Policy, ToolNetworkPolicy, ToolPolicy};
+use mcp_writ_bench::counting::{self, COUNTING, PEAK};
 use mcp_writ_bench::{Args, emit, json_str, measure_json, parse_args, quantiles};
 
 const TOOL_COUNTS: [usize; 3] = [1, 100, 1000];
 
-/// Outstanding bytes (alloc minus dealloc) and the high-water mark —
-/// the resident/peak pair the M2 spec asks for without an OS-specific
-/// RSS read, so the same formula runs on every bench host. Counting
-/// runs only while `COUNTING` is set, so a counted window must be
-/// self-contained: every block counted on alloc gets freed before the
-/// window closes (one freed while untracked would leak into
-/// `OUTSTANDING`; an untracked block freed or shrunk inside a window
-/// would underflow it), and no measurement buffer crosses the boundary.
-struct Counting;
-
-static COUNTING: AtomicBool = AtomicBool::new(false);
-static OUTSTANDING: AtomicU64 = AtomicU64::new(0);
-static PEAK: AtomicU64 = AtomicU64::new(0);
-
-impl Counting {
-    /// `OUTSTANDING` += `size` with `PEAK` raised to the new mark —
-    /// the bookkeeping for every successful grow (`alloc`,
-    /// `alloc_zeroed`, `realloc` growth). Shrinks subtract from
-    /// `OUTSTANDING` only: the mark is a high-water, never lowered.
-    fn note_growth(size: u64) {
-        let now = OUTSTANDING.fetch_add(size, Ordering::Relaxed) + size;
-        PEAK.fetch_max(now, Ordering::Relaxed);
-    }
-}
-
-// SAFETY: `Counting` upholds the `GlobalAlloc` contract by delegating
-// every call to `System` — the allocator the default would have been —
-// so blocks always round-trip alloc→realloc→dealloc through the same
-// backend; the atomics add size bookkeeping only and never touch the
-// memory.
-#[allow(unsafe_code)]
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forwards `layout` to `System` and returns its pointer
-        // verbatim; the counting below reads `layout.size()` only,
-        // never the memory `p` addresses.
-        let p = unsafe { System.alloc(layout) };
-        if !p.is_null() && COUNTING.load(Ordering::Relaxed) {
-            Self::note_growth(layout.size() as u64);
-        }
-        p
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: same pass-through as `alloc`, via the zeroed entry
-        // point the default impl would have reached only through a
-        // fresh `alloc` plus a manual memset.
-        let p = unsafe { System.alloc_zeroed(layout) };
-        if !p.is_null() && COUNTING.load(Ordering::Relaxed) {
-            Self::note_growth(layout.size() as u64);
-        }
-        p
-    }
-
-    unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: forwards the block, its layout, and `new_size` to
-        // `System` verbatim, keeping the backend's in-place growth —
-        // the default impl's alloc-copy-dealloc would double the
-        // block's footprint mid-call and skew the measured marks.
-        let q = unsafe { System.realloc(p, layout, new_size) };
-        // Counted on success only: a failed realloc returns null with
-        // `p`'s block still owned by the caller, so the books stay
-        // unchanged — and a shrink never raises the high-water mark.
-        if !q.is_null() && COUNTING.load(Ordering::Relaxed) {
-            let old = layout.size() as u64;
-            let new = new_size as u64;
-            if new > old {
-                Self::note_growth(new - old);
-            } else {
-                OUTSTANDING.fetch_sub(old - new, Ordering::Relaxed);
-            }
-        }
-        q
-    }
-
-    unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-        if COUNTING.load(Ordering::Relaxed) {
-            OUTSTANDING.fetch_sub(layout.size() as u64, Ordering::Relaxed);
-        }
-        // SAFETY: forwards the pointer and layout the runtime supplies
-        // for a block this `alloc` returned straight to `System`; the
-        // impl adds no memory access of its own.
-        unsafe { System.dealloc(p, layout) };
-    }
-}
-
 #[global_allocator]
-static ALLOC: Counting = Counting;
-
-fn outstanding() -> u64 {
-    OUTSTANDING.load(Ordering::Relaxed)
-}
-
-fn peak() -> u64 {
-    PEAK.load(Ordering::Relaxed)
-}
+static ALLOC: counting::Counting = counting::Counting;
 
 /// A policy of `tools` entries — every tenth is network-restricted and
 /// declares two opaque fields (a bare member and a nested pointer), so
@@ -217,7 +123,7 @@ fn measure_allocations(
     warmup: usize,
 ) -> (u64, u64) {
     COUNTING.store(true, Ordering::Relaxed);
-    let base = outstanding();
+    let base = counting::outstanding();
     // Reset the mark to this window's baseline so the reported peak is
     // the run's own, not the cumulative process maximum.
     PEAK.store(base, Ordering::Relaxed);
@@ -235,9 +141,9 @@ fn measure_allocations(
     // itself adds (index, per-tool rules) — the moved-in document's
     // heap predates the baseline.
     let owned = doc.clone();
-    let alloc_base = outstanding();
+    let alloc_base = counting::outstanding();
     let prepared = PreparedPolicy::new(black_box(owned));
-    let prep_alloc_bytes = outstanding() - alloc_base;
+    let prep_alloc_bytes = counting::outstanding() - alloc_base;
 
     // The request path the view serves — first call, warmup, then the
     // steady-state mix — replayed untimed so its transient heap lifts
@@ -261,7 +167,7 @@ fn measure_allocations(
         ));
     }
 
-    let run_peak = peak().saturating_sub(base);
+    let run_peak = counting::peak().saturating_sub(base);
     // `prepared`'s counted heap returns before the window closes so a
     // later run's baseline is not inflated by this run's view.
     drop(prepared);
