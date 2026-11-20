@@ -13,8 +13,10 @@
 //! A counting global allocator adds a real allocator reading beside
 //! the structural `resident_bytes`: `prep_alloc_bytes` is the net
 //! heap delta of the session view (its `Policy` is moved in, not
-//! rebuilt, so the delta is the index + per-tool rules), and
-//! `peak_alloc_bytes` is the high-water mark across the whole run.
+//! rebuilt, so the delta is the index + per-tool rules), and each
+//! run's `peak_alloc_bytes` is its own workload high-water mark — the
+//! retained report buffers `runs` holds are subtracted out; the
+//! top-level field reports the largest across the tool counts.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -59,6 +61,14 @@ static ALLOC: Counting = Counting;
 
 fn outstanding() -> u64 {
     OUTSTANDING.load(Ordering::Relaxed)
+}
+
+/// Heap held by the retained report strings: each `String`'s buffer
+/// plus the `Vec`'s element array — the bytes a later run's peak must
+/// not count, while the workload's own resident allocations stay in.
+fn report_buffer_bytes(runs: &Vec<String>) -> u64 {
+    (runs.capacity() * std::mem::size_of::<String>()
+        + runs.iter().map(|s| s.capacity()).sum::<usize>()) as u64
 }
 
 fn peak() -> u64 {
@@ -137,8 +147,18 @@ fn request_mix(tools: usize, count: usize) -> Vec<String> {
         .collect()
 }
 
-fn run_count(tools: usize, iterations: usize, warmup: usize) -> String {
+fn run_count(tools: usize, iterations: usize, warmup: usize, retained: u64) -> (String, u64) {
     let doc = policy(tools);
+
+    // Per-run high-water of the workload only: `retained` — the heap
+    // `main`'s `runs` keeps live for earlier reports — is a measurement
+    // artifact, so it comes out of the reported mark below. The reset
+    // stays on the absolute live baseline: `retained` is constant
+    // through the run, so `peak() - retained` is the workload
+    // high-water and the delta accounting (`alloc_prep_bytes`) already
+    // cancels it. Resetting `PEAK` per run keeps the mark this run's
+    // own rather than the cumulative process maximum.
+    PEAK.store(outstanding(), Ordering::Relaxed);
 
     // Preparation distribution: the same finalized document prepped
     // `iterations` times. The `clone` materializes the input *before*
@@ -196,15 +216,24 @@ fn run_count(tools: usize, iterations: usize, warmup: usize) -> String {
     }
     let request_measure = measure_json("policy");
 
-    format!(
-        "{{\"tools\":{tools},\"opaque_tools\":{},\
-         \"prep_ns\":{},\"estimated_resident_bytes\":{estimated_resident},\"alloc_prep_bytes\":{prep_alloc_bytes},\
-         \"first_request_ns\":{first_request_ns},\"request_ns\":{},\
-         \"outcomes\":{{\"pass\":{pass},\"deny\":{deny}}},\
-         \"measure_prep\":{prep_measure},\"measure_requests\":{request_measure}}}",
-        (tools + 9) / 10,
-        quantiles(&prep_ns).to_json(),
-        quantiles(&request_ns).to_json(),
+    // Captured before the report JSON below is built, so this run's
+    // own report stays out; `retained` subtracts the earlier reports'
+    // buffers still live in `runs` — measurement artifacts, never
+    // workload.
+    let run_peak = peak().saturating_sub(retained);
+
+    (
+        format!(
+            "{{\"tools\":{tools},\"opaque_tools\":{},\
+             \"prep_ns\":{},\"estimated_resident_bytes\":{estimated_resident},\"alloc_prep_bytes\":{prep_alloc_bytes},\"peak_alloc_bytes\":{run_peak},\
+             \"first_request_ns\":{first_request_ns},\"request_ns\":{},\
+             \"outcomes\":{{\"pass\":{pass},\"deny\":{deny}}},\
+             \"measure_prep\":{prep_measure},\"measure_requests\":{request_measure}}}",
+            tools.div_ceil(10),
+            quantiles(&prep_ns).to_json(),
+            quantiles(&request_ns).to_json(),
+        ),
+        run_peak,
     )
 }
 
@@ -224,15 +253,19 @@ fn main() {
     }
 
     let mut runs = Vec::with_capacity(TOOL_COUNTS.len());
+    let mut global_peak = 0u64;
     for &tools in &TOOL_COUNTS {
         mcp_writ::measure::reset();
-        runs.push(run_count(tools, iterations, warmup));
+        let retained = report_buffer_bytes(&runs);
+        let (run, run_peak) = run_count(tools, iterations, warmup, retained);
+        global_peak = global_peak.max(run_peak);
+        runs.push(run);
     }
 
     let report = format!(
         "{{\"target\":\"m2_policy\",\"tool_counts\":{:?},\"seed\":{seed},\
          \"iterations\":{iterations},\"warmup\":{warmup},\
-         \"os\":{},\"profile\":{},\"peak_alloc_bytes\":{},\
+         \"os\":{},\"profile\":{},\"peak_alloc_bytes\":{global_peak},\
          \"note\":{},\"runs\":[{}]}}",
         TOOL_COUNTS,
         json_str(std::env::consts::OS),
@@ -241,11 +274,12 @@ fn main() {
         } else {
             "release"
         }),
-        peak(),
         json_str(
             "prep_ns is PreparedPolicy::new per iteration; estimated_resident_bytes is the \
              capacity-based structural estimate, alloc_prep_bytes the allocator net delta; \
-             measure_requests proves zero request-path rebuilds"
+             each run's peak_alloc_bytes is its own workload high-water mark, excluding the \
+             retained report buffers (top-level: largest across counts); measure_requests \
+             proves zero request-path rebuilds"
         ),
         runs.join(","),
     );

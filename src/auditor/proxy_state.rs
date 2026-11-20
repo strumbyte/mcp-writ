@@ -333,6 +333,13 @@ impl<W> ProxyShared<W> {
     /// index from ever being consulted against a newer document. The
     /// relay itself never replaces a session policy; test harnesses
     /// use this to shape `ProxyShared`.
+    ///
+    /// The swap is local to this `ProxyShared` clone: clones made
+    /// before the call keep their own `Arc<PreparedPolicy>` pointing
+    /// at the old view. A future production swap must either run
+    /// before the shared state is cloned into the relay tasks or
+    /// coordinate every clone — otherwise the directions would serve
+    /// different policy generations.
     #[cfg(test)]
     pub(crate) fn set_policy(&mut self, policy: Policy) {
         self.policy = Arc::new(PreparedPolicy::new(policy));

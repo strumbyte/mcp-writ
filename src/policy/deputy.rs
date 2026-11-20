@@ -420,6 +420,10 @@ pub enum DeputyBinding<'a> {
 /// An explicit `deputy` block on the tool wins — including
 /// `role="none"`, which suppresses the compatibility mapping. Tools
 /// without a `deputy` block keep the PR-13 fixed-name roles.
+///
+/// The standalone/public entry: the session relay resolves the binding
+/// against the prepared index's already-located entry through
+/// [`deputy_binding_tool`]; this remains the bare-`Policy` spelling.
 pub fn deputy_binding<'a>(policy: &'a Policy, tool_name: &str) -> DeputyBinding<'a> {
     deputy_binding_tool(policy.tools.iter().find(|t| t.name == tool_name), tool_name)
 }

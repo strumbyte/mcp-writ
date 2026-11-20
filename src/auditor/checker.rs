@@ -434,6 +434,9 @@ pub fn check_request_prepared(
 ) -> Result<CheckPass, PolicyViolation> {
     let view = match VerifiedFrame::parse_and_verify(line) {
         Ok(view) => view,
+        // `FrameReject::Parse` drops the parse detail by design, so the
+        // message mirrors the relay's `deny_malformed` wording rather
+        // than `check_request`'s "invalid JSON: {e}".
         Err(FrameReject::Parse) => {
             return Err(PolicyViolation::new(
                 "<unknown>",

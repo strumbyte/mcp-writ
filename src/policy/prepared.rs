@@ -113,9 +113,11 @@ pub struct PreparedPolicy {
 impl PreparedPolicy {
     /// Build the execution view once, where the tool set is final —
     /// `Auditor::new` for the product session, `set_policy` wherever a
-    /// policy is swapped. The index keys copy each tool name once per
-    /// policy (never per request) — the one bounded duplication a
-    /// `HashMap` index needs since it cannot borrow `ToolPolicy::name`.
+    /// policy is swapped. The `entry` API takes an owned key per
+    /// `tools` entry (never per request); a duplicate name's transient
+    /// `Box<str>` is dropped by `and_modify`, so the map keeps one copy
+    /// per distinct name — the one bounded duplication a `HashMap`
+    /// index needs since it cannot borrow `ToolPolicy::name`.
     /// No `tools` entry is cloned or rewritten; `tools[i]` describes
     /// `policy.tools[i]`.
     pub fn new(policy: Policy) -> Self {
