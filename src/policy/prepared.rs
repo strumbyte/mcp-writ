@@ -322,6 +322,32 @@ impl<T: ToolIndex + ?Sized> ToolIndex for std::sync::Arc<T> {
     }
 }
 
+/// `Box<Policy>` / `Box<PreparedPolicy>` callers keep working the way
+/// the `&Policy` signatures' deref coercion used to allow: a generic
+/// `L: ToolIndex` parameter sees the box itself, so it needs the same
+/// pass-through impl `Arc` has.
+impl<T: ToolIndex + ?Sized> ToolIndex for Box<T> {
+    fn document(&self) -> &Policy {
+        self.as_ref().document()
+    }
+
+    fn tool_named(&self, name: &str) -> Option<ToolHit<'_>> {
+        self.as_ref().tool_named(name)
+    }
+
+    fn tool_named_allowed(&self, name: &str) -> Option<ToolHit<'_>> {
+        self.as_ref().tool_named_allowed(name)
+    }
+
+    fn tool_allowed(&self, name: &str) -> bool {
+        self.as_ref().tool_allowed(name)
+    }
+
+    fn tool_listed(&self, name: &str) -> bool {
+        self.as_ref().tool_listed(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,16 +11,21 @@
 //! must preserve.
 //!
 //! A counting global allocator adds a real allocator reading beside
-//! the structural `resident_bytes`: `prep_alloc_bytes` is the net
-//! heap delta of the session view (its `Policy` is moved in, not
-//! rebuilt, so the delta is the index + per-tool rules), and each
-//! run's `peak_alloc_bytes` is its own workload high-water mark — the
-//! retained report buffers `runs` holds are subtracted out; the
-//! top-level field reports the largest across the tool counts.
+//! the structural `resident_bytes`. Counting is gated by `COUNTING`
+//! so the timed passes run untracked on `System` — the production
+//! allocator path — while a separate pass replays the same workload
+//! untimed inside one counted window for the allocator readings:
+//! `alloc_prep_bytes` is the net heap delta of the session view (its
+//! `Policy` is moved in, not rebuilt, so the delta is the index +
+//! per-tool rules), and `peak_alloc_bytes` is the run's own workload
+//! high-water mark. Latency and allocation results are measured
+//! independently, and every snapshot/report serialization stays
+//! outside the counted window — nothing the harness allocates is
+//! counted and then subtracted back out.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use mcp_writ::policy::opaque::OpaqueField;
@@ -32,26 +37,86 @@ const TOOL_COUNTS: [usize; 3] = [1, 100, 1000];
 
 /// Outstanding bytes (alloc minus dealloc) and the high-water mark —
 /// the resident/peak pair the M2 spec asks for without an OS-specific
-/// RSS read, so the same formula runs on every bench host.
+/// RSS read, so the same formula runs on every bench host. Counting
+/// runs only while `COUNTING` is set, so a counted window must be
+/// self-contained: every block counted on alloc gets freed before the
+/// window closes (one freed while untracked would leak into
+/// `OUTSTANDING`; an untracked block freed or shrunk inside a window
+/// would underflow it), and no measurement buffer crosses the boundary.
 struct Counting;
 
+static COUNTING: AtomicBool = AtomicBool::new(false);
 static OUTSTANDING: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
+impl Counting {
+    /// `OUTSTANDING` += `size` with `PEAK` raised to the new mark —
+    /// the bookkeeping for every successful grow (`alloc`,
+    /// `alloc_zeroed`, `realloc` growth). Shrinks subtract from
+    /// `OUTSTANDING` only: the mark is a high-water, never lowered.
+    fn note_growth(size: u64) {
+        let now = OUTSTANDING.fetch_add(size, Ordering::Relaxed) + size;
+        PEAK.fetch_max(now, Ordering::Relaxed);
+    }
+}
+
+// SAFETY: `Counting` upholds the `GlobalAlloc` contract by delegating
+// every call to `System` — the allocator the default would have been —
+// so blocks always round-trip alloc→realloc→dealloc through the same
+// backend; the atomics add size bookkeeping only and never touch the
+// memory.
 #[allow(unsafe_code)]
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwards `layout` to `System` and returns its pointer
+        // verbatim; the counting below reads `layout.size()` only,
+        // never the memory `p` addresses.
         let p = unsafe { System.alloc(layout) };
-        if !p.is_null() {
-            let now = OUTSTANDING.fetch_add(layout.size() as u64, Ordering::Relaxed)
-                + layout.size() as u64;
-            PEAK.fetch_max(now, Ordering::Relaxed);
+        if !p.is_null() && COUNTING.load(Ordering::Relaxed) {
+            Self::note_growth(layout.size() as u64);
         }
         p
     }
 
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: same pass-through as `alloc`, via the zeroed entry
+        // point the default impl would have reached only through a
+        // fresh `alloc` plus a manual memset.
+        let p = unsafe { System.alloc_zeroed(layout) };
+        if !p.is_null() && COUNTING.load(Ordering::Relaxed) {
+            Self::note_growth(layout.size() as u64);
+        }
+        p
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: forwards the block, its layout, and `new_size` to
+        // `System` verbatim, keeping the backend's in-place growth —
+        // the default impl's alloc-copy-dealloc would double the
+        // block's footprint mid-call and skew the measured marks.
+        let q = unsafe { System.realloc(p, layout, new_size) };
+        // Counted on success only: a failed realloc returns null with
+        // `p`'s block still owned by the caller, so the books stay
+        // unchanged — and a shrink never raises the high-water mark.
+        if !q.is_null() && COUNTING.load(Ordering::Relaxed) {
+            let old = layout.size() as u64;
+            let new = new_size as u64;
+            if new > old {
+                Self::note_growth(new - old);
+            } else {
+                OUTSTANDING.fetch_sub(old - new, Ordering::Relaxed);
+            }
+        }
+        q
+    }
+
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-        OUTSTANDING.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        if COUNTING.load(Ordering::Relaxed) {
+            OUTSTANDING.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        }
+        // SAFETY: forwards the pointer and layout the runtime supplies
+        // for a block this `alloc` returned straight to `System`; the
+        // impl adds no memory access of its own.
         unsafe { System.dealloc(p, layout) };
     }
 }
@@ -61,14 +126,6 @@ static ALLOC: Counting = Counting;
 
 fn outstanding() -> u64 {
     OUTSTANDING.load(Ordering::Relaxed)
-}
-
-/// Heap held by the retained report strings: each `String`'s buffer
-/// plus the `Vec`'s element array — the bytes a later run's peak must
-/// not count, while the workload's own resident allocations stay in.
-fn report_buffer_bytes(runs: &Vec<String>) -> u64 {
-    (runs.capacity() * std::mem::size_of::<String>()
-        + runs.iter().map(|s| s.capacity()).sum::<usize>()) as u64
 }
 
 fn peak() -> u64 {
@@ -147,18 +204,80 @@ fn request_mix(tools: usize, count: usize) -> Vec<String> {
         .collect()
 }
 
-fn run_count(tools: usize, iterations: usize, warmup: usize, retained: u64) -> (String, u64) {
-    let doc = policy(tools);
+/// The untimed replay the allocator readings come from: the same prep
+/// iterations, session view, and request traffic the timed pass ran,
+/// inside one self-contained counted window (see `Counting`). Returns
+/// `(alloc_prep_bytes, peak_alloc_bytes)` — the session view's net
+/// heap delta and this run's own workload high-water mark.
+fn measure_allocations(
+    doc: &Policy,
+    requests: &[String],
+    probe: &str,
+    iterations: usize,
+    warmup: usize,
+) -> (u64, u64) {
+    COUNTING.store(true, Ordering::Relaxed);
+    let base = outstanding();
+    // Reset the mark to this window's baseline so the reported peak is
+    // the run's own, not the cumulative process maximum.
+    PEAK.store(base, Ordering::Relaxed);
 
-    // Per-run high-water of the workload only: `retained` — the heap
-    // `main`'s `runs` keeps live for earlier reports — is a measurement
-    // artifact, so it comes out of the reported mark below. The reset
-    // stays on the absolute live baseline: `retained` is constant
-    // through the run, so `peak() - retained` is the workload
-    // high-water and the delta accounting (`alloc_prep_bytes`) already
-    // cancels it. Resetting `PEAK` per run keeps the mark this run's
-    // own rather than the cumulative process maximum.
-    PEAK.store(outstanding(), Ordering::Relaxed);
+    // Preparation distribution replay: the transient clone + view of
+    // each iteration, dropped inside the window.
+    for _ in 0..iterations {
+        let owned = black_box(doc.clone());
+        let view = PreparedPolicy::new(owned);
+        black_box(&view);
+    }
+
+    // The session view: `alloc_base` is taken after the document clone
+    // so the net delta is only the structures `PreparedPolicy::new`
+    // itself adds (index, per-tool rules) — the moved-in document's
+    // heap predates the baseline.
+    let owned = doc.clone();
+    let alloc_base = outstanding();
+    let prepared = PreparedPolicy::new(black_box(owned));
+    let prep_alloc_bytes = outstanding() - alloc_base;
+
+    // The request path the view serves — first call, warmup, then the
+    // steady-state mix — replayed untimed so its transient heap lifts
+    // the same high-water mark the timed pass produced.
+    let _ = black_box(mcp_writ::auditor::checker::check_request_prepared(
+        black_box(probe),
+        &prepared,
+    ));
+    for _ in 0..warmup {
+        for line in requests {
+            let _ = black_box(mcp_writ::auditor::checker::check_request_prepared(
+                black_box(line),
+                &prepared,
+            ));
+        }
+    }
+    for line in requests {
+        let _ = black_box(mcp_writ::auditor::checker::check_request_prepared(
+            black_box(line),
+            &prepared,
+        ));
+    }
+
+    let run_peak = peak().saturating_sub(base);
+    // `prepared`'s counted heap returns before the window closes so a
+    // later run's baseline is not inflated by this run's view.
+    drop(prepared);
+    COUNTING.store(false, Ordering::Relaxed);
+    (prep_alloc_bytes, run_peak)
+}
+
+fn run_count(tools: usize, iterations: usize, warmup: usize) -> (String, u64) {
+    // Inputs exist before either pass — a session preps a policy it
+    // already owns, and the mix is the request workload's own input.
+    let doc = policy(tools);
+    let requests = request_mix(tools, iterations);
+    let probe = call_url(0, "tool_0");
+
+    // ── latency pass: counting stays off, so every timed window pays
+    // only `System` — the allocator path production runs. ──
 
     // Preparation distribution: the same finalized document prepped
     // `iterations` times. The `clone` materializes the input *before*
@@ -172,14 +291,9 @@ fn run_count(tools: usize, iterations: usize, warmup: usize, retained: u64) -> (
         black_box(&view);
     }
 
-    // The session view: prepped once, kept resident. `alloc_base` is
-    // taken after the document clone so the net delta is only the
-    // structures `PreparedPolicy::new` itself adds (index, per-tool
-    // rules) — the moved-in document's heap predates the baseline.
-    let owned = doc.clone();
-    let alloc_base = outstanding();
-    let prepared = PreparedPolicy::new(black_box(owned));
-    let prep_alloc_bytes = outstanding() - alloc_base;
+    // The session view the request timings run against — prepped once,
+    // kept resident for the whole pass.
+    let prepared = PreparedPolicy::new(black_box(doc.clone()));
     let estimated_resident = prepared.estimated_resident_bytes();
     let prep_measure = measure_json("policy");
 
@@ -187,8 +301,6 @@ fn run_count(tools: usize, iterations: usize, warmup: usize, retained: u64) -> (
     // the opaque+net class at every count — so a single-iteration run
     // never indexes into the measured mix. Then warmup, then the
     // steady-state distribution — the same mix every pass.
-    let requests = request_mix(tools, iterations);
-    let probe = call_url(0, "tool_0");
     let t = Instant::now();
     let first = mcp_writ::auditor::checker::check_request_prepared(black_box(&probe), &prepared);
     let first_request_ns = t.elapsed().as_nanos() as u64;
@@ -216,11 +328,12 @@ fn run_count(tools: usize, iterations: usize, warmup: usize, retained: u64) -> (
     }
     let request_measure = measure_json("policy");
 
-    // Captured before the report JSON below is built, so this run's
-    // own report stays out; `retained` subtracts the earlier reports'
-    // buffers still live in `runs` — measurement artifacts, never
-    // workload.
-    let run_peak = peak().saturating_sub(retained);
+    // ── allocation pass: the same workload replayed untimed inside
+    // one self-contained counted window. The measure snapshots and
+    // the report string below stay untracked, so no serialization
+    // buffer — transient or retained — ever enters the accounting. ──
+    let (prep_alloc_bytes, run_peak) =
+        measure_allocations(&doc, &requests, &probe, iterations, warmup);
 
     (
         format!(
@@ -256,8 +369,7 @@ fn main() {
     let mut global_peak = 0u64;
     for &tools in &TOOL_COUNTS {
         mcp_writ::measure::reset();
-        let retained = report_buffer_bytes(&runs);
-        let (run, run_peak) = run_count(tools, iterations, warmup, retained);
+        let (run, run_peak) = run_count(tools, iterations, warmup);
         global_peak = global_peak.max(run_peak);
         runs.push(run);
     }
@@ -277,9 +389,10 @@ fn main() {
         json_str(
             "prep_ns is PreparedPolicy::new per iteration; estimated_resident_bytes is the \
              capacity-based structural estimate, alloc_prep_bytes the allocator net delta; \
-             each run's peak_alloc_bytes is its own workload high-water mark, excluding the \
-             retained report buffers (top-level: largest across counts); measure_requests \
-             proves zero request-path rebuilds"
+             each run's peak_alloc_bytes is its own workload high-water mark, taken in a \
+             separate counted pass so timed windows and report serialization stay out of \
+             the accounting (top-level: largest across counts); measure_requests proves \
+             zero request-path rebuilds"
         ),
         runs.join(","),
     );

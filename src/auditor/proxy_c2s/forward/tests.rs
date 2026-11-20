@@ -200,9 +200,11 @@ async fn allowed_tools_call_runs_one_parse_and_one_dupkey_scan() {
 #[tokio::test]
 async fn session_policy_prep_runs_once_and_requests_rebuild_nothing() {
     let (mut shared, _rx, mut child_read) = shared_for_test();
-    let mut policy = Policy::default();
-    policy.confused_deputy_protection = true;
-    policy.trajectory = true;
+    let mut policy = Policy {
+        confused_deputy_protection: true,
+        trajectory: true,
+        ..Default::default()
+    };
     policy.tools.push({
         let mut t = crate::policy::ToolPolicy::named("read_file", true);
         t.opaque_fields = vec![crate::policy::opaque::OpaqueField::parse("note").unwrap()];
@@ -231,21 +233,31 @@ async fn session_policy_prep_runs_once_and_requests_rebuild_nothing() {
         .record_paths(&["/workspace/a.txt".to_string()]);
     shared.session = Some(session);
 
-    let call = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/a.txt","note":"anything"}}}"#;
-    for i in 0..8 {
-        let id = RpcId::from_u64(7 + i);
+    // Each forward carries its own id end to end — the frame, `RpcId`,
+    // and `raw_id` move together the way a real stream's do — and the
+    // child's copy is the concatenation of those exact frames.
+    let mut expected = String::new();
+    for i in 0..8u64 {
+        let n = 7 + i;
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":{n},"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"/workspace/a.txt","note":"anything"}}}}}}"#
+        );
+        let raw_id = n.to_string();
+        let id = RpcId::from_u64(n);
         forward_allowed(
             &shared,
-            &verified(call),
+            &verified(&call),
             "tools/call",
             &id,
-            "7",
+            &raw_id,
             SupportedProtocolVersion::Mcp2025November25,
             McpVerdict::Allow(AllowReason::RuleAllow),
             ExtractedRequest::default(),
         )
         .await
         .unwrap();
+        expected.push_str(&call);
+        expected.push('\n');
     }
     assert_eq!(
         window.count("policy.opaque.matcher.builds"),
@@ -259,8 +271,7 @@ async fn session_policy_prep_runs_once_and_requests_rebuild_nothing() {
     );
 
     // The forwarded frames still reach the child.
-    let expected = format!("{call}\n");
-    let mut buf = vec![0u8; expected.len() * 8];
+    let mut buf = vec![0u8; expected.len()];
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::io::AsyncReadExt::read_exact(&mut child_read, &mut buf),
@@ -268,7 +279,7 @@ async fn session_policy_prep_runs_once_and_requests_rebuild_nothing() {
     .await
     .expect("the forwarded frames must arrive within the bound")
     .expect("the child read must complete");
-    assert_eq!(buf, expected.repeat(8).as_bytes());
+    assert_eq!(buf, expected.as_bytes());
 }
 
 /// Publish a verified generation the way `verify_and_emit_list` does:
@@ -924,8 +935,10 @@ fn mrtr_retry_still_runs_the_trajectory_gate() {
 #[tokio::test]
 async fn mrtr_retry_through_forward_allowed_enforces_deputy() {
     let (mut shared, _rx, mut child_read) = shared_for_test();
-    let mut policy = Policy::default();
-    policy.confused_deputy_protection = true;
+    let mut policy = Policy {
+        confused_deputy_protection: true,
+        ..Default::default()
+    };
     policy
         .tools
         .push(crate::policy::ToolPolicy::named("read_file", true));
