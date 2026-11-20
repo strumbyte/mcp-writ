@@ -26,6 +26,12 @@ uuid = { version = "1.26.1", features = ["v4", "v7"] }
 name = "m1_check_request"
 path = "bench_targets/m1_check_request.rs"
 
+# RF05a's prepared-policy pair: one-time prep cost (wall + resident)
+# against the request path it serves, at tool counts 1/100/1,000.
+[[bin]]
+name = "m2_policy"
+path = "bench_targets/m2_policy.rs"
+
 [[bin]]
 name = "m3_audit"
 path = "bench_targets/m3_audit.rs"

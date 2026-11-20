@@ -11,3 +11,8 @@ exclude_paths:
   # backing the PR-11 validation record — deliberate unsafe/raw-API
   # probes, not product code (same exclusion as .coderabbit.yaml).
   - "docs/validation/pr11-mxc/**"
+  # bench/ holds the opt-in refactoring-baseline measurement targets:
+  # excluded from `default-members` and the packaged crate, so its
+  # required `unsafe` (the counting global allocator) is measurement
+  # tooling, not shipped product code.
+  - "bench/**"

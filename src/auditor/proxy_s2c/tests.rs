@@ -30,7 +30,7 @@ fn shared_for_test() -> (
     let (client_read, client_write) = tokio::io::duplex(64 * 1024);
     (
         ProxyShared {
-            policy: Policy::default(),
+            policy: crate::policy::prepared::PreparedPolicy::new(Policy::default()).into(),
             dry_run: false,
             fail_on: crate::verifier::fail_on::FailOn::None,
             max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
@@ -75,7 +75,8 @@ fn shared_for_test() -> (
 #[tokio::test]
 async fn input_required_fixture_forwards_its_result_to_the_client() {
     let (mut shared, _rx, mut client_read) = shared_for_test();
-    shared.policy.mcp_rules.push(ServerMcpRules::new(
+    let mut policy = Policy::default();
+    policy.mcp_rules.push(ServerMcpRules::new(
         None,
         vec![McpRule {
             effect: RuleEffect::Allow,
@@ -86,6 +87,7 @@ async fn input_required_fixture_forwards_its_result_to_the_client() {
             filters: Vec::new(),
         }],
     ));
+    shared.set_policy(policy);
 
     let path = format!(
         "{}/tests/fixtures/mrtr/input_required_result.json",
@@ -207,7 +209,8 @@ fn trajectory_shared() -> (
     RpcId,
 ) {
     let (mut shared, _rx, client_read) = shared_for_test();
-    shared.policy.mcp_rules.push(ServerMcpRules::new(
+    let mut policy = Policy::default();
+    policy.mcp_rules.push(ServerMcpRules::new(
         None,
         vec![McpRule {
             effect: RuleEffect::Allow,
@@ -218,11 +221,12 @@ fn trajectory_shared() -> (
             filters: Vec::new(),
         }],
     ));
-    shared.policy.trajectory = true;
-    shared.policy.trajectory_rules = vec![crate::policy::TrajectoryRule {
+    policy.trajectory = true;
+    policy.trajectory_rules = vec![crate::policy::TrajectoryRule {
         after_side_effect: crate::policy::SideEffect::Network,
         deny_next: crate::policy::SideEffect::Execute,
     }];
+    shared.set_policy(policy);
     let session = Arc::new(Mutex::new(crate::auditor::session::SessionState::new()));
     shared.session = Some(session.clone());
     (shared, client_read, session, RpcId::from_u64(2))

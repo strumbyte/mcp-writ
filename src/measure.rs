@@ -212,6 +212,16 @@ pub static SCHEMA_PARSE_CALLS: Counter = Counter::new("schema.parse.calls");
 /// the per-request regex builds RF05b removes.
 pub static SCHEMA_REGEX_BUILDS: Counter = Counter::new("schema.regex.builds");
 
+/// `PreparedPolicy::new` invocations — the execution-policy prep RF05a
+/// runs once where the tool set becomes final (`Auditor::new`, a
+/// session `set_policy` swap).
+pub static POLICY_PREPARE_CALLS: Counter = Counter::new("policy.prepare.calls");
+
+/// `OpaqueMatcher::build` calls that produced a matcher — RF05a moves
+/// them to one per opaque-declaring tool at prep; request-path
+/// consumers reuse the index's build.
+pub static OPAQUE_MATCHER_BUILDS: Counter = Counter::new("policy.opaque.matcher.builds");
+
 /// Grant entries visited by `DynamicAllowList` lookup/name/qual scans —
 /// the full-set walks RF07 indexes away.
 pub static DNS_SCAN_ENTRIES: Counter = Counter::new("dns.scan.entries");
@@ -236,6 +246,8 @@ static COUNTERS: &[&Counter] = &[
     &DUPKEY_OBJECT_NODES,
     &SCHEMA_PARSE_CALLS,
     &SCHEMA_REGEX_BUILDS,
+    &POLICY_PREPARE_CALLS,
+    &OPAQUE_MATCHER_BUILDS,
     &DNS_SCAN_ENTRIES,
     &DNS_STAGED_SCAN_ENTRIES,
     &AUDIT_EVENTS_DEQUEUED,
@@ -275,9 +287,14 @@ pub static AUDIT_REOPEN_NS: Timing = Timing::new("audit.reopen.ns");
 /// `audit.reopen.ns` measures.
 pub static AUDIT_CONTROL_WAIT_NS: Timing = Timing::new("audit.control_wait.ns");
 
+/// `PreparedPolicy::new` wall time — the once-per-finalized-policy
+/// prep cost RF05a's M2 pair compares against per-request time.
+pub static POLICY_PREPARE_NS: Timing = Timing::new("policy.prepare.ns");
+
 /// All timings, for [`snapshot`].
 static TIMINGS: &[&Timing] = &[
     &DNS_LOCK_NS,
+    &POLICY_PREPARE_NS,
     &AUDIT_SYNC_NS,
     &AUDIT_SYNC_START_DELAY_NS,
     &AUDIT_FLUSH_NS,

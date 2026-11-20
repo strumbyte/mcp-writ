@@ -4,6 +4,7 @@
 
 use crate::policy::host::extract_host_from_url;
 use crate::policy::opaque::OpaqueMatcher;
+use crate::policy::prepared::ToolHit;
 use crate::policy::{EgressDest, EgressProto, Policy, ToolPolicy};
 
 use super::targets::{ExtractedTargets, collect_argument_targets_opaque};
@@ -131,16 +132,26 @@ pub(super) struct SubPolicyOutcome {
 /// Returns `true` if any sub-policy was evaluated.
 pub(super) fn check_tool_sub_policy(
     json: &nojson::RawJson<'_>,
-    tool: &ToolPolicy,
+    hit: ToolHit<'_>,
     policy: &Policy,
 ) -> Result<SubPolicyOutcome, PolicyViolation> {
+    let tool = hit.tool;
     let mut has_sub = false;
     // The tool's `arguments { opaque }` declarations: leaves under the
     // named members stay out of the unrecognized-argument refusal —
     // every other classification (path, URL, host, secret path) still
-    // applies to the same values.
-    let opaque = OpaqueMatcher::build(&tool.opaque_fields);
-    let extracted = collect_argument_targets_opaque(json, opaque.as_ref());
+    // applies to the same values. The session's prepared index hands
+    // over the matcher it built once; the standalone `&Policy` path
+    // builds it here per call exactly as it always did.
+    let built;
+    let opaque = match hit.prepared {
+        Some(p) => p.opaque.as_ref(),
+        None => {
+            built = OpaqueMatcher::build(&tool.opaque_fields);
+            built.as_ref()
+        }
+    };
+    let extracted = collect_argument_targets_opaque(json, opaque);
     let fs_restricted = tool.fs.as_ref().is_some_and(|fs_policy| {
         fs_policy.allow_specified
             || fs_policy.require_path.is_some()
@@ -148,9 +159,7 @@ pub(super) fn check_tool_sub_policy(
             || !fs_policy.denied_paths.is_empty()
     });
 
-    let read_only = crate::policy::SideEffect::parse(tool.side_effect.as_deref().unwrap_or(""))
-        .ok()
-        == Some(crate::policy::SideEffect::ReadOnly);
+    let read_only = hit.side_effect() == Some(crate::policy::SideEffect::ReadOnly);
     if read_only && (!extracted.hosts.is_empty() || !extracted.urls.is_empty()) {
         return Err(PolicyViolation::new(
             tool.name.clone(),
@@ -381,8 +390,11 @@ pub(super) fn check_tool_sub_policy(
         // when the block carried structured egress rules, destination
         // authorization runs against the qualified rule set, deny-first —
         // a `port=443` allow must not authorize `host:444`, and a target
-        // whose qualifiers cannot be determined is not covered.
-        let qualified = net_policy.egress_rule_set();
+        // whose qualifiers cannot be determined is not covered. The
+        // borrowed rule set is `egress_rule_set()` verbatim under
+        // `has_qualified` (the empty-rules projection was computed and
+        // discarded here per request before).
+        let qualified = &net_policy.egress_rules;
         let has_qualified = !net_policy.egress_rules.is_empty();
         for target in &targets {
             let host = &target.host;

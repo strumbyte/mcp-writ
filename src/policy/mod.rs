@@ -18,6 +18,10 @@ pub mod mcp;
 pub mod merge;
 pub mod opaque;
 mod outbound;
+/// RF05a execution view — internal machinery; `pub` only because the
+/// relay's `run_proxy` signature carries it.
+#[doc(hidden)]
+pub mod prepared;
 pub mod review;
 pub mod validator;
 pub mod version_diff;

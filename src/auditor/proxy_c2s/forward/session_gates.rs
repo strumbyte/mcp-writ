@@ -5,7 +5,8 @@
 use crate::auditor::checker;
 use crate::auditor::proxy_state::ProxyShared;
 use crate::auditor::session::{RpcId, SessionState};
-use crate::policy::Policy;
+use crate::policy::opaque::OpaqueMatcher;
+use crate::policy::prepared::ToolIndex;
 /// The legacy per-session gates for an allowed `tools/call`: trajectory
 /// check, then the name-fixed Confused Deputy gate, then pending-call
 /// registration. Mirrors the pre-PR-10 ordering. The session lock covers
@@ -92,20 +93,21 @@ where
 /// protection is disabled, no tool bound, a `use`/`none` binding, or
 /// a `None` envelope id — so rollback ownership mirrors the actual
 /// insertion.
-pub(super) fn apply_confused_deputy_c2s(
-    policy: &Policy,
+pub(super) fn apply_confused_deputy_c2s<L: ToolIndex + ?Sized>(
+    index: &L,
     state: &mut SessionState,
     json: &nojson::RawJson<'_>,
     envelope_id: Option<&RpcId>,
     tool: Option<&str>,
 ) -> Result<bool, checker::PolicyViolation> {
-    if !policy.confused_deputy_protection {
+    if !index.document().confused_deputy_protection {
         return Ok(false);
     }
     let Some(tool_name) = tool else {
         return Ok(false);
     };
-    match crate::policy::deputy::deputy_binding(policy, tool_name) {
+    let hit = index.tool_named(tool_name);
+    match crate::policy::deputy::deputy_binding_tool(hit.map(|h| h.tool), tool_name) {
         crate::policy::deputy::DeputyBinding::Discover(rules) => {
             if matches!(envelope_id, Some(&RpcId::Null)) {
                 return Err(checker::PolicyViolation::new(
@@ -128,16 +130,20 @@ pub(super) fn apply_confused_deputy_c2s(
         crate::policy::deputy::DeputyBinding::Use(rules) => {
             // The tool's `arguments { opaque }` declarations apply to the
             // closed-contract check exactly as they do to the tool's own
-            // sub-policy — the deputy binding lookup already found this
-            // tool by name.
-            let opaque_fields = policy
-                .tools
-                .iter()
-                .find(|t| t.name == tool_name)
-                .map(|t| t.opaque_fields.as_slice())
-                .unwrap_or(&[]);
-            let paths = checker::extract_deputy_use_targets_rc(json, rules, opaque_fields)
-                .map_err(|reason| {
+            // sub-policy — the name lookup above already found this
+            // tool; the session's prepared matcher comes along with it
+            // (the standalone path rebuilds from the declarations, as
+            // it always did).
+            let built;
+            let opaque = match hit.and_then(|h| h.prepared) {
+                Some(p) => p.opaque.as_ref(),
+                None => {
+                    built = hit.and_then(|h| OpaqueMatcher::build(&h.tool.opaque_fields));
+                    built.as_ref()
+                }
+            };
+            let paths =
+                checker::extract_deputy_use_targets_rc(json, rules, opaque).map_err(|reason| {
                     checker::PolicyViolation::new(
                         tool_name,
                         checker::DenialKind::Session,

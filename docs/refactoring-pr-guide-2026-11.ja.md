@@ -375,12 +375,14 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 
 **タスク**
 
-- [ ] load・検証・server bindingとAuditor生成の呼出順を追い、ツール集合が確定する地点を特定する。ポリシー生成・KDL出力・hash計算の利用側も一覧化する。
-- [ ] 確定したポリシーから実行用表現を一度だけ準備する。ツール名から元定義を参照できる索引と、ツールごとのopaque matcherを構築する。可変OS状態やrequest／session状態は含めない。
-- [ ] 同じ文字列・ツール定義の多重保持を避け、共有が必要な箇所だけ`Arc`等を使う。索引の寿命を元定義の寿命に結び付け、policyの更新・再生成がある経路では古い準備結果を再利用しない。
-- [ ] checkerとtools/listの認可・可視性判定を同じ準備済み規則へ接続する。deny優先、未指定と明示的空allowの意味、server binding後の重複名処理を保存する。
-- [ ] 元文書、provenance、KDL出力、policy hashの生成は既存の意味と順序を維持する。hash mapの列挙順を外部の配列・文書・digestへ漏らさない。
-- [ ] tool数1・100・1,000で準備回数と要求中の再構築回数を観測し、準備時間・常駐量と要求時間を対で測る。
+- [x] load・検証・server bindingとAuditor生成の呼出順を追い、ツール集合が確定する地点を特定する。ポリシー生成・KDL出力・hash計算の利用側も一覧化する。 → 確定地点は`Auditor::new`（`src/auditor/mod.rs`で`PreparedPolicy::new`を一度だけ実行）。KDL出力・hash・provenanceの利用側は`document()`／`Deref`経由で不変の`Policy`を読む
+- [x] 確定したポリシーから実行用表現を一度だけ準備する。ツール名から元定義を参照できる索引と、ツールごとのopaque matcherを構築する。可変OS状態やrequest／session状態は含めない。 → `src/policy/prepared.rs`新設：`PreparedPolicy`（文書所有＋`HashMap<Box<str>,ToolSlot>`索引＋`Vec<PreparedTool>`：opaque matcher・解析済み`side_effect`・解決済み`input_responses`）
+- [x] 同じ文字列・ツール定義の多重保持を避け、共有が必要な箇所だけ`Arc`等を使う。索引の寿命を元定義の寿命に結び付け、policyの更新・再生成がある経路では古い準備結果を再利用しない。 → 複製は索引キーの`Box<str>`のみ（HashMapがVecから借用不可のため）。`Arc<PreparedPolicy>`をC2S／S2C・tools/listが共有。文書所有のため寿命は一致、swapは`set_policy`で全体再準備
+- [x] checkerとtools/listの認可・可視性判定を同じ準備済み規則へ接続する。deny優先、未指定と明示的空allowの意味、server binding後の重複名処理を保存する。 → 両経路とも`ToolIndex`（`tool_is_allowed(&shared.policy)`等）。`ToolSlot{first,first_allowed}`がfind先頭一致とany(allowed)の非対称を保存。線形走査との判定一致は`auditor::checker::tests::prepared`・`policy::prepared::tests`で差分検証
+- [x] 元文書、provenance、KDL出力、policy hashの生成は既存の意味と順序を維持する。hash mapの列挙順を外部の配列・文書・digestへ漏らさない。 → 索引は`.get()`参照のみで列挙しない。`policy::prepared::tests::document_forms_are_untouched`が`document()`・`to_kdl()`・`declared_servers()`の一致を検証
+- [x] tool数1・100・1,000で準備回数と要求中の再構築回数を観測し、準備時間・常駐量と要求時間を対で測る。 → `bench`に`[[bin]] m2_policy`追加。`policy.prepare.calls`=iterations+1、`policy.opaque.matcher.builds`は準備フェーズのみ（`measure_requests`不変＝要求時再構築0）。release計測: prep p50 0.4µs/5.7µs/159µs、`estimated_resident_bytes` 839B/16.8KB/195.4KB、要求p50約128µsでtool数に依らず一定
+
+検証結果: `cargo test --lib` 2,585件・`--features measure` 2,587件・統合テスト全pass（重複名・opaque重複／階層・資源形拒否・空allow・inherit／include／when・複数サーバーは既存スイートで確認）。`windows_sandbox_vm_e2e` 3件は`wsb`バイナリ未導入の環境不足で未検証として残す。RF04の解析共有（`VerifiedFrame`経路）は不変。
 
 **検証・計測:** T-BASE、T-POLICY、T-PROTOCOL。複数サーバー、binding後のtool名、inherit／include／when、空allow、opaque宣言の重複・階層・既知資源形の拒否を検査する。M2で起動・初回・定常要求・常駐メモリを比較する。
 
