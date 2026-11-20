@@ -1,6 +1,7 @@
 use super::schema_validator;
 use super::session::SessionState;
-use crate::policy::{InputResponsesMode, Policy, ResolvedInputResponses, SideEffect, ToolPolicy};
+use crate::policy::prepared::{ToolHit, ToolIndex};
+use crate::policy::{InputResponsesMode, Policy, ResolvedInputResponses, SideEffect};
 use crate::protocol::{MCP_VERSION_2025_11_25, MCP_VERSION_2026_07_28, META_PROTOCOL_VERSION};
 
 mod sub_policy;
@@ -351,8 +352,8 @@ fn check_duplicate_keys_at_depth(
 /// [`check_request`] and the `tools/list` visibility filter in
 /// `proxy_tools_list`: a tool the client may not call is a tool the client
 /// must not see.
-pub fn tool_is_allowed(policy: &Policy, name: &str) -> bool {
-    policy.tools.iter().any(|t| t.name == name && t.allowed)
+pub fn tool_is_allowed<L: ToolIndex + ?Sized>(index: &L, name: &str) -> bool {
+    index.tool_allowed(name)
 }
 
 /// Check a JSON-RPC request line against the policy.
@@ -403,9 +404,9 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
 /// run once, not once per consumer. The `VerifiedFrame` type is proof
 /// the structural gate ran; standalone callers keep using
 /// [`check_request`], which performs its own checks.
-pub(crate) fn check_request_verified(
+pub(crate) fn check_request_verified<L: ToolIndex + ?Sized>(
     view: &VerifiedFrame<'_>,
-    policy: &Policy,
+    index: &L,
 ) -> Result<CheckPass, PolicyViolation> {
     // The gate verified structure (duplicate keys / nesting depth), not
     // envelope kind — the object check stays part of this entry so a
@@ -417,15 +418,45 @@ pub(crate) fn check_request_verified(
             "request must be a JSON object (batch requests are not supported)",
         ));
     }
-    check_request_inner(view.json(), policy)
+    check_request_inner(view.json(), index)
+}
+
+/// The M2 request-time façade for the `bench` package: runs the same
+/// verified-frame + prepared-policy path the product relay uses, so a
+/// benchmark can time the request path against the prepared index
+/// without driving the relay. Feature-gated like the `fuzz` /
+/// `measure` façades — not part of the shipped API surface.
+#[cfg(feature = "measure")]
+#[doc(hidden)]
+pub fn check_request_prepared(
+    line: &str,
+    prepared: &crate::policy::prepared::PreparedPolicy,
+) -> Result<CheckPass, PolicyViolation> {
+    let view = match VerifiedFrame::parse_and_verify(line) {
+        Ok(view) => view,
+        Err(FrameReject::Parse) => {
+            return Err(PolicyViolation::new(
+                "<unknown>",
+                DenialKind::Other,
+                "invalid JSON".to_string(),
+            ));
+        }
+        Err(FrameReject::Checked { reason, .. }) => {
+            return Err(PolicyViolation::new("<unknown>", DenialKind::Other, reason));
+        }
+    };
+    check_request_verified(&view, prepared)
 }
 
 /// The shared body of [`check_request`] / [`check_request_verified`] —
 /// everything downstream of parse, envelope-shape, and the duplicate-key
-/// walk, which each entry runs (or proves already ran) first.
-fn check_request_inner(
+/// walk, which each entry runs (or proves already ran) first. Tool
+/// lookups run through the caller's index — the session's prepared
+/// rules on the product path, the same linear scans a bare `&Policy`
+/// answers with on the standalone path.
+fn check_request_inner<L: ToolIndex + ?Sized>(
     json: &nojson::RawJson<'_>,
-    policy: &Policy,
+    index: &L,
 ) -> Result<CheckPass, PolicyViolation> {
     // Iterate through object members to extract method
     let mut method_opt: Option<String> = None;
@@ -466,6 +497,7 @@ fn check_request_inner(
     }
 
     let mut audit_notes = protocol_version_audit_notes(json);
+    let policy = index.document();
 
     // Step 1: Check method field
     let is_tools_call = method_opt.as_deref() == Some("tools/call");
@@ -481,8 +513,8 @@ fn check_request_inner(
     let tool_name = extract_tool_name(json)?;
 
     // Step 3-6: Check against policy (including MRTR retries with a new JSON-RPC id)
-    if !tool_is_allowed(policy, &tool_name) {
-        let listed = policy.tools.iter().any(|t| t.name == tool_name);
+    if !index.tool_allowed(&tool_name) {
+        let listed = index.tool_listed(&tool_name);
         let reason = if listed {
             REASON_TOOL_NOT_ALLOWED
         } else {
@@ -495,13 +527,9 @@ fn check_request_inner(
         ));
     }
 
-    let tool = match policy
-        .tools
-        .iter()
-        .find(|t| t.name == tool_name && t.allowed)
-    {
-        Some(tool) => tool,
-        // Unreachable: `tool_is_allowed` just proved a listed, allowed entry
+    let hit = match index.tool_named_allowed(&tool_name) {
+        Some(hit) => hit,
+        // Unreachable: `tool_allowed` just proved a listed, allowed entry
         // exists (duplicate tool names are rejected at policy load).
         None => {
             return Err(PolicyViolation::new(
@@ -513,16 +541,16 @@ fn check_request_inner(
     };
 
     // Step 4: Schema validation (if args_schema is defined)
-    if let Some(ref schema_ref) = tool.args_schema {
+    if let Some(ref schema_ref) = hit.tool.args_schema {
         validate_tool_args(json, &tool_name, schema_ref)?;
     }
 
     // Step 5: MRTR siblings of `arguments` — never feed requestState to schema
     check_request_state(json, &tool_name, &mut audit_notes)?;
-    check_input_responses(json, tool, &tool_name, &mut audit_notes)?;
+    check_input_responses(json, &hit, &tool_name, &mut audit_notes)?;
 
     // Step 6: Tool-specific sub-policy checks (fs, network)
-    let outcome = sub_policy::check_tool_sub_policy(json, tool, policy)?;
+    let outcome = sub_policy::check_tool_sub_policy(json, hit, policy)?;
     if outcome.opaque_fields > 0 {
         // How many of the tool's `arguments { opaque }` declared fields
         // carried a value past the unrecognized-argument refusal —
@@ -661,7 +689,7 @@ pub(crate) fn request_state_byte_len(value: nojson::RawJsonValue<'_, '_>) -> usi
 
 fn check_input_responses(
     json: &nojson::RawJson<'_>,
-    tool: &ToolPolicy,
+    hit: &ToolHit<'_>,
     tool_name: &str,
     audit_notes: &mut Vec<String>,
 ) -> Result<(), PolicyViolation> {
@@ -669,12 +697,11 @@ fn check_input_responses(
         return Ok(());
     }
 
-    let resolved = tool.input_responses.resolve(tool.has_security_contract());
-    match resolved {
+    match hit.resolved_input_responses() {
         ResolvedInputResponses::Deny => Err(PolicyViolation::new(
             tool_name,
             DenialKind::Other,
-            input_responses_denied_reason(tool.input_responses),
+            input_responses_denied_reason(hit.tool.input_responses),
         )),
         ResolvedInputResponses::Allow => Ok(()),
         ResolvedInputResponses::Inspect => {
@@ -729,21 +756,19 @@ pub fn check_trajectory(
 /// gate shares the C2S gate's `RawJson` rather than reparsing the line.
 /// The `policy.trajectory` opt-out still short-circuits so a caller that
 /// did not pre-check it sees the same no-op contract as the wrapper.
-pub(crate) fn check_trajectory_json(
+pub(crate) fn check_trajectory_json<L: ToolIndex + ?Sized>(
     json: &nojson::RawJson<'_>,
-    policy: &Policy,
+    index: &L,
     session: &SessionState,
 ) -> Result<(), PolicyViolation> {
+    let policy = index.document();
     if !policy.trajectory {
         return Ok(());
     }
     let tool_name = extract_tool_name(json)?;
-    let next_side_effect = policy
-        .tools
-        .iter()
-        .find(|t| t.name == tool_name)
-        .and_then(|t| t.side_effect.as_deref())
-        .and_then(|raw| SideEffect::parse(raw).ok());
+    let next_side_effect = index
+        .tool_named(&tool_name)
+        .and_then(|hit| hit.side_effect());
     let has_host_or_url = request_has_host_or_url_json(json);
     session
         .check_trajectory(
@@ -756,13 +781,10 @@ pub(crate) fn check_trajectory_json(
 }
 
 /// Look up a tool's documented `side_effect` for trajectory bookkeeping.
-pub fn tool_side_effect(policy: &Policy, tool_name: &str) -> Option<SideEffect> {
-    policy
-        .tools
-        .iter()
-        .find(|t| t.name == tool_name)
-        .and_then(|t| t.side_effect.as_deref())
-        .and_then(|raw| SideEffect::parse(raw).ok())
+pub fn tool_side_effect<L: ToolIndex + ?Sized>(index: &L, tool_name: &str) -> Option<SideEffect> {
+    index
+        .tool_named(tool_name)
+        .and_then(|hit| hit.side_effect())
 }
 
 fn validate_tool_args(

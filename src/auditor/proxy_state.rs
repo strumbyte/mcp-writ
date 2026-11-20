@@ -11,6 +11,7 @@ use super::proxy_rpc::WireState;
 use super::session::{RpcId, SessionState};
 use crate::audit_log::AuditLogger;
 use crate::policy::Policy;
+use crate::policy::prepared::PreparedPolicy;
 use crate::verifier::fail_on::FailOn;
 
 /// Bounded set of in-flight tools/list request ids.
@@ -184,7 +185,12 @@ impl PendingToolsList {
 /// the `Arc` fields so `list_busy`, the pending list set, and the abort
 /// channel observe the same underlying state.
 pub(crate) struct ProxyShared<W> {
-    pub(crate) policy: Policy,
+    /// The session's bound policy plus its once-built execution view
+    /// (tool index + per-tool matchers — RF05a). `Deref` chains
+    /// `Arc → PreparedPolicy → Policy`, so every `shared.policy.<doc>`
+    /// read sees the document unchanged while the checkers answer
+    /// lookups from the index.
+    pub(crate) policy: Arc<PreparedPolicy>,
     pub(crate) dry_run: bool,
     pub(crate) fail_on: FailOn,
     /// Configured JSON-RPC frame cap (`--max-frame-bytes`) applied by
@@ -320,6 +326,16 @@ impl<W> ProxyShared<W> {
     pub(crate) async fn raise_list_gate(&self) -> bool {
         let _epoch = self.list_epoch.lock().await;
         self.list_busy.swap(true, Ordering::SeqCst)
+    }
+
+    /// Replace the session's bound policy — the only policy-swap path:
+    /// re-running `PreparedPolicy::new` here is what keeps a stale
+    /// index from ever being consulted against a newer document. The
+    /// relay itself never replaces a session policy; test harnesses
+    /// use this to shape `ProxyShared`.
+    #[cfg(test)]
+    pub(crate) fn set_policy(&mut self, policy: Policy) {
+        self.policy = Arc::new(PreparedPolicy::new(policy));
     }
 }
 

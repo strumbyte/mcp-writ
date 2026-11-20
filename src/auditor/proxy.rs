@@ -7,7 +7,7 @@ use super::proxy_state::{PendingToolsList, ProxyShared};
 use super::session::SessionState;
 use crate::audit_log::AuditLogger;
 use crate::error::AuditorError;
-use crate::policy::Policy;
+use crate::policy::prepared::PreparedPolicy;
 use crate::verifier::fail_on::FailOn;
 
 /// Run the bidirectional JSON-RPC proxy between client (our stdin/stdout) and
@@ -25,7 +25,7 @@ use crate::verifier::fail_on::FailOn;
 /// All tools/call requests are recorded in the audit log.
 #[expect(clippy::too_many_arguments)]
 pub async fn run_proxy<W, R>(
-    policy: &Policy,
+    policy: Arc<PreparedPolicy>,
     dry_run: bool,
     fail_on: FailOn,
     max_frame_bytes: usize,
@@ -41,19 +41,20 @@ where
     // Cancellation signal shared between S2C and C2S to immediately abort session
     let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
 
+    // Process-local session: Confused Deputy and/or trajectory (never requestState).
+    let session = if policy.confused_deputy_protection || policy.trajectory {
+        Some(Arc::new(tokio::sync::Mutex::new(SessionState::new())))
+    } else {
+        None
+    };
     let shared = ProxyShared {
-        policy: policy.clone(),
+        policy,
         dry_run,
         fail_on,
         max_frame_bytes,
         audit: audit_logger,
         tally,
-        // Process-local session: Confused Deputy and/or trajectory (never requestState).
-        session: if policy.confused_deputy_protection || policy.trajectory {
-            Some(Arc::new(tokio::sync::Mutex::new(SessionState::new())))
-        } else {
-            None
-        },
+        session,
         wire: Arc::new(tokio::sync::Mutex::new(super::proxy_rpc::WireState::new())),
         pending_tools_list: Arc::new(tokio::sync::Mutex::new(PendingToolsList::new())),
         client_out: Arc::new(tokio::sync::Mutex::new(

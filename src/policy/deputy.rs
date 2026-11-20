@@ -31,7 +31,7 @@
 
 use std::collections::HashSet;
 
-use super::Policy;
+use super::{Policy, ToolPolicy};
 
 /// Maximum `extract`/`shape` rules in one `deputy` block.
 pub const MAX_DEPUTY_RULES: usize = 16;
@@ -421,12 +421,18 @@ pub enum DeputyBinding<'a> {
 /// `role="none"`, which suppresses the compatibility mapping. Tools
 /// without a `deputy` block keep the PR-13 fixed-name roles.
 pub fn deputy_binding<'a>(policy: &'a Policy, tool_name: &str) -> DeputyBinding<'a> {
-    if let Some(dep) = policy
-        .tools
-        .iter()
-        .find(|t| t.name == tool_name)
-        .and_then(|t| t.deputy.as_ref())
-    {
+    deputy_binding_tool(policy.tools.iter().find(|t| t.name == tool_name), tool_name)
+}
+
+/// [`deputy_binding`] resolved against an already-located tool — the
+/// prepared index hands the caller its first `tools` entry under
+/// `tool_name` (`None` when unlisted), matching the `find` this
+/// performs over `policy.tools`.
+pub(crate) fn deputy_binding_tool<'a>(
+    tool: Option<&'a ToolPolicy>,
+    tool_name: &str,
+) -> DeputyBinding<'a> {
+    if let Some(dep) = tool.and_then(|t| t.deputy.as_ref()) {
         return match dep.role {
             DeputyRole::None => DeputyBinding::None,
             DeputyRole::Discover => DeputyBinding::Discover(&dep.rules),

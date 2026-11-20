@@ -143,6 +143,8 @@ impl OpaqueMatcher {
         if fields.is_empty() {
             return Option::None;
         }
+        #[cfg(feature = "measure")]
+        crate::measure::incr(&crate::measure::OPAQUE_MATCHER_BUILDS, 1);
         let mut root = Self::default();
         for (index, field) in fields.iter().enumerate() {
             let mut node = &mut root;
@@ -165,6 +167,19 @@ impl OpaqueMatcher {
     /// so every scalar under it is free-form for this tool.
     pub fn declaration(&self) -> Option<u32> {
         self.terminal
+    }
+
+    /// Heap bytes this node's subtree owns — the children map's bucket
+    /// array (one control byte each) and member-name buffers. Child
+    /// nodes themselves live inside that array, so the recursion only
+    /// adds their own `children` allocations.
+    #[cfg(feature = "measure")]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let mut n = self.children.capacity() * (std::mem::size_of::<(String, OpaqueMatcher)>() + 1);
+        for (name, child) in &self.children {
+            n += name.capacity() + child.heap_bytes();
+        }
+        n
     }
 }
 

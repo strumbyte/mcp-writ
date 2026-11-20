@@ -257,26 +257,30 @@ pub fn extract_deputy_use_targets(
     crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
     let json =
         nojson::RawJson::parse(line).map_err(|e| format!("request is not valid JSON: {e}"))?;
-    extract_deputy_use_targets_as(&json, rules, opaque_fields)
+    // The standalone entry keeps building the matcher from the
+    // declarations — the session path passes the prepared one instead.
+    let opaque = OpaqueMatcher::build(opaque_fields);
+    extract_deputy_use_targets_as(&json, rules, opaque.as_ref())
 }
 
 /// [`extract_deputy_use_targets`] returning shared `Rc<str>` targets for
 /// the auditor's own deputy check. The public entry keeps `Vec<String>`
 /// so the external signature (and its `Send`/`Sync`) is unchanged; the
 /// shared-storage internals stay crate-internal. The product path passes
-/// the C2S gate's shared `RawJson` — the frame is never reparsed here.
+/// the C2S gate's shared `RawJson` — the frame is never reparsed here —
+/// and the session's prepared opaque matcher, never rebuilt per call.
 pub(crate) fn extract_deputy_use_targets_rc(
     json: &nojson::RawJson<'_>,
     rules: &[DeputyRule],
-    opaque_fields: &[OpaqueField],
+    opaque: Option<&OpaqueMatcher>,
 ) -> Result<Vec<Rc<str>>, String> {
-    extract_deputy_use_targets_as(json, rules, opaque_fields)
+    extract_deputy_use_targets_as(json, rules, opaque)
 }
 
 fn extract_deputy_use_targets_as<S: TargetString>(
     json: &nojson::RawJson<'_>,
     rules: &[DeputyRule],
-    opaque_fields: &[OpaqueField],
+    opaque: Option<&OpaqueMatcher>,
 ) -> Result<Vec<S>, String> {
     let mut out: Vec<S> = Vec::new();
     // `shape "fs_targets"` already covers `params.inputResponses` through
@@ -295,15 +299,14 @@ fn extract_deputy_use_targets_as<S: TargetString>(
     // resolutions happen the same number of times and in the same
     // order as the independent walks this replaces.
     let mut combined: Option<CollectedLeaves> = None;
-    // The tool's declared free-form members — built once here so every
-    // combined classify applies the same exemption set.
-    let opaque = OpaqueMatcher::build(opaque_fields);
+    // The tool's declared free-form members — the caller hands the
+    // matcher (prepared once per session, or built at the standalone
+    // entry) so every combined classify applies the same exemption set.
     for rule in rules {
         match rule {
             DeputyRule::Shape(KnownShape::FsTargets) => {
                 input_responses_covered = true;
-                let targets: ExtractedTargets<S> =
-                    combined_classify(json, &mut combined, opaque.as_ref());
+                let targets: ExtractedTargets<S> = combined_classify(json, &mut combined, opaque);
                 // A truncated classified walk leaves unchecked targets —
                 // a `use`-role call never passes on a partial path set.
                 if targets.truncated {
@@ -368,7 +371,7 @@ fn extract_deputy_use_targets_as<S: TargetString>(
     // fields they cover, and the raw request is forwarded whole — a
     // plausible selector under an undeclared field is refused like an
     // extraction failure rather than reaching the child unchecked.
-    let classified: ExtractedTargets<S> = combined_classify(json, &mut combined, opaque.as_ref());
+    let classified: ExtractedTargets<S> = combined_classify(json, &mut combined, opaque);
     if classified.truncated {
         return Err("argument target extraction exceeded the work budget".to_string());
     }

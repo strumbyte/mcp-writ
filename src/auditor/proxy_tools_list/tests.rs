@@ -19,7 +19,7 @@ fn shared_for_test_with(
     let (abort_tx, abort_rx) = watch::channel(false);
     let (_child_read, child_write) = tokio::io::duplex(64);
     let shared = ProxyShared {
-        policy,
+        policy: crate::policy::prepared::PreparedPolicy::new(policy).into(),
         dry_run,
         fail_on: crate::verifier::fail_on::FailOn::DEFAULT,
         max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,

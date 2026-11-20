@@ -17,7 +17,10 @@ use crate::policy::Policy;
 use crate::verifier::fail_on::FailOn;
 
 pub struct Auditor {
-    policy: Policy,
+    /// The finalized policy plus its once-built execution view —
+    /// the tool-name index and per-tool matchers the checkers and the
+    /// tools/list filter share (RF05a).
+    policy: Arc<crate::policy::prepared::PreparedPolicy>,
     dry_run: bool,
     fail_on: FailOn,
     /// JSON-RPC frame cap applied by both relay directions
@@ -30,7 +33,9 @@ pub struct Auditor {
 impl Auditor {
     pub fn new(policy: Policy, audit_logger: crate::audit_log::AuditLogger) -> Self {
         Self {
-            policy,
+            // The tool set is final here — the session's execution view
+            // is prepared exactly once.
+            policy: Arc::new(crate::policy::prepared::PreparedPolicy::new(policy)),
             dry_run: false,
             fail_on: FailOn::DEFAULT,
             max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
@@ -69,7 +74,7 @@ impl Auditor {
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
         proxy::run_proxy(
-            &self.policy,
+            self.policy.clone(),
             self.dry_run,
             self.fail_on,
             self.max_frame_bytes,

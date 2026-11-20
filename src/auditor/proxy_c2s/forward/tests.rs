@@ -28,7 +28,7 @@ fn shared_for_test_with_writer<W>(child_write: W) -> (ProxyShared<W>, watch::Rec
     let (abort_tx, abort_rx) = watch::channel(false);
     (
         ProxyShared {
-            policy: Policy::default(),
+            policy: crate::policy::prepared::PreparedPolicy::new(Policy::default()).into(),
             dry_run: false,
             fail_on: crate::verifier::fail_on::FailOn::None,
             max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
@@ -140,14 +140,15 @@ fn verified(line: &str) -> checker::VerifiedFrame<'_> {
 #[tokio::test]
 async fn allowed_tools_call_runs_one_parse_and_one_dupkey_scan() {
     let (mut shared, _rx, mut child_read) = shared_for_test();
-    shared
-        .policy
+    let mut policy = Policy::default();
+    policy
         .tools
         .push(crate::policy::ToolPolicy::named("t", true));
     // Trajectory on + a session so `apply_session_gates` exercises
     // the shared-`RawJson` checks (`check_trajectory_json`,
     // `request_has_host_or_url_json`) rather than early-returning.
-    shared.policy.trajectory = true;
+    policy.trajectory = true;
+    shared.set_policy(policy);
     shared.session = Some(Arc::new(Mutex::new(SessionState::new())));
     let window = crate::measure::CountWindow::open();
     let view = verified(CALL_LINE);
@@ -186,6 +187,88 @@ async fn allowed_tools_call_runs_one_parse_and_one_dupkey_scan() {
     .expect("the forwarded frame must arrive within the bound")
     .expect("the child read must complete");
     assert_eq!(buf, expected.as_bytes());
+}
+
+/// RF05a measurement: `set_policy` runs `PreparedPolicy::new` once —
+/// building the tool index and each opaque-declaring tool's matcher —
+/// and N allowed `tools/call` forwards add zero matcher builds and
+/// zero re-preps. The request path (admission lookup, sub-policy,
+/// trajectory, deputy use-gate, pending-call `side_effect`) draws all
+/// of them from the same prepared slots; the deputy gate even reuses
+/// the tool's prepared `OpaqueMatcher` for its closed-contract walk.
+#[cfg(feature = "measure")]
+#[tokio::test]
+async fn session_policy_prep_runs_once_and_requests_rebuild_nothing() {
+    let (mut shared, _rx, mut child_read) = shared_for_test();
+    let mut policy = Policy::default();
+    policy.confused_deputy_protection = true;
+    policy.trajectory = true;
+    policy.tools.push({
+        let mut t = crate::policy::ToolPolicy::named("read_file", true);
+        t.opaque_fields = vec![crate::policy::opaque::OpaqueField::parse("note").unwrap()];
+        t.side_effect = Some("read_only".to_string());
+        t
+    });
+    policy
+        .tools
+        .push(crate::policy::ToolPolicy::named("memo", true));
+
+    let window = crate::measure::CountWindow::open();
+    shared.set_policy(policy);
+    assert_eq!(window.count("policy.prepare.calls"), 1, "one prep per swap");
+    // Exactly the tools declaring opaque fields built a matcher —
+    // `OpaqueMatcher::build` on empty declarations returns `None`
+    // without constructing one.
+    assert_eq!(window.count("policy.opaque.matcher.builds"), 1);
+
+    // `read_file` binds the compat use-role: the discovered path
+    // passes the deputy gate, and every forward exercises the
+    // prepared lookups end to end.
+    let session = Arc::new(Mutex::new(SessionState::new()));
+    session
+        .lock()
+        .await
+        .record_paths(&["/workspace/a.txt".to_string()]);
+    shared.session = Some(session);
+
+    let call = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/a.txt","note":"anything"}}}"#;
+    for i in 0..8 {
+        let id = RpcId::from_u64(7 + i);
+        forward_allowed(
+            &shared,
+            &verified(call),
+            "tools/call",
+            &id,
+            "7",
+            SupportedProtocolVersion::Mcp2025November25,
+            McpVerdict::Allow(AllowReason::RuleAllow),
+            ExtractedRequest::default(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        window.count("policy.opaque.matcher.builds"),
+        1,
+        "no request-path opaque matcher rebuild"
+    );
+    assert_eq!(
+        window.count("policy.prepare.calls"),
+        1,
+        "no request-path re-prep"
+    );
+
+    // The forwarded frames still reach the child.
+    let expected = format!("{call}\n");
+    let mut buf = vec![0u8; expected.len() * 8];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_exact(&mut child_read, &mut buf),
+    )
+    .await
+    .expect("the forwarded frames must arrive within the bound")
+    .expect("the child read must complete");
+    assert_eq!(buf, expected.repeat(8).as_bytes());
 }
 
 /// Publish a verified generation the way `verify_and_emit_list` does:
@@ -522,10 +605,11 @@ async fn matching_list_generation_forwards() {
 async fn unadvertised_tool_is_denied_at_admission() {
     let (mut shared, _rx, mut child_read) = shared_for_test();
     shared.fail_on = crate::verifier::fail_on::FailOn::Critical;
-    shared
-        .policy
+    let mut policy = Policy::default();
+    policy
         .tools
         .push(crate::policy::ToolPolicy::named("t", true));
+    shared.set_policy(policy);
     set_verified(&shared, 1, &["other_tool"]);
     let id = RpcId::from_u64(7);
     forward_allowed(
@@ -556,10 +640,11 @@ async fn unadvertised_tool_is_denied_at_admission() {
 async fn advertised_tool_forwards_under_its_generation() {
     let (mut shared, _rx, mut child_read) = shared_for_test();
     shared.fail_on = crate::verifier::fail_on::FailOn::Critical;
-    shared
-        .policy
+    let mut policy = Policy::default();
+    policy
         .tools
         .push(crate::policy::ToolPolicy::named("t", true));
+    shared.set_policy(policy);
     set_verified(&shared, 1, &["t"]);
     let id = RpcId::from_u64(7);
     forward_allowed(
@@ -839,11 +924,12 @@ fn mrtr_retry_still_runs_the_trajectory_gate() {
 #[tokio::test]
 async fn mrtr_retry_through_forward_allowed_enforces_deputy() {
     let (mut shared, _rx, mut child_read) = shared_for_test();
-    shared.policy.confused_deputy_protection = true;
-    shared
-        .policy
+    let mut policy = Policy::default();
+    policy.confused_deputy_protection = true;
+    policy
         .tools
         .push(crate::policy::ToolPolicy::named("read_file", true));
+    shared.set_policy(policy);
     let session = Arc::new(Mutex::new(SessionState::new()));
     session
         .lock()
@@ -927,16 +1013,18 @@ async fn mrtr_retry_through_forward_allowed_enforces_deputy() {
 #[tokio::test]
 async fn mrtr_retry_through_forward_allowed_enforces_trajectory() {
     let (mut shared, _rx, mut child_read) = shared_for_test();
-    shared.policy.trajectory = true;
-    shared.policy.trajectory_rules = vec![crate::policy::TrajectoryRule {
+    let mut policy = Policy::default();
+    policy.trajectory = true;
+    policy.trajectory_rules = vec![crate::policy::TrajectoryRule {
         after_side_effect: crate::policy::SideEffect::ReadOnly,
         deny_next: crate::policy::SideEffect::Network,
     }];
-    shared.policy.tools.push({
+    policy.tools.push({
         let mut t = crate::policy::ToolPolicy::named("fetch_url", true);
         t.side_effect = Some("network".to_string());
         t
     });
+    shared.set_policy(policy);
     let session = Arc::new(Mutex::new(SessionState::new()));
     session
         .lock()
