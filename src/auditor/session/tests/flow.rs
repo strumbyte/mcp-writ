@@ -459,27 +459,24 @@ fn test_trajectory_verified_success_keeps_unverified_candidates() {
         )
         .unwrap_err();
     assert!(err.contains("deny-next=\"execute\""), "{err}");
-    // Only the call's own definitive response resolves the
-    // tombstone, and only when the verdict establishes non-execution —
-    // the `succeeded=false` transition the response path emits for an
-    // MRTR `input_required` suspend. A JSON-RPC `error` is no longer
-    // treated as proof the call never ran: the response path keeps the
-    // candidate unverified for ambiguous errors, since an internal
-    // error may follow partial work — treating it as non-execution
-    // was an assumption on the server contract, not a wire fact. After
-    // this resolution `after=network` no longer matches — while the
-    // verified Write marker continues to govern.
+    // An MRTR `input_required` suspend is ambiguous — the response
+    // path resolves it through `release_pending_tool_call_unverified`,
+    // never a `succeeded=false` completion: that transition is
+    // reserved for proven non-execution (a registration rollback),
+    // which only ever applies to a live pending entry. Even issuing it
+    // against this id cannot resolve the tombstone — the Network
+    // candidate still denies Execute while the verified Write marker
+    // continues to govern.
     state.complete_pending_tool_call(&RpcId::Number("2".into()), false);
-    assert!(
-        state
-            .check_trajectory(
-                &network_then_execute_rule(),
-                "run_cmd",
-                Some(crate::policy::SideEffect::Execute),
-                false,
-            )
-            .is_ok()
-    );
+    let err = state
+        .check_trajectory(
+            &network_then_execute_rule(),
+            "run_cmd",
+            Some(crate::policy::SideEffect::Execute),
+            false,
+        )
+        .unwrap_err();
+    assert!(err.contains("deny-next=\"execute\""), "{err}");
     let err = state
         .check_trajectory(
             &[crate::policy::TrajectoryRule {
@@ -535,4 +532,47 @@ fn test_trajectory_maybe_tool_name_overflow_disables_exemption() {
         )
         .unwrap_err();
     assert!(err.contains("deny-next=\"read_only\""), "{err}");
+}
+
+#[test]
+fn test_trajectory_tombstoned_id_cannot_be_rearmed() {
+    let mut state = SessionState::new();
+    let id = RpcId::Number("9".into());
+    state
+        .record_pending_tool_call(
+            id.clone(),
+            "read_file",
+            Some(crate::policy::SideEffect::ReadOnly),
+        )
+        .unwrap();
+    // Released without a verdict — the id now carries a tombstone.
+    state.release_pending_tool_call_unverified(&id);
+    // A second call under the same id is refused before it can
+    // forward: recording it would overwrite the first candidate on
+    // release, and the refusal charges nothing.
+    let err = state
+        .record_pending_tool_call(
+            id.clone(),
+            "run_cmd",
+            Some(crate::policy::SideEffect::Execute),
+        )
+        .unwrap_err();
+    assert!(err.contains("unverified"), "{err}");
+    // The first tombstone still counts for `after` matching — a
+    // different tool's network call is denied under after=read_only.
+    let err = state
+        .check_trajectory(
+            &read_only_then_network_rule(),
+            "fetch_url",
+            Some(crate::policy::SideEffect::Network),
+            false,
+        )
+        .unwrap_err();
+    assert!(err.contains("deny-next=\"network\""), "{err}");
+    // The tombstone's own definitive verdict still resolves it — the
+    // id frees once the late reply completes the cancelled call.
+    state.complete_pending_tool_call(&id, true);
+    state
+        .record_pending_tool_call(id, "run_cmd", Some(crate::policy::SideEffect::Execute))
+        .unwrap();
 }

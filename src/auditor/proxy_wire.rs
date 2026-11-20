@@ -647,11 +647,12 @@ fn colon_after(buf: &[u8], after: usize, following: Option<&[u8]>) -> bool {
 /// Member-name positions (the byte just past each name's closing
 /// quote) for members of the frame's *last* complete root — the root
 /// whose close is the retained last byte. `whole` is the reassembled
-/// frame, so `whole[0]` is the frame's own first byte; `tail_start` is
-/// the offset inside it where the retained tail window begins, and
-/// only members ending inside the tail window are reported — members
-/// before it already went through the head scan's own adjudication,
-/// so the tail scan must not resurrect a literal the head rejected.
+/// frame, so `whole[0]` is the frame's own first byte. Every member of
+/// the last root is reported, including ones the head scan already saw
+/// — the callers extract values from `whole` (the complete span) and
+/// deduplicate — while a member whose name closed in the head window
+/// but whose value landed in the tail, invisible to the head scan's
+/// window-bounded extraction, is rescued here.
 ///
 /// A `}`/`]` at the frame's end is not by itself evidence of a root
 /// close — `{"result":{…,"id":5}` ends on a nested `}` the same scan
@@ -667,14 +668,18 @@ fn colon_after(buf: &[u8], after: usize, following: Option<&[u8]>) -> bool {
 /// so a phantom name the backward scan would have credited (a closing
 /// quote of an earlier string reading as `"id"` on raw bytes) can
 /// never be attributed.
-fn tail_member_positions(whole: &[u8], tail_start: usize, name: &str) -> Vec<usize> {
+fn tail_member_positions(whole: &[u8], name: &str) -> Vec<usize> {
     let Some((root_open, _)) = last_root_span(whole) else {
         return Vec::new();
     };
     head_member_positions(&whole[root_open..], name, Some(&[]))
         .into_iter()
         .map(|at| root_open + at)
-        .filter(|&at| at >= tail_start)
+        // Members the head window's own scan already adjudicated are
+        // re-reported — the callers extract values from `whole` and
+        // deduplicate — but a name ending in the head whose value
+        // completes in the tail is recoverable nowhere else, so
+        // position alone must not discard it.
         .rev()
         .collect()
 }
@@ -718,6 +723,14 @@ fn last_root_span(whole: &[u8]) -> Option<(usize, usize)> {
         }
         match b {
             b'"' => {
+                // A `"` at depth 0 opens a *scalar* root — only
+                // `{`/`[` documents bind a frame here, the same
+                // boundary `head_member_positions` enforces on the
+                // first root — so a string between roots leaves the
+                // trailing close's root membership unproven.
+                if depth == 0 {
+                    return None;
+                }
                 // Even or odd backslash run, the bytes ahead lie inside
                 // a string: an unescaped `"` opens one, and an escaped
                 // `\"` can only appear *inside* one. The in-string arm
@@ -867,18 +880,24 @@ pub(crate) fn recover_id_candidates(frame: &OversizeFrame, prefer_tail: bool) ->
     let tail: Vec<String> = whole
         .as_deref()
         .map(|whole| {
-            tail_member_positions(whole, frame.head.len(), "id")
+            tail_member_positions(whole, "id")
                 .into_iter()
                 .filter_map(|at| member_value_literal(whole, at, Some(&[])))
                 .collect()
         })
         .unwrap_or_default();
-    let mut out: Vec<String> = if prefer_tail {
-        tail.into_iter().chain(head).collect()
+    // First-occurrence dedup — tail and head hits can repeat each other
+    // non-adjacently (a seam-crossing member resolves in both scans).
+    let mut out: Vec<String> = Vec::new();
+    for lit in if prefer_tail {
+        tail.into_iter().chain(head)
     } else {
-        head.into_iter().chain(tail).collect()
-    };
-    out.dedup();
+        head.into_iter().chain(tail)
+    } {
+        if !out.contains(&lit) {
+            out.push(lit);
+        }
+    }
     out
 }
 
@@ -1008,23 +1027,55 @@ pub(crate) fn oversize_extra(frame: &OversizeFrame, limit: usize) -> String {
     s
 }
 
+/// Which root document of an oversized frame a recovered member was
+/// read from — lets a caller pair another member only when it came
+/// from the same root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameRoot {
+    /// The frame's first root — `head`-side members, including
+    /// head-window hits on a disjoint frame.
+    First,
+    /// The last complete root — only reachable on a reassembled frame.
+    Last,
+}
+
+/// `id` candidates from the reassembled frame's *last* complete root
+/// only — the same-root counterpart for a `method` recovered from the
+/// tail scan. A disjoint frame yields nothing: without the frame's
+/// first byte the tail's anchor is unprovable.
+pub(crate) fn recover_last_root_id_candidates(frame: &OversizeFrame) -> Vec<String> {
+    reassembled_frame(frame)
+        .map(|whole| {
+            tail_member_positions(&whole, "id")
+                .into_iter()
+                .filter_map(|at| member_value_literal(&whole, at, Some(&[])))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The `method` member of an oversized frame, when it survived in the
 /// retained windows — head first (every emitter writes `method` near
 /// the top), then tail for completeness. `None` means the frame is
-/// treated as a response (requests always carry `method`).
-pub(crate) fn recover_method(frame: &OversizeFrame) -> Option<String> {
+/// treated as a response (requests always carry `method`). The
+/// [`FrameRoot`] says which document supplied it: on a reassembled
+/// multi-root frame an `id` from the *other* root was never named by
+/// this request and must not be paired with it.
+pub(crate) fn recover_method(frame: &OversizeFrame) -> Option<(String, FrameRoot)> {
     let whole = reassembled_frame(frame);
     let tail = whole
         .as_deref()
         .map(|whole| {
-            tail_member_positions(whole, frame.head.len(), "method")
+            tail_member_positions(whole, "method")
                 .into_iter()
                 .filter_map(|at| member_value_literal(whole, at, Some(&[])))
         })
         .into_iter()
-        .flatten();
-    for lit in member_literal_candidates(&frame.head, head_continuation(frame), "method")
+        .flatten()
+        .map(|lit| (lit, FrameRoot::Last));
+    for (lit, root) in member_literal_candidates(&frame.head, head_continuation(frame), "method")
         .into_iter()
+        .map(|lit| (lit, FrameRoot::First))
         .chain(tail)
     {
         // Wrap the literal in an object so a bare scalar parses as a
@@ -1034,7 +1085,7 @@ pub(crate) fn recover_method(frame: &OversizeFrame) -> Option<String> {
             && let Some(v) = member.optional()
             && let Ok(s) = v.as_string_str()
         {
-            return Some(s.to_string());
+            return Some((s.to_string(), root));
         }
     }
     None
@@ -1044,19 +1095,12 @@ pub(crate) async fn write_client_frame<W: tokio::io::AsyncWrite + Unpin>(
     out: &tokio::sync::Mutex<W>,
     line: &str,
 ) -> Result<(), AuditorError> {
-    let mut buf = Vec::with_capacity(line.len() + 1);
-    buf.extend_from_slice(line.as_bytes());
-    buf.push(b'\n');
     let mut guard = out.lock().await;
-    guard.write_all(&buf).await.map_err(io_err)?;
-    // Every byte committed — a flush failure cannot prove the frame
-    // never crossed, so the outcome is unprovable rather than a
-    // clean non-delivery.
-    guard
-        .flush()
-        .await
-        .map_err(AuditorError::DeliveryUncertain)?;
-    Ok(())
+    // The frame bytes and trailing newline write separately so the
+    // delivery classification matches `write_frame_bytes`: a frame
+    // failure is proven non-delivery, while a newline failure leaves
+    // the complete document possibly crossed — `DeliveryUncertain`.
+    write_frame_bytes(&mut *guard, line).await
 }
 
 /// The frame bytes themselves — newline-terminated JSON. Shared by the

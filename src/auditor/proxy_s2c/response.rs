@@ -207,7 +207,13 @@ where
             let is_listen = answered
                 .as_ref()
                 .is_some_and(|a| a.method == "subscriptions/listen");
-            let entry = if is_listen && is_result {
+            // Consume only the registration the `waited_seq`-bound
+            // probe resolved — a stale frame the policy happens to
+            // allow must not retire a same-id replacement (or an
+            // already-answered subscription) sitting under the id.
+            let entry = if answered.is_none() {
+                None
+            } else if is_listen && is_result {
                 wire.mark_responded(C2S, id)
             } else {
                 wire.take(C2S, id)
@@ -316,7 +322,7 @@ where
                         && st.idle()
                         && !shared.raise_list_gate().await
                     {
-                        proxy_tools_list::begin_revalidation(shared, st).await?;
+                        proxy_tools_list::begin_revalidation(shared, st, false).await?;
                     }
                     Ok(())
                 }

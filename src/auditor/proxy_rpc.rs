@@ -467,8 +467,9 @@ pub(crate) struct TrackedRequest {
     /// whole record — until [`WireState::mark_dispatched`] runs after a
     /// successful write, `answered`/`take` treat the entry as invisible:
     /// a frame naming its id while the request still sits in the
-    /// outbound pipe cannot retire work the peer never saw. Internal
-    /// registrations start dispatched — they are written immediately.
+    /// outbound pipe cannot retire work the peer never saw. Every
+    /// registration is born undispatched — including internal ones —
+    /// so a forgotten mark fails closed (invisible), never open.
     pub dispatched: bool,
     /// Registration identity stamped by `register`: a monotonically
     /// increasing sequence distinguishing this registration from a later
@@ -514,7 +515,10 @@ impl TrackedRequest {
             level: ext.level.clone(),
             cancelled: false,
             responded: false,
-            dispatched: true,
+            // Born undispatched like `internal_list` — registration
+            // precedes the write; `mark_dispatched` after it lands is
+            // the boundary where a response may correlate.
+            dispatched: false,
             seq: 0,
             subscription,
         }
@@ -566,6 +570,96 @@ pub(crate) struct AnsweredRequest {
 
 mod wire;
 pub(crate) use wire::WireState;
+
+/// Consume a request's registration after its dispatch resolves —
+/// the same sequence-bound wait the ordinary response paths run
+/// inline. The entry may have registered but not yet been written
+/// (`dispatched` false): the response then parks on
+/// `dispatch_changed` instead of misreading an in-flight write, and
+/// the parked wait binds to that registration's `seq` — a pre-write
+/// rollback frees the id, and a same-id replacement must neither keep
+/// the waiter parked nor be retired by a response addressed to the
+/// removed registration. `bound_seq` pins the consumption to a
+/// registration a prior [`WireState::answered`] probe already
+/// resolved; `None` binds to whatever registration the first probe
+/// sees. `None` is returned when no registration is ever answerable —
+/// absent, still undispatched after its outcome, or removed before
+/// the mark.
+pub(crate) async fn take_after_dispatch(
+    wire_state: &std::sync::Arc<tokio::sync::Mutex<WireState>>,
+    request_dir: MessageDirection,
+    id: &RpcId,
+    bound_seq: Option<u64>,
+) -> Option<TrackedRequest> {
+    let response_dir = opposite(request_dir);
+    let mut bound = bound_seq;
+    let mut wire = wire_state.lock().await;
+    loop {
+        let answered = wire
+            .answered(response_dir, id)
+            .filter(|a| bound.is_none_or(|seq| a.seq == seq));
+        if answered.is_some() {
+            // `answered` and `take` share this guard — the consumed
+            // entry is exactly the registration the probe resolved.
+            return wire.take(request_dir, id);
+        }
+        let waiting = wire
+            .get(request_dir, id)
+            .filter(|e| !e.dispatched && bound.is_none_or(|seq| e.seq == seq))
+            .map(|e| e.seq);
+        let seq = waiting?;
+        let notify = wire.dispatch_changed();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        bound = Some(seq);
+        drop(wire);
+        notified.await;
+        wire = wire_state.lock().await;
+    }
+}
+
+/// The probe half of [`take_after_dispatch`] — resolve the request a
+/// response answers *without* consuming it: the same dispatch wait,
+/// bound to the same `seq`, returning the [`WireState::answered`]
+/// record once the observed registration becomes answerable. `None`
+/// when no registration is ever answerable — absent, still
+/// undispatched after its outcome, removed before the mark, or
+/// replaced under the same id (a same-id replacement can neither keep
+/// the waiter parked nor pose as the removed one). Callers that only
+/// classify — a tools/list reroute, an attribution hint — use this so
+/// the consume decision stays theirs.
+pub(crate) async fn answered_after_dispatch(
+    wire_state: &std::sync::Arc<tokio::sync::Mutex<WireState>>,
+    request_dir: MessageDirection,
+    id: &RpcId,
+    bound_seq: Option<u64>,
+) -> Option<AnsweredRequest> {
+    let response_dir = opposite(request_dir);
+    let mut bound = bound_seq;
+    let mut wire = wire_state.lock().await;
+    loop {
+        let answered = wire
+            .answered(response_dir, id)
+            .filter(|a| bound.is_none_or(|seq| a.seq == seq));
+        if answered.is_some() {
+            return answered;
+        }
+        let waiting = wire
+            .get(request_dir, id)
+            .filter(|e| !e.dispatched && bound.is_none_or(|seq| e.seq == seq))
+            .map(|e| e.seq);
+        let seq = waiting?;
+        let notify = wire.dispatch_changed();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        bound = Some(seq);
+        drop(wire);
+        notified.await;
+        wire = wire_state.lock().await;
+    }
+}
 
 // ── Decision audit ────────────────────────────────────────────────────
 

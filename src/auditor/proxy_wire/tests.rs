@@ -493,17 +493,31 @@ fn window_edge_numeric_id_is_rejected_only_when_unproven() {
     assert!(recover_id_candidates(&disjoint(Some(b'e')), false).is_empty());
     assert!(recover_id_candidates(&disjoint(Some(b'E')), false).is_empty());
 
-    // Adjacent windows — the head's last byte and the tail's first
-    // are consecutive, so the tail proves whether the token
-    // continued. `1}` continues the number (`421`): `42` is only a
-    // prefix and must not be recovered.
+    // Adjacent windows — the windows reassemble into the whole frame,
+    // so a number spanning the seam is recovered as the complete
+    // literal it really is: `1}` joins the head's `42` into the
+    // envelope id `421`. The name closed inside the head window but
+    // its value landed in the tail — recoverable only on the
+    // reassembled root.
     let continues = oversize(br##"{"jsonrpc":"2.0","id":42"##, br##"1}"##);
-    assert!(recover_id_candidates(&continues, false).is_empty());
-    assert!(recover_id_candidates(&continues, true).is_empty());
-    // `e1}` continues it the same way — `42e1` is a single literal.
+    assert_eq!(
+        recover_id_candidates(&continues, false),
+        vec!["421".to_string()]
+    );
+    assert_eq!(
+        recover_id_candidates(&continues, true),
+        vec!["421".to_string()]
+    );
+    // `e1}` completes it the same way — `42e1` is a single literal.
     let exponent = oversize(br##"{"jsonrpc":"2.0","id":42"##, br##"e1}"##);
-    assert!(recover_id_candidates(&exponent, false).is_empty());
-    assert!(recover_id_candidates(&exponent, true).is_empty());
+    assert_eq!(
+        recover_id_candidates(&exponent, false),
+        vec!["42e1".to_string()]
+    );
+    assert_eq!(
+        recover_id_candidates(&exponent, true),
+        vec!["42e1".to_string()]
+    );
 
     // `,` ends the token — the head's `42` is the complete envelope id.
     let complete = oversize(br##"{"jsonrpc":"2.0","id":42"##, br##","x":1}"##);
@@ -662,13 +676,19 @@ fn structured_id_members_are_skipped() {
     let frame = oversize(br##"{"id":{"nested":1},"method":"x""##, b"");
     assert!(recover_id_candidates(&frame, false).is_empty());
     // …but the method is still recoverable.
-    assert_eq!(recover_method(&frame).as_deref(), Some("x"));
+    assert_eq!(
+        recover_method(&frame).map(|(m, _)| m),
+        Some("x".to_string())
+    );
 }
 
 #[test]
 fn recover_method_reads_string_values_only() {
     let request = oversize(br##"{"jsonrpc":"2.0","method":"tools/list","##, b"");
-    assert_eq!(recover_method(&request).as_deref(), Some("tools/list"));
+    assert_eq!(
+        recover_method(&request).map(|(m, _)| m),
+        Some("tools/list".to_string())
+    );
     let response = oversize(br##"{"jsonrpc":"2.0","method":5,"result":{"##, b"}");
     assert_eq!(recover_method(&response), None);
 }

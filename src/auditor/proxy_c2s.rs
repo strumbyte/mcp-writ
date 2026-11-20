@@ -13,9 +13,10 @@ use super::checker;
 use super::proxy_rpc::{self, WireFrame, WireState};
 use super::proxy_state::ProxyShared;
 use super::proxy_wire::{
-    build_jsonrpc_error, build_tools_list_error_response, extract_raw_id_json,
+    FrameRoot, build_jsonrpc_error, build_tools_list_error_response, extract_raw_id_json,
     extract_tool_name_from_json, frame_too_large_message, oversize_extra, read_proxy_frame,
-    recover_id_candidates, recover_method, rpc_id_from_raw_id, write_child_frame,
+    recover_id_candidates, recover_id_candidates_proven, recover_last_root_id_candidates,
+    recover_method, recover_response_evidence, rpc_id_from_raw_id, write_child_frame,
     write_client_frame,
 };
 use super::session::RpcId;
@@ -232,30 +233,47 @@ async fn c2s_oversize<W>(shared: &ProxyShared<W>, frame: &OversizeFrame) -> Resu
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let method = recover_method(frame);
-    // `prefer_tail`: a response's `id` is serialized last by the TS SDK;
-    // a request's sits ahead of `params`.
-    let ids = recover_id_candidates(frame, method.is_none());
+    let (method, method_root) = recover_method(frame)
+        .map(|(m, r)| (Some(m), r))
+        .unwrap_or((None, FrameRoot::First));
+    let ids = if method.is_some() {
+        // A recovered `method` pairs only with `id` candidates from
+        // the same root — on a reassembled multi-root frame another
+        // root's `id` was never named by this request.
+        match method_root {
+            FrameRoot::First => recover_id_candidates_proven(frame),
+            FrameRoot::Last => recover_last_root_id_candidates(frame),
+        }
+    } else {
+        // `prefer_tail`: a response's `id` is serialized last by the
+        // TS SDK; a request's sits ahead of `params`.
+        recover_id_candidates(frame, true)
+    };
 
-    if method.is_none() {
+    if method.is_none() && recover_response_evidence(frame) {
         // Response interpretation first: a recovered id that names a
         // tracked server→client request is answered with an error back
         // to the server (the denied-response path's existing posture).
+        // Both the shape and the id must be *proven* — a client
+        // request's `method` can sit in the omitted middle, so a
+        // method-less frame is not by itself a response, and only
+        // envelope-depth candidates count: a tail hit a nested
+        // `result.id` could spell must not retire a registration.
         let mut released: Option<(String, super::proxy_rpc::TrackedRequest)> = None;
-        {
-            let mut wire = shared.wire.lock().await;
-            for raw in &ids {
-                let Some(id) = rpc_id_from_raw_id(raw) else {
-                    continue;
-                };
-                if wire.answered(C2S, &id).is_none() {
-                    continue;
-                }
-                if let Some(entry) = wire.take(S2C, &id) {
-                    released = Some((raw.clone(), entry));
-                }
-                break;
+        for raw in recover_id_candidates_proven(frame) {
+            let Some(id) = rpc_id_from_raw_id(&raw) else {
+                continue;
+            };
+            // A response can race its own request's dispatch — wait on
+            // the outcome bound to the registration seen first, as the
+            // ordinary response path does: a cancel retiring it
+            // mid-wait, or a same-id replacement following, can never
+            // be handed this frame.
+            if let Some(entry) = proxy_rpc::take_after_dispatch(&shared.wire, S2C, &id, None).await
+            {
+                released = Some((raw, entry));
             }
+            break;
         }
         if let Some((raw, entry)) = released {
             proxy_rpc::audit_decision(
@@ -323,10 +341,18 @@ where
     if kind == "notification" {
         return Ok(());
     }
+    // A recovered response id names a request the *server* made —
+    // echoing it to the client would attribute the refusal to a request
+    // the client never sent, so an unmatched response errors on null.
+    let error_id = if kind == "response" {
+        "null"
+    } else {
+        raw_id.as_deref().unwrap_or("null")
+    };
     write_client_frame(
         &shared.client_out,
         &build_jsonrpc_error(
-            raw_id.as_deref().unwrap_or("null"),
+            error_id,
             &frame_too_large_message("request", shared.max_frame_bytes),
         ),
     )
@@ -637,41 +663,28 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let ext = proxy_rpc::extract_response(view.value());
-    let mut wire = shared.wire.lock().await;
-    let mut answered = wire.answered(C2S, id);
     // A response can race its own request's dispatch: `s2c_request`
     // registers the (S2C,id) entry before the client write and marks it
     // dispatched only after the write lands, so a fast answer can
-    // arrive in between. Wait on the dispatch outcome instead of
-    // rejecting — the mark makes the entry answerable and any removal
-    // ends the wait the same way. The waiter registers while this task
-    // still holds the wire lock, so the transition can never be missed.
-    //
-    // The wait is bound to the registration it started on (`seq`): a
-    // pre-write rollback frees the id, and a *new* request re-registering
-    // it undispatched must neither keep this waiter parked nor resolve
-    // through `answered` — the frame answers the removed registration,
-    // never the replacement.
-    let mut waited_seq = None;
-    while answered.is_none()
-        && let Some(entry) = wire.get(S2C, id)
-        && !entry.dispatched
-        && waited_seq.is_none_or(|seq| seq == entry.seq)
-    {
-        waited_seq = Some(entry.seq);
-        let notify = wire.dispatch_changed();
-        let notified = notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        drop(wire);
-        notified.await;
-        wire = shared.wire.lock().await;
-        answered = wire.answered(C2S, id).filter(|a| Some(a.seq) == waited_seq);
-    }
+    // arrive in between. The wait binds to the registration it started
+    // on (`seq`): a pre-write rollback frees the id, and a *new*
+    // request re-registering it undispatched must neither keep this
+    // waiter parked nor resolve through `answered` — the frame answers
+    // the removed registration, never the replacement.
+    let answered = proxy_rpc::answered_after_dispatch(&shared.wire, S2C, id, None).await;
+    let mut wire = shared.wire.lock().await;
+    // The probe ran outside this guard — re-confirm the registration
+    // under the id is still the one that resolved before consuming it:
+    // a cancel plus same-id replacement could have interleaved.
+    let answered = answered.filter(|a| wire.get(S2C, id).is_some_and(|e| e.seq == a.seq));
     // The revision a response is judged under is the answered request's —
-    // absent a tracked request, fall back to the established wire.
+    // the registration the `waited_seq`-bound probe resolved, never a
+    // same-id replacement or an already-answered subscription sitting
+    // under the id now. Absent a matched request, fall back to the
+    // established wire rather than adopt a replacement's revision.
     let version = wire
         .get(S2C, id)
+        .filter(|e| answered.as_ref().is_some_and(|a| a.seq == e.seq))
         .map(|e| e.version)
         .unwrap_or_else(|| wire.passive_version());
     let verdict = {
@@ -681,7 +694,14 @@ where
     };
     match verdict {
         McpVerdict::Allow(_) => {
-            let entry = wire.take(S2C, id);
+            // Consume only the registration the `waited_seq` probe
+            // resolved — a same-id replacement or an already-answered
+            // subscription under the id is not this response's request.
+            let entry = if answered.is_some() {
+                wire.take(S2C, id)
+            } else {
+                None
+            };
             if let Some(ref e) = entry {
                 wire.on_response_forwarded(C2S, e, &ext, ext.has_result && !ext.is_error);
             }

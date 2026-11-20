@@ -187,39 +187,61 @@ where
                 if tracked {
                     return route_tools_list(shared, st, line, &parsed, value, Some(reason)).await;
                 }
-                // A tools/list request armed on the C2S side could
-                // register between the `tracked` probe above and this
-                // lookup — `answered` still proves the request genuinely
-                // crossed, so the frame belongs to the list pipeline's
-                // fail-closed malformed handling. Route without
-                // consuming: `handle_tools_list_response` unwinds the
-                // `pending_tools_list` membership and gate state itself —
-                // an entry already taken here leaves its listing armed
-                // with no registration left to complete it.
-                if let Some(ref id) = rpc_id
-                    && shared
-                        .wire
-                        .lock()
-                        .await
-                        .answered(S2C, id)
-                        .is_some_and(|a| a.method == "tools/list")
-                {
-                    return route_tools_list(shared, st, line, &parsed, value, Some(reason)).await;
-                }
-                // A malformed response answering any other tracked
-                // request still terminates that RPC — dropping it would
-                // leave the client's waiter hanging and leak the wire
-                // entry plus the tools/call pending bookkeeping. Consume
-                // the entry the same way the denied-response path does
-                // (`responded` entries are never re-answerable), release
-                // the session state, and answer the waiter with an
-                // error; dry-run observes by forwarding the frame.
+                // Dispatch resolution, method classification, and the
+                // consume itself share one wire lock — a tools/list
+                // request could reach `dispatched` between separate
+                // probes (armed on the C2S side after `answered` missed
+                // the first time), and a listing taken here would
+                // bypass the pipeline's own fail-closed settlement.
                 let entry = if let Some(ref id) = rpc_id {
-                    let mut wire = shared.wire.lock().await;
-                    if wire.answered(S2C, id).is_some() {
-                        wire.take(C2S, id)
-                    } else {
-                        None
+                    // The frame can still race its own request's
+                    // dispatch mark — wait on the outcome bound to the
+                    // registration first observed, as the well-formed
+                    // response path does. A rollback frees the id, and
+                    // a same-id replacement must neither keep the wait
+                    // parked nor be consumed by a frame addressed to
+                    // the removed registration.
+                    match proxy_rpc::answered_after_dispatch(&shared.wire, C2S, id, None).await {
+                        // `answered` proves the listing genuinely
+                        // crossed — the frame belongs to the list
+                        // pipeline's malformed handling. Route without
+                        // consuming: `handle_tools_list_response`
+                        // unwinds the `pending_tools_list` membership
+                        // and gate state itself — an entry already
+                        // taken here leaves its listing armed with no
+                        // registration left to complete it.
+                        Some(a) if a.method == "tools/list" => {
+                            return route_tools_list(
+                                shared,
+                                st,
+                                line,
+                                &parsed,
+                                value,
+                                Some(reason),
+                            )
+                            .await;
+                        }
+                        // A malformed response answering any other
+                        // tracked request still terminates that RPC —
+                        // dropping it would leave the client's waiter
+                        // hanging and leak the wire entry plus the
+                        // tools/call pending bookkeeping. Consume the
+                        // entry the same way the denied-response path
+                        // does (`responded` entries are never
+                        // re-answerable), release the session state,
+                        // and answer the waiter with an error; dry-run
+                        // observes by forwarding the frame.
+                        // Consume bound to the resolved registration's
+                        // seq — the probe-to-take gap can have seen a
+                        // removal plus a same-id replacement, which
+                        // this frame must not retire.
+                        Some(a) => {
+                            proxy_rpc::take_after_dispatch(&shared.wire, C2S, id, Some(a.seq)).await
+                        }
+                        // The observed registration vanished, or a
+                        // same-id replacement sits under the id now —
+                        // the frame matched neither, so it drops.
+                        None => None,
                     }
                 } else {
                     None

@@ -10,9 +10,10 @@ use crate::auditor::proxy_list_state::S2cListState;
 use crate::auditor::proxy_rpc;
 use crate::auditor::proxy_state::ProxyShared;
 use crate::auditor::proxy_wire::{
-    build_jsonrpc_error, frame_too_large_message, oversize_extra, recover_id_candidates,
-    recover_id_candidates_proven, recover_method, recover_response_evidence,
-    recover_response_shape, rpc_id_from_raw_id, write_child_frame, write_client_frame,
+    FrameRoot, build_jsonrpc_error, frame_too_large_message, oversize_extra,
+    recover_id_candidates_proven, recover_last_root_id_candidates, recover_method,
+    recover_response_evidence, recover_response_shape, rpc_id_from_raw_id, write_child_frame,
+    write_client_frame,
 };
 use crate::auditor::session::RpcId;
 use crate::error::AuditorError;
@@ -41,13 +42,14 @@ use crate::policy::mcp::{DenyReason, McpVerdict};
 /// that id; the session continues on the next frame. A response that
 /// cannot be correlated is audited and answered with `id: null` — the
 /// JSON-RPC convention for an error that cannot name its request —
-/// rather than dropping the session over it. The unproven `id`
+/// rather than dropping the session over it. The shape root's own `id`
 /// candidates still decide what the frame may have stranded: an id
 /// naming a live request retires it with a per-request error (an
 /// internal id aborts, a pending `tools/list` unwinds through the list
 /// machinery), while a frame offering no trustworthy request-specific
 /// evidence — no candidates, or only untracked ones — must not select
-/// or fail unrelated pending requests.
+/// or fail unrelated pending requests, and a frame whose middle was
+/// dropped can never be proven an orphan at all.
 ///
 /// Nothing oversized is ever forwarded — under `--dry-run` either,
 /// because only bounded windows were retained of the refused frame.
@@ -62,9 +64,17 @@ where
     let version = shared.wire.lock().await.passive_version();
     let extra = || Some(oversize_extra(frame, shared.max_frame_bytes));
 
-    if let Some(method) = recover_method(frame) {
-        // A request's `id` sits ahead of `params` — head-first recovery.
-        let raw_id = recover_id_candidates(frame, false)
+    if let Some((method, root)) = recover_method(frame) {
+        // The server-facing error echoes an `id` only when it came
+        // from the same root that supplied the `method` — on a
+        // reassembled multi-root frame another root's `id` was never
+        // named by this request. A request's `id` sits ahead of
+        // `params`, so the first-root scan already orders correctly.
+        let candidates = match root {
+            FrameRoot::First => recover_id_candidates_proven(frame),
+            FrameRoot::Last => recover_last_root_id_candidates(frame),
+        };
+        let raw_id = candidates
             .into_iter()
             .find(|raw| rpc_id_from_raw_id(raw).is_some_and(|id| !matches!(id, RpcId::Null)));
         // Only a recovered `notifications/*` method proves a dropped
@@ -113,15 +123,18 @@ where
     // depth); a frame showing neither may be an oversized server
     // request whose live `id` must not be retired. Correlation
     // candidates are likewise restricted to provable top-level members
-    // — head-window hits only: a disjoint tail's backward scan can
-    // promote a nested `result.id` to apparent envelope depth. (The
-    // unresolvable arm below does consult unproven tail hits — as
+    // — the response-shape root's own `id`s only: a disjoint tail's
+    // backward scan can promote a nested `result.id` to apparent
+    // envelope depth, and on a reassembled multi-root frame a later
+    // root's `id` was never named by the response. (The unresolvable
+    // arm below consults the same root-scoped candidates as
     // attribution hints for which live requests the frame stranded —
-    // never as the frame's own proven id.) `answered` and `take` run
-    // under one lock hold: probing first and removing later would let a
-    // cancel / capacity reclaim retire the matched request in between
-    // and hand this handler either a stale entry or a replacement
-    // request carrying the same id.
+    // never as the frame's own proven id.) The consume runs through
+    // the same sequence-bound dispatch wait the ordinary response
+    // path uses: a response racing its own request's write waits for
+    // that registration's outcome, and a cancel / capacity reclaim
+    // that retires it in between — or a same-id replacement that
+    // follows — can never be answered by this frame.
     let mut resolved: Option<(String, RpcId, proxy_rpc::TrackedRequest)> = None;
     if recover_response_evidence(frame) {
         for raw in recover_id_candidates_proven(frame) {
@@ -131,14 +144,8 @@ where
             if matches!(id, RpcId::Null) {
                 continue;
             }
-            let entry = {
-                let mut wire = shared.wire.lock().await;
-                match wire.answered(S2C, &id) {
-                    Some(_) => wire.take(C2S, &id),
-                    None => None,
-                }
-            };
-            if let Some(entry) = entry {
+            if let Some(entry) = proxy_rpc::take_after_dispatch(&shared.wire, C2S, &id, None).await
+            {
                 resolved = Some((raw, id, entry));
                 break;
             }
@@ -173,34 +180,30 @@ where
         // `result`/`error` member at envelope depth — is enough for
         // this: even a fully retained frame whose `jsonrpc` member is
         // missing or invalid consumed its response slot, so returning
-        // success here would strand whatever it answered. The unproven
-        // `id` candidates — tail hits never complete an RPC, but they
-        // are the best attribution hint the frame leaves — select what
-        // the frame plausibly stranded: a candidate naming a live
-        // request marks that call, a tools/list candidate unwinds its
-        // listing through the same path a correlated refusal takes,
-        // and an internal id aborts like the internal rejection.
-        // Candidates naming only untracked ids make the frame an
-        // orphan that stranded nothing, and a frame that yields no
-        // candidate at all provides no request-specific evidence — a
-        // null-id error must never select or fail unrelated pending
-        // requests.
+        // success here would strand whatever it answered. The `id`
+        // candidates select what the frame plausibly stranded: a
+        // candidate naming a live request marks that call, a tools/list
+        // candidate unwinds its listing through the same path a
+        // correlated refusal takes, and an internal id aborts like the
+        // internal rejection.
         if recover_response_shape(frame) {
-            // Tail-window candidates are attribution hints only when
-            // the windows cover the whole frame: the tail scan then
-            // proves the trailing `}`/`]` really is a root close —
-            // the forward scan must see depth return to 0 exactly at
-            // the frame's last byte, back to the frame's own first
-            // byte. On a disjoint tail no byte is the frame start, so
-            // no close in it can be proven a root close — a nested
-            // `result.id` ending an unclosed root reads identically to
-            // a genuine trailing envelope `id` — and on an
-            // unterminated tail cut mid-frame the last byte may be a
-            // nested close either way. Unproven hits could retire,
-            // unwind, or abort a live request they were never
-            // addressed to, so only proven candidates are trusted.
-            let candidates = recover_id_candidates(frame, true);
+            // Candidates are restricted to the root that supplied the
+            // response shape — the frame's first root, which is also
+            // where `recover_response_shape` scans. On a reassembled
+            // multi-root frame the tail scan's anchor is the *last*
+            // root: a second root's `id` was never named by the
+            // response and must not retire a request. When the shape
+            // root is also the last — the single-root case — its
+            // trailing members still recover, and on a disjoint frame
+            // only head-window hits are provable either way.
+            let candidates = recover_id_candidates_proven(frame);
             let no_candidates = candidates.is_empty();
+            // A frame the retained windows do not cover is
+            // unclassifiable — the response's real `id` may sit in the
+            // dropped middle, so an all-miss candidate list cannot
+            // prove the frame an orphan either.
+            let whole_covered = frame.head.len().saturating_add(frame.tail.len()) >= frame.bytes;
+            let mut consumed_any = false;
             for raw in candidates {
                 let Some(sid) = rpc_id_from_raw_id(&raw) else {
                     continue;
@@ -208,10 +211,18 @@ where
                 if matches!(sid, RpcId::Null) {
                     continue;
                 }
-                // Only a live, dispatched request can have been answered
-                // — the `take` below still revalidates because a cancel
-                // or reclaim can retire the selected entry first.
-                let Some(answered) = shared.wire.lock().await.answered(S2C, &sid) else {
+                // Only a request that crossed can have been answered —
+                // but the dispatch mark can lag the wire write by an
+                // await, so wait on the observed registration's
+                // outcome bound to its `seq`: a frame naming an
+                // undispatched id whose write then lands *is* that
+                // request's dropped answer, while a rollback or a
+                // same-id replacement resolves the wait without
+                // matching — the frame can never be handed a
+                // replacement's slot.
+                let Some(answered) =
+                    proxy_rpc::answered_after_dispatch(&shared.wire, C2S, &sid, None).await
+                else {
                     continue;
                 };
                 if answered.internal || st.is_internal_response(Some(&sid)) {
@@ -220,21 +231,34 @@ where
                 let on_list_path = answered.method == "tools/list"
                     && shared.pending_tools_list.lock().await.contains(&sid);
                 if on_list_path {
-                    // Retire the registration, then unwind the pending
-                    // listing — the same unwind a correlated refusal
-                    // takes.
-                    shared.wire.lock().await.take(C2S, &sid);
-                    return unwind_oversized_listing(shared, st, &sid, &raw).await;
+                    // Retire exactly the registration resolved above —
+                    // bound to its seq — then unwind the pending
+                    // listing the same way a correlated refusal does.
+                    // A `None` means a cancel or reclaim already
+                    // retired it between the membership check and the
+                    // take: the frame stranded nothing this unwind
+                    // owns, so it must neither send the listing error
+                    // nor alter a newer listing's state.
+                    if proxy_rpc::take_after_dispatch(&shared.wire, C2S, &sid, Some(answered.seq))
+                        .await
+                        .is_some()
+                    {
+                        return unwind_oversized_listing(shared, st, &sid, &raw).await;
+                    }
+                    continue;
                 }
                 if answered.method == "tools/list" {
                     // A stale answer to a cancelled client listing —
                     // its bookkeeping is already gone; nothing is owed.
                     continue;
                 }
-                let entry = shared.wire.lock().await.take(C2S, &sid);
-                let Some(entry) = entry else {
+                let Some(entry) =
+                    proxy_rpc::take_after_dispatch(&shared.wire, C2S, &sid, Some(answered.seq))
+                        .await
+                else {
                     continue;
                 };
+                consumed_any = true;
                 if entry.method == "tools/call"
                     && let Some(ref session) = shared.session
                 {
@@ -259,11 +283,16 @@ where
             // indistinguishable from a stray frame, so per-request
             // failure cannot be isolated: terminate the session and
             // let teardown settle the pending calls rather than leave
-            // them hanging or fail unrelated work. Candidates that
-            // resolved to live requests were handled above; candidates
-            // naming only untracked ids make the frame an orphan that
-            // stranded nothing it claimed.
-            if no_candidates && shared.wire.lock().await.has_unanswered(C2S) {
+            // them hanging or fail unrelated work. On a fully retained
+            // frame candidates that resolved to live requests were
+            // handled above and candidates naming only untracked ids
+            // make the frame an orphan that stranded nothing it
+            // claimed — but with a dropped middle the miss proves
+            // nothing, so only attribution itself discharges the abort.
+            if !consumed_any
+                && (no_candidates || !whole_covered)
+                && shared.wire.lock().await.has_unanswered(C2S)
+            {
                 return Err(AuditorError::VerificationFailed(
                     "oversized response could not be attributed to an in-flight request"
                         .to_string(),

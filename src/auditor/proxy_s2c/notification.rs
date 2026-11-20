@@ -82,8 +82,16 @@ where
                 Err(e) => {
                     // Skipped for `DeliveryUncertain` — the complete
                     // frame may still have crossed, so "not forwarded"
-                    // is unprovable.
-                    if !matches!(e, AuditorError::DeliveryUncertain(_)) {
+                    // is unprovable — except for list_changed:
+                    // `handle_list_changed` holds the notification in
+                    // `st.held_list_changed` and its only writes are
+                    // the internal probe's child-bound one, so a
+                    // `DeliveryUncertain` there describes the probe's
+                    // delivery, never this notification's — the
+                    // notification provably never crossed.
+                    let suppress = matches!(e, AuditorError::DeliveryUncertain(_))
+                        && method != "notifications/tools/list_changed";
+                    if !suppress {
                         proxy_rpc::audit_forward_failed(
                             &shared.audit,
                             S2C,

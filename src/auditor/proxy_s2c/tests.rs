@@ -117,6 +117,7 @@ async fn input_required_fixture_forwards_its_result_to_the_client() {
             TrackedRequest::from_extracted("tools/call", V26, true, false, &ext),
         )
         .expect("register the tracked tools/call");
+        wire.mark_dispatched(C2S, &id);
         // Establish the 2026 revision the way a first C2S forward does.
         wire.on_request_forwarded(C2S, &id, "tools/call", V26, &ext);
     }
@@ -404,9 +405,10 @@ async fn input_required_result_keeps_cancelled_calls_deny_candidate() {
     let line = std::fs::read_to_string(&path).expect("fixture");
     let line = line.trim_end();
     let emitted = run_response(shared, client_read, id, "2", line).await;
-    assert!(
-        !emitted.is_empty(),
-        "a valid interim result still forwards to the client"
+    assert_eq!(
+        emitted,
+        format!("{line}\n").into_bytes(),
+        "a valid interim result still forwards to the client unchanged"
     );
     assert!(
         execute_denied(&session).await,
@@ -553,6 +555,7 @@ async fn unterminated_oversize_nested_tail_id_cannot_retire_a_live_request() {
             TrackedRequest::from_extracted("tools/call", V26, true, false, &ext),
         )
         .expect("register the tracked tools/call");
+        wire.mark_dispatched(C2S, &id);
     }
     let frame = crate::framing::OversizeFrame {
         // `result` at envelope depth proves response shape; the nested
@@ -597,6 +600,7 @@ async fn terminated_oversize_nested_close_cannot_retire_a_live_request() {
             TrackedRequest::from_extracted("tools/call", V26, true, false, &ext),
         )
         .expect("register the tracked tools/call");
+        wire.mark_dispatched(C2S, &id);
     }
     let frame = crate::framing::OversizeFrame {
         // Root and `result` both stay unclosed — the tail's last `}`
@@ -616,5 +620,50 @@ async fn terminated_oversize_nested_close_cannot_retire_a_live_request() {
     assert!(
         shared.wire.lock().await.get(C2S, &id).is_some(),
         "the nested trailing id must not retire the live request"
+    );
+}
+
+/// A reassembled two-root frame: the response shape comes from the
+/// first root, so only that root may name the request it answers. A
+/// second root's `id` — provable as that root's own envelope member —
+/// was never named by the response and must not retire a live
+/// request. The frame is unattributable: fail closed, registration
+/// preserved.
+#[tokio::test]
+async fn reassembled_second_root_id_cannot_retire_a_live_request() {
+    let (shared, _abort_rx, _client_read) = shared_for_test();
+    let mut st = S2cListState::new();
+    let id = RpcId::from_u64(99);
+    {
+        let mut wire = shared.wire.lock().await;
+        let ext = ExtractedRequest::default();
+        wire.register(
+            C2S,
+            id.clone(),
+            TrackedRequest::from_extracted("tools/call", V26, true, false, &ext),
+        )
+        .expect("register the tracked tools/call");
+        wire.mark_dispatched(C2S, &id);
+    }
+    // The windows cover the whole frame: root-1 is a complete
+    // response-shaped document carrying no `id`, root-2 a separate
+    // response-shaped document carrying the live request's id. A
+    // `method` in root-2 would route the frame to the request arm
+    // instead of exercising the response attribution under test.
+    let frame = crate::framing::OversizeFrame {
+        head: br##"{"jsonrpc":"2.0","result":{"x":1}}{"##.to_vec(),
+        tail: br##""id":99,"result":{}}"##.to_vec(),
+        head_next: None,
+        bytes: 55,
+        terminated: true,
+    };
+    let result = oversize::s2c_oversize(&shared, &mut st, &frame).await;
+    assert!(
+        matches!(result, Err(AuditorError::VerificationFailed(_))),
+        "an unattributable oversized response must fail closed: {result:?}"
+    );
+    assert!(
+        shared.wire.lock().await.get(C2S, &id).is_some(),
+        "a second root's id must not retire the live request"
     );
 }

@@ -97,8 +97,9 @@ pub(super) struct LeafWalk {
 /// normalizes or retains its tail.
 pub(in crate::auditor::checker) struct CollectedLeaves<'a> {
     leaves: Vec<ScalarLeaf<'a>>,
-    /// The shared leaf budget tripped during collection — the stored
-    /// leaves are a strict prefix of the real scalar set.
+    /// The collection stopped before the scalar set ran out — either
+    /// the shared leaf budget or the first classify's own target
+    /// budget tripped — so the stored leaves are a strict prefix.
     leaf_truncated: bool,
 }
 
@@ -172,11 +173,16 @@ pub(in crate::auditor::checker) fn walk_combined_classified<'a, S: TargetString>
     if walk.truncated {
         out.truncated = true;
     }
+    // The merged cutoff — a classify-side budget trip aborts the walk
+    // via `done` without setting `walk.truncated`, yet the stored
+    // leaves are still a strict prefix of the real scalar set, so
+    // replays must propagate truncated.
+    let leaf_truncated = out.truncated;
     (
         out,
         CollectedLeaves {
             leaves,
-            leaf_truncated: walk.truncated,
+            leaf_truncated,
         },
     )
 }

@@ -366,9 +366,11 @@ impl WireState {
     }
 
     /// Consume the tracked request a response answers. An entry whose
-    /// request never finished dispatching (`dispatched` still false)
-    /// cannot be consumed — its bytes never left the proxy, so no frame
-    /// can legitimately answer it.
+    /// dispatch the proxy has not confirmed (`dispatched` still false)
+    /// cannot be consumed — that is only an absence of confirmation,
+    /// not proof the request bytes never left the proxy or that the
+    /// peer could not have answered, so `take` leaves the entry alone
+    /// rather than treating it as undeliverable.
     pub(crate) fn take(
         &mut self,
         direction: MessageDirection,

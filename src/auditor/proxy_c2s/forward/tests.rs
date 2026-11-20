@@ -506,7 +506,11 @@ async fn matching_list_generation_forwards() {
     .await
     .unwrap();
     assert!(forwarded);
-    assert!(shared.wire.lock().await.get(C2S, &id).is_some());
+    let answered = shared.wire.lock().await.answered(super::super::S2C, &id);
+    assert!(
+        answered.is_some_and(|a| a.method == "tools/call"),
+        "the forwarded request must be dispatched and correlate a response"
+    );
 }
 
 /// F6: a statically allowed tool the verified listing did not

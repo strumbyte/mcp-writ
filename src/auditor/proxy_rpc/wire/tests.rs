@@ -1,7 +1,13 @@
 use super::*;
 
 fn req(method: &str) -> TrackedRequest {
-    TrackedRequest::from_extracted(method, V25, true, false, &ExtractedRequest::default())
+    // Most wire tests exercise the post-write view — hand them an
+    // already-dispatched entry; the invisibility boundary has its own
+    // coverage below.
+    let mut entry =
+        TrackedRequest::from_extracted(method, V25, true, false, &ExtractedRequest::default());
+    entry.dispatched = true;
+    entry
 }
 
 fn num(n: u64) -> RpcId {

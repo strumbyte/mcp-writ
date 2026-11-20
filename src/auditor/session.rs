@@ -338,6 +338,14 @@ impl SessionState {
         if self.pending_tool_calls.contains_key(&request_id) {
             return Err("duplicate in-flight JSON-RPC id".to_string());
         }
+        if self.unverified_tool_calls.contains_key(&request_id) {
+            // The id still carries the earlier call's tombstone — a
+            // second call recorded under it would overwrite that
+            // candidate on release, so the request is refused before
+            // it can forward. Retained bytes stay with the tombstone:
+            // nothing new was charged.
+            return Err("JSON-RPC id still carries an unverified call".to_string());
+        }
         if self.pending_tool_calls.len() >= MAX_PENDING_TOOL_CALLS {
             return Err("too many pending tool calls".to_string());
         }
@@ -380,9 +388,7 @@ impl SessionState {
             }
             return;
         }
-        if let Some(tombstone) = self.take_unverified(request_id)
-            && succeeded
-        {
+        if succeeded && let Some(tombstone) = self.take_unverified(request_id) {
             self.record_verified_success(tombstone.tool_name, tombstone.side_effect);
         }
     }

@@ -49,16 +49,19 @@ where
             // The entry is born undispatched — invisible to `answered`/
             // `take` until the client write completes, so a response
             // frame cannot retire a request the client never saw.
-            let mut tracked =
+            let tracked =
                 TrackedRequest::from_extracted(method, version, true, shared.dry_run, &ext);
-            tracked.dispatched = false;
             let registered = wire
                 .register(S2C, id.clone(), tracked)
                 .map(|()| wire.on_request_forwarded(S2C, id, method, version, &ext));
             drop(wire);
             match registered {
                 Ok(undo) => {
-                    proxy_rpc::audit_forwarded_decision(
+                    // A failed commit means the frame must not cross —
+                    // the request provably never reached the client, so
+                    // the registration and the side effect committed
+                    // with it unwind like a definite write failure.
+                    if let Err(e) = proxy_rpc::audit_forwarded_decision(
                         &shared.audit,
                         S2C,
                         "request",
@@ -69,7 +72,11 @@ where
                         shared.dry_run,
                         None,
                     )
-                    .await?;
+                    .await
+                    {
+                        shared.wire.lock().await.rollback_forwarded_request(undo);
+                        return Err(e);
+                    }
                     match write_client_frame(&shared.client_out, line).await {
                         Ok(()) => {
                             // The request reached the client — it may

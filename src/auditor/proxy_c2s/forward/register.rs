@@ -67,10 +67,11 @@ where
 /// here — the refusal must be durable ahead of delivery to the child,
 /// not recorded once the forward result is known. `Ok(false)` has the
 /// same refusal-or-stale-admission meaning as the allowed path. A
-/// proven non-delivery write failure unwinds the registration without a
-/// corrective record — the caller's committed decision already stands
-/// as the request's fate — while `DeliveryUncertain` retains it because
-/// the frame may still have crossed.
+/// proven non-delivery write failure unwinds the registration; this
+/// helper writes no corrective record itself — the `deny_request`
+/// caller reconciles the committed decision with
+/// `audit_forward_failed` on that outcome — while `DeliveryUncertain`
+/// retains the registration because the frame may still have crossed.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn register_and_forward_denied<W>(
     shared: &ProxyShared<W>,
@@ -133,9 +134,7 @@ where
         // this id while the request still sits in the child-stdin pipe
         // is an anomaly that must not retire a request the server never
         // received. `mark_dispatched` runs when the write completes.
-        let mut tracked =
-            TrackedRequest::from_extracted(method, version, allowed, shared.dry_run, ext);
-        tracked.dispatched = false;
+        let tracked = TrackedRequest::from_extracted(method, version, allowed, shared.dry_run, ext);
         match wire.register(C2S, id.clone(), tracked) {
             Err(reason) => {
                 drop(wire);
@@ -155,12 +154,21 @@ where
                         Some(format!("register={reason}")),
                     )?;
                 }
-                write_client_frame(
+                // Same separation as the stale-admission refusal below:
+                // the request provably never crossed (registration
+                // refused it), so a `DeliveryUncertain` from this
+                // refusal reply describes the error frame's delivery —
+                // never the request's — and must not surface as
+                // request-delivery uncertainty upstream.
+                return match write_client_frame(
                     &shared.client_out,
                     &build_jsonrpc_error(raw_id, &format!("request denied ({reason})")),
                 )
-                .await?;
-                return Ok(false);
+                .await
+                {
+                    Ok(()) => Ok(false),
+                    Err(e) => Err(AuditorError::PostDeliveryFailure(Box::new(e))),
+                };
             }
             Ok(()) => wire.on_request_forwarded(C2S, id, method, version, ext),
         }
@@ -170,7 +178,10 @@ where
     // record, so a saturated or dead sink refuses the forward here
     // rather than discovering the failure on the next frame.
     if let Some(verdict) = audit_verdict {
-        proxy_rpc::audit_forwarded_decision(
+        // A failed commit means the frame must not cross — the request
+        // provably never reached the child, so the provisional
+        // registration unwinds like every other proven non-delivery.
+        if let Err(e) = proxy_rpc::audit_forwarded_decision(
             &shared.audit,
             C2S,
             "request",
@@ -181,9 +192,16 @@ where
             shared.dry_run,
             request_extra(ext),
         )
-        .await?;
+        .await
+        {
+            shared.wire.lock().await.rollback_forwarded_request(undo);
+            return Err(e);
+        }
     }
-    shared.audit.ensure_available()?;
+    if let Err(e) = shared.audit.ensure_available() {
+        shared.wire.lock().await.rollback_forwarded_request(undo);
+        return Err(e);
+    }
     // Verified-set recheck (F6/F10): the admission-time capture is
     // compared immediately before the child write. A `list_changed`
     // revalidation raises `list_busy` before it starts and bumps the
@@ -271,12 +289,26 @@ where
                 request_extra(ext),
             );
         }
-        write_client_frame(
+        // The refusal send is separate from the request's dispatch
+        // outcome, which is already settled — rolled back above and
+        // reconciled not-forwarded. A `DeliveryUncertain` from this
+        // client write describes the error frame's delivery, never the
+        // request's arrival at the child, so it must not surface as
+        // `Err(DeliveryUncertain)` and trigger request-delivery
+        // uncertainty handling upstream (which would keep an unverified
+        // tool-call candidate for a request that provably never
+        // crossed). `PostDeliveryFailure` propagates the real error for
+        // teardown while the request's own bookkeeping resolves as
+        // proven non-execution.
+        return match write_client_frame(
             &shared.client_out,
             &build_jsonrpc_error(raw_id, "tools/list revalidation began during authorization"),
         )
-        .await?;
-        return Ok(false);
+        .await
+        {
+            Ok(()) => Ok(false),
+            Err(e) => Err(AuditorError::PostDeliveryFailure(Box::new(e))),
+        };
     };
     if let Some(verdict) = audit_verdict
         && result.is_err()

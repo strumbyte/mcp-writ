@@ -26,8 +26,8 @@ fn pad() -> String {
 /// `result.id` could impersonate the same scan shape — so the client
 /// gets the uncorrelatable `id: null` error rather than a wrong
 /// request being retired. The audit record carries `frame-too-large`
-/// and a following request still completes — the refusal stays
-/// per-frame.
+/// and the session ends while a request is still outstanding — stdout
+/// EOFs and the child exits non-zero rather than stranding it.
 #[tokio::test]
 async fn oversized_response_with_unprovable_tail_id_aborts_the_session() {
     let dir = make_test_dir("oversize_s2c");
@@ -82,7 +82,7 @@ async fn oversized_response_with_unprovable_tail_id_aborts_the_session() {
             match reader.next_line().await {
                 Ok(Some(_)) => continue,
                 Ok(None) => return true,
-                Err(_) => return true,
+                Err(e) => panic!("the stdout read must not error: {e}"),
             }
         }
     })
@@ -306,14 +306,16 @@ async fn oversized_uncorrelated_response_errors_null_then_aborts() {
     // The ghost's `id` sits in a disjoint tail window — it can never
     // carry root-boundary evidence, so the frame is unattributable
     // while request 51 waits on an answer that may have been consumed:
-    // fail-closed ends the session instead of stranding it.
+    // fail-closed ends the session instead of stranding it. Nothing
+    // may follow the refusal — including request 51's real result —
+    // the next stdout read must already be EOF.
     let reached_eof = timeout(Duration::from_secs(TIMEOUT_SECS), async {
-        loop {
-            match reader.next_line().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => return true,
-                Err(_) => return true,
+        match reader.next_line().await {
+            Ok(None) => true,
+            Ok(Some(line)) => {
+                panic!("no response may follow the uncorrelatable refusal: {line}")
             }
+            Err(e) => panic!("the stdout read must not error: {e}"),
         }
     })
     .await
