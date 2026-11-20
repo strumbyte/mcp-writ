@@ -1055,12 +1055,12 @@ pub(crate) fn recover_last_root_id_candidates(frame: &OversizeFrame) -> Vec<Stri
 }
 
 /// The `method` member of an oversized frame, when it survived in the
-/// retained windows — head first (every emitter writes `method` near
-/// the top), then tail for completeness. `None` means the frame is
-/// treated as a response (requests always carry `method`). The
-/// [`FrameRoot`] says which document supplied it: on a reassembled
-/// multi-root frame an `id` from the *other* root was never named by
-/// this request and must not be paired with it.
+/// retained windows — the first root first (every emitter writes
+/// `method` near the top), then the last root for completeness. `None`
+/// means the frame is treated as a response (requests always carry
+/// `method`). The [`FrameRoot`] says which document supplied it: on a
+/// reassembled multi-root frame an `id` from the *other* root was
+/// never named by this request and must not be paired with it.
 pub(crate) fn recover_method(frame: &OversizeFrame) -> Option<(String, FrameRoot)> {
     let whole = reassembled_frame(frame);
     let tail = whole
@@ -1073,7 +1073,15 @@ pub(crate) fn recover_method(frame: &OversizeFrame) -> Option<(String, FrameRoot
         .into_iter()
         .flatten()
         .map(|lit| (lit, FrameRoot::Last));
-    for (lit, root) in member_literal_candidates(&frame.head, head_continuation(frame), "method")
+    // The first root reads from the complete bytes when the retained
+    // windows reassemble — a `method` value split at a window seam is
+    // still recovered whole, inside the root that owns it. Disjoint
+    // windows only prove what the head window itself retained.
+    let first = match whole.as_deref() {
+        Some(whole) => member_literal_candidates(whole, Some(&[]), "method"),
+        None => member_literal_candidates(&frame.head, head_continuation(frame), "method"),
+    };
+    for (lit, root) in first
         .into_iter()
         .map(|lit| (lit, FrameRoot::First))
         .chain(tail)

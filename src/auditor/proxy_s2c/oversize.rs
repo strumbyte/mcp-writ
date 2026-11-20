@@ -24,7 +24,10 @@ use crate::policy::mcp::{DenyReason, McpVerdict};
 ///
 /// A recovered `method` marks a server request or notification — a
 /// request is answered with an error back to the *server* (2025 only —
-/// 2026 forbids server→client requests). A frame whose `method`
+/// 2026 forbids server→client requests). A `method` recovered from a
+/// *later* root of a reassembled multi-root frame never reclassifies a
+/// first root proving response shape — that response is correlated
+/// from its own root, or fails closed below. A frame whose `method`
 /// survives but whose `id` does not is answered on `id: null` unless
 /// the method names a `notifications/*` method: JSON-RPC orders
 /// members freely, so a request's `id` can sit between the retained
@@ -64,7 +67,17 @@ where
     let version = shared.wire.lock().await.passive_version();
     let extra = || Some(oversize_extra(frame, shared.max_frame_bytes));
 
-    if let Some((method, root)) = recover_method(frame) {
+    // A `method` recovered from a *later* root never reclassifies the
+    // frame's own (first) root: a root proving response shape consumed
+    // a response slot, so the response arm below owns the frame —
+    // correlated from its own root's `id` candidates, or failed closed
+    // when the conflicting roots prevent attribution. A frame that is
+    // a single notification root still owes no answer.
+    let method = match recover_method(frame) {
+        Some((_, FrameRoot::Last)) if recover_response_shape(frame) => None,
+        recovered => recovered,
+    };
+    if let Some((method, root)) = method {
         // The server-facing error echoes an `id` only when it came
         // from the same root that supplied the `method` — on a
         // reassembled multi-root frame another root's `id` was never
@@ -197,7 +210,14 @@ where
             // trailing members still recover, and on a disjoint frame
             // only head-window hits are provable either way.
             let candidates = recover_id_candidates_proven(frame);
-            let no_candidates = candidates.is_empty();
+            // Only a candidate that *names* a request — a literal
+            // resolving to a non-null `RpcId` — can prove the frame an
+            // orphan: `null` and unusable literals name nothing, so a
+            // frame carrying no usable id is as unattributable as one
+            // whose `id` fell into the dropped middle.
+            let no_usable_id = !candidates
+                .iter()
+                .any(|raw| rpc_id_from_raw_id(raw).is_some_and(|id| !matches!(id, RpcId::Null)));
             // A frame the retained windows do not cover is
             // unclassifiable — the response's real `id` may sit in the
             // dropped middle, so an all-miss candidate list cannot
@@ -290,7 +310,7 @@ where
             // claimed — but with a dropped middle the miss proves
             // nothing, so only attribution itself discharges the abort.
             if !consumed_any
-                && (no_candidates || !whole_covered)
+                && (no_usable_id || !whole_covered)
                 && shared.wire.lock().await.has_unanswered(C2S)
             {
                 return Err(AuditorError::VerificationFailed(

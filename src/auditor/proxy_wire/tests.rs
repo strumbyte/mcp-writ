@@ -694,6 +694,41 @@ fn recover_method_reads_string_values_only() {
 }
 
 #[test]
+fn recover_method_seam_split_value_stays_with_its_root() {
+    // The method's *name* closed inside the head window but its value
+    // completed in the tail: the reassembled first-root scan still
+    // recovers it — attributed to the first root it belongs to, not
+    // rescued by the last-root scan.
+    let frame = oversize(
+        br##"{"jsonrpc":"2.0","method":"tools/"##,
+        br##"call","id":7}"##,
+    );
+    assert_eq!(
+        recover_method(&frame),
+        Some(("tools/call".to_string(), FrameRoot::First))
+    );
+
+    // The same split on a multi-root frame: the first root's `method`
+    // is invisible to the last-root scan — losing it would reclassify
+    // a request as a response.
+    let multi = oversize(
+        br##"{"method":"tools/"##,
+        br##"call","id":9}{"result":{}}"##,
+    );
+    assert_eq!(
+        recover_method(&multi),
+        Some(("tools/call".to_string(), FrameRoot::First))
+    );
+
+    // A `method` only a *later* root supplies still reports `Last`.
+    let last = oversize(br##"{"result":{"x":1}"##, br##"}{"method":"ping"}"##);
+    assert_eq!(
+        recover_method(&last),
+        Some(("ping".to_string(), FrameRoot::Last))
+    );
+}
+
+#[test]
 fn test_extract_raw_id_null_value() {
     let line = r#"{"jsonrpc":"2.0","id":null,"method":"tools/call"}"#;
     assert_eq!(extract_raw_id(line), Some("null".to_string()));

@@ -1,3 +1,4 @@
+use super::super::{S2C, c2s_oversize};
 use super::register::*;
 use super::session_gates::*;
 use super::*;
@@ -1004,5 +1005,289 @@ async fn mrtr_retry_through_forward_allowed_enforces_trajectory() {
         String::from_utf8(frame).unwrap(),
         format!("{retry}\n"),
         "the child must receive the retry frame verbatim"
+    );
+}
+
+/// An oversized client frame proving response shape that correlates to
+/// no tracked server→client request cannot be settled: whichever
+/// dispatched server request it answered would hang waiting on a reply
+/// that is never coming. With one still awaiting, the refusal fails
+/// the session closed — the same unattributable-response posture the
+/// S2C oversize path takes — rather than answering `id: null` and
+/// letting the waiter hang.
+#[tokio::test]
+async fn unattributable_oversize_response_fails_closed_2025() {
+    let (shared, _rx, _child_read) = shared_for_test();
+    let id = RpcId::from_u64(9);
+    {
+        let mut wire = shared.wire.lock().await;
+        let ext = ExtractedRequest::default();
+        wire.register(
+            S2C,
+            id.clone(),
+            proxy_rpc::TrackedRequest::from_extracted(
+                "sampling/createMessage",
+                SupportedProtocolVersion::Mcp2025November25,
+                true,
+                false,
+                &ext,
+            ),
+        )
+        .expect("register the tracked server request");
+        wire.mark_dispatched(S2C, &id);
+    }
+    let body = br##"{"jsonrpc":"2.0","result":{"x":1},"id":null}"##.to_vec();
+    let frame = crate::framing::OversizeFrame {
+        bytes: body.len(),
+        head: body,
+        tail: Vec::new(),
+        head_next: None,
+        terminated: true,
+    };
+    let result = c2s_oversize(&shared, &frame).await;
+    assert!(
+        matches!(result, Err(AuditorError::VerificationFailed(_))),
+        "an unattributable oversized response must fail closed: {result:?}"
+    );
+    assert!(
+        shared.wire.lock().await.get(S2C, &id).is_some(),
+        "the unanswerable frame must not retire the server request"
+    );
+}
+
+/// The same frame naming a *usable* but untracked `id` is a proven
+/// orphan on a fully retained frame — it answered nothing still in
+/// flight, so the session survives with the generic `id: null`
+/// refusal.
+#[tokio::test]
+async fn untracked_id_oversize_response_is_a_proven_orphan() {
+    let (shared, _rx, _child_read) = shared_for_test();
+    let id = RpcId::from_u64(9);
+    {
+        let mut wire = shared.wire.lock().await;
+        let ext = ExtractedRequest::default();
+        wire.register(
+            S2C,
+            id.clone(),
+            proxy_rpc::TrackedRequest::from_extracted(
+                "sampling/createMessage",
+                SupportedProtocolVersion::Mcp2025November25,
+                true,
+                false,
+                &ext,
+            ),
+        )
+        .expect("register the tracked server request");
+        wire.mark_dispatched(S2C, &id);
+    }
+    let body = br##"{"jsonrpc":"2.0","id":5,"result":{"x":1}}"##.to_vec();
+    let frame = crate::framing::OversizeFrame {
+        bytes: body.len(),
+        head: body,
+        tail: Vec::new(),
+        head_next: None,
+        terminated: true,
+    };
+    let result = c2s_oversize(&shared, &frame).await;
+    assert!(
+        result.is_ok(),
+        "a proven orphan must not tear down the session: {result:?}"
+    );
+    assert!(
+        shared.wire.lock().await.get(S2C, &id).is_some(),
+        "an orphan's untracked id must not retire the server request"
+    );
+}
+
+/// A recovered `id` naming a tracked server→client request is still
+/// answered with an error back to the *server* — the matched-2025
+/// path keeps its reply so the request does not hang.
+#[tokio::test]
+async fn matched_oversize_response_still_answers_the_server() {
+    let (shared, _rx, mut child_read) = shared_for_test();
+    let id = RpcId::from_u64(9);
+    {
+        let mut wire = shared.wire.lock().await;
+        let ext = ExtractedRequest::default();
+        wire.register(
+            S2C,
+            id.clone(),
+            proxy_rpc::TrackedRequest::from_extracted(
+                "sampling/createMessage",
+                SupportedProtocolVersion::Mcp2025November25,
+                true,
+                false,
+                &ext,
+            ),
+        )
+        .expect("register the tracked server request");
+        wire.mark_dispatched(S2C, &id);
+    }
+    let body = br##"{"jsonrpc":"2.0","id":9,"result":{"x":1}}"##.to_vec();
+    let frame = crate::framing::OversizeFrame {
+        bytes: body.len(),
+        head: body,
+        tail: Vec::new(),
+        head_next: None,
+        terminated: true,
+    };
+    let result = c2s_oversize(&shared, &frame).await;
+    assert!(
+        result.is_ok(),
+        "a matched response settles without aborting: {result:?}"
+    );
+    assert!(
+        shared.wire.lock().await.get(S2C, &id).is_none(),
+        "the correlated id retires the server request's tracking"
+    );
+    let mut buf = vec![0u8; 512];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut child_read, &mut buf),
+    )
+    .await
+    .expect("the server must see the refusal within the bound")
+    .expect("the server read must complete");
+    assert!(
+        String::from_utf8_lossy(&buf[..n]).contains("\"id\":9"),
+        "the refusal echoes the correlated id: {}",
+        String::from_utf8_lossy(&buf[..n])
+    );
+}
+
+/// The matched arm keeps the 2026 posture: a tracked server→client
+/// request registered under the 2026 revision is retired silently —
+/// server→client requests are revision-illegal there, so the matched
+/// path writes the server no reply.
+#[tokio::test]
+async fn matched_oversize_response_writes_no_server_reply_2026() {
+    let (shared, _rx, mut child_read) = shared_for_test();
+    let id = RpcId::from_u64(9);
+    {
+        let mut wire = shared.wire.lock().await;
+        let ext = ExtractedRequest::default();
+        wire.register(
+            S2C,
+            id.clone(),
+            proxy_rpc::TrackedRequest::from_extracted(
+                "sampling/createMessage",
+                SupportedProtocolVersion::Mcp2026July28,
+                true,
+                false,
+                &ext,
+            ),
+        )
+        .expect("register the tracked server request");
+        wire.mark_dispatched(S2C, &id);
+    }
+    let body = br##"{"jsonrpc":"2.0","id":9,"result":{"x":1}}"##.to_vec();
+    let frame = crate::framing::OversizeFrame {
+        bytes: body.len(),
+        head: body,
+        tail: Vec::new(),
+        head_next: None,
+        terminated: true,
+    };
+    let result = c2s_oversize(&shared, &frame).await;
+    assert!(
+        result.is_ok(),
+        "a matched response settles without aborting: {result:?}"
+    );
+    assert!(
+        shared.wire.lock().await.get(S2C, &id).is_none(),
+        "the correlated id retires the server request's tracking"
+    );
+    let mut buf = [0u8; 64];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        tokio::io::AsyncReadExt::read(&mut child_read, &mut buf),
+    )
+    .await;
+    assert!(
+        read.is_err(),
+        "the 2026 matched path writes the server no reply"
+    );
+}
+
+/// Two raw spellings of one canonical id — `9` and `9.0` — must probe
+/// the wire once. The first probe parks on the undispatched
+/// registration's seq; a rollback frees the id and a replacement
+/// re-registers it before the probe's miss resolves, so the parked
+/// lookup returns `None`. A second lookup on the same canonical id
+/// would observe — and consume — that replacement, a registration the
+/// frame postdates and could never have answered.
+#[tokio::test]
+async fn repeated_canonical_id_cannot_consume_a_replacement() {
+    let (shared, _rx, mut child_read) = shared_for_test();
+    let id = RpcId::from_u64(9);
+    {
+        let mut wire = shared.wire.lock().await;
+        let ext = ExtractedRequest::default();
+        wire.register(
+            S2C,
+            id.clone(),
+            proxy_rpc::TrackedRequest::from_extracted(
+                "sampling/createMessage",
+                SupportedProtocolVersion::Mcp2025November25,
+                true,
+                false,
+                &ext,
+            ),
+        )
+        .expect("register the tracked server request");
+        // Deliberately undispatched — the response's first probe parks
+        // on this registration's seq.
+    }
+    let body = br##"{"jsonrpc":"2.0","id":9,"id":9.0,"result":{"x":1}}"##.to_vec();
+    let frame = crate::framing::OversizeFrame {
+        bytes: body.len(),
+        head: body,
+        tail: Vec::new(),
+        head_next: None,
+        terminated: true,
+    };
+    let task_shared = shared.clone();
+    let handle = tokio::spawn(async move { c2s_oversize(&task_shared, &frame).await });
+    // The parked probe binds to the first registration's seq — give
+    // the spawned task its turns so it is waiting before the id's
+    // slot changes hands.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    {
+        let mut wire = shared.wire.lock().await;
+        wire.unregister(S2C, &id);
+        let ext = ExtractedRequest::default();
+        wire.register(
+            S2C,
+            id.clone(),
+            proxy_rpc::TrackedRequest::from_extracted(
+                "sampling/createMessage",
+                SupportedProtocolVersion::Mcp2025November25,
+                true,
+                false,
+                &ext,
+            ),
+        )
+        .expect("register the replacement");
+        wire.mark_dispatched(S2C, &id);
+    }
+    let result = handle.await.expect("the oversize task completes");
+    assert!(
+        result.is_ok(),
+        "the frame is a proven orphan — both spellings name a usable id: {result:?}"
+    );
+    assert!(
+        shared.wire.lock().await.get(S2C, &id).is_some(),
+        "a repeat probe on the same canonical id must not consume the replacement"
+    );
+    let mut buf = [0u8; 64];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        tokio::io::AsyncReadExt::read(&mut child_read, &mut buf),
+    )
+    .await;
+    assert!(
+        read.is_err(),
+        "no release reply may reach the server for an unconsumed registration"
     );
 }

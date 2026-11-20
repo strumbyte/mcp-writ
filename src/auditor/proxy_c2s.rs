@@ -16,7 +16,7 @@ use super::proxy_wire::{
     FrameRoot, build_jsonrpc_error, build_tools_list_error_response, extract_raw_id_json,
     extract_tool_name_from_json, frame_too_large_message, oversize_extra, read_proxy_frame,
     recover_id_candidates, recover_id_candidates_proven, recover_last_root_id_candidates,
-    recover_method, recover_response_evidence, rpc_id_from_raw_id, write_child_frame,
+    recover_method, recover_response_shape, rpc_id_from_raw_id, write_child_frame,
     write_client_frame,
 };
 use super::session::RpcId;
@@ -223,8 +223,14 @@ where
 /// server→client request: resolved `id` candidates release that
 /// request's tracked entry and an error goes to the *server* (2025
 /// only — 2026 forbids client→server responses) so its request does
-/// not hang. Unidentifiable frames get an `id: null` error, the same
-/// posture `deny_malformed` takes.
+/// not hang. A frame that proves response shape yet correlates to
+/// nothing fails the session closed while a dispatched server→client
+/// request still awaits its answer — the same unattributable-response
+/// posture the S2C path takes; a fully retained frame naming only
+/// untracked ids is a proven orphan. A `method` recovered from a
+/// *later* root of a reassembled multi-root frame never reclassifies
+/// a first root proving response shape. Unidentifiable frames get an
+/// `id: null` error, the same posture `deny_malformed` takes.
 ///
 /// Nothing oversized is ever forwarded — including under `--dry-run`,
 /// because dry-run observes decisions on frames the proxy still
@@ -233,9 +239,20 @@ async fn c2s_oversize<W>(shared: &ProxyShared<W>, frame: &OversizeFrame) -> Resu
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (method, method_root) = recover_method(frame)
-        .map(|(m, r)| (Some(m), r))
-        .unwrap_or((None, FrameRoot::First));
+    let response_shape = recover_response_shape(frame);
+    let (method, method_root) = match recover_method(frame) {
+        // A `method` recovered from a *later* root never reclassifies
+        // the frame's own (first) root: a root proving response shape
+        // consumed a response slot, so the response handling below
+        // owns the frame — correlated from its own root's `id`
+        // candidates, or failed closed when the conflicting roots
+        // prevent attribution. A single notification root still owes
+        // no answer.
+        Some((_, FrameRoot::Last)) if response_shape => (None, FrameRoot::First),
+        recovered => recovered
+            .map(|(m, r)| (Some(m), r))
+            .unwrap_or((None, FrameRoot::First)),
+    };
     let ids = if method.is_some() {
         // A recovered `method` pairs only with `id` candidates from
         // the same root — on a reassembled multi-root frame another
@@ -250,7 +267,7 @@ where
         recover_id_candidates(frame, true)
     };
 
-    if method.is_none() && recover_response_evidence(frame) {
+    if method.is_none() && response_shape {
         // Response interpretation first: a recovered id that names a
         // tracked server→client request is answered with an error back
         // to the server (the denied-response path's existing posture).
@@ -260,10 +277,21 @@ where
         // envelope-depth candidates count: a tail hit a nested
         // `result.id` could spell must not retire a registration.
         let mut released: Option<(String, super::proxy_rpc::TrackedRequest)> = None;
+        // Distinct raw spellings resolve to the same canonical id —
+        // `9` and `9.0` are both `Number("9e0")`. Repeating a lookup
+        // for a canonical id already probed `None` would observe a
+        // *newer* registration than the miss settled: a same-id
+        // replacement registered after the miss must never be consumed
+        // by a frame it postdates, so probes dedup on `RpcId` while
+        // still scanning every distinct id the frame names.
+        let mut probed = std::collections::HashSet::new();
         for raw in recover_id_candidates_proven(frame) {
             let Some(id) = rpc_id_from_raw_id(&raw) else {
                 continue;
             };
+            if !probed.insert(id.clone()) {
+                continue;
+            }
             // A response can race its own request's dispatch — wait on
             // the outcome bound to the registration seen first, as the
             // ordinary response path does: a cancel retiring it
@@ -272,8 +300,8 @@ where
             if let Some(entry) = proxy_rpc::take_after_dispatch(&shared.wire, S2C, &id, None).await
             {
                 released = Some((raw, entry));
+                break;
             }
-            break;
         }
         if let Some((raw, entry)) = released {
             proxy_rpc::audit_decision(
@@ -340,6 +368,34 @@ where
     )?;
     if kind == "notification" {
         return Ok(());
+    }
+    // A frame that proved response shape consumed a response slot —
+    // whichever in-flight server→client request it answered may now
+    // wait forever on a reply that is never coming, and its identity
+    // is unprovable: candidates that resolved were already settled by
+    // the matched arm above, so a fully retained frame whose usable
+    // (parseable, non-null) `id`s are all untracked is a proven
+    // orphan that stranded nothing it claimed. Anything else — no
+    // usable id, or the real `id` lost in the dropped middle — cannot
+    // be attributed, so the session fails closed and teardown settles
+    // the pending requests rather than leave them hanging (2025 only:
+    // 2026 forbids server→client requests, so nothing can be
+    // stranded).
+    if kind == "response"
+        && !matches!(version, V26)
+        && response_shape
+        && shared.wire.lock().await.has_unanswered(S2C)
+    {
+        let whole_covered = frame.head.len().saturating_add(frame.tail.len()) >= frame.bytes;
+        let orphan = whole_covered
+            && recover_id_candidates_proven(frame)
+                .iter()
+                .any(|raw| rpc_id_from_raw_id(raw).is_some_and(|id| !matches!(id, RpcId::Null)));
+        if !orphan {
+            return Err(AuditorError::VerificationFailed(
+                "oversized response could not be attributed to an in-flight request".to_string(),
+            ));
+        }
     }
     // A recovered response id names a request the *server* made —
     // echoing it to the client would attribute the refusal to a request

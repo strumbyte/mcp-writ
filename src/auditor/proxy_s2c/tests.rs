@@ -667,3 +667,166 @@ async fn reassembled_second_root_id_cannot_retire_a_live_request() {
         "a second root's id must not retire the live request"
     );
 }
+
+/// A fully retained oversized response whose only envelope `id` is the
+/// literal `null` names no request — but `null` is also the marker a
+/// peer emits when it cannot identify the request it answers, so it
+/// cannot prove the frame an orphan either: with an in-flight request
+/// still waiting the frame is unattributable and fails closed.
+#[tokio::test]
+async fn null_id_oversize_cannot_discharge_the_orphan_check() {
+    let (shared, _abort_rx, _client_read) = shared_for_test();
+    let mut st = S2cListState::new();
+    let id = RpcId::from_u64(99);
+    {
+        let mut wire = shared.wire.lock().await;
+        let ext = ExtractedRequest::default();
+        wire.register(
+            C2S,
+            id.clone(),
+            TrackedRequest::from_extracted("tools/call", V26, true, false, &ext),
+        )
+        .expect("register the tracked tools/call");
+        wire.mark_dispatched(C2S, &id);
+    }
+    let body = br##"{"jsonrpc":"2.0","error":{"code":-1,"message":"x"},"id":null}"##.to_vec();
+    let frame = crate::framing::OversizeFrame {
+        bytes: body.len(),
+        head: body,
+        tail: Vec::new(),
+        head_next: None,
+        terminated: true,
+    };
+    let result = oversize::s2c_oversize(&shared, &mut st, &frame).await;
+    assert!(
+        matches!(result, Err(AuditorError::VerificationFailed(_))),
+        "a null-id response cannot prove an orphan — it must fail closed: {result:?}"
+    );
+    assert!(
+        shared.wire.lock().await.get(C2S, &id).is_some(),
+        "the null id must not retire the live request"
+    );
+}
+
+/// A reassembled two-root frame whose *first* root proves a response: a
+/// later notification-shaped root cannot suppress it — silently
+/// dropping the frame would strand the request the response answered.
+/// The response is correlated from its own root's `id`s: the live
+/// request retires and the client gets the refusal on its id.
+#[tokio::test]
+async fn later_notification_root_cannot_suppress_a_proven_response() {
+    let (shared, _abort_rx, mut client_read) = shared_for_test();
+    let mut st = S2cListState::new();
+    let id = RpcId::from_u64(99);
+    {
+        let mut wire = shared.wire.lock().await;
+        let ext = ExtractedRequest::default();
+        wire.register(
+            C2S,
+            id.clone(),
+            TrackedRequest::from_extracted("tools/call", V26, true, false, &ext),
+        )
+        .expect("register the tracked tools/call");
+        wire.mark_dispatched(C2S, &id);
+    }
+    let head = br##"{"jsonrpc":"2.0","result":{"x":1},"id":99}{"##.to_vec();
+    let tail = br##""method":"notifications/progress","params":{}}"##.to_vec();
+    let frame = crate::framing::OversizeFrame {
+        bytes: head.len() + tail.len(),
+        head,
+        tail,
+        head_next: None,
+        terminated: true,
+    };
+    let result = oversize::s2c_oversize(&shared, &mut st, &frame).await;
+    assert!(
+        result.is_ok(),
+        "a correlated response settles without aborting: {result:?}"
+    );
+    assert!(
+        shared.wire.lock().await.get(C2S, &id).is_none(),
+        "the first root's response id retires its request"
+    );
+    drop(shared);
+    let mut emitted = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut client_read, &mut emitted)
+        .await
+        .expect("read the emitted client error");
+    let emitted = String::from_utf8_lossy(&emitted);
+    assert!(
+        emitted.contains("\"id\":99"),
+        "the client sees the refusal on the correlated id: {emitted}"
+    );
+}
+
+/// The same two-root conflict with nothing to correlate against: the
+/// first root proves a response consumed a slot but carries no `id`
+/// the wire table knows — and the later notification root cannot
+/// declare the frame harmless. Unattributable while a request awaits:
+/// fail closed, registration preserved.
+#[tokio::test]
+async fn conflicting_roots_fail_closed_when_unattributable() {
+    let (shared, _abort_rx, _client_read) = shared_for_test();
+    let mut st = S2cListState::new();
+    let id = RpcId::from_u64(99);
+    {
+        let mut wire = shared.wire.lock().await;
+        let ext = ExtractedRequest::default();
+        wire.register(
+            C2S,
+            id.clone(),
+            TrackedRequest::from_extracted("tools/call", V26, true, false, &ext),
+        )
+        .expect("register the tracked tools/call");
+        wire.mark_dispatched(C2S, &id);
+    }
+    let head = br##"{"jsonrpc":"2.0","result":{"x":1}}{"##.to_vec();
+    let tail = br##""method":"notifications/cancelled"}"##.to_vec();
+    let frame = crate::framing::OversizeFrame {
+        bytes: head.len() + tail.len(),
+        head,
+        tail,
+        head_next: None,
+        terminated: true,
+    };
+    let result = oversize::s2c_oversize(&shared, &mut st, &frame).await;
+    assert!(
+        matches!(result, Err(AuditorError::VerificationFailed(_))),
+        "an unattributable oversized response must fail closed: {result:?}"
+    );
+    assert!(
+        shared.wire.lock().await.get(C2S, &id).is_some(),
+        "the conflicting roots must not retire the live request"
+    );
+}
+
+/// A frame whose only root is a notification owed no answer: the
+/// single-root no-reply path stays silent — and silence is provable,
+/// since the harness drops the server's read half so any attempted
+/// `write_child_frame` would surface BrokenPipe instead.
+#[tokio::test]
+async fn single_notification_root_owes_no_reply() {
+    let (shared, _abort_rx, mut client_read) = shared_for_test();
+    let mut st = S2cListState::new();
+    let body =
+        br##"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"##
+            .to_vec();
+    let frame = crate::framing::OversizeFrame {
+        bytes: body.len(),
+        head: body,
+        tail: Vec::new(),
+        head_next: None,
+        terminated: true,
+    };
+    let result = oversize::s2c_oversize(&shared, &mut st, &frame).await;
+    assert!(result.is_ok(), "a notification owes no reply: {result:?}");
+    drop(shared);
+    let mut emitted = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut client_read, &mut emitted)
+        .await
+        .expect("read the client stream to its end");
+    assert!(
+        emitted.is_empty(),
+        "a notification emits nothing on either writer: {emitted:?}"
+    );
+}
