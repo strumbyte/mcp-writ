@@ -21,11 +21,15 @@ fn pad() -> String {
 }
 
 /// A ~2 MiB response (`id` serialized last, the TS-SDK layout) crosses a
-/// 1 MiB cap: the request gets a JSON-RPC error on its recovered id, the
-/// audit record carries `frame-too-large`, and a following request still
-/// completes — the refusal stays per-request.
+/// 1 MiB cap: the recovered `id` lands in the disjoint tail window,
+/// which cannot *prove* it is a top-level member — a nested
+/// `result.id` could impersonate the same scan shape — so the client
+/// gets the uncorrelatable `id: null` error rather than a wrong
+/// request being retired. The audit record carries `frame-too-large`
+/// and the session ends while a request is still outstanding — stdout
+/// EOFs and the child exits non-zero rather than stranding it.
 #[tokio::test]
-async fn oversized_response_errors_per_request_and_session_continues() {
+async fn oversized_response_with_unprovable_tail_id_aborts_the_session() {
     let dir = make_test_dir("oversize_s2c");
     let policy = write_policy(dir.path(), WIRE_POLICY);
     let audit_log = common::next_audit_log_path();
@@ -38,28 +42,61 @@ async fn oversized_response_errors_per_request_and_session_continues() {
     );
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let _guard = ChildGuard(child);
+    let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
-    let err = send_and_recv(&mut stdin, &mut reader, &call("read_file", 41)).await;
+    // A second request dispatched *before* the oversized response is
+    // consumed — the frame's `id` sits at its very end, inside the
+    // retained tail window of a frame too large to reassemble.
+    stdin
+        .write_all(format!("{}\n", call("read_file", 41)).as_bytes())
+        .await
+        .expect("write request 41");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}\n")
+        .await
+        .expect("write request 42");
+    stdin.flush().await.expect("flush both requests");
+
+    let err = recv_jsonrpc(&mut reader).await;
     assert!(has_error(&err), "oversized response must error: {err}");
-    // The frame's `id` sits at its very end — recovering `41` proves
-    // the tail-window scan.
-    assert_eq!(json_id(&err).as_deref(), Some("41"), "got: {err}");
+    // A tail-window hit on a disjoint frame is only a hint — the
+    // trailing `}` cannot be proven to close the root (the same bytes
+    // spell a nested `result.id` on a malformed root), so the error
+    // cannot name its request.
+    assert_eq!(json_id(&err).as_deref(), Some("null"), "got: {err}");
     assert!(
         error_message(&err).contains("frame-too-large"),
         "got: {err}"
     );
 
-    // The session continues on the next frame.
-    let pong = send_and_recv(
-        &mut stdin,
-        &mut reader,
-        r#"{"jsonrpc":"2.0","id":42,"method":"ping"}"#,
-    )
-    .await;
-    assert!(has_result(&pong), "ping after refusal must pass: {pong}");
+    // No candidate carries root-boundary evidence, so the frame cannot
+    // be attributed to a live request — and with requests still
+    // unanswered, whichever one it answered would hang forever.
+    // Fail-closed settles them by ending the session: stdout EOFs and
+    // the child exits non-zero rather than letting a nested trailing
+    // id retire the wrong request.
+    let reached_eof = timeout(Duration::from_secs(TIMEOUT_SECS), async {
+        loop {
+            match reader.next_line().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => return true,
+                Err(e) => panic!("the stdout read must not error: {e}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        reached_eof,
+        "an unattributable oversized response must end the session"
+    );
+    let status = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
+        .await
+        .expect("guard must exit")
+        .expect("wait");
+    assert!(!status.success(), "the aborted launch must fail: {status}");
 
     let audit = wait_audit_contains(&audit_log, "frame-too-large");
     let denied = audit_lines(&audit, "mcp_message.denied");
@@ -237,7 +274,7 @@ async fn oversized_notification_dropped_without_client_error() {
 /// refused with `id: null` — the JSON-RPC convention for an
 /// uncorrelatable error — and the call's real answer still completes it.
 #[tokio::test]
-async fn oversized_uncorrelated_response_errors_null_and_continues() {
+async fn oversized_uncorrelated_response_errors_null_then_aborts() {
     let dir = make_test_dir("oversize_ghost");
     let policy = write_policy(dir.path(), WIRE_POLICY);
     let audit_log = common::next_audit_log_path();
@@ -250,7 +287,7 @@ async fn oversized_uncorrelated_response_errors_null_and_continues() {
     );
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let _guard = ChildGuard(child);
+    let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
@@ -266,11 +303,29 @@ async fn oversized_uncorrelated_response_errors_null_and_continues() {
         has_error(&first) && json_id(&first).as_deref() == Some("null"),
         "the uncorrelatable refusal must carry id null: {first}"
     );
-    let second = recv_jsonrpc(&mut reader).await;
-    assert!(
-        has_result(&second) && json_id(&second).as_deref() == Some("51"),
-        "the real response must still complete the call: {second}"
-    );
+    // The ghost's `id` sits in a disjoint tail window — it can never
+    // carry root-boundary evidence, so the frame is unattributable
+    // while request 51 waits on an answer that may have been consumed:
+    // fail-closed ends the session instead of stranding it. Nothing
+    // may follow the refusal — including request 51's real result —
+    // the next stdout read must already be EOF.
+    let reached_eof = timeout(Duration::from_secs(TIMEOUT_SECS), async {
+        match reader.next_line().await {
+            Ok(None) => true,
+            Ok(Some(line)) => {
+                panic!("no response may follow the uncorrelatable refusal: {line}")
+            }
+            Err(e) => panic!("the stdout read must not error: {e}"),
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(reached_eof, "the unattributable frame must end the session");
+    let status = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
+        .await
+        .expect("guard must exit")
+        .expect("wait");
+    assert!(!status.success(), "the aborted launch must fail: {status}");
 }
 
 /// An oversized client→server *response* to a server request resolves

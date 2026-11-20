@@ -199,7 +199,8 @@ pub(crate) struct ProxyShared<W> {
     /// in-flight requests in both directions.
     pub(crate) wire: Arc<Mutex<WireState>>,
     pub(crate) pending_tools_list: Arc<Mutex<PendingToolsList>>,
-    pub(crate) client_out: Arc<Mutex<tokio::io::Stdout>>,
+    /// Client-facing writer, boxed so tests can capture emitted frames.
+    pub(crate) client_out: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
     /// Both relay directions can write (internal tools/list requests use S2C).
     /// `Option` lets client EOF close the actual pipe even while the other
     /// direction holds an `Arc`.
@@ -272,8 +273,9 @@ pub(crate) struct ProxyShared<W> {
     ///
     /// It is a `tokio::sync::Mutex` because the dispatch side holds it
     /// across an `await`; a raise site only runs the atomic swap inside
-    /// it, so no lock-order cycle exists (epoch → child_stdin on the
-    /// dispatch side; epoch alone on the raise side). The epoch-held
+    /// it, so no lock-order cycle exists (epoch → child_stdin → wire on
+    /// the dispatch side, and nothing holds wire while acquiring the
+    /// epoch; epoch alone on the raise side). The epoch-held
     /// write is bounded by `EPOCH_CHILD_WRITE_BUDGET`: the raise side
     /// is also the task draining the child's stdout, so an unbounded
     /// write into a full stdin pipe would deadlock with it. C2S-side

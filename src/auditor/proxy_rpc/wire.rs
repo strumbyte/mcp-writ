@@ -54,6 +54,15 @@ pub(crate) struct WireState {
     retired_ids: HashSet<(MessageDirection, RpcId)>,
     /// Aggregate serialized bytes retained across all collections.
     wire_bytes: usize,
+    /// Wakes response handlers that arrived while their own request was
+    /// still queued on the outbound pipe. `mark_dispatched` and every
+    /// removal path signal it, so the wait ends on either outcome.
+    dispatch_changed: std::sync::Arc<tokio::sync::Notify>,
+    /// Registration identity counter stamped into each `TrackedRequest`
+    /// at `register`. A waiter parked on `dispatch_changed` binds to the
+    /// `seq` it first observed, so a rollback freeing the id and a
+    /// replacement re-registering it cannot absorb the older frame.
+    next_registration_seq: u64,
 }
 
 impl WireState {
@@ -161,6 +170,7 @@ impl WireState {
         } else {
             self.refund_bytes(Self::request_bytes(&key.1, &entry));
         }
+        self.dispatch_changed.notify_waiters();
         Some(entry)
     }
 
@@ -224,7 +234,7 @@ impl WireState {
         &mut self,
         direction: MessageDirection,
         id: RpcId,
-        entry: TrackedRequest,
+        mut entry: TrackedRequest,
     ) -> Result<(), &'static str> {
         if matches!(id, RpcId::Null) {
             return Err("request id must not be null");
@@ -297,6 +307,8 @@ impl WireState {
         // Proven to fit by the anticipated check above — the reclaim
         // refund is already applied, so this cannot hit the cap.
         self.charge_bytes(charge);
+        entry.seq = self.next_registration_seq;
+        self.next_registration_seq = self.next_registration_seq.wrapping_add(1);
         self.requests.insert(key, entry);
         Ok(())
     }
@@ -353,18 +365,50 @@ impl WireState {
         self.requests.get(&(direction, id.clone()))
     }
 
-    /// Consume the tracked request a response answers.
+    /// Consume the tracked request a response answers. An entry whose
+    /// dispatch the proxy has not confirmed (`dispatched` still false)
+    /// cannot be consumed — that is only an absence of confirmation,
+    /// not proof the request bytes never left the proxy or that the
+    /// peer could not have answered, so `take` leaves the entry alone
+    /// rather than treating it as undeliverable.
     pub(crate) fn take(
         &mut self,
         direction: MessageDirection,
         id: &RpcId,
     ) -> Option<TrackedRequest> {
-        self.remove_request(&(direction, id.clone()), false)
+        let key = (direction, id.clone());
+        if !self.requests.get(&key).is_some_and(|e| e.dispatched) {
+            return None;
+        }
+        self.remove_request(&key, false)
+    }
+
+    /// The registered request's bytes reached the peer — it may now
+    /// correlate an answer. Registration must precede the write (a
+    /// failed write rolls the whole record back), so the entry is
+    /// born invisible; this mark is the boundary after which
+    /// `answered`/`take` can see it.
+    pub(crate) fn mark_dispatched(&mut self, direction: MessageDirection, id: &RpcId) {
+        if let Some(entry) = self.requests.get_mut(&(direction, id.clone())) {
+            entry.dispatched = true;
+            self.dispatch_changed.notify_waiters();
+        }
+    }
+
+    /// The `Notify` a response handler waits on when a frame arrives
+    /// while its own request is still between registration and
+    /// `mark_dispatched`. Register the waiter *while holding* the wire
+    /// lock and release it before awaiting, so the dispatch outcome can
+    /// never be missed.
+    pub(crate) fn dispatch_changed(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.dispatch_changed.clone()
     }
 
     /// Look up the request a response answers without consuming it.
     /// Entries whose response already correlated (`responded` — the
-    /// 2026 `subscriptions/listen` case) cannot be answered twice.
+    /// 2026 `subscriptions/listen` case) cannot be answered twice, and
+    /// entries whose request is still queued on the outbound pipe
+    /// (`dispatched` false) cannot be answered at all.
     pub(crate) fn answered(
         &self,
         response_direction: MessageDirection,
@@ -372,7 +416,7 @@ impl WireState {
     ) -> Option<AnsweredRequest> {
         self.requests
             .get(&(opposite(response_direction), id.clone()))
-            .filter(|e| !e.responded)
+            .filter(|e| e.dispatched && !e.responded)
             .map(|e| AnsweredRequest {
                 request_direction: opposite(response_direction),
                 method: e.method.clone(),
@@ -382,7 +426,19 @@ impl WireState {
                 // for PR-11's `input_required` gate.
                 reached_peer: e.allowed || e.dry_run,
                 internal: e.internal,
+                seq: e.seq,
             })
+    }
+
+    /// Any registered request in `direction` still answerable — its
+    /// bytes crossed (`dispatched`) and no response consumed it
+    /// (`responded`). An oversized response that provably consumed a
+    /// response slot while attributing to nothing may have stranded one
+    /// of these — the caller decides whether the session survives it.
+    pub(crate) fn has_unanswered(&self, direction: MessageDirection) -> bool {
+        self.requests
+            .iter()
+            .any(|((d, _), e)| *d == direction && e.dispatched && !e.responded)
     }
 
     /// `notifications/cancelled` correlation: in-flight request travelling

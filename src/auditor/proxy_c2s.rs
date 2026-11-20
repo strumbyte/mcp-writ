@@ -13,9 +13,10 @@ use super::checker;
 use super::proxy_rpc::{self, WireFrame, WireState};
 use super::proxy_state::ProxyShared;
 use super::proxy_wire::{
-    build_jsonrpc_error, build_tools_list_error_response, extract_raw_id,
-    extract_tool_name_from_line, frame_too_large_message, oversize_extra, read_proxy_frame,
-    recover_id_candidates, recover_method, rpc_id_from_raw_id, write_child_frame,
+    FrameRoot, build_jsonrpc_error, build_tools_list_error_response, extract_raw_id_json,
+    extract_tool_name_from_json, frame_too_large_message, oversize_extra, read_proxy_frame,
+    recover_id_candidates, recover_id_candidates_proven, recover_last_root_id_candidates,
+    recover_method, recover_response_shape, rpc_id_from_raw_id, write_child_frame,
     write_client_frame,
 };
 use super::session::RpcId;
@@ -88,36 +89,35 @@ where
             Ok(Some(BoundedFrame::Line(line))) => {
                 // Structural gate: invalid JSON or duplicate keys never
                 // reach the decision layer — the client gets an error and
-                // nothing is forwarded.
-                #[cfg(feature = "measure")]
-                crate::measure::incr(&crate::measure::JSON_PARSE_CALLS, 1);
-                let parsed = nojson::RawJson::parse(line.trim());
-                let Ok(json) = parsed else {
-                    deny_malformed(&shared, None, "invalid JSON").await?;
-                    continue;
-                };
-                if let Err(violation) = checker::check_duplicate_keys_recursively(json.value()) {
-                    deny_malformed(
-                        &shared,
-                        extract_raw_id(&line).or(Some("null".to_string())),
-                        &violation.reason,
-                    )
-                    .await?;
-                    continue;
-                }
-                match proxy_rpc::classify_frame(json.value()) {
-                    WireFrame::Malformed { reason, raw_id } => {
-                        deny_malformed(&shared, raw_id.or_else(|| extract_raw_id(&line)), reason)
+                // nothing is forwarded. `parse_and_verify` is the one
+                // parse this frame gets: classification, the policy
+                // checker, and the session gates all share its `RawJson`
+                // through the `VerifiedFrame` view instead of reparsing.
+                let view = match checker::VerifiedFrame::parse_and_verify(&line) {
+                    Ok(view) => view,
+                    Err(checker::FrameReject::Parse) => {
+                        deny_malformed(&shared, None, "invalid JSON").await?;
+                        continue;
+                    }
+                    Err(checker::FrameReject::Checked { json, reason }) => {
+                        let raw_id = extract_raw_id_json(&json);
+                        deny_malformed(&shared, raw_id.as_deref().or(Some("null")), &reason)
                             .await?;
+                        continue;
+                    }
+                };
+                match proxy_rpc::classify_frame(view.value()) {
+                    WireFrame::Malformed { reason, raw_id } => {
+                        deny_malformed(&shared, raw_id, reason).await?;
                     }
                     WireFrame::Notification { method } => {
-                        c2s_notification(&shared, json.value(), &line, &method).await?;
+                        c2s_notification(&shared, &view, &method).await?;
                     }
                     WireFrame::Response { id, raw_id } => {
-                        c2s_response(&shared, json.value(), &line, &id, &raw_id).await?;
+                        c2s_response(&shared, &view, &id, raw_id).await?;
                     }
                     WireFrame::Request { method, id, raw_id } => {
-                        c2s_request(&shared, json.value(), &line, &method, &id, &raw_id).await?;
+                        c2s_request(&shared, &view, &method, &id, raw_id).await?;
                     }
                 }
             }
@@ -196,7 +196,7 @@ where
         if let WireFrame::Request { method, raw_id, .. } = proxy_rpc::classify_frame(json.value())
             && method == "tools/list"
         {
-            let response = build_tools_list_error_response(&raw_id);
+            let response = build_tools_list_error_response(raw_id);
             write_client_frame(&shared.client_out, &response).await?;
             emitted = true;
         }
@@ -223,8 +223,14 @@ where
 /// server→client request: resolved `id` candidates release that
 /// request's tracked entry and an error goes to the *server* (2025
 /// only — 2026 forbids client→server responses) so its request does
-/// not hang. Unidentifiable frames get an `id: null` error, the same
-/// posture `deny_malformed` takes.
+/// not hang. A frame that proves response shape yet correlates to
+/// nothing fails the session closed while a dispatched server→client
+/// request still awaits its answer — the same unattributable-response
+/// posture the S2C path takes; a fully retained frame naming only
+/// untracked ids is a proven orphan. A `method` recovered from a
+/// *later* root of a reassembled multi-root frame never reclassifies
+/// a first root proving response shape. Unidentifiable frames get an
+/// `id: null` error, the same posture `deny_malformed` takes.
 ///
 /// Nothing oversized is ever forwarded — including under `--dry-run`,
 /// because dry-run observes decisions on frames the proxy still
@@ -233,28 +239,67 @@ async fn c2s_oversize<W>(shared: &ProxyShared<W>, frame: &OversizeFrame) -> Resu
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let method = recover_method(frame);
-    // `prefer_tail`: a response's `id` is serialized last by the TS SDK;
-    // a request's sits ahead of `params`.
-    let ids = recover_id_candidates(frame, method.is_none());
+    let response_shape = recover_response_shape(frame);
+    let (method, method_root) = match recover_method(frame) {
+        // A `method` recovered from a *later* root never reclassifies
+        // the frame's own (first) root: a root proving response shape
+        // consumed a response slot, so the response handling below
+        // owns the frame — correlated from its own root's `id`
+        // candidates, or failed closed when the conflicting roots
+        // prevent attribution. A single notification root still owes
+        // no answer.
+        Some((_, FrameRoot::Last)) if response_shape => (None, FrameRoot::First),
+        recovered => recovered
+            .map(|(m, r)| (Some(m), r))
+            .unwrap_or((None, FrameRoot::First)),
+    };
+    let ids = if method.is_some() {
+        // A recovered `method` pairs only with `id` candidates from
+        // the same root — on a reassembled multi-root frame another
+        // root's `id` was never named by this request.
+        match method_root {
+            FrameRoot::First => recover_id_candidates_proven(frame),
+            FrameRoot::Last => recover_last_root_id_candidates(frame),
+        }
+    } else {
+        // `prefer_tail`: a response's `id` is serialized last by the
+        // TS SDK; a request's sits ahead of `params`.
+        recover_id_candidates(frame, true)
+    };
 
-    if method.is_none() {
+    if method.is_none() && response_shape {
         // Response interpretation first: a recovered id that names a
         // tracked server→client request is answered with an error back
         // to the server (the denied-response path's existing posture).
+        // Both the shape and the id must be *proven* — a client
+        // request's `method` can sit in the omitted middle, so a
+        // method-less frame is not by itself a response, and only
+        // envelope-depth candidates count: a tail hit a nested
+        // `result.id` could spell must not retire a registration.
         let mut released: Option<(String, super::proxy_rpc::TrackedRequest)> = None;
-        {
-            let mut wire = shared.wire.lock().await;
-            for raw in &ids {
-                let Some(id) = rpc_id_from_raw_id(raw) else {
-                    continue;
-                };
-                if wire.answered(C2S, &id).is_none() {
-                    continue;
-                }
-                if let Some(entry) = wire.take(S2C, &id) {
-                    released = Some((raw.clone(), entry));
-                }
+        // Distinct raw spellings resolve to the same canonical id —
+        // `9` and `9.0` are both `Number("9e0")`. Repeating a lookup
+        // for a canonical id already probed `None` would observe a
+        // *newer* registration than the miss settled: a same-id
+        // replacement registered after the miss must never be consumed
+        // by a frame it postdates, so probes dedup on `RpcId` while
+        // still scanning every distinct id the frame names.
+        let mut probed = std::collections::HashSet::new();
+        for raw in recover_id_candidates_proven(frame) {
+            let Some(id) = rpc_id_from_raw_id(&raw) else {
+                continue;
+            };
+            if !probed.insert(id.clone()) {
+                continue;
+            }
+            // A response can race its own request's dispatch — wait on
+            // the outcome bound to the registration seen first, as the
+            // ordinary response path does: a cancel retiring it
+            // mid-wait, or a same-id replacement following, can never
+            // be handed this frame.
+            if let Some(entry) = proxy_rpc::take_after_dispatch(&shared.wire, S2C, &id, None).await
+            {
+                released = Some((raw, entry));
                 break;
             }
         }
@@ -324,10 +369,46 @@ where
     if kind == "notification" {
         return Ok(());
     }
+    // A frame that proved response shape consumed a response slot —
+    // whichever in-flight server→client request it answered may now
+    // wait forever on a reply that is never coming, and its identity
+    // is unprovable: candidates that resolved were already settled by
+    // the matched arm above, so a fully retained frame whose usable
+    // (parseable, non-null) `id`s are all untracked is a proven
+    // orphan that stranded nothing it claimed. Anything else — no
+    // usable id, or the real `id` lost in the dropped middle — cannot
+    // be attributed, so the session fails closed and teardown settles
+    // the pending requests rather than leave them hanging (2025 only:
+    // 2026 forbids server→client requests, so nothing can be
+    // stranded).
+    if kind == "response"
+        && !matches!(version, V26)
+        && response_shape
+        && shared.wire.lock().await.has_unanswered(S2C)
+    {
+        let whole_covered = frame.head.len().saturating_add(frame.tail.len()) >= frame.bytes;
+        let orphan = whole_covered
+            && recover_id_candidates_proven(frame)
+                .iter()
+                .any(|raw| rpc_id_from_raw_id(raw).is_some_and(|id| !matches!(id, RpcId::Null)));
+        if !orphan {
+            return Err(AuditorError::VerificationFailed(
+                "oversized response could not be attributed to an in-flight request".to_string(),
+            ));
+        }
+    }
+    // A recovered response id names a request the *server* made —
+    // echoing it to the client would attribute the refusal to a request
+    // the client never sent, so an unmatched response errors on null.
+    let error_id = if kind == "response" {
+        "null"
+    } else {
+        raw_id.as_deref().unwrap_or("null")
+    };
     write_client_frame(
         &shared.client_out,
         &build_jsonrpc_error(
-            raw_id.as_deref().unwrap_or("null"),
+            error_id,
             &frame_too_large_message("request", shared.max_frame_bytes),
         ),
     )
@@ -338,7 +419,7 @@ where
 /// readable) and a `mcp_message.denied` audit event — nothing forwards.
 async fn deny_malformed<W>(
     shared: &ProxyShared<W>,
-    raw_id: Option<String>,
+    raw_id: Option<&str>,
     reason: &str,
 ) -> Result<(), AuditorError>
 where
@@ -349,7 +430,7 @@ where
         C2S,
         "malformed",
         None,
-        raw_id.as_deref(),
+        raw_id,
         shared
             .wire
             .lock()
@@ -364,7 +445,7 @@ where
     write_client_frame(
         &shared.client_out,
         &build_jsonrpc_error(
-            raw_id.as_deref().unwrap_or("null"),
+            raw_id.unwrap_or("null"),
             &format!("malformed JSON-RPC frame ({reason})"),
         ),
     )
@@ -374,14 +455,13 @@ where
 /// One client-originated notification: decide, then forward or drop.
 async fn c2s_notification<W>(
     shared: &ProxyShared<W>,
-    value: nojson::RawJsonValue<'_, '_>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     method: &str,
 ) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let ext = proxy_rpc::extract_notification(value, method);
+    let ext = proxy_rpc::extract_notification(view.value(), method);
     let mut wire = shared.wire.lock().await;
     let version = wire.passive_version();
     // A `notifications/cancelled` naming the reserved internal-request
@@ -477,20 +557,25 @@ where
                 None,
             )
             .await?;
-            match write_child_frame(&shared.child_stdin, line).await {
+            match write_child_frame(&shared.child_stdin, view.frame()).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    proxy_rpc::audit_forward_failed(
-                        &shared.audit,
-                        C2S,
-                        "notification",
-                        Some(method),
-                        None,
-                        version,
-                        verdict,
-                        shared.dry_run,
-                        None,
-                    );
+                    // Skipped for `DeliveryUncertain` — the complete
+                    // frame may still have crossed, so "not forwarded"
+                    // is unprovable.
+                    if !matches!(e, AuditorError::DeliveryUncertain(_)) {
+                        proxy_rpc::audit_forward_failed(
+                            &shared.audit,
+                            C2S,
+                            "notification",
+                            Some(method),
+                            None,
+                            version,
+                            verdict,
+                            shared.dry_run,
+                            None,
+                        );
+                    }
                     Err(e)
                 }
             }
@@ -626,21 +711,36 @@ async fn release_cancelled_bookkeeping<W>(
 /// client→server responses entirely).
 async fn c2s_response<W>(
     shared: &ProxyShared<W>,
-    value: nojson::RawJsonValue<'_, '_>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     id: &RpcId,
     raw_id: &str,
 ) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let ext = proxy_rpc::extract_response(value);
+    let ext = proxy_rpc::extract_response(view.value());
+    // A response can race its own request's dispatch: `s2c_request`
+    // registers the (S2C,id) entry before the client write and marks it
+    // dispatched only after the write lands, so a fast answer can
+    // arrive in between. The wait binds to the registration it started
+    // on (`seq`): a pre-write rollback frees the id, and a *new*
+    // request re-registering it undispatched must neither keep this
+    // waiter parked nor resolve through `answered` — the frame answers
+    // the removed registration, never the replacement.
+    let answered = proxy_rpc::answered_after_dispatch(&shared.wire, S2C, id, None).await;
     let mut wire = shared.wire.lock().await;
-    let answered = wire.answered(C2S, id);
+    // The probe ran outside this guard — re-confirm the registration
+    // under the id is still the one that resolved before consuming it:
+    // a cancel plus same-id replacement could have interleaved.
+    let answered = answered.filter(|a| wire.get(S2C, id).is_some_and(|e| e.seq == a.seq));
     // The revision a response is judged under is the answered request's —
-    // absent a tracked request, fall back to the established wire.
+    // the registration the `waited_seq`-bound probe resolved, never a
+    // same-id replacement or an already-answered subscription sitting
+    // under the id now. Absent a matched request, fall back to the
+    // established wire rather than adopt a replacement's revision.
     let version = wire
         .get(S2C, id)
+        .filter(|e| answered.as_ref().is_some_and(|a| a.seq == e.seq))
         .map(|e| e.version)
         .unwrap_or_else(|| wire.passive_version());
     let verdict = {
@@ -650,7 +750,14 @@ where
     };
     match verdict {
         McpVerdict::Allow(_) => {
-            let entry = wire.take(S2C, id);
+            // Consume only the registration the `waited_seq` probe
+            // resolved — a same-id replacement or an already-answered
+            // subscription under the id is not this response's request.
+            let entry = if answered.is_some() {
+                wire.take(S2C, id)
+            } else {
+                None
+            };
             if let Some(ref e) = entry {
                 wire.on_response_forwarded(C2S, e, &ext, ext.has_result && !ext.is_error);
             }
@@ -667,20 +774,25 @@ where
                 None,
             )
             .await?;
-            match write_child_frame(&shared.child_stdin, line).await {
+            match write_child_frame(&shared.child_stdin, view.frame()).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    proxy_rpc::audit_forward_failed(
-                        &shared.audit,
-                        C2S,
-                        "response",
-                        entry.as_ref().map(|e| e.method.as_str()),
-                        Some(raw_id),
-                        version,
-                        verdict,
-                        shared.dry_run,
-                        None,
-                    );
+                    // Skipped for `DeliveryUncertain` — the complete
+                    // frame may still have crossed, so "not forwarded"
+                    // is unprovable.
+                    if !matches!(e, AuditorError::DeliveryUncertain(_)) {
+                        proxy_rpc::audit_forward_failed(
+                            &shared.audit,
+                            C2S,
+                            "response",
+                            entry.as_ref().map(|e| e.method.as_str()),
+                            Some(raw_id),
+                            version,
+                            verdict,
+                            shared.dry_run,
+                            None,
+                        );
+                    }
                     Err(e)
                 }
             }
@@ -734,8 +846,7 @@ where
 /// then method-specific legacy gates for `tools/call` and `tools/list`.
 async fn c2s_request<W>(
     shared: &ProxyShared<W>,
-    value: nojson::RawJsonValue<'_, '_>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     method: &str,
     id: &RpcId,
     raw_id: &str,
@@ -743,13 +854,13 @@ async fn c2s_request<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let ext = proxy_rpc::extract_request(value, method);
+    let ext = proxy_rpc::extract_request(view.value(), method);
 
     // A null id cannot be tracked — deny outright.
     if matches!(id, RpcId::Null) {
         return deny_request(
             shared,
-            line,
+            view,
             method,
             id,
             raw_id,
@@ -813,17 +924,17 @@ where
 
     match verdict {
         McpVerdict::Allow(_) => {
-            forward_allowed(shared, line, method, id, raw_id, version, verdict, ext).await
+            forward_allowed(shared, view, method, id, raw_id, version, verdict, ext).await
         }
         McpVerdict::Deny(_) => {
-            let message = match extract_tool_name_from_line(line) {
+            let message = match extract_tool_name_from_json(view.json()) {
                 Some(tool) if method == "tools/call" => {
                     format!("request '{method}' tool '{tool}' denied by MCP policy")
                 }
                 _ => format!("request '{method}' denied by MCP policy"),
             };
             deny_request(
-                shared, line, method, id, raw_id, version, &ext, verdict, &message,
+                shared, view, method, id, raw_id, version, &ext, verdict, &message,
             )
             .await
         }
@@ -831,7 +942,7 @@ where
         _ => {
             deny_request(
                 shared,
-                line,
+                view,
                 method,
                 id,
                 raw_id,

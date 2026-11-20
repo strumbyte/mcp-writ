@@ -87,33 +87,38 @@ fn opposite(direction: MessageDirection) -> MessageDirection {
 
 /// Classification of one parsed JSON-RPC frame. The request /
 /// notification / response split drives which decision inputs apply.
+/// `method` / `raw_id` borrow the frame's text (unescaped methods
+/// allocate only through `Cow::Owned`) — a classified frame costs no
+/// intermediate `String` copies of fields the wire already stores.
 #[derive(Debug)]
-pub(crate) enum WireFrame {
+pub(crate) enum WireFrame<'a> {
     /// `method` + `id`.
     Request {
-        method: String,
+        method: std::borrow::Cow<'a, str>,
         id: RpcId,
-        raw_id: String,
+        raw_id: &'a str,
     },
     /// `method`, no `id`.
-    Notification { method: String },
+    Notification { method: std::borrow::Cow<'a, str> },
     /// `result`/`error` + `id`, no `method`.
-    Response { id: RpcId, raw_id: String },
+    Response { id: RpcId, raw_id: &'a str },
     /// Not a usable JSON-RPC envelope — never forwarded. `raw_id` echoes
     /// the `id` member when one was readable so request-shaped failures
     /// can still be answered.
     Malformed {
         reason: &'static str,
-        raw_id: Option<String>,
+        raw_id: Option<&'a str>,
     },
 }
 
 /// Member access: `Some` whenever the member exists — including a `null`
-/// value, which JSON-RPC distinguishes from an absent member.
-fn member<'a>(
-    value: nojson::RawJsonValue<'a, 'a>,
+/// value, which JSON-RPC distinguishes from an absent member. Both
+/// lifetimes are preserved so a caller can borrow member text (`method`,
+/// `id`) at the frame-text lifetime rather than the index borrow.
+fn member<'t, 'r>(
+    value: nojson::RawJsonValue<'t, 'r>,
     name: &str,
-) -> Option<nojson::RawJsonValue<'a, 'a>> {
+) -> Option<nojson::RawJsonValue<'t, 'r>> {
     value.to_member(name).ok().and_then(|m| m.optional())
 }
 
@@ -136,15 +141,15 @@ fn rpc_id_member(params: Option<nojson::RawJsonValue<'_, '_>>, name: &str) -> Op
 /// Classify a parsed frame. Anything that is not a well-formed
 /// request / notification / response envelope is `Malformed` — the caller
 /// fails closed rather than forwarding it.
-pub(crate) fn classify_frame(value: nojson::RawJsonValue<'_, '_>) -> WireFrame {
-    fn bad(reason: &'static str, raw_id: Option<String>) -> WireFrame {
+pub(crate) fn classify_frame<'a>(value: nojson::RawJsonValue<'a, '_>) -> WireFrame<'a> {
+    fn bad<'a>(reason: &'static str, raw_id: Option<&'a str>) -> WireFrame<'a> {
         WireFrame::Malformed { reason, raw_id }
     }
     if value.kind() != nojson::JsonValueKind::Object {
         return bad("frame is not a JSON object", None);
     }
     let id_value = member(value, "id");
-    let raw_id = id_value.map(|v| v.as_raw_str().to_string());
+    let raw_id = id_value.map(|v| v.as_raw_str());
     // `jsonrpc: "2.0"` is a required member on every frame.
     let jsonrpc_ok = member(value, "jsonrpc")
         .and_then(|v| v.as_string_str().ok())
@@ -172,16 +177,14 @@ pub(crate) fn classify_frame(value: nojson::RawJsonValue<'_, '_>) -> WireFrame {
         if id_value.is_some() {
             match rpc_id {
                 Some(id) => WireFrame::Request {
-                    method: method.into_owned(),
+                    method,
                     id,
-                    raw_id: raw_id.unwrap_or_else(|| "null".to_string()),
+                    raw_id: raw_id.unwrap_or("null"),
                 },
                 None => bad("request id must be a string, number, or null", raw_id),
             }
         } else {
-            WireFrame::Notification {
-                method: method.into_owned(),
-            }
+            WireFrame::Notification { method }
         }
     } else if has_result && has_error {
         // `result` and `error` are mutually exclusive in JSON-RPC — a
@@ -191,7 +194,7 @@ pub(crate) fn classify_frame(value: nojson::RawJsonValue<'_, '_>) -> WireFrame {
         match rpc_id {
             Some(id) => WireFrame::Response {
                 id,
-                raw_id: raw_id.unwrap_or_else(|| "null".to_string()),
+                raw_id: raw_id.unwrap_or("null"),
             },
             None => bad("response id missing or invalid", raw_id),
         }
@@ -459,6 +462,22 @@ pub(crate) struct TrackedRequest {
     /// the request itself completes; `responded` keeps a second response
     /// from correlating again.
     pub responded: bool,
+    /// The request's bytes reached the peer's input. Registration
+    /// happens *before* the forward write so a failed write unwinds the
+    /// whole record — until [`WireState::mark_dispatched`] runs after a
+    /// successful write, `answered`/`take` treat the entry as invisible:
+    /// a frame naming its id while the request still sits in the
+    /// outbound pipe cannot retire work the peer never saw. Every
+    /// registration is born undispatched — including internal ones —
+    /// so a forgotten mark fails closed (invisible), never open.
+    pub dispatched: bool,
+    /// Registration identity stamped by `register`: a monotonically
+    /// increasing sequence distinguishing this registration from a later
+    /// one that reuses the same `(direction, id)` after a rollback.
+    /// Waiters parked on `dispatch_changed` bind to it, so a response
+    /// meant for a rolled-back registration can never resolve (or keep
+    /// waiting on) a replacement request carrying the same id.
+    pub seq: u64,
     /// 2026 `subscriptions/listen` bookkeeping.
     pub subscription: Option<SubTracker>,
 }
@@ -496,11 +515,20 @@ impl TrackedRequest {
             level: ext.level.clone(),
             cancelled: false,
             responded: false,
+            // Born undispatched like `internal_list` — registration
+            // precedes the write; `mark_dispatched` after it lands is
+            // the boundary where a response may correlate.
+            dispatched: false,
+            seq: 0,
             subscription,
         }
     }
 
-    /// An Auditor-emitted internal `tools/list` request.
+    /// An Auditor-emitted internal `tools/list` request. Born
+    /// undispatched like the forwarded entries — the caller's
+    /// `mark_dispatched` after the child write is the boundary where a
+    /// response may correlate: a frame naming a predictable internal
+    /// id must not resolve before the request crossed.
     pub(crate) fn internal_list(version: SupportedProtocolVersion) -> Self {
         Self {
             method: "tools/list".to_string(),
@@ -515,6 +543,8 @@ impl TrackedRequest {
             level: None,
             cancelled: false,
             responded: false,
+            dispatched: false,
+            seq: 0,
             subscription: None,
         }
     }
@@ -532,10 +562,104 @@ pub(crate) struct AnsweredRequest {
     /// `input_required` gate reads that raw value, not this one).
     pub reached_peer: bool,
     pub internal: bool,
+    /// The registration identity of the entry this probe resolved —
+    /// lets a `dispatch_changed` waiter confirm the answered request is
+    /// still the registration it parked on, not a same-id replacement.
+    pub seq: u64,
 }
 
 mod wire;
 pub(crate) use wire::WireState;
+
+/// Consume a request's registration after its dispatch resolves —
+/// the same sequence-bound wait the ordinary response paths run
+/// inline. The entry may have registered but not yet been written
+/// (`dispatched` false): the response then parks on
+/// `dispatch_changed` instead of misreading an in-flight write, and
+/// the parked wait binds to that registration's `seq` — a pre-write
+/// rollback frees the id, and a same-id replacement must neither keep
+/// the waiter parked nor be retired by a response addressed to the
+/// removed registration. `bound_seq` pins the consumption to a
+/// registration a prior [`WireState::answered`] probe already
+/// resolved; `None` binds to whatever registration the first probe
+/// sees. `None` is returned when no registration is ever answerable —
+/// absent, still undispatched after its outcome, or removed before
+/// the mark.
+pub(crate) async fn take_after_dispatch(
+    wire_state: &std::sync::Arc<tokio::sync::Mutex<WireState>>,
+    request_dir: MessageDirection,
+    id: &RpcId,
+    bound_seq: Option<u64>,
+) -> Option<TrackedRequest> {
+    let response_dir = opposite(request_dir);
+    let mut bound = bound_seq;
+    let mut wire = wire_state.lock().await;
+    loop {
+        let answered = wire
+            .answered(response_dir, id)
+            .filter(|a| bound.is_none_or(|seq| a.seq == seq));
+        if answered.is_some() {
+            // `answered` and `take` share this guard — the consumed
+            // entry is exactly the registration the probe resolved.
+            return wire.take(request_dir, id);
+        }
+        let waiting = wire
+            .get(request_dir, id)
+            .filter(|e| !e.dispatched && bound.is_none_or(|seq| e.seq == seq))
+            .map(|e| e.seq);
+        let seq = waiting?;
+        let notify = wire.dispatch_changed();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        bound = Some(seq);
+        drop(wire);
+        notified.await;
+        wire = wire_state.lock().await;
+    }
+}
+
+/// The probe half of [`take_after_dispatch`] — resolve the request a
+/// response answers *without* consuming it: the same dispatch wait,
+/// bound to the same `seq`, returning the [`WireState::answered`]
+/// record once the observed registration becomes answerable. `None`
+/// when no registration is ever answerable — absent, still
+/// undispatched after its outcome, removed before the mark, or
+/// replaced under the same id (a same-id replacement can neither keep
+/// the waiter parked nor pose as the removed one). Callers that only
+/// classify — a tools/list reroute, an attribution hint — use this so
+/// the consume decision stays theirs.
+pub(crate) async fn answered_after_dispatch(
+    wire_state: &std::sync::Arc<tokio::sync::Mutex<WireState>>,
+    request_dir: MessageDirection,
+    id: &RpcId,
+    bound_seq: Option<u64>,
+) -> Option<AnsweredRequest> {
+    let response_dir = opposite(request_dir);
+    let mut bound = bound_seq;
+    let mut wire = wire_state.lock().await;
+    loop {
+        let answered = wire
+            .answered(response_dir, id)
+            .filter(|a| bound.is_none_or(|seq| a.seq == seq));
+        if answered.is_some() {
+            return answered;
+        }
+        let waiting = wire
+            .get(request_dir, id)
+            .filter(|e| !e.dispatched && bound.is_none_or(|seq| e.seq == seq))
+            .map(|e| e.seq);
+        let seq = waiting?;
+        let notify = wire.dispatch_changed();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        bound = Some(seq);
+        drop(wire);
+        notified.await;
+        wire = wire_state.lock().await;
+    }
+}
 
 // ── Decision audit ────────────────────────────────────────────────────
 

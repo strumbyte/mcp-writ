@@ -401,6 +401,12 @@ fn test_request_state_over_cap_generic_path() {
         ),
         None
     );
+    // Exactly at the cap is still eligible — the check is `>`, not `>=`.
+    let at_cap = "x".repeat(REQUEST_STATE_MAX_BYTES);
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"ping","params":{{"requestState":"{at_cap}"}}}}"#
+    );
+    assert_eq!(request_state_over_cap(&line), None);
     assert_eq!(request_state_over_cap("not json"), None);
     // A non-string member is measured on its raw text — still opaque.
     let big_object = format!(

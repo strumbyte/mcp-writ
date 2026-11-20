@@ -10,19 +10,24 @@ use uuid::Uuid;
 use super::C2S;
 use crate::audit_log::{Action, AuditEvent, EventType, Outcome, Severity};
 use crate::auditor::checker;
-use crate::auditor::proxy_rpc::{self, ExtractedRequest, TrackedRequest};
-use crate::auditor::proxy_state::{MAX_ORIGINAL_TOOLS_LIST_BYTES, ProxyShared};
+use crate::auditor::proxy_rpc::{self, ExtractedRequest};
+use crate::auditor::proxy_state::ProxyShared;
 use crate::auditor::proxy_wire::{
-    build_error_response, build_jsonrpc_error, deny_explanation, extract_raw_id,
-    extract_tool_name_from_line, join_audit_details, write_child_frame, write_child_frame_epoch,
-    write_client_frame,
+    build_error_response, build_jsonrpc_error, deny_explanation, extract_tool_name_from_json,
+    join_audit_details, write_client_frame,
 };
-use crate::auditor::session::{RpcId, SessionState};
+use crate::auditor::session::RpcId;
 use crate::error::AuditorError;
-use crate::policy::Policy;
 use crate::policy::mcp::{DenyReason, McpVerdict};
 use crate::protocol::SupportedProtocolVersion;
 
+mod register;
+mod session_gates;
+mod tools_list;
+
+use register::{register_and_forward, register_and_forward_denied};
+use session_gates::apply_session_gates;
+use tools_list::{arm_tools_list, unwind_tools_list};
 pub(super) async fn wire_version_or_default<W>(shared: &ProxyShared<W>) -> SupportedProtocolVersion
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -44,7 +49,7 @@ where
 #[expect(clippy::too_many_arguments)]
 pub(super) async fn deny_request<W>(
     shared: &ProxyShared<W>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     method: &str,
     id: &RpcId,
     raw_id: &str,
@@ -57,7 +62,7 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if method == "tools/call"
-        && let Some(tool) = extract_tool_name_from_line(line)
+        && let Some(tool) = extract_tool_name_from_json(view.json())
     {
         shared.tally.lock().unwrap().record_call(&tool);
     }
@@ -78,22 +83,28 @@ where
             request_extra(ext),
         )
         .await?;
-        match register_and_forward_denied(shared, line, method, id, raw_id, version, ext, None)
+        match register_and_forward_denied(shared, view, method, id, raw_id, version, ext, None)
             .await
         {
             Ok(true) => return Ok(()),
             result => {
-                proxy_rpc::audit_forward_failed(
-                    &shared.audit,
-                    C2S,
-                    "request",
-                    Some(method),
-                    Some(raw_id),
-                    version,
-                    verdict,
-                    shared.dry_run,
-                    request_extra(ext),
-                );
+                // Skipped for `DeliveryUncertain` — the complete frame
+                // may still have crossed, so "not forwarded" is
+                // unprovable. `Ok(false)` refusal and proven write
+                // failures still reconcile.
+                if !matches!(result, Err(AuditorError::DeliveryUncertain(_))) {
+                    proxy_rpc::audit_forward_failed(
+                        &shared.audit,
+                        C2S,
+                        "request",
+                        Some(method),
+                        Some(raw_id),
+                        version,
+                        verdict,
+                        shared.dry_run,
+                        request_extra(ext),
+                    );
+                }
                 return result.map(|_| ());
             }
         }
@@ -172,7 +183,7 @@ pub(super) fn request_extra(ext: &ExtractedRequest) -> Option<String> {
 #[expect(clippy::too_many_arguments)]
 pub(super) async fn forward_allowed<W>(
     shared: &ProxyShared<W>,
-    line: &str,
+    view: &checker::VerifiedFrame<'_>,
     method: &str,
     id: &RpcId,
     raw_id: &str,
@@ -185,7 +196,7 @@ where
 {
     // ── tools/call legacy gates: list-busy, tool policy, session ──
     if method == "tools/call" {
-        let tool = extract_tool_name_from_line(line);
+        let tool = extract_tool_name_from_json(view.json());
         if let Some(tool) = tool.as_deref() {
             shared.tally.lock().unwrap().record_call(tool);
         }
@@ -208,7 +219,7 @@ where
                 deny_busy_tools_call(
                     shared,
                     raw_id,
-                    line,
+                    tool.as_deref(),
                     "no verified tools/list has been published yet",
                     None,
                     false,
@@ -224,7 +235,7 @@ where
             deny_busy_tools_call(
                 shared,
                 raw_id,
-                line,
+                tool.as_deref(),
                 "tools/list revalidation in progress",
                 None,
                 false,
@@ -247,7 +258,7 @@ where
         if let Err(reason) = eligibility {
             return deny_request(
                 shared,
-                line,
+                view,
                 method,
                 id,
                 raw_id,
@@ -258,8 +269,9 @@ where
             )
             .await;
         }
-        let check_result = checker::check_request(line, &shared.policy);
-        let check_result = apply_session_gates(shared, check_result, line, id).await;
+        let check_result = checker::check_request_verified(view, &shared.policy);
+        let check_result =
+            apply_session_gates(shared, check_result, view, id, tool.as_deref()).await;
         return match check_result {
             Ok(check_pass) => {
                 // F6: among calls the policy allows, only names the
@@ -288,7 +300,7 @@ where
                         deny_busy_tools_call(
                             shared,
                             raw_id,
-                            line,
+                            tool.as_deref(),
                             crate::auditor::checker::REASON_TOOL_NOT_ALLOWED,
                             Some(&format!(
                                 "tool '{}' is not advertised by the verified tools/list",
@@ -314,7 +326,7 @@ where
                 shared.audit.log_committed(event).await?;
                 match register_and_forward(
                     shared,
-                    line,
+                    view,
                     method,
                     id,
                     raw_id,
@@ -333,32 +345,40 @@ where
                         if let Some(ref session) = shared.session {
                             let mut state = session.lock().await;
                             state.take_pending_list(id);
-                            state.complete_pending_tool_call(id, false);
+                            // A write whose delivery is unprovable may
+                            // still have crossed — the call keeps an
+                            // unverified candidate rather than resolving
+                            // as proven non-execution.
+                            if matches!(result, Err(AuditorError::DeliveryUncertain(_))) {
+                                state.release_pending_tool_call_unverified(id);
+                            } else {
+                                state.complete_pending_tool_call(id, false);
+                            }
                         }
                         result.map(|_| ())
                     }
                 }
             }
             Err(violation) => {
-                let request_id = extract_raw_id(line);
+                // The classified `raw_id` is the request's `id` literal —
+                // no member re-extraction from the frame is needed.
+                let request_id = Some(raw_id.to_string());
                 // Dry-run observes the tool violation — except the one
                 // refusal that exists only to keep a blob off the wire:
                 // forwarding an over-cap requestState defeats the cap
                 // outright.
-                let observe = shared.dry_run && checker::request_state_over_cap(line).is_none();
-                if !observe {
-                    // Session gates may have partially registered (the
-                    // deputy pending list runs before the trajectory
-                    // pending call): release whatever was recorded — the
-                    // denied request never completes its own RPC. In
-                    // dry-run the request still forwards, so the response
-                    // path consumes the entries instead.
-                    if let Some(ref session) = shared.session {
-                        let mut state = session.lock().await;
-                        state.take_pending_list(id);
-                        state.complete_pending_tool_call(id, false);
-                    }
-                }
+                let observe =
+                    shared.dry_run && checker::request_state_over_cap_json(view.json()).is_none();
+                // A refused request carries no session bookkeeping: the
+                // gates record pending entries only on their success
+                // path, and the one partial record a mid-sequence
+                // refusal can leave (the deputy pending list ahead of
+                // the trajectory pending call) is rolled back inside
+                // `apply_session_gates` — scoped to entries *this* call
+                // created so a denied duplicate can never release an
+                // earlier in-flight call's discovery credit.
+                // In dry-run the request still forwards, so any response
+                // path consumes whatever it legitimately registered.
                 let correlation_id = Uuid::now_v7();
                 let action = if observe {
                     Action::Observed
@@ -426,7 +446,7 @@ where
                     );
                     register_and_forward_denied(
                         shared,
-                        line,
+                        view,
                         method,
                         id,
                         raw_id,
@@ -461,10 +481,10 @@ where
     // ── MRTR `params.requestState` cap — the tools/call checker enforces
     //    it on its own path; every other allowed request caps here so a
     //    retry blob stays bounded on any method. ──
-    if let Some(size) = checker::request_state_over_cap(line) {
+    if let Some(size) = checker::request_state_over_cap_json(view.json()) {
         return deny_request(
             shared,
-            line,
+            view,
             method,
             id,
             raw_id,
@@ -481,18 +501,22 @@ where
 
     // ── tools/list bookkeeping: bounded pending set + template capture ──
     if method == "tools/list" {
-        if !arm_tools_list(shared, line, id, raw_id, version).await? {
+        if !arm_tools_list(shared, view, id, raw_id, version).await? {
             return Ok(());
         }
+        // The revalidation template is published inside
+        // `register_and_forward` immediately before the request becomes
+        // answerable — after its bytes crossed, inside the same
+        // `list_epoch` section — so a direct or queued revalidation can
+        // never observe the prior listing's params for this request,
+        // and a refused or unwritten request can never seed it.
         return match register_and_forward(
-            shared, line, method, id, raw_id, version, verdict, &ext, None,
+            shared, view, method, id, raw_id, version, verdict, &ext, None,
         )
         .await
         {
             Ok(true) => Ok(()),
             result => {
-                // Registration refused or write failed: unwind the
-                // pending bookkeeping so the session is not left busy.
                 unwind_tools_list(shared, id, raw_id).await;
                 match result {
                     Ok(false) => Ok(()),
@@ -504,428 +528,10 @@ where
     }
 
     register_and_forward(
-        shared, line, method, id, raw_id, version, verdict, &ext, None,
+        shared, view, method, id, raw_id, version, verdict, &ext, None,
     )
     .await
     .map(|_| ())
-}
-
-/// Arm the client-facing tracking a forwarded `tools/list` needs on the
-/// response side: the bounded pending-id set, the busy gate, the request
-/// template internal pagination rebuilds from, and the original request
-/// keyed by raw id. Returns `true` when armed; on contention the entry
-/// is unwound, the refusal audited, and the client answered — the
-/// request is not forwarded either way.
-pub(super) async fn arm_tools_list<W>(
-    shared: &ProxyShared<W>,
-    line: &str,
-    id: &RpcId,
-    raw_id: &str,
-    version: SupportedProtocolVersion,
-) -> Result<bool, AuditorError>
-where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let accepted = shared
-        .pending_tools_list
-        .lock()
-        .await
-        .try_insert(id.clone());
-    if !accepted {
-        tracing::warn!("rejecting tools/list: duplicate or too many unanswered ids");
-        proxy_rpc::audit_decision(
-            &shared.audit,
-            C2S,
-            "request",
-            Some("tools/list"),
-            Some(raw_id),
-            version,
-            McpVerdict::Deny(DenyReason::Shape),
-            false,
-            shared.dry_run,
-            Some("duplicate or too many unanswered tools/list requests".to_string()),
-        )?;
-        write_client_frame(
-            &shared.client_out,
-            &build_jsonrpc_error(
-                raw_id,
-                "duplicate or too many unanswered tools/list requests",
-            ),
-        )
-        .await?;
-        return Ok(false);
-    }
-    // Acquire the busy gate atomically — a load-then-store pair would
-    // let two racing tools/list requests both win. On contention the
-    // pending entry is unwound and the request rejected; this side
-    // never clears the gate (S2C owns release).
-    let mut armed = shared
-        .list_busy
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok();
-    if !armed {
-        shared.pending_tools_list.lock().await.remove(id);
-        // The raised gate may belong to an internal listing — the
-        // post-`initialize` probe or a `list_changed` revalidation —
-        // rather than a client request (nothing client-side is in
-        // `pending_tools_list`). That listing settles shortly: hold the
-        // request so the verified emit, or an unwind error, answers it
-        // instead of refusing a routine client listing.
-        if hold_client_list(shared, id, raw_id).await {
-            return Ok(false);
-        }
-        // Not held — either a live client listing owns the gate, or it
-        // raced closed beneath the hold attempt. One CAS retry
-        // separates the two cases before refusing on real contention.
-        armed = shared
-            .pending_tools_list
-            .lock()
-            .await
-            .try_insert(id.clone())
-            && shared
-                .list_busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok();
-        if !armed {
-            shared.pending_tools_list.lock().await.remove(id);
-            // The raised gate this CAS lost to may be a stale latch that
-            // `resume_queued_revalidation` left in place because this
-            // pending entry was still visible — wake the S2C loop so it
-            // re-resolves now that the entry is unwound (a live listing
-            // owner makes that resume a no-op).
-            shared.list_kick.notify_one();
-            proxy_rpc::audit_decision(
-                &shared.audit,
-                C2S,
-                "request",
-                Some("tools/list"),
-                Some(raw_id),
-                version,
-                McpVerdict::Deny(DenyReason::Shape),
-                false,
-                shared.dry_run,
-                Some("tools/list already in progress".to_string()),
-            )?;
-            write_client_frame(
-                &shared.client_out,
-                &build_jsonrpc_error(raw_id, "tools/list already in progress"),
-            )
-            .await?;
-            return Ok(false);
-        }
-    }
-    *shared.last_list_template.lock().await = line.to_string();
-    {
-        // Keyed by canonical RpcId — a canonically-equal response id in
-        // a different spelling (`1` vs `1.0`) still resolves the entry.
-        let mut originals = shared.original_tools_list.lock().await;
-        let retained: usize = originals.values().map(|v| v.len()).sum();
-        if retained.saturating_add(line.len()) > MAX_ORIGINAL_TOOLS_LIST_BYTES {
-            shared.pending_tools_list.lock().await.remove(id);
-            shared.list_kick.notify_one();
-            proxy_rpc::audit_decision(
-                &shared.audit,
-                C2S,
-                "request",
-                Some("tools/list"),
-                Some(raw_id),
-                version,
-                McpVerdict::Deny(DenyReason::Shape),
-                false,
-                shared.dry_run,
-                Some("tools/list original retention budget exhausted".to_string()),
-            )?;
-            write_client_frame(
-                &shared.client_out,
-                &build_jsonrpc_error(raw_id, "tools/list retention budget exhausted"),
-            )
-            .await?;
-            // `list_busy` stays raised; S2C's resume path releases it.
-            return Ok(false);
-        }
-        originals.insert(id.clone(), line.to_string());
-    }
-    Ok(true)
-}
-
-/// Hold a client `tools/list` that lost the busy-gate CAS while the gate
-/// is owned by internal work — the post-`initialize` probe or a
-/// `list_changed` revalidation — rather than a client listing (then a
-/// `pending_tools_list` entry would exist). The request is stored, not
-/// forwarded; the S2C side answers it from the verified emit when the
-/// in-flight listing settles, or with an error when that listing
-/// unwinds. Returns `true` only when actually held: a live client
-/// listing, an existing hold, or a gate that already raced closed all
-/// fall back to the caller's contention path. A gate still raised is
-/// drained by its owner's release path; `list_kick` covers a residual
-/// raise with nothing left in flight.
-async fn hold_client_list<W>(shared: &ProxyShared<W>, id: &RpcId, raw_id: &str) -> bool {
-    let mut slot = shared.held_client_list.lock().await;
-    if slot.is_some() || !shared.pending_tools_list.lock().await.is_empty() {
-        return false;
-    }
-    *slot = Some((id.clone(), raw_id.to_string()));
-    if shared.list_busy.load(Ordering::SeqCst) {
-        drop(slot);
-        shared.list_kick.notify_one();
-        return true;
-    }
-    slot.take();
-    false
-}
-
-/// Unwind [`arm_tools_list`] when the forward never reached the server:
-/// drop the pending id and the stored request. `list_busy` is not
-/// cleared here — only the S2C side ever releases the gate: a
-/// `store(false)` from this side could land underneath a revalidation
-/// queued in the meantime, stranding it. Wake the loop;
-/// `resume_queued_revalidation` inspects `st.idle()` and
-/// `pending_tools_list`, then drives owed work or clears the gate
-/// itself. The request never reached the server, so no collection
-/// can be bound to its id and the cancelled-id slot stays for a real
-/// cancel.
-pub(super) async fn unwind_tools_list<W>(shared: &ProxyShared<W>, id: &RpcId, _raw_id: &str)
-where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    shared.pending_tools_list.lock().await.remove(id);
-    shared.original_tools_list.lock().await.remove(id);
-    shared.list_kick.notify_one();
-}
-
-/// Register in the wire table, apply forward-time side effects, write.
-/// Side effects commit under the same lock as the registration so a
-/// response that lands the instant the write completes already sees
-/// them; a failed write unwinds both so the table never tracks a
-/// request the server did not see. Returns `Ok(false)` when registration
-/// refused the request (duplicate id / capacity) — the client already
-/// got an error; callers with bookkeeping must unwind.
-#[expect(clippy::too_many_arguments)]
-pub(super) async fn register_and_forward<W>(
-    shared: &ProxyShared<W>,
-    line: &str,
-    method: &str,
-    id: &RpcId,
-    raw_id: &str,
-    version: SupportedProtocolVersion,
-    verdict: McpVerdict,
-    ext: &ExtractedRequest,
-    expected_list_gen: Option<u64>,
-) -> Result<bool, AuditorError>
-where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    register_and_forward_impl(
-        shared,
-        line,
-        method,
-        id,
-        raw_id,
-        version,
-        ext,
-        true,
-        Some(verdict),
-        expected_list_gen,
-    )
-    .await
-}
-
-/// Dry-run forward of a denied request: tracked with `allowed: false`.
-/// The caller audits the deny verdict itself, once the forward result
-/// is known.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn register_and_forward_denied<W>(
-    shared: &ProxyShared<W>,
-    line: &str,
-    method: &str,
-    id: &RpcId,
-    raw_id: &str,
-    version: SupportedProtocolVersion,
-    ext: &ExtractedRequest,
-    expected_list_gen: Option<u64>,
-) -> Result<bool, AuditorError>
-where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    register_and_forward_impl(
-        shared,
-        line,
-        method,
-        id,
-        raw_id,
-        version,
-        ext,
-        false,
-        None,
-        expected_list_gen,
-    )
-    .await
-}
-
-/// `audit_verdict` is `Some` only for policy-allowed forwards — the
-/// decision (or a registration refusal) is recorded here. Denied
-/// dry-run forwards pass `None`; their caller owns the audit record.
-#[expect(clippy::too_many_arguments)]
-pub(super) async fn register_and_forward_impl<W>(
-    shared: &ProxyShared<W>,
-    line: &str,
-    method: &str,
-    id: &RpcId,
-    raw_id: &str,
-    version: SupportedProtocolVersion,
-    ext: &ExtractedRequest,
-    allowed: bool,
-    audit_verdict: Option<McpVerdict>,
-    expected_list_gen: Option<u64>,
-) -> Result<bool, AuditorError>
-where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let undo = {
-        let mut wire = shared.wire.lock().await;
-        match wire.register(
-            C2S,
-            id.clone(),
-            TrackedRequest::from_extracted(method, version, allowed, shared.dry_run, ext),
-        ) {
-            Err(reason) => {
-                drop(wire);
-                if audit_verdict.is_some() {
-                    // Registration refused an allowed request (duplicate
-                    // id / capacity) — audit it like the S2C direction.
-                    proxy_rpc::audit_decision(
-                        &shared.audit,
-                        C2S,
-                        "request",
-                        Some(method),
-                        Some(raw_id),
-                        version,
-                        McpVerdict::Deny(DenyReason::Shape),
-                        false,
-                        shared.dry_run,
-                        Some(format!("register={reason}")),
-                    )?;
-                }
-                write_client_frame(
-                    &shared.client_out,
-                    &build_jsonrpc_error(raw_id, &format!("request denied ({reason})")),
-                )
-                .await?;
-                return Ok(false);
-            }
-            Ok(()) => wire.on_request_forwarded(C2S, id, method, version, ext),
-        }
-    };
-    // The decision record is send-ordered ahead of the frame — the
-    // protected action must never cross ahead of its own authorization
-    // record, so a saturated or dead sink refuses the forward here
-    // rather than discovering the failure on the next frame.
-    if let Some(verdict) = audit_verdict {
-        proxy_rpc::audit_forwarded_decision(
-            &shared.audit,
-            C2S,
-            "request",
-            Some(method),
-            Some(raw_id),
-            version,
-            verdict,
-            shared.dry_run,
-            request_extra(ext),
-        )
-        .await?;
-    }
-    shared.audit.ensure_available()?;
-    // Verified-set recheck (F6/F10): the admission-time capture is
-    // compared immediately before the child write. A `list_changed`
-    // revalidation raises `list_busy` before it starts and bumps the
-    // generation (with its advertised-name set) when it verifies, so a
-    // stale admission is caught by either arm — unwind the registration
-    // and deny rather than let the call execute against a tool set that
-    // may have moved. `verified_tools` is authoritative: the names a
-    // call was admitted against cannot change without its generation.
-    //
-    // The recheck and the write hold one `list_epoch` critical section:
-    // every gate raise (`handle_list_changed` and the other S2C sites)
-    // acquires the same guard first, so the gate can never flip between
-    // this check and the dispatch. A raise queued behind us runs only
-    // after the frame is written — the call legitimately predates the
-    // revalidation — and a call queued behind a raise observes busy and
-    // unwinds. Without the epoch a raise could land in the gap after
-    // the check, letting a stale-generation call cross after
-    // revalidation had already begun.
-    //
-    // The epoch-held write is bounded (`EPOCH_CHILD_WRITE_BUDGET`): the
-    // raises this section serializes against run on the S2C task that
-    // drains the child's stdout, so an unbounded write into a full
-    // stdin pipe would deadlock — the write waits on the child reading,
-    // the child on its stdout draining, the drain on this epoch. And
-    // the stale-check's denial (wire rollback, corrective audit, client
-    // error) runs only after the guard drops: a blocked client write or
-    // wire lock must not stretch the critical section either.
-    let dispatched = if let Some(expected) = expected_list_gen {
-        let _epoch = shared.list_epoch.lock().await;
-        if shared.list_busy.load(Ordering::SeqCst)
-            || shared.verified_tools.lock().unwrap().generation != expected
-        {
-            // `None` records the stale verdict; the epoch drops before
-            // the denial work below.
-            None
-        } else {
-            Some(write_child_frame_epoch(&shared.child_stdin, line).await)
-        }
-    } else {
-        Some(write_child_frame(&shared.child_stdin, line).await)
-    };
-    let Some(result) = dispatched else {
-        shared.wire.lock().await.rollback_forwarded_request(undo);
-        if let Some(verdict) = audit_verdict {
-            // The pre-write record claimed `forwarded=true`; reconcile
-            // the wire truth with a corrective not-forwarded record.
-            proxy_rpc::audit_forward_failed(
-                &shared.audit,
-                C2S,
-                "request",
-                Some(method),
-                Some(raw_id),
-                version,
-                verdict,
-                shared.dry_run,
-                request_extra(ext),
-            );
-        }
-        write_client_frame(
-            &shared.client_out,
-            &build_jsonrpc_error(raw_id, "tools/list revalidation began during authorization"),
-        )
-        .await?;
-        return Ok(false);
-    };
-    if let Some(verdict) = audit_verdict
-        && result.is_err()
-    {
-        // The pre-write record claimed `forwarded=true`; reconcile the
-        // wire truth with a corrective not-forwarded record.
-        proxy_rpc::audit_forward_failed(
-            &shared.audit,
-            C2S,
-            "request",
-            Some(method),
-            Some(raw_id),
-            version,
-            verdict,
-            shared.dry_run,
-            request_extra(ext),
-        );
-    }
-    match result {
-        Ok(()) => Ok(true),
-        Err(e) => {
-            // The request never reached the server: unwind the
-            // registration and the side effects committed with it.
-            shared.wire.lock().await.rollback_forwarded_request(undo);
-            Err(e)
-        }
-    }
 }
 
 /// The tools/call denial while the verified-list gate is closed — a
@@ -940,7 +546,7 @@ where
 pub(super) async fn deny_busy_tools_call<W>(
     shared: &ProxyShared<W>,
     raw_id: &str,
-    line: &str,
+    tool: Option<&str>,
     reason: &str,
     audit_reason: Option<&str>,
     tool_denied: bool,
@@ -948,8 +554,8 @@ pub(super) async fn deny_busy_tools_call<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let tool = extract_tool_name_from_line(line).unwrap_or_else(|| "<unknown>".into());
-    let error_response = build_error_response(raw_id, &tool, reason, tool_denied);
+    let tool = tool.unwrap_or("<unknown>");
+    let error_response = build_error_response(raw_id, tool, reason, tool_denied);
     write_client_frame(&shared.client_out, &error_response).await?;
     let correlation_id = Uuid::now_v7();
     let mut event = AuditEvent::new(
@@ -959,653 +565,12 @@ where
         Outcome::Failure,
         Action::Denied,
     );
-    event.target_tool = Some(tool);
+    event.target_tool = Some(tool.to_string());
     event.request_id = Some(proxy_rpc::truncate_for_audit(raw_id));
     event.details = Some(audit_reason.unwrap_or(reason).to_string());
     shared.audit.log(event);
     Ok(())
 }
 
-/// The legacy per-session gates for an allowed `tools/call`: trajectory
-/// check, then the name-fixed Confused Deputy gate, then pending-call
-/// registration. Mirrors the pre-PR-10 ordering.
-pub(super) async fn apply_session_gates<W>(
-    shared: &ProxyShared<W>,
-    check_result: Result<checker::CheckPass, checker::PolicyViolation>,
-    line: &str,
-    id: &RpcId,
-) -> Result<checker::CheckPass, checker::PolicyViolation>
-where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let Ok(check_pass) = check_result else {
-        return check_result;
-    };
-    let Some(ref session) = shared.session else {
-        return Ok(check_pass);
-    };
-    let mut state = session.lock().await;
-    let tool = extract_tool_name_from_line(line);
-    if shared.policy.trajectory
-        && let Err(violation) = checker::check_trajectory(line, &shared.policy, &state)
-    {
-        return Err(violation);
-    }
-    apply_confused_deputy_c2s(&shared.policy, &mut state, line, Some(id), tool.as_deref())?;
-    if shared.policy.trajectory {
-        let se = tool
-            .as_deref()
-            .and_then(|name| checker::tool_side_effect(&shared.policy, name));
-        if let Err(reason) =
-            state.record_pending_tool_call(id.clone(), tool.as_deref().unwrap_or("<unknown>"), se)
-        {
-            // A discover-role gate above may have registered a pending
-            // list under this id — roll it back here so the entry cannot
-            // linger toward the cap. The caller's deny path releases it
-            // too; a still-forwarded dry-run deny must not seed either.
-            state.take_pending_list(id);
-            return Err(checker::PolicyViolation::new(
-                tool.unwrap_or_else(|| "<unknown>".into()),
-                checker::DenialKind::Session,
-                format!("trajectory: {reason}"),
-            ));
-        }
-    }
-    Ok(check_pass)
-}
-
-/// Opt-in Confused Deputy gate (`confused_deputy_protection`, default
-/// off). The tool's role comes from `deputy::deputy_binding` — an
-/// explicit `deputy` block wins, else the fixed-name compatibility
-/// mapping applies:
-///
-/// - `Discover` (`deputy role="discover"`, or compat `list_files` /
-///   `list_directory`): register the call's id, snapshotting the
-///   extraction rules its **successful** correlated response may seed
-///   `known_paths` with.
-/// - `Use` (`deputy role="use"`, or compat `read_file`): every path the
-///   tool's rules extract must already be in `known_paths`. A call whose
-///   rules extract nothing — or whose extraction fails (bad JSON,
-///   pointer value-bound overflow) — is denied; a `use` call never
-///   passes unchecked. `../` traversal (incl. percent-encoded forms) is
-///   always denied.
-/// - `None` (`deputy role="none"` or no role bound): no check here — the
-///   tool's ordinary policy gates (allowlist / `args_schema` /
-///   `side_effect` / fs / net / trajectory) apply unchanged.
-///
-/// `known_paths` is process-local to this child — interleaved clients
-/// share the set; configurable roles are not session separation.
-pub(super) fn apply_confused_deputy_c2s(
-    policy: &Policy,
-    state: &mut SessionState,
-    line: &str,
-    envelope_id: Option<&RpcId>,
-    tool: Option<&str>,
-) -> Result<(), checker::PolicyViolation> {
-    if !policy.confused_deputy_protection {
-        return Ok(());
-    }
-    let Some(tool_name) = tool else {
-        return Ok(());
-    };
-    match crate::policy::deputy::deputy_binding(policy, tool_name) {
-        crate::policy::deputy::DeputyBinding::Discover(rules) => {
-            if matches!(envelope_id, Some(&RpcId::Null)) {
-                return Err(checker::PolicyViolation::new(
-                    tool_name,
-                    checker::DenialKind::Session,
-                    "confused deputy: JSON-RPC id must not be null",
-                ));
-            }
-            if let Some(id) = envelope_id
-                && let Err(reason) = state.record_pending_list(id.clone(), tool_name, rules)
-            {
-                return Err(checker::PolicyViolation::new(
-                    tool_name,
-                    checker::DenialKind::Session,
-                    format!("confused deputy: {reason}"),
-                ));
-            }
-            Ok(())
-        }
-        crate::policy::deputy::DeputyBinding::Use(rules) => {
-            // The tool's `arguments { opaque }` declarations apply to the
-            // closed-contract check exactly as they do to the tool's own
-            // sub-policy — the deputy binding lookup already found this
-            // tool by name.
-            let opaque_fields = policy
-                .tools
-                .iter()
-                .find(|t| t.name == tool_name)
-                .map(|t| t.opaque_fields.as_slice())
-                .unwrap_or(&[]);
-            let paths = checker::extract_deputy_use_targets_rc(line, rules, opaque_fields)
-                .map_err(|reason| {
-                    checker::PolicyViolation::new(
-                        tool_name,
-                        checker::DenialKind::Session,
-                        format!("confused deputy: {reason}"),
-                    )
-                })?;
-            if paths.is_empty() {
-                return Err(checker::PolicyViolation::new(
-                    tool_name,
-                    checker::DenialKind::Session,
-                    format!(
-                        "confused deputy: tool '{tool_name}' is missing a resolvable path target"
-                    ),
-                ));
-            }
-            for path in &paths {
-                if let Err(denial) = state.check_access(path) {
-                    // A `..` escape found by the session gate is a real
-                    // traversal attempt — the `validation.path_traversal`
-                    // audit event applies even wrapped in the deputy
-                    // reason. Everything else is a session-state refusal.
-                    let kind = match &denial {
-                        crate::auditor::session::AccessDenial::PathTraversal(_) => {
-                            checker::DenialKind::Validation(checker::ValidationKind::PathTraversal)
-                        }
-                        crate::auditor::session::AccessDenial::NotDiscovered(_) => {
-                            checker::DenialKind::Session
-                        }
-                    };
-                    return Err(checker::PolicyViolation::new(
-                        tool_name,
-                        kind,
-                        format!("confused deputy: {}", denial.reason()),
-                    ));
-                }
-            }
-            Ok(())
-        }
-        crate::policy::deputy::DeputyBinding::None => Ok(()),
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::auditor::proxy_state::PendingToolsList;
-    use crate::policy::mcp::AllowReason;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use tokio::sync::{Mutex, watch};
-
-    fn shared_for_test() -> (
-        ProxyShared<tokio::io::DuplexStream>,
-        watch::Receiver<bool>,
-        tokio::io::DuplexStream,
-    ) {
-        let (abort_tx, abort_rx) = watch::channel(false);
-        // The read half must outlive the test — a dropped reader makes
-        // `write_child_frame` fail with BrokenPipe.
-        let (child_read, child_write) = tokio::io::duplex(64 * 1024);
-        (
-            ProxyShared {
-                policy: Policy::default(),
-                dry_run: false,
-                fail_on: crate::verifier::fail_on::FailOn::None,
-                max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
-                audit: Arc::new(crate::audit_log::AuditLogger::to_tracing()),
-                tally: std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::auditor::proxy_state::CallTally::default(),
-                )),
-                session: None,
-                wire: Arc::new(Mutex::new(proxy_rpc::WireState::new())),
-                pending_tools_list: Arc::new(Mutex::new(PendingToolsList::new())),
-                client_out: Arc::new(Mutex::new(tokio::io::stdout())),
-                child_stdin: Arc::new(Mutex::new(Some(child_write))),
-                original_tools_list: Arc::new(Mutex::new(std::collections::HashMap::new())),
-                list_busy: Arc::new(AtomicBool::new(false)),
-                list_kick: Arc::new(tokio::sync::Notify::new()),
-                cancelled_list_id: Arc::new(Mutex::new(None)),
-                held_client_list: Arc::new(Mutex::new(None)),
-                internal_list_failure: Arc::new(tokio::sync::Mutex::new(None)),
-                list_epoch: Arc::new(tokio::sync::Mutex::new(())),
-                list_generation: Arc::new(AtomicU64::new(0)),
-                verified_tools: Arc::new(std::sync::Mutex::new(
-                    crate::auditor::proxy_state::VerifiedToolSet {
-                        generation: 0,
-                        names: std::collections::HashSet::new(),
-                    },
-                )),
-                last_list_template: Arc::new(Mutex::new(String::new())),
-                next_internal_id: Arc::new(AtomicU64::new(910_001)),
-                init_order_warned: Arc::new(AtomicBool::new(false)),
-                abort_tx,
-            },
-            abort_rx,
-            child_read,
-        )
-    }
-
-    const CALL_LINE: &str =
-        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"t","arguments":{}}}"#;
-
-    /// Publish a verified generation the way `verify_and_emit_list` does:
-    /// the name set and counter move together under the mutex, and the
-    /// atomic mirror follows.
-    fn set_verified(
-        shared: &ProxyShared<tokio::io::DuplexStream>,
-        generation: u64,
-        names: &[&str],
-    ) {
-        {
-            let mut vt = shared.verified_tools.lock().unwrap();
-            vt.generation = generation;
-            vt.names = names.iter().map(|s| s.to_string()).collect();
-        }
-        shared.list_generation.store(generation, Ordering::SeqCst);
-    }
-
-    /// F10: a tools/call admitted under verified generation N must
-    /// unwind and refuse the child write when a revalidation published
-    /// a newer generation in between.
-    #[tokio::test]
-    async fn stale_list_generation_unwinds_registration_before_write() {
-        let (shared, _rx, _child_read) = shared_for_test();
-        // Verification of the *next* set published since admission.
-        set_verified(&shared, 2, &["t"]);
-        let id = RpcId::from_u64(7);
-        let ext = ExtractedRequest::default();
-        let forwarded = register_and_forward_impl(
-            &shared,
-            CALL_LINE,
-            "tools/call",
-            &id,
-            "7",
-            SupportedProtocolVersion::Mcp2025November25,
-            &ext,
-            true,
-            Some(McpVerdict::Allow(AllowReason::RuleAllow)),
-            Some(1),
-        )
-        .await
-        .unwrap();
-        assert!(!forwarded, "stale generation must refuse the forward");
-        assert!(
-            shared.wire.lock().await.get(C2S, &id).is_none(),
-            "the refused registration must be unwound"
-        );
-    }
-
-    /// F10: a list_changed revalidation raises the busy gate before it
-    /// starts — a call admitted just before the mark unwinds at the
-    /// pre-write recheck even if the generation has not moved yet.
-    #[tokio::test]
-    async fn busy_gate_mid_authorization_unwinds_before_write() {
-        let (shared, _rx, _child_read) = shared_for_test();
-        set_verified(&shared, 1, &["t"]);
-        shared.list_busy.store(true, Ordering::SeqCst);
-        let id = RpcId::from_u64(7);
-        let ext = ExtractedRequest::default();
-        let forwarded = register_and_forward_impl(
-            &shared,
-            CALL_LINE,
-            "tools/call",
-            &id,
-            "7",
-            SupportedProtocolVersion::Mcp2025November25,
-            &ext,
-            true,
-            Some(McpVerdict::Allow(AllowReason::RuleAllow)),
-            Some(1),
-        )
-        .await
-        .unwrap();
-        assert!(!forwarded, "a raised busy gate must refuse the forward");
-        assert!(shared.wire.lock().await.get(C2S, &id).is_none());
-    }
-
-    /// F-dispatch-race: the recheck+write critical section is serialized
-    /// against the gate raise by `list_epoch`. With the dispatch queued
-    /// on the epoch ahead of a `list_changed` raise, the frame must
-    /// reach the child *before* the gate flips — the call legitimately
-    /// predates the revalidation.
-    #[tokio::test]
-    async fn dispatch_holding_epoch_writes_before_gate_raise() {
-        let (shared, _rx, mut child_read) = shared_for_test();
-        set_verified(&shared, 1, &["t"]);
-
-        // Hold the epoch so both contenders queue behind us; tokio's
-        // mutex grants waiters FIFO, so spawn order fixes the winner.
-        let epoch_guard = shared.list_epoch.lock().await;
-
-        let shared_dispatch = shared.clone();
-        let dispatch = tokio::spawn(async move {
-            let id = RpcId::from_u64(7);
-            let ext = ExtractedRequest::default();
-            register_and_forward_impl(
-                &shared_dispatch,
-                CALL_LINE,
-                "tools/call",
-                &id,
-                "7",
-                SupportedProtocolVersion::Mcp2025November25,
-                &ext,
-                true,
-                Some(McpVerdict::Allow(AllowReason::RuleAllow)),
-                Some(1),
-            )
-            .await
-        });
-        // Let the dispatch run to its epoch acquisition point.
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-
-        let shared_raise = shared.clone();
-        let raise = tokio::spawn(async move { shared_raise.raise_list_gate().await });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-
-        drop(epoch_guard);
-        let forwarded = dispatch.await.unwrap().unwrap();
-        let was_busy = raise.await.unwrap();
-
-        assert!(
-            forwarded,
-            "the dispatch held the epoch first — its write predates the raise"
-        );
-        assert!(!was_busy, "the raise must observe the gate still down");
-        assert!(
-            shared.list_busy.load(Ordering::SeqCst),
-            "the raise must own the gate afterwards"
-        );
-        let mut buf = vec![0u8; CALL_LINE.len() + 8];
-        let n = tokio::io::AsyncReadExt::read(&mut child_read, &mut buf)
-            .await
-            .unwrap();
-        assert!(
-            buf[..n]
-                .windows(CALL_LINE.len())
-                .any(|w| w == CALL_LINE.as_bytes()),
-            "the tools/call frame must reach the child before the gate rose"
-        );
-    }
-
-    /// F-dispatch-race, opposite winner: the `list_changed` raise queued
-    /// on the epoch first — the stale-generation call that arrives after
-    /// observes the raised gate and unwinds instead of writing.
-    #[tokio::test]
-    async fn dispatch_behind_gate_raise_unwinds_without_write() {
-        let (shared, _rx, mut child_read) = shared_for_test();
-        set_verified(&shared, 1, &["t"]);
-
-        let epoch_guard = shared.list_epoch.lock().await;
-
-        let shared_raise = shared.clone();
-        let raise = tokio::spawn(async move { shared_raise.raise_list_gate().await });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-
-        let shared_dispatch = shared.clone();
-        let dispatch = tokio::spawn(async move {
-            let id = RpcId::from_u64(7);
-            let ext = ExtractedRequest::default();
-            register_and_forward_impl(
-                &shared_dispatch,
-                CALL_LINE,
-                "tools/call",
-                &id,
-                "7",
-                SupportedProtocolVersion::Mcp2025November25,
-                &ext,
-                true,
-                Some(McpVerdict::Allow(AllowReason::RuleAllow)),
-                Some(1),
-            )
-            .await
-        });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-
-        drop(epoch_guard);
-        let was_busy = raise.await.unwrap();
-        let forwarded = dispatch.await.unwrap().unwrap();
-
-        assert!(!was_busy);
-        assert!(
-            !forwarded,
-            "a call queued behind the raise must see the gate and refuse"
-        );
-        assert!(shared.list_busy.load(Ordering::SeqCst));
-        let id = RpcId::from_u64(7);
-        assert!(
-            shared.wire.lock().await.get(C2S, &id).is_none(),
-            "the refused registration must be unwound"
-        );
-        let mut buf = [0u8; 64];
-        let read = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            tokio::io::AsyncReadExt::read(&mut child_read, &mut buf),
-        )
-        .await;
-        assert!(
-            read.is_err(),
-            "no frame may reach the child after the gate rose"
-        );
-    }
-
-    /// F10: with the admission generation still current and no
-    /// revalidation raised, the call forwards and stays registered.
-    #[tokio::test]
-    async fn matching_list_generation_forwards() {
-        let (shared, _rx, _child_read) = shared_for_test();
-        set_verified(&shared, 1, &["t"]);
-        let id = RpcId::from_u64(7);
-        let ext = ExtractedRequest::default();
-        let forwarded = register_and_forward_impl(
-            &shared,
-            CALL_LINE,
-            "tools/call",
-            &id,
-            "7",
-            SupportedProtocolVersion::Mcp2025November25,
-            &ext,
-            true,
-            Some(McpVerdict::Allow(AllowReason::RuleAllow)),
-            Some(1),
-        )
-        .await
-        .unwrap();
-        assert!(forwarded);
-        assert!(shared.wire.lock().await.get(C2S, &id).is_some());
-    }
-
-    /// F6: a statically allowed tool the verified listing did not
-    /// advertise is refused at admission — the generation number alone
-    /// never carried the tool-name set, so an omitted `t` must not keep
-    /// its channel.
-    #[tokio::test]
-    async fn unadvertised_tool_is_denied_at_admission() {
-        let (mut shared, _rx, mut child_read) = shared_for_test();
-        shared.fail_on = crate::verifier::fail_on::FailOn::Critical;
-        shared
-            .policy
-            .tools
-            .push(crate::policy::ToolPolicy::named("t", true));
-        set_verified(&shared, 1, &["other_tool"]);
-        let id = RpcId::from_u64(7);
-        forward_allowed(
-            &shared,
-            CALL_LINE,
-            "tools/call",
-            &id,
-            "7",
-            SupportedProtocolVersion::Mcp2025November25,
-            McpVerdict::Allow(AllowReason::RuleAllow),
-            ExtractedRequest::default(),
-        )
-        .await
-        .unwrap();
-        assert!(shared.wire.lock().await.get(C2S, &id).is_none());
-        let mut buf = [0u8; 64];
-        let read = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            tokio::io::AsyncReadExt::read(&mut child_read, &mut buf),
-        )
-        .await;
-        assert!(read.is_err(), "the denied call must not reach the child");
-    }
-
-    /// F6: a tool the verified listing advertised — and the policy
-    /// allows — forwards under its generation.
-    #[tokio::test]
-    async fn advertised_tool_forwards_under_its_generation() {
-        let (mut shared, _rx, mut child_read) = shared_for_test();
-        shared.fail_on = crate::verifier::fail_on::FailOn::Critical;
-        shared
-            .policy
-            .tools
-            .push(crate::policy::ToolPolicy::named("t", true));
-        set_verified(&shared, 1, &["t"]);
-        let id = RpcId::from_u64(7);
-        forward_allowed(
-            &shared,
-            CALL_LINE,
-            "tools/call",
-            &id,
-            "7",
-            SupportedProtocolVersion::Mcp2025November25,
-            McpVerdict::Allow(AllowReason::RuleAllow),
-            ExtractedRequest::default(),
-        )
-        .await
-        .unwrap();
-        assert!(shared.wire.lock().await.get(C2S, &id).is_some());
-        let mut buf = [0u8; 256];
-        let n = tokio::io::AsyncReadExt::read(&mut child_read, &mut buf)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&buf[..n]).contains("tools/call"));
-    }
-
-    /// F6: an admission captured before a revalidation publishes is
-    /// denied at the pre-write recheck even when the *new* set also
-    /// names the tool — the generation is bound to the set, not to the
-    /// name alone.
-    #[tokio::test]
-    async fn republished_set_still_stales_an_earlier_admission() {
-        let (shared, _rx, _child_read) = shared_for_test();
-        set_verified(&shared, 2, &["t"]);
-        let id = RpcId::from_u64(7);
-        let ext = ExtractedRequest::default();
-        let forwarded = register_and_forward_impl(
-            &shared,
-            CALL_LINE,
-            "tools/call",
-            &id,
-            "7",
-            SupportedProtocolVersion::Mcp2025November25,
-            &ext,
-            true,
-            Some(McpVerdict::Allow(AllowReason::RuleAllow)),
-            Some(1),
-        )
-        .await
-        .unwrap();
-        assert!(!forwarded);
-        assert!(shared.wire.lock().await.get(C2S, &id).is_none());
-    }
-
-    /// A client `tools/list` that loses the busy-gate CAS to an internal
-    /// listing — the post-`initialize` probe or a `list_changed`
-    /// revalidation — is held for the verified emit to answer instead
-    /// of being refused: `pending_tools_list` stays empty, so the
-    /// internal owner drains it when the listing settles.
-    #[tokio::test]
-    async fn arm_tools_list_holds_a_request_racing_internal_listing() {
-        let (shared, _rx, _child_read) = shared_for_test();
-        shared.list_busy.store(true, Ordering::SeqCst);
-        let id = RpcId::from_u64(0);
-        let armed = arm_tools_list(
-            &shared,
-            r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#,
-            &id,
-            "0",
-            SupportedProtocolVersion::Mcp2025November25,
-        )
-        .await
-        .unwrap();
-        assert!(!armed, "a held request is not forwarded to the child");
-        assert_eq!(
-            shared
-                .held_client_list
-                .lock()
-                .await
-                .as_ref()
-                .map(|(_, raw)| raw.as_str()),
-            Some("0")
-        );
-        assert!(shared.pending_tools_list.lock().await.is_empty());
-    }
-
-    /// A gate owned by a *client* listing still refuses outright — the
-    /// hold slot is only for internally-owned gates, and real
-    /// client-side contention keeps the "already in progress" refusal.
-    #[tokio::test]
-    async fn arm_tools_list_refuses_when_a_client_listing_owns_the_gate() {
-        let (shared, _rx, _child_read) = shared_for_test();
-        shared.list_busy.store(true, Ordering::SeqCst);
-        shared
-            .pending_tools_list
-            .lock()
-            .await
-            .try_insert(RpcId::from_u64(9));
-        let id = RpcId::from_u64(0);
-        let armed = arm_tools_list(
-            &shared,
-            r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#,
-            &id,
-            "0",
-            SupportedProtocolVersion::Mcp2025November25,
-        )
-        .await
-        .unwrap();
-        assert!(!armed);
-        assert!(shared.held_client_list.lock().await.is_none());
-    }
-
-    /// The deputy gate's `AccessDenial` carries the refusal kind: a
-    /// `..` escape keeps earning the `validation.path_traversal` audit
-    /// event while an ordinary undiscovered path stays a session-state
-    /// refusal — neither lands in the widening candidates. The
-    /// classification reads the typed error, never the wrapped reason
-    /// text.
-    #[test]
-    fn deputy_gate_denials_carry_typed_kind() {
-        let policy = Policy {
-            confused_deputy_protection: true,
-            ..Default::default()
-        };
-        let mut state = SessionState::new();
-        // `read_file` binds the compat use-role (FsTargets) — every
-        // extracted path must already be in `known_paths`, and a `..`
-        // spelling is refused outright.
-        let traversal = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/../secret"}}}"#;
-        let err =
-            apply_confused_deputy_c2s(&policy, &mut state, traversal, None, Some("read_file"))
-                .unwrap_err();
-        assert_eq!(
-            err.validation_kind(),
-            Some(EventType::ValidationPathTraversal),
-            "{}",
-            err.reason
-        );
-        assert!(err.reason.contains("path traversal"), "{}", err.reason);
-        assert!(!err.is_denied_target());
-
-        let undiscovered = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/undiscovered.txt"}}}"#;
-        let err =
-            apply_confused_deputy_c2s(&policy, &mut state, undiscovered, None, Some("read_file"))
-                .unwrap_err();
-        assert!(err.validation_kind().is_none(), "{}", err.reason);
-        assert!(!err.is_denied_target());
-        assert!(err.reason.contains("confused deputy"), "{}", err.reason);
-    }
-}
+mod tests;

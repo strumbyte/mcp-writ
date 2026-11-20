@@ -118,6 +118,36 @@ impl RpcId {
     pub(crate) fn is_internal_namespace(&self) -> bool {
         matches!(self, Self::String(s) if s.starts_with(INTERNAL_ID_PREFIX))
     }
+
+    /// Re-serialize as a JSON literal for an echo — the error a retired
+    /// in-flight request is answered with carries the canonical id, not
+    /// the original frame's spelling. `Number` keeps its canonical
+    /// `mantissa e exponent` spelling (a valid JSON number equal to the
+    /// original), `String` is quoted with escapes, `Null` is `null`.
+    pub(crate) fn to_json_literal(&self) -> String {
+        match self {
+            Self::Null => "null".to_string(),
+            // `Ne0` spells an integer — emit the digits, not the
+            // exponent form, so the echo reads like the original id.
+            Self::Number(n) => n.strip_suffix("e0").unwrap_or(n).to_string(),
+            Self::String(s) => {
+                let mut out = String::with_capacity(s.len() + 2);
+                out.push('"');
+                for ch in s.chars() {
+                    match ch {
+                        '"' => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        c if (c as u32) < 0x20 => {
+                            out.push_str(&format!("\\u{:04x}", c as u32));
+                        }
+                        c => out.push(c),
+                    }
+                }
+                out.push('"');
+                out
+            }
+        }
+    }
 }
 
 /// Serialized byte cost of a canonical id for the accounting budgets.

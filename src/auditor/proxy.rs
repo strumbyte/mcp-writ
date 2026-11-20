@@ -56,7 +56,9 @@ where
         },
         wire: Arc::new(tokio::sync::Mutex::new(super::proxy_rpc::WireState::new())),
         pending_tools_list: Arc::new(tokio::sync::Mutex::new(PendingToolsList::new())),
-        client_out: Arc::new(tokio::sync::Mutex::new(tokio::io::stdout())),
+        client_out: Arc::new(tokio::sync::Mutex::new(
+            Box::new(tokio::io::stdout()) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>
+        )),
         // Both relay directions can write (internal tools/list requests use S2C).
         // Option lets client EOF close the actual pipe even while S2C holds an Arc.
         child_stdin: Arc::new(tokio::sync::Mutex::new(Some(child_stdin))),

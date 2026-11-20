@@ -338,6 +338,14 @@ impl SessionState {
         if self.pending_tool_calls.contains_key(&request_id) {
             return Err("duplicate in-flight JSON-RPC id".to_string());
         }
+        if self.unverified_tool_calls.contains_key(&request_id) {
+            // The id still carries the earlier call's tombstone — a
+            // second call recorded under it would overwrite that
+            // candidate on release, so the request is refused before
+            // it can forward. Retained bytes stay with the tombstone:
+            // nothing new was charged.
+            return Err("JSON-RPC id still carries an unverified call".to_string());
+        }
         if self.pending_tool_calls.len() >= MAX_PENDING_TOOL_CALLS {
             return Err("too many pending tool calls".to_string());
         }
@@ -361,15 +369,18 @@ impl SessionState {
     /// Complete a pending `tools/call`. On success, store its side_effect.
     ///
     /// `succeeded` is true only for a JSON-RPC **response** with a completed
-    /// `result`. JSON-RPC `error`, MCP `result.isError=true`, and MRTR
-    /// `input_required` must be passed as `false` and do not replace the
-    /// last successful side_effect.
+    /// `result`. A delivered JSON-RPC `error`, MCP `result.isError=true`,
+    /// or an MRTR `input_required` suspend is an *ambiguous* verdict —
+    /// an internal error may follow partial work, and nothing enforces
+    /// pre-suspend purity on the tool — so the response path releases
+    /// those into the unverified candidates instead of completing them
+    /// here. `false` covers only proven non-execution (a registration
+    /// rollback — the frame never crossed).
     ///
     /// A response arriving for an id with no pending entry may still
     /// resolve an unverified tombstone — the wire's definitive verdict
     /// for a cancelled call arrives under the same id, so a completed
-    /// `result` proves the call ran (it becomes the verified marker)
-    /// and an error proves it did not.
+    /// `result` proves the call ran (it becomes the verified marker).
     pub fn complete_pending_tool_call(&mut self, request_id: &RpcId, succeeded: bool) {
         if let Some(pending) = self.remove_pending_tool_call(request_id) {
             if succeeded {
@@ -377,18 +388,19 @@ impl SessionState {
             }
             return;
         }
-        if let Some(tombstone) = self.take_unverified(request_id)
-            && succeeded
-        {
+        if succeeded && let Some(tombstone) = self.take_unverified(request_id) {
             self.record_verified_success(tombstone.tool_name, tombstone.side_effect);
         }
     }
 
-    /// Release a pending `tools/call` that ended **without an execution
-    /// verdict**: a forwarded `notifications/cancelled`, or a response the
-    /// policy refused to relay. Both mean the call reached the server and
-    /// may have run — unlike a delivered `error` / `isError` result, which
-    /// is a definite failure verdict and completes `succeeded=false`.
+    /// Release a pending `tools/call` that ended **without a proven
+    /// execution verdict**: a forwarded `notifications/cancelled`, a
+    /// response the policy refused to relay — or a delivered verdict
+    /// that cannot prove non-execution. A JSON-RPC `error`, MCP
+    /// `result.isError=true`, or an MRTR `input_required` suspend may
+    /// follow partial work (nothing enforces pre-suspend purity), so
+    /// the call may still have run; only a completed `result` is a
+    /// definite verdict and completes instead.
     ///
     /// The entry joins the unverified tombstones: its side_effect can
     /// satisfy the `after` side of a trajectory deny rule, but the verified

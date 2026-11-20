@@ -90,7 +90,7 @@ where
     if st.hold_list_changed(line, was_busy) {
         return Ok(());
     }
-    begin_revalidation(shared, st).await
+    begin_revalidation(shared, st, false).await
 }
 
 /// A cancelled client `tools/list` released its C2S bookkeeping — the
@@ -136,7 +136,7 @@ where
         return Ok(());
     }
     if st.take_queued_revalidation() {
-        return begin_revalidation(shared, st).await;
+        return begin_revalidation(shared, st, false).await;
     }
     shared.list_busy.store(false, Ordering::SeqCst);
     // A request held behind the just-released gate has nothing in flight
@@ -201,22 +201,31 @@ async fn failure_emit_id<W>(
 /// notification. Also used to emit the initial internal `tools/list`
 /// right after `initialize` when verification is enforced — the caller
 /// must raise `list_busy` first so `tools/call` cannot race in.
+/// `replied` records whether the listing this revalidation follows
+/// already delivered its client reply — the abort drain's `id: null`
+/// observability fallback stays silent then. The flag must reach
+/// `internal_list_failure` *before* the abort signal can fire the
+/// drain, so the failure arms below take it as a parameter rather
+/// than letting the caller merge it afterwards.
 pub(crate) async fn begin_revalidation<W>(
     shared: &ProxyShared<W>,
     st: &mut S2cListState,
+    replied: bool,
 ) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let internal_id = shared.next_internal_id.fetch_add(1, Ordering::Relaxed);
     let template = shared.last_list_template.lock().await.clone();
-    st.begin_revalidation(template.clone(), internal_id);
     let follow = build_internal_tools_list_request(&template, internal_id);
     // Register before the write: a failed write aborts the session, so
     // the entry can never outlive the request it tracks. A refused
     // registration must not emit an untracked request either — fail
     // closed and keep list_busy set so tools/call stays denied until
-    // the abort completes.
+    // the abort completes. The entry is born undispatched and `st` arms
+    // only after the write — a frame naming the sequential internal id
+    // must not resolve or reach the list pipeline before the request
+    // crossed.
     let registered = {
         let mut wire = shared.wire.lock().await;
         let version = wire.passive_version();
@@ -231,11 +240,42 @@ where
         tracing::error!(reason = %block_reason, "internal tools/list tracking failed: aborting session");
         // A client listing held behind this internal one — or still in
         // transit in the C2S pipe — is answered by the abort drain.
-        *shared.internal_list_failure.lock().await = Some((block_reason.clone(), false));
+        // The first failure remains the drain's reason; the reply
+        // state merges so a delivered listing is never re-reported.
+        {
+            let mut failure = shared.internal_list_failure.lock().await;
+            match &mut *failure {
+                Some((_, prior_replied)) => *prior_replied |= replied,
+                None => *failure = Some((block_reason.clone(), replied)),
+            }
+        }
         shared.abort_tx.send(true).ok();
         return Err(AuditorError::VerificationFailed(block_reason));
     }
-    write_child_frame(&shared.child_stdin, &follow).await?;
+    if let Err(e) = write_child_frame(&shared.child_stdin, &follow).await {
+        // The write failure aborts the session — record the reason
+        // and signal the drain so a client listing held behind this
+        // internal one, or still in transit in the C2S pipe, is
+        // answered instead of dying on teardown. `replied` marks
+        // whether a verified listing already reached the client (the
+        // drain's `id: null` observability fallback stays silent
+        // then), and an earlier record stands: the first failure
+        // remains the drain's reason, with the reply state merged.
+        {
+            let mut failure = shared.internal_list_failure.lock().await;
+            match &mut *failure {
+                Some((_, prior_replied)) => *prior_replied |= replied,
+                None => *failure = Some((e.to_string(), replied)),
+            }
+        }
+        shared.abort_tx.send(true).ok();
+        return Err(e);
+    }
+    st.begin_revalidation(template, internal_id);
+    shared.wire.lock().await.mark_dispatched(
+        MessageDirection::ClientToServer,
+        &RpcId::internal(internal_id),
+    );
     Ok(())
 }
 
@@ -578,9 +618,11 @@ where
         }
         let internal_id = shared.next_internal_id.fetch_add(1, Ordering::Relaxed);
         let follow = build_pagination_request(st.original_request(), internal_id, &cursor);
-        st.expect_internal_response(internal_id);
         // Never emit an untracked pagination request — same fail-closed
         // rule as the initial internal request; list_busy stays set.
+        // The entry is born undispatched and the expected-response arm
+        // lands only after the write: a frame naming the sequential
+        // internal id must not resolve before the request crossed.
         let registered = {
             let mut wire = shared.wire.lock().await;
             let version = wire.passive_version();
@@ -600,7 +642,22 @@ where
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(block_reason));
         }
-        write_child_frame(&shared.child_stdin, &follow).await?;
+        if let Err(e) = write_child_frame(&shared.child_stdin, &follow).await {
+            // Same settlement rule as `begin_revalidation`: the
+            // failure aborts the session, so record the reason and
+            // signal the drain rather than let a held client listing
+            // die on teardown. No client reply was emitted here.
+            if shared.internal_list_failure.lock().await.is_none() {
+                *shared.internal_list_failure.lock().await = Some((e.to_string(), false));
+            }
+            shared.abort_tx.send(true).ok();
+            return Err(e);
+        }
+        st.expect_internal_response(internal_id);
+        shared.wire.lock().await.mark_dispatched(
+            MessageDirection::ClientToServer,
+            &RpcId::internal(internal_id),
+        );
         return Ok(ListFlow::Handled);
     }
 
@@ -965,6 +1022,12 @@ where
         shared.list_busy.store(false, Ordering::SeqCst);
     }
 
+    // Whether this response's own reply committed to the client —
+    // reaching the revalidation block below with `replied` true means
+    // the verified frame was written; `false` means nothing client-
+    // visible was emitted (internal listing or revalidation-owned
+    // response), so a probe failure there is not a post-delivery one.
+    let replied = verified.is_some();
     if let Some(verified) = verified {
         // Re-check immediately before the forward: the committed record
         // above raced nothing, but the sink could have died in between —
@@ -974,7 +1037,34 @@ where
     }
 
     if revalidate {
-        begin_revalidation(shared, st).await?;
+        // When the verified listing already reached the client, a probe
+        // failure here is the next revalidation's, not this response's
+        // forwarding failure. The session still dies (the owed
+        // revalidation can never run): record the drain's reason,
+        // signal the abort, and wrap the error so the response path's
+        // forward-failed reconciliation does not misreport a delivered
+        // frame. `internal_list_failure` may already carry
+        // `begin_revalidation`'s own reason — keep the first record,
+        // with `replied` marking whether an inline reply on a real
+        // request id already made the abort observable. With no reply
+        // emitted the probe's failure stands on its own semantics —
+        // its child-write uncertainty is never recorded as the
+        // client's — and the caller's reconciliation still runs.
+        // `replied` is threaded into `begin_revalidation` so the
+        // delivered-reply status lands in `internal_list_failure`
+        // *before* its abort signal can fire the drain — merging it
+        // here would race the drain reading a stale `false`.
+        if let Err(e) = begin_revalidation(shared, st, replied).await {
+            shared.abort_tx.send(true).ok();
+            return Err(if replied {
+                AuditorError::PostDeliveryFailure(Box::new(e))
+            } else {
+                match e {
+                    AuditorError::DeliveryUncertain(e) => AuditorError::Io(e),
+                    e => e,
+                }
+            });
+        }
         return Ok(ListFlow::Handled);
     }
 
