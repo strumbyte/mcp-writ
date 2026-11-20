@@ -145,7 +145,8 @@ pub fn resolve_schema(schema_ref: &str) -> Result<String, SchemaRefError> {
 /// human-readable description of the first violation found.
 ///
 /// This entry prepares a fresh [`PreparedSchema`] per call — the same
-/// per-request parse the bare `&Policy` check path always did. Prepared
+/// per-request parse the bare `&Policy` check path always did, at the
+/// cost of one `String` copy the owned document needs. Prepared
 /// sessions route through [`validate_prepared`] instead, which shares
 /// one document and its `$ref`/`pattern` memos across requests.
 pub fn validate_arguments(arguments: RawJsonValue<'_, '_>, schema_str: &str) -> Result<(), String> {

@@ -89,11 +89,13 @@ pub struct PreparedTool {
 
 /// The `args_schema` execution plan for one prepared tool — RF05b.
 ///
-/// `Inline` is the shape KDL-loaded policies produce: the loader
-/// resolves `@file` spellings to inline JSON at parse time
-/// (`Policy::inlined_schemas`), so a prepared view only ever sees a
-/// `@`-spelling on programmatically built documents that skipped that
-/// step. `File` covers that case without changing what a request does:
+/// `Inline` is the shape validated policies produce: the KDL loader
+/// resolves `@file` spellings to inline JSON at load time
+/// (`Policy::inlined_schemas`), and `validate_args_schemas` refuses a
+/// `@`-spelling that survived to validation — so a prepared view sees
+/// one only on a document that skipped those steps (a programmatically
+/// built `Policy`, an unvalidated parse without a base dir). `File`
+/// covers that case without changing what a request does:
 /// the checker still calls `schema_validator::resolve_schema` per
 /// call (the cwd-scoped, no-follow read is the contract), and this
 /// single-entry memo keys on the *resolved bytes* — identical bytes
@@ -115,6 +117,12 @@ pub enum ToolSchema {
 /// displaced plan drops once its last in-flight `Arc` drains, so a
 /// long-lived `PreparedPolicy` never accumulates versions of the same
 /// `@file` schema.
+///
+/// Replacement is last-writer-wins on the resolved bytes: under
+/// concurrent divergent resolutions a stale-bytes request can
+/// displace a fresher entry. Every request still evaluates the bytes
+/// *it* resolved — the `Arc` outlives the swap — so only the memo
+/// thrashes under alternating rewrites, never the verdict.
 #[derive(Debug)]
 pub struct FileSchemaEntry {
     content: Box<str>,

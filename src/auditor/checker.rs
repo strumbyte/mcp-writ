@@ -806,7 +806,8 @@ fn validate_tool_args(
     //   at load): the document `PreparedPolicy` parsed once is shared
     //   by the session; no I/O ever happens here.
     // - `File` (a `@path` spelling that reached a prepared view — only
-    //   programmatically built policies produce one): `resolve_schema`
+    //   unvalidated documents produce one, e.g. a programmatically
+    //   built `Policy`): `resolve_schema`
     //   still runs per call — the cwd-scoped, no-follow read is the
     //   contract — and the `File` memo keys on the resolved *bytes*,
     //   so identical content reuses one parse while a rewrite plans
