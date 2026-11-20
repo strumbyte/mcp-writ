@@ -131,7 +131,12 @@ async fn s2c_frame<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let parsed = nojson::RawJson::parse(line.trim());
+    // Parse the frame's exact bytes — the same text the client would
+    // receive on a forward. `RawJson` skips only the four JSON
+    // whitespace characters, so a Unicode "space" like U+00A0 around
+    // the frame is a parse rejection, not a silent normalization
+    // (same posture as the C2S gate's `parse_and_verify`).
+    let parsed = nojson::RawJson::parse(line);
     let Ok(json) = &parsed else {
         // Fail closed: unparseable frames from the server are dropped.
         audit_malformed(shared, None, "invalid JSON").await?;
@@ -182,6 +187,25 @@ where
                 if tracked {
                     return route_tools_list(shared, st, line, &parsed, value, Some(reason)).await;
                 }
+                // A tools/list request armed on the C2S side could
+                // register between the `tracked` probe above and this
+                // lookup — `answered` still proves the request genuinely
+                // crossed, so the frame belongs to the list pipeline's
+                // fail-closed malformed handling. Route without
+                // consuming: `handle_tools_list_response` unwinds the
+                // `pending_tools_list` membership and gate state itself —
+                // an entry already taken here leaves its listing armed
+                // with no registration left to complete it.
+                if let Some(ref id) = rpc_id
+                    && shared
+                        .wire
+                        .lock()
+                        .await
+                        .answered(S2C, id)
+                        .is_some_and(|a| a.method == "tools/list")
+                {
+                    return route_tools_list(shared, st, line, &parsed, value, Some(reason)).await;
+                }
                 // A malformed response answering any other tracked
                 // request still terminates that RPC — dropping it would
                 // leave the client's waiter hanging and leak the wire
@@ -200,17 +224,6 @@ where
                 } else {
                     None
                 };
-                // A tools/list request armed on the C2S side could
-                // register between the `tracked` probe above and this
-                // take — the taken entry proves the request genuinely
-                // crossed, so the frame belongs to the list pipeline's
-                // fail-closed malformed handling, not the generic
-                // waiter-error path. Consuming it here would strand
-                // `pending_tools_list` and `list_busy` for the listing
-                // whose real response is still in flight.
-                if entry.as_ref().is_some_and(|e| e.method == "tools/list") {
-                    return route_tools_list(shared, st, line, &parsed, value, Some(reason)).await;
-                }
                 if let (Some(e), Some(id)) = (&entry, &rpc_id)
                     && e.method == "tools/call"
                     && let Some(ref session) = shared.session

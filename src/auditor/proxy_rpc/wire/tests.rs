@@ -20,6 +20,49 @@ fn cancel(wire: &mut WireState, direction: MessageDirection, id: RpcId) {
     );
 }
 
+/// A request registered but not yet written is invisible to response
+/// correlation — a frame naming its id while the request still waits
+/// in the outbound pipe cannot retire it. `mark_dispatched` is the
+/// boundary: after it runs the entry answers and consumes normally.
+#[test]
+fn undispatched_entries_cannot_be_answered_or_taken() {
+    let mut wire = WireState::new();
+    let mut entry = req("tools/list");
+    entry.dispatched = false;
+    wire.register(C2S, num(7), entry).unwrap();
+    assert!(wire.answered(S2C, &num(7)).is_none());
+    assert!(wire.take(C2S, &num(7)).is_none());
+    wire.mark_dispatched(C2S, &num(7));
+    assert!(wire.answered(S2C, &num(7)).is_some());
+    assert!(wire.take(C2S, &num(7)).is_some());
+}
+
+/// A waiter registered while the lock is held wakes when
+/// `mark_dispatched` runs — the dispatch-boundary pattern the
+/// response handlers rely on.
+#[tokio::test]
+async fn dispatch_waiter_wakes_on_mark() {
+    let wire = std::sync::Arc::new(tokio::sync::Mutex::new(WireState::new()));
+    {
+        let mut w = wire.lock().await;
+        let mut entry = req("ping");
+        entry.dispatched = false;
+        w.register(C2S, num(7), entry).unwrap();
+        let notify = w.dispatch_changed();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        drop(w);
+        let marker = wire.clone();
+        tokio::spawn(async move {
+            marker.lock().await.mark_dispatched(C2S, &num(7));
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("the waiter must wake on mark_dispatched");
+    }
+}
+
 /// At capacity a cancelled entry frees its slot, but its id stays
 /// retired: reuse is refused and a late response never correlates.
 #[test]

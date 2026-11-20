@@ -462,6 +462,21 @@ pub(crate) struct TrackedRequest {
     /// the request itself completes; `responded` keeps a second response
     /// from correlating again.
     pub responded: bool,
+    /// The request's bytes reached the peer's input. Registration
+    /// happens *before* the forward write so a failed write unwinds the
+    /// whole record — until [`WireState::mark_dispatched`] runs after a
+    /// successful write, `answered`/`take` treat the entry as invisible:
+    /// a frame naming its id while the request still sits in the
+    /// outbound pipe cannot retire work the peer never saw. Internal
+    /// registrations start dispatched — they are written immediately.
+    pub dispatched: bool,
+    /// Registration identity stamped by `register`: a monotonically
+    /// increasing sequence distinguishing this registration from a later
+    /// one that reuses the same `(direction, id)` after a rollback.
+    /// Waiters parked on `dispatch_changed` bind to it, so a response
+    /// meant for a rolled-back registration can never resolve (or keep
+    /// waiting on) a replacement request carrying the same id.
+    pub seq: u64,
     /// 2026 `subscriptions/listen` bookkeeping.
     pub subscription: Option<SubTracker>,
 }
@@ -499,11 +514,17 @@ impl TrackedRequest {
             level: ext.level.clone(),
             cancelled: false,
             responded: false,
+            dispatched: true,
+            seq: 0,
             subscription,
         }
     }
 
-    /// An Auditor-emitted internal `tools/list` request.
+    /// An Auditor-emitted internal `tools/list` request. Born
+    /// undispatched like the forwarded entries — the caller's
+    /// `mark_dispatched` after the child write is the boundary where a
+    /// response may correlate: a frame naming a predictable internal
+    /// id must not resolve before the request crossed.
     pub(crate) fn internal_list(version: SupportedProtocolVersion) -> Self {
         Self {
             method: "tools/list".to_string(),
@@ -518,6 +539,8 @@ impl TrackedRequest {
             level: None,
             cancelled: false,
             responded: false,
+            dispatched: false,
+            seq: 0,
             subscription: None,
         }
     }
@@ -535,6 +558,10 @@ pub(crate) struct AnsweredRequest {
     /// `input_required` gate reads that raw value, not this one).
     pub reached_peer: bool,
     pub internal: bool,
+    /// The registration identity of the entry this probe resolved —
+    /// lets a `dispatch_changed` waiter confirm the answered request is
+    /// still the registration it parked on, not a same-id replacement.
+    pub seq: u64,
 }
 
 mod wire;

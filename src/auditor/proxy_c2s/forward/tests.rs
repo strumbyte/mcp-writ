@@ -14,10 +14,17 @@ fn shared_for_test() -> (
     watch::Receiver<bool>,
     tokio::io::DuplexStream,
 ) {
-    let (abort_tx, abort_rx) = watch::channel(false);
     // The read half must outlive the test — a dropped reader makes
     // `write_child_frame` fail with BrokenPipe.
     let (child_read, child_write) = tokio::io::duplex(64 * 1024);
+    let (shared, abort_rx) = shared_for_test_with_writer(child_write);
+    (shared, abort_rx, child_read)
+}
+
+/// `shared_for_test` over an arbitrary child-stdin writer, so a test
+/// can instrument the pipe. The caller keeps the read half.
+fn shared_for_test_with_writer<W>(child_write: W) -> (ProxyShared<W>, watch::Receiver<bool>) {
+    let (abort_tx, abort_rx) = watch::channel(false);
     (
         ProxyShared {
             policy: Policy::default(),
@@ -55,8 +62,53 @@ fn shared_for_test() -> (
             abort_tx,
         },
         abort_rx,
-        child_read,
     )
+}
+
+/// Child-stdin writer that signals the first `poll_write` returning
+/// `Poll::Pending` — the moment the pipe is provably full. A test
+/// waiting on the notify observes the writer parked mid-frame instead
+/// of inferring the stall from a fixed yield count. `Notify` keeps a
+/// permit, so the signal is not lost when it fires before the test
+/// starts listening.
+struct PendingSignalWriter {
+    inner: tokio::io::DuplexStream,
+    pending: Arc<tokio::sync::Notify>,
+    signalled: bool,
+}
+
+impl tokio::io::AsyncWrite for PendingSignalWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_write(cx, buf) {
+            std::task::Poll::Pending => {
+                if !this.signalled {
+                    this.signalled = true;
+                    this.pending.notify_one();
+                }
+                std::task::Poll::Pending
+            }
+            poll => poll,
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 const CALL_LINE: &str =
@@ -138,7 +190,7 @@ async fn allowed_tools_call_runs_one_parse_and_one_dupkey_scan() {
 /// Publish a verified generation the way `verify_and_emit_list` does:
 /// the name set and counter move together under the mutex, and the
 /// atomic mirror follows.
-fn set_verified(shared: &ProxyShared<tokio::io::DuplexStream>, generation: u64, names: &[&str]) {
+fn set_verified<W>(shared: &ProxyShared<W>, generation: u64, names: &[&str]) {
     {
         let mut vt = shared.verified_tools.lock().unwrap();
         vt.generation = generation;
@@ -152,7 +204,7 @@ fn set_verified(shared: &ProxyShared<tokio::io::DuplexStream>, generation: u64, 
 /// a newer generation in between.
 #[tokio::test]
 async fn stale_list_generation_unwinds_registration_before_write() {
-    let (shared, _rx, _child_read) = shared_for_test();
+    let (shared, _rx, mut child_read) = shared_for_test();
     // Verification of the *next* set published since admission.
     set_verified(&shared, 2, &["t"]);
     let id = RpcId::from_u64(7);
@@ -176,6 +228,16 @@ async fn stale_list_generation_unwinds_registration_before_write() {
         shared.wire.lock().await.get(C2S, &id).is_none(),
         "the refused registration must be unwound"
     );
+    let mut buf = [0u8; 64];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        tokio::io::AsyncReadExt::read(&mut child_read, &mut buf),
+    )
+    .await;
+    assert!(
+        read.is_err(),
+        "a stale-generation refusal writes no child bytes"
+    );
 }
 
 /// F10: a list_changed revalidation raises the busy gate before it
@@ -183,7 +245,7 @@ async fn stale_list_generation_unwinds_registration_before_write() {
 /// pre-write recheck even if the generation has not moved yet.
 #[tokio::test]
 async fn busy_gate_mid_authorization_unwinds_before_write() {
-    let (shared, _rx, _child_read) = shared_for_test();
+    let (shared, _rx, mut child_read) = shared_for_test();
     set_verified(&shared, 1, &["t"]);
     shared.list_busy.store(true, Ordering::SeqCst);
     let id = RpcId::from_u64(7);
@@ -204,6 +266,13 @@ async fn busy_gate_mid_authorization_unwinds_before_write() {
     .unwrap();
     assert!(!forwarded, "a raised busy gate must refuse the forward");
     assert!(shared.wire.lock().await.get(C2S, &id).is_none());
+    let mut buf = [0u8; 64];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        tokio::io::AsyncReadExt::read(&mut child_read, &mut buf),
+    )
+    .await;
+    assert!(read.is_err(), "a busy-gate refusal writes no child bytes");
 }
 
 /// F-dispatch-race: the recheck+write critical section is serialized
@@ -213,7 +282,15 @@ async fn busy_gate_mid_authorization_unwinds_before_write() {
 /// predates the revalidation.
 #[tokio::test]
 async fn dispatch_holding_epoch_writes_before_gate_raise() {
-    let (shared, _rx, mut child_read) = shared_for_test();
+    let pending = Arc::new(tokio::sync::Notify::new());
+    // The read half must outlive the test — a dropped reader makes
+    // `write_child_frame` fail with BrokenPipe.
+    let (mut child_read, child_write) = tokio::io::duplex(64 * 1024);
+    let (shared, _rx) = shared_for_test_with_writer(PendingSignalWriter {
+        inner: child_write,
+        pending: pending.clone(),
+        signalled: false,
+    });
     set_verified(&shared, 1, &["t"]);
 
     // A frame larger than the duplex capacity makes the epoch-held
@@ -259,6 +336,28 @@ async fn dispatch_holding_epoch_writes_before_gate_raise() {
     });
     dispatch_queued_rx.await.unwrap();
 
+    drop(epoch_guard);
+    // The dispatch runs until its write stalls on the full pipe: the
+    // writer's first `Pending` fires `pending`, so this wait proves the
+    // frame is parked mid-write holding the epoch — not merely that a
+    // fixed number of scheduler turns elapsed.
+    tokio::time::timeout(std::time::Duration::from_secs(2), pending.notified())
+        .await
+        .expect("the epoch-held child write must stall on the full pipe");
+    // The write is paused mid-frame holding the epoch: with the test's
+    // guard dropped, the stalled dispatch is the only possible owner.
+    assert!(
+        shared.list_epoch.try_lock().is_err(),
+        "the epoch must be held by the stalled dispatch"
+    );
+    assert!(
+        !dispatch.is_finished(),
+        "the dispatch must be parked on the stalled epoch write"
+    );
+    assert!(!shared.list_busy.load(Ordering::SeqCst));
+
+    // Only now queue the raise — it must wait behind the epoch the
+    // stalled write still holds.
     let (raise_queued_tx, raise_queued_rx) = tokio::sync::oneshot::channel();
     let shared_raise = shared.clone();
     let raise = tokio::spawn(async move {
@@ -267,28 +366,9 @@ async fn dispatch_holding_epoch_writes_before_gate_raise() {
     });
     raise_queued_rx.await.unwrap();
 
-    // Both contenders have requested the epoch and neither has run:
-    // the gate is still down and no frame has crossed.
-    assert!(!shared.list_busy.load(Ordering::SeqCst));
     assert!(
         !dispatch.is_finished(),
-        "the dispatch must still be queued on the epoch"
-    );
-    assert!(
-        !raise.is_finished(),
-        "the raise must still be queued on the epoch"
-    );
-
-    drop(epoch_guard);
-    // Let the dispatch run until its write stalls on the full pipe.
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
-    // The write is paused mid-frame holding the epoch: the dispatch
-    // cannot finish, and the raise queued behind it cannot complete.
-    assert!(
-        !dispatch.is_finished(),
-        "the dispatch must be parked on the stalled epoch write"
+        "the dispatch must still be parked on the stalled epoch write"
     );
     assert!(
         !raise.is_finished(),
@@ -572,6 +652,10 @@ async fn arm_tools_list_holds_a_request_racing_internal_listing() {
 #[tokio::test]
 async fn arm_tools_list_refuses_when_a_client_listing_owns_the_gate() {
     let (shared, _rx, _child_read) = shared_for_test();
+    // Capture the client stream so the refusal's wire reply is
+    // observable — the helper's default `client_out` is stdout.
+    let (mut client_read, client_write) = tokio::io::duplex(64 * 1024);
+    *shared.client_out.lock().await = Box::new(client_write);
     shared.list_busy.store(true, Ordering::SeqCst);
     shared
         .pending_tools_list
@@ -590,6 +674,33 @@ async fn arm_tools_list_refuses_when_a_client_listing_owns_the_gate() {
     .unwrap();
     assert!(!armed);
     assert!(shared.held_client_list.lock().await.is_none());
+    // The owning listing's pending entry is untouched, and the refused
+    // request is answered with exactly one error frame.
+    assert!(
+        shared
+            .pending_tools_list
+            .lock()
+            .await
+            .contains(&RpcId::from_u64(9)),
+        "the owning listing's pending id must survive the refusal"
+    );
+    // `shared` drops here — the client write half closes, so
+    // `read_to_end` sees EOF after the refusal and any stray extra
+    // frame would fail the byte comparison.
+    drop(shared);
+    let mut out = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut client_read, &mut out)
+        .await
+        .unwrap();
+    let expected = format!(
+        "{}\n",
+        crate::auditor::proxy_wire::build_jsonrpc_error("0", "tools/list already in progress")
+    );
+    assert_eq!(
+        out,
+        expected.as_bytes(),
+        "the refusal must emit exactly one already-in-progress error"
+    );
 }
 
 /// The deputy gate's `AccessDenial` carries the refusal kind: a
@@ -859,5 +970,35 @@ async fn mrtr_retry_through_forward_allowed_enforces_trajectory() {
     assert!(
         read.is_err(),
         "a trajectory-denied retry must not reach the child"
+    );
+
+    // The same retry frame on a fresh session — no ReadOnly
+    // predecessor — must forward: the deny above was the trajectory
+    // predecessor, not anything in the `requestState` retry itself.
+    shared.session = Some(Arc::new(Mutex::new(SessionState::new())));
+    forward_allowed(
+        &shared,
+        &verified(retry),
+        "tools/call",
+        &RpcId::from_u64(11),
+        "11",
+        SupportedProtocolVersion::Mcp2025November25,
+        McpVerdict::Allow(AllowReason::RuleAllow),
+        ExtractedRequest::default(),
+    )
+    .await
+    .unwrap();
+    let mut frame = vec![0u8; retry.len() + 1];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_exact(&mut child_read, &mut frame),
+    )
+    .await
+    .expect("the retry must reach the child within the bound")
+    .expect("the child read must complete");
+    assert_eq!(
+        String::from_utf8(frame).unwrap(),
+        format!("{retry}\n"),
+        "the child must receive the retry frame verbatim"
     );
 }

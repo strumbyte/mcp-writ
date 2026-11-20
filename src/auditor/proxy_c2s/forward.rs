@@ -88,17 +88,23 @@ where
         {
             Ok(true) => return Ok(()),
             result => {
-                proxy_rpc::audit_forward_failed(
-                    &shared.audit,
-                    C2S,
-                    "request",
-                    Some(method),
-                    Some(raw_id),
-                    version,
-                    verdict,
-                    shared.dry_run,
-                    request_extra(ext),
-                );
+                // Skipped for `DeliveryUncertain` — the complete frame
+                // may still have crossed, so "not forwarded" is
+                // unprovable. `Ok(false)` refusal and proven write
+                // failures still reconcile.
+                if !matches!(result, Err(AuditorError::DeliveryUncertain(_))) {
+                    proxy_rpc::audit_forward_failed(
+                        &shared.audit,
+                        C2S,
+                        "request",
+                        Some(method),
+                        Some(raw_id),
+                        version,
+                        verdict,
+                        shared.dry_run,
+                        request_extra(ext),
+                    );
+                }
                 return result.map(|_| ());
             }
         }
@@ -339,7 +345,15 @@ where
                         if let Some(ref session) = shared.session {
                             let mut state = session.lock().await;
                             state.take_pending_list(id);
-                            state.complete_pending_tool_call(id, false);
+                            // A write whose delivery is unprovable may
+                            // still have crossed — the call keeps an
+                            // unverified candidate rather than resolving
+                            // as proven non-execution.
+                            if matches!(result, Err(AuditorError::DeliveryUncertain(_))) {
+                                state.release_pending_tool_call_unverified(id);
+                            } else {
+                                state.complete_pending_tool_call(id, false);
+                            }
                         }
                         result.map(|_| ())
                     }
@@ -490,16 +504,12 @@ where
         if !arm_tools_list(shared, view, id, raw_id, version).await? {
             return Ok(());
         }
-        // Publish this request as the revalidation template *before* the
-        // forward's awaits: a `list_changed` revalidation firing while
-        // registration/write is in flight must rebuild from the newest
-        // admitted request's params, never an older template. The prior
-        // template is restored when the forward unwinds, so a refused or
-        // unwritten request still cannot become it.
-        let prev_template = {
-            let mut template = shared.last_list_template.lock().await;
-            std::mem::replace(&mut *template, view.frame().to_string())
-        };
+        // The revalidation template is published inside
+        // `register_and_forward` immediately before the request becomes
+        // answerable — after its bytes crossed, inside the same
+        // `list_epoch` section — so a direct or queued revalidation can
+        // never observe the prior listing's params for this request,
+        // and a refused or unwritten request can never seed it.
         return match register_and_forward(
             shared, view, method, id, raw_id, version, verdict, &ext, None,
         )
@@ -507,12 +517,6 @@ where
         {
             Ok(true) => Ok(()),
             result => {
-                // Restore the displaced template BEFORE the unwind's
-                // `list_kick` makes this failed listing's slot eligible
-                // for a resumed revalidation — a resume that fires
-                // between the kick and the restore would rebuild its
-                // request from the refused frame's params.
-                *shared.last_list_template.lock().await = prev_template;
                 unwind_tools_list(shared, id, raw_id).await;
                 match result {
                     Ok(false) => Ok(()),

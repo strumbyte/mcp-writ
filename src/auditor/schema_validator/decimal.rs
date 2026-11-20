@@ -2,6 +2,14 @@
 //! compares arbitrary-precision JSON `number` literals without binary
 //! rounding, and the significand-divisibility helpers implement
 //! `multipleOf` on zero-padded digit vectors.
+//!
+//! Exact comparison has no fixed significand-precision limit — the
+//! digit vector carries as many digits as the literal does. The bound
+//! is on exponents: parsing requires both the literal exponent *and*
+//! the normalized (digit-position-adjusted) exponent to fit in `i64`,
+//! and the literal is checked first — `10e-9223372036854775809` fails
+//! before normalization even though the normalized exponent
+//! (`i64::MIN`) would fit.
 
 use std::cmp::Ordering;
 
@@ -167,33 +175,31 @@ pub(super) fn is_multiple_of(value: &str, divisor: &str) -> Result<bool, EvalErr
     }
     // `sv`/`sd` are each operand's scale — the power of ten of its least
     // significant digit. Exponents parse as i64 (`1e-9223372036854775808`
-    // is a legal literal), so the span arithmetic is checked: an overflow
-    // means the operand sits astronomically past the bound — it must not
-    // wrap into a negative length feeding `resize` below.
+    // is a legal literal), so the span arithmetic runs in `i128`: `sv`
+    // alone can sit past the i64 edge while the *shared* scale
+    // difference `sv - t` cancels to a small shift — `1e-…808` mod
+    // `1e-…808` must not Fatal on an i64 overflow that never survives
+    // the subtraction. The cost product stays checked: operands that
+    // sit astronomically past the bound are rejected, never wrapped
+    // into a negative length feeding `resize` below.
     let span_overflow = || {
         EvalError::Fatal(
             "multipleOf operands exceed evaluation bound (exponent span overflows)".to_string(),
         )
     };
-    let sv = dv
-        .exp
-        .checked_sub(dv.digits.len() as i64 - 1)
-        .ok_or_else(span_overflow)?;
-    let sd = dd
-        .exp
-        .checked_sub(dd.digits.len() as i64 - 1)
-        .ok_or_else(span_overflow)?;
+    let sv = dv.exp as i128 - (dv.digits.len() as i128 - 1);
+    let sd = dd.exp as i128 - (dd.digits.len() as i128 - 1);
     let t = sv.min(sd);
     // Bound before materializing: a hostile schema like `1e999999` would
     // otherwise allocate the full exponent span as digits.
-    let len_a = (dv.digits.len() as i64)
+    let len_a = (dv.digits.len() as i128)
         .checked_add(sv.checked_sub(t).ok_or_else(span_overflow)?)
         .ok_or_else(span_overflow)?;
-    let len_b = (dd.digits.len() as i64)
+    let len_b = (dd.digits.len() as i128)
         .checked_add(sd.checked_sub(t).ok_or_else(span_overflow)?)
         .ok_or_else(span_overflow)?;
     let cost = len_a.checked_mul(len_b).ok_or_else(span_overflow)?;
-    if cost > MAX_MULTIPLE_OF_COST as i64 {
+    if cost > MAX_MULTIPLE_OF_COST as i128 {
         return Err(EvalError::Fatal(format!(
             "multipleOf operands exceed evaluation bound ({cost} digit cells > {MAX_MULTIPLE_OF_COST})"
         )));

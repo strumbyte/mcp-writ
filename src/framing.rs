@@ -34,6 +34,12 @@ pub struct OversizeFrame {
     /// Last bytes of the frame, ending at the newline or EOF (up to
     /// `OVERSIZE_WINDOW_BYTES`).
     pub tail: Vec<u8>,
+    /// The frame byte immediately after `head`'s retained window, when
+    /// a full window exists and the frame continues past it — the
+    /// context a literal scanned to `head`'s edge needs to prove it
+    /// ended there. `None` while the head window is unfilled or the
+    /// frame ends at its boundary.
+    pub head_next: Option<u8>,
     /// Total frame length in bytes, excluding the terminating newline.
     pub bytes: usize,
     /// `false` when EOF ended the frame without a newline — the peer is
@@ -111,6 +117,9 @@ pub async fn read_frame_bounded<R: AsyncBufRead + Unpin>(
 ) -> Result<Option<BoundedFrame>, FramingError> {
     let mut acc: Vec<u8> = Vec::new();
     let mut tail: VecDeque<u8> = VecDeque::new();
+    // One byte of context past the head window: without it a literal
+    // scanned to the head's edge can only be proven a prefix.
+    let mut head_next: Option<u8> = None;
     let mut total: usize = 0;
     let mut oversize = false;
     loop {
@@ -120,6 +129,7 @@ pub async fn read_frame_bounded<R: AsyncBufRead + Unpin>(
                 return Ok(Some(BoundedFrame::Oversize(OversizeFrame {
                     head: acc,
                     tail: tail.into(),
+                    head_next,
                     bytes: total,
                     terminated: false,
                 })));
@@ -146,6 +156,11 @@ pub async fn read_frame_bounded<R: AsyncBufRead + Unpin>(
                     .iter()
                     .copied(),
             );
+            // When `acc` already overflows the head window, the first
+            // truncated byte is the lookahead past the head's edge.
+            if acc.len() > OVERSIZE_WINDOW_BYTES {
+                head_next = Some(acc[OVERSIZE_WINDOW_BYTES]);
+            }
             acc.truncate(OVERSIZE_WINDOW_BYTES);
         }
         if oversize {
@@ -153,9 +168,12 @@ pub async fn read_frame_bounded<R: AsyncBufRead + Unpin>(
             // first segment may itself cross the cap, so `acc` can
             // still have room to fill. Tail tracks the last window; a
             // frame smaller than the window lands whole in both.
-            if acc.len() < OVERSIZE_WINDOW_BYTES {
-                let room = OVERSIZE_WINDOW_BYTES - acc.len();
-                acc.extend_from_slice(&seg[..room.min(seg.len())]);
+            let head_room = OVERSIZE_WINDOW_BYTES.saturating_sub(acc.len());
+            acc.extend_from_slice(&seg[..head_room.min(seg.len())]);
+            // The first byte a full head cannot take is the lookahead
+            // for literals scanned to the window boundary.
+            if head_next.is_none() && seg.len() > head_room {
+                head_next = Some(seg[head_room]);
             }
             tail.extend(seg.iter().copied());
             while tail.len() > OVERSIZE_WINDOW_BYTES {
@@ -173,6 +191,7 @@ pub async fn read_frame_bounded<R: AsyncBufRead + Unpin>(
                 return Ok(Some(BoundedFrame::Oversize(OversizeFrame {
                     head: acc,
                     tail: tail.into(),
+                    head_next,
                     bytes: total,
                     terminated: true,
                 })));

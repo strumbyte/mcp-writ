@@ -1,7 +1,10 @@
 //! Wire-table registration and the child write for the C2S direction:
 //! the tracked request commits under the wire lock together with the
 //! forward-time side effects, the decision record is send-ordered ahead
-//! of the frame, and a failed write unwinds both.
+//! of the frame, and write failure is reconciled by what it proves —
+//! proven non-delivery unwinds entry and side effects, while
+//! `DeliveryUncertain` retains them (the complete frame may have
+//! crossed) and the session ends on the propagated error.
 
 use std::sync::atomic::Ordering;
 
@@ -20,10 +23,15 @@ use crate::protocol::SupportedProtocolVersion;
 /// Register in the wire table, apply forward-time side effects, write.
 /// Side effects commit under the same lock as the registration so a
 /// response that lands the instant the write completes already sees
-/// them; a failed write unwinds both so the table never tracks a
-/// request the server did not see. Returns `Ok(false)` when registration
-/// refused the request (duplicate id / capacity) — the client already
-/// got an error; callers with bookkeeping must unwind.
+/// them. `Ok(false)` means the request never left: registration refused
+/// it (duplicate id / capacity), or the epoch-guarded recheck caught a
+/// stale admission — including an entry a response already answered —
+/// either way the registration is rolled back and the client got an
+/// error, so callers with bookkeeping must unwind. `Err` from the write
+/// is reconciled by what it proves: proven non-delivery (an incomplete
+/// frame can never parse) rolls back the entry and its side effects;
+/// `DeliveryUncertain` retains them — the complete frame may have
+/// crossed — while the error still ends the session.
 #[expect(clippy::too_many_arguments)]
 pub(super) async fn register_and_forward<W>(
     shared: &ProxyShared<W>,
@@ -55,8 +63,14 @@ where
 }
 
 /// Dry-run forward of a denied request: tracked with `allowed: false`.
-/// The caller audits the deny verdict itself, once the forward result
-/// is known.
+/// The caller commits the deny verdict's audit record *before* calling
+/// here — the refusal must be durable ahead of delivery to the child,
+/// not recorded once the forward result is known. `Ok(false)` has the
+/// same refusal-or-stale-admission meaning as the allowed path. A
+/// proven non-delivery write failure unwinds the registration without a
+/// corrective record — the caller's committed decision already stands
+/// as the request's fate — while `DeliveryUncertain` retains it because
+/// the frame may still have crossed.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn register_and_forward_denied<W>(
     shared: &ProxyShared<W>,
@@ -89,6 +103,13 @@ where
 /// `audit_verdict` is `Some` only for policy-allowed forwards — the
 /// decision (or a registration refusal) is recorded here. Denied
 /// dry-run forwards pass `None`; their caller owns the audit record.
+///
+/// Outcomes: `Ok(true)` — the request crossed and is answerable.
+/// `Ok(false)` — refused by registration or by the stale-admission
+/// recheck (including an id a response already answered); the wire
+/// entry is rolled back and the client already has an error. `Err` —
+/// proven non-delivery rolls back entry and side effects;
+/// `DeliveryUncertain` retains both and propagates.
 #[expect(clippy::too_many_arguments)]
 pub(super) async fn register_and_forward_impl<W>(
     shared: &ProxyShared<W>,
@@ -107,11 +128,15 @@ where
 {
     let undo = {
         let mut wire = shared.wire.lock().await;
-        match wire.register(
-            C2S,
-            id.clone(),
-            TrackedRequest::from_extracted(method, version, allowed, shared.dry_run, ext),
-        ) {
+        // Born undispatched: the entry exists for rollback ahead of the
+        // write, but `answered`/`take` cannot see it — a frame naming
+        // this id while the request still sits in the child-stdin pipe
+        // is an anomaly that must not retire a request the server never
+        // received. `mark_dispatched` runs when the write completes.
+        let mut tracked =
+            TrackedRequest::from_extracted(method, version, allowed, shared.dry_run, ext);
+        tracked.dispatched = false;
+        match wire.register(C2S, id.clone(), tracked) {
             Err(reason) => {
                 drop(wire);
                 if audit_verdict.is_some() {
@@ -206,7 +231,27 @@ where
             // the denial work below.
             None
         } else {
-            Some(write_child_frame_epoch(&shared.child_stdin, view.frame()).await)
+            match write_child_frame_epoch(&shared.child_stdin, view.frame()).await {
+                Ok(()) => {
+                    // A tools/list about to become answerable publishes
+                    // its request params first: a response that lands at
+                    // the mark, or a `list_changed` revalidation queued
+                    // behind this epoch, must rebuild the probe from
+                    // *this* request — never a prior listing's template.
+                    // Only the write-success branch reaches here, so a
+                    // refused or unwritten request still cannot seed it.
+                    if method == "tools/list" && allowed {
+                        *shared.last_list_template.lock().await = view.frame().to_string();
+                    }
+                    // The bytes crossed — the request is now answerable.
+                    // Marking inside the epoch keeps the invisible
+                    // window to wire-lock contention; no legitimate
+                    // response can arrive before the write completes.
+                    shared.wire.lock().await.mark_dispatched(C2S, id);
+                    Some(Ok(()))
+                }
+                Err(e) => Some(Err(e)),
+            }
         }
     };
     let Some(result) = dispatched else {
@@ -235,9 +280,12 @@ where
     };
     if let Some(verdict) = audit_verdict
         && result.is_err()
+        && !matches!(result, Err(AuditorError::DeliveryUncertain(_)))
     {
         // The pre-write record claimed `forwarded=true`; reconcile the
-        // wire truth with a corrective not-forwarded record.
+        // wire truth with a corrective not-forwarded record. Skipped
+        // for `DeliveryUncertain` — the complete frame may still have
+        // crossed, so "not forwarded" is unprovable.
         proxy_rpc::audit_forward_failed(
             &shared.audit,
             C2S,
@@ -253,9 +301,13 @@ where
     match result {
         Ok(()) => Ok(true),
         Err(e) => {
-            // The request never reached the server: unwind the
-            // registration and the side effects committed with it.
-            shared.wire.lock().await.rollback_forwarded_request(undo);
+            // Uncertain delivery — the complete frame may still have
+            // crossed, so the registration and its side effects stay;
+            // the error still ends the session. Proven non-delivery
+            // (an incomplete frame never parses) unwinds normally.
+            if !matches!(e, AuditorError::DeliveryUncertain(_)) {
+                shared.wire.lock().await.rollback_forwarded_request(undo);
+            }
             Err(e)
         }
     }

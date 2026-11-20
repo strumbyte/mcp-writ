@@ -34,21 +34,15 @@ where
     {
         return Err(violation);
     }
-    // Does the deputy gate below record a pending list *for this
-    // request*? Only then may the rollback remove it — under a reused
-    // id the entry belongs to the earlier in-flight call, whose
-    // discovery credit a duplicate's refusal must not consume.
-    // `record_pending_list` refuses duplicates itself, so this
-    // predicate mirrors the gate: a Discover binding plus a usable
-    // (non-null) envelope id.
-    let records_pending_list = !matches!(id, RpcId::Null)
-        && tool.is_some_and(|name| {
-            matches!(
-                crate::policy::deputy::deputy_binding(&shared.policy, name),
-                crate::policy::deputy::DeputyBinding::Discover(_)
-            )
-        });
-    apply_confused_deputy_c2s(&shared.policy, &mut state, view.json(), Some(id), tool)?;
+    // Did the deputy gate record a pending list *for this request*?
+    // Only then may the rollback remove it — under a reused id the
+    // entry belongs to the earlier in-flight call, whose discovery
+    // credit a duplicate's refusal must not consume. The gate's own
+    // report is authoritative: it is false whenever protection is
+    // disabled or no insertion happens, so the predicate can never
+    // drift from the actual bookkeeping.
+    let inserted_pending_list =
+        apply_confused_deputy_c2s(&shared.policy, &mut state, view.json(), Some(id), tool)?;
     if shared.policy.trajectory {
         let se = tool.and_then(|name| checker::tool_side_effect(&shared.policy, name));
         if let Err(reason) =
@@ -57,7 +51,7 @@ where
             // Roll back only the pending list this request registered —
             // a duplicate id failure means an earlier call's discovery
             // bookkeeping lives under this id and stays untouched.
-            if records_pending_list {
+            if inserted_pending_list {
                 state.take_pending_list(id);
             }
             return Err(checker::PolicyViolation::new(
@@ -91,18 +85,25 @@ where
 ///
 /// `known_paths` is process-local to this child — interleaved clients
 /// share the set; configurable roles are not session separation.
+///
+/// The `Ok` value reports whether this call inserted a pending list:
+/// `true` only on the `Discover` arm with a usable (non-null, present)
+/// envelope id whose `record_pending_list` succeeded — `false` when
+/// protection is disabled, no tool bound, a `use`/`none` binding, or
+/// a `None` envelope id — so rollback ownership mirrors the actual
+/// insertion.
 pub(super) fn apply_confused_deputy_c2s(
     policy: &Policy,
     state: &mut SessionState,
     json: &nojson::RawJson<'_>,
     envelope_id: Option<&RpcId>,
     tool: Option<&str>,
-) -> Result<(), checker::PolicyViolation> {
+) -> Result<bool, checker::PolicyViolation> {
     if !policy.confused_deputy_protection {
-        return Ok(());
+        return Ok(false);
     }
     let Some(tool_name) = tool else {
-        return Ok(());
+        return Ok(false);
     };
     match crate::policy::deputy::deputy_binding(policy, tool_name) {
         crate::policy::deputy::DeputyBinding::Discover(rules) => {
@@ -122,7 +123,7 @@ pub(super) fn apply_confused_deputy_c2s(
                     format!("confused deputy: {reason}"),
                 ));
             }
-            Ok(())
+            Ok(envelope_id.is_some())
         }
         crate::policy::deputy::DeputyBinding::Use(rules) => {
             // The tool's `arguments { opaque }` declarations apply to the
@@ -173,8 +174,8 @@ pub(super) fn apply_confused_deputy_c2s(
                     ));
                 }
             }
-            Ok(())
+            Ok(false)
         }
-        crate::policy::deputy::DeputyBinding::None => Ok(()),
+        crate::policy::deputy::DeputyBinding::None => Ok(false),
     }
 }

@@ -8,20 +8,23 @@ use super::DISCOVER_RULES;
 fn test_full_confused_deputy_flow() {
     let mut state = SessionState::new();
 
-    // Step 1: list_files request goes through, record pending
+    // Step 1: list_files request goes through, record pending under the
+    // canonical id the C2S forward registers.
     state
-        .record_pending_list(RpcId::Number("1".into()), "list_files", DISCOVER_RULES)
+        .record_pending_list(RpcId::from_u64(1), "list_files", DISCOVER_RULES)
         .unwrap();
 
     // Step 2: list_files response comes back with paths — consumed the
-    // way the production response handler does: take the pending entry
-    // and run the exact response through the rules it snapshotted, so a
-    // response the rules reject records nothing.
+    // way the production response handler does: resolve the pending
+    // entry by the id the response itself carries, then run the exact
+    // response through the rules it snapshotted, so a response the
+    // rules reject records nothing.
     let response = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"/workspace/a.txt\n/workspace/b.txt"}]}}"#;
-    let pending = state
-        .take_pending_list(&RpcId::Number("1".into()))
-        .expect("the pending list entry must be consumed");
     let json = nojson::RawJson::parse(response).expect("response parses");
+    let response_id = RpcId::from_line(response).expect("the response id resolves");
+    let pending = state
+        .take_pending_list(&response_id)
+        .expect("the pending list entry must be consumed");
     let paths = extract_paths_for_pending(json.value(), pending.rules());
     state.record_paths(&paths);
 

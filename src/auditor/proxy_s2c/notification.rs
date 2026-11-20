@@ -80,17 +80,22 @@ where
             match result {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    proxy_rpc::audit_forward_failed(
-                        &shared.audit,
-                        S2C,
-                        "notification",
-                        Some(method),
-                        None,
-                        version,
-                        verdict,
-                        shared.dry_run,
-                        None,
-                    );
+                    // Skipped for `DeliveryUncertain` — the complete
+                    // frame may still have crossed, so "not forwarded"
+                    // is unprovable.
+                    if !matches!(e, AuditorError::DeliveryUncertain(_)) {
+                        proxy_rpc::audit_forward_failed(
+                            &shared.audit,
+                            S2C,
+                            "notification",
+                            Some(method),
+                            None,
+                            version,
+                            verdict,
+                            shared.dry_run,
+                            None,
+                        );
+                    }
                     Err(e)
                 }
             }

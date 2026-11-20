@@ -32,8 +32,20 @@ async fn epoch_write_times_out_on_wedged_child() {
     let shared = Arc::new(tokio::sync::Mutex::new(Some(writer)));
     let big = "x".repeat(4096); // far over the 64-byte duplex buffer
     let start = std::time::Instant::now();
-    let result = write_child_frame_epoch(&shared, &big).await;
-    assert!(result.is_err());
+    // An independent deadline past the write budget: a regression that
+    // stops bounding the write fails this test instead of hanging it.
+    let result = tokio::time::timeout(
+        EPOCH_CHILD_WRITE_BUDGET * 3,
+        write_child_frame_epoch(&shared, &big),
+    )
+    .await
+    .expect("the epoch write must hit its own budget");
+    // The cancelled write may have committed the complete frame —
+    // the outcome is uncertain, never proven non-delivery.
+    assert!(
+        matches!(result, Err(AuditorError::DeliveryUncertain(_))),
+        "timed-out write must report DeliveryUncertain: {result:?}"
+    );
     assert!(
         start.elapsed() >= EPOCH_CHILD_WRITE_BUDGET,
         "refusal must come from the bound, not an early pipe error"
@@ -43,9 +55,13 @@ async fn epoch_write_times_out_on_wedged_child() {
     // corrupt tail: the child sees EOF, and further writes fail
     // closed rather than extending a poisoned stream.
     assert!(shared.lock().await.is_none());
-    let mut buf = [0u8; 4096];
-    let _ = reader.read(&mut buf).await; // drain the partial bytes
-    assert_eq!(reader.read(&mut buf).await.unwrap(), 0); // EOF
+    tokio::time::timeout(EPOCH_CHILD_WRITE_BUDGET * 3, async {
+        let mut buf = [0u8; 4096];
+        let _ = reader.read(&mut buf).await; // drain the partial bytes
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 0); // EOF
+    })
+    .await
+    .expect("a writer left open would never deliver EOF");
     assert!(write_child_frame(&shared, "{}").await.is_err());
     assert!(write_child_frame_epoch(&shared, "{}").await.is_err());
 }
@@ -78,28 +94,47 @@ async fn epoch_timeout_closes_ahead_of_queued_writer() {
     .expect("the stalled epoch write must take child_stdin");
     // Drive the queued write's own future against the held
     // `child_stdin` lock — a Pending poll is direct proof of mutex
-    // contention, not a guess from an unscheduled task.
-    let mut queued = std::pin::pin!(write_child_frame(&shared, "{}"));
+    // contention, not a guess from an unscheduled task. That first
+    // poll is also the signal the writer is parked: handing the same
+    // future to a real task keeps it queued on the mutex with a live
+    // waker, so a timeout that freed the lock before closing the
+    // writer would let it slip in and append onto the partial frame.
+    let mut queued = Box::pin({
+        let shared = shared.clone();
+        async move { write_child_frame(&shared, "{}").await }
+    });
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(
         std::future::Future::poll(queued.as_mut(), &mut cx).is_pending(),
         "the queued writer must park on the held child_stdin"
     );
+    let queued = tokio::spawn(queued);
     // The stalled epoch write must still hit its production timeout —
     // a deadline turns a regression there into a failure, not a hang.
     let stalled_result = tokio::time::timeout(EPOCH_CHILD_WRITE_BUDGET * 3, stalled)
         .await
         .expect("the stalled epoch write must hit its own budget")
         .unwrap();
-    assert!(stalled_result.is_err());
     assert!(
-        queued.await.is_err(),
+        matches!(stalled_result, Err(AuditorError::DeliveryUncertain(_))),
+        "timed-out write must report DeliveryUncertain: {stalled_result:?}"
+    );
+    let queued_result = tokio::time::timeout(EPOCH_CHILD_WRITE_BUDGET * 3, queued)
+        .await
+        .expect("the queued writer must resolve once the epoch frees")
+        .expect("the queued writer task must not panic");
+    assert!(
+        queued_result.is_err(),
         "queued write must not append onto the partial frame"
     );
     // The child reads only the partial bytes, then EOF — the
-    // competing frame never made the stream.
+    // competing frame never made the stream. The deadline keeps a
+    // writer left open from hanging the test instead of failing it.
     let mut got = Vec::new();
-    reader.read_to_end(&mut got).await.unwrap();
+    tokio::time::timeout(EPOCH_CHILD_WRITE_BUDGET * 3, reader.read_to_end(&mut got))
+        .await
+        .expect("a writer left open would never deliver EOF")
+        .unwrap();
     assert_eq!(got.len(), 64);
     assert!(got.iter().all(|b| *b == b'a'));
 }
@@ -115,16 +150,14 @@ async fn epoch_write_succeeds_when_child_drains() {
     let shared = Arc::new(tokio::sync::Mutex::new(Some(writer)));
     let big = "x".repeat(4096); // far over the 64-byte duplex buffer
     let expected = format!("{big}\n").into_bytes();
-    let mut write = tokio::spawn({
-        let shared = shared.clone();
-        async move { write_child_frame_epoch(&shared, &big).await }
-    });
-    // Nobody drains yet: the oversized frame must be pending against
-    // the full pipe — a completed write would prove nothing.
+    // Drive the write future directly: its first poll must report
+    // Pending while it still holds `child_stdin` against the full
+    // pipe — a spawned task plus a sleep would only guess at the
+    // stall.
+    let mut write = std::pin::pin!(write_child_frame_epoch(&shared, &big));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), &mut write)
-            .await
-            .is_err(),
+        std::future::Future::poll(write.as_mut(), &mut cx).is_pending(),
         "the epoch write must stall until the child drains"
     );
     let drain = tokio::spawn(async move {
@@ -135,10 +168,9 @@ async fn epoch_write_succeeds_when_child_drains() {
             .expect("the drain must complete");
         got
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), write)
+    tokio::time::timeout(std::time::Duration::from_secs(5), write.as_mut())
         .await
         .expect("the epoch write must complete once the pipe drains")
-        .expect("the writer task must not panic")
         .expect("the epoch write must succeed");
     // Close the writer so `read_to_end` sees EOF.
     shared.lock().await.take();
@@ -290,6 +322,7 @@ fn oversize(head: &[u8], tail: &[u8]) -> OversizeFrame {
     OversizeFrame {
         head: head.to_vec(),
         tail: tail.to_vec(),
+        head_next: None,
         bytes: head.len() + tail.len(),
         terminated: true,
     }
@@ -301,7 +334,7 @@ fn recovers_head_id_for_requests() {
     // finds it before any nested `params.id`.
     let frame = oversize(
         br##"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"id":99"##,
-        br##""other":1}}}"##,
+        br##",\"other\":1}}"##,
     );
     let ids = recover_id_candidates(&frame, false);
     assert_eq!(ids.first().map(String::as_str), Some("7"));
@@ -314,7 +347,7 @@ fn nested_members_are_never_id_candidates() {
     // not mis-correlate it.
     let frame = oversize(
         br##"{"jsonrpc":"2.0","id":7,"params":{"nested":{"id":42"##,
-        br##"}},"z":{"id":99}}}"##,
+        br##"},"z":{"id":99}}}"##,
     );
     let ids = recover_id_candidates(&frame, false);
     assert_eq!(ids, vec!["7".to_string()]);
@@ -330,8 +363,8 @@ fn nested_tail_id_is_not_recovered() {
     // inside the last member — it must not be recovered even though
     // it is the last `id` text in the frame.
     let frame = oversize(
-        br##"{"jsonrpc":"2.0","id":7,"result":{"data":"##,
-        br##""pad","z":{"id":42}}}"##,
+        br##"{"jsonrpc":"2.0","id":7,"result":{"data":{"##,
+        br##""pad":1,"z":{"id":42}}}}"##,
     );
     assert_eq!(recover_id_candidates(&frame, true), vec!["7".to_string()]);
 }
@@ -431,18 +464,34 @@ fn member_name_after_escaped_backslash_is_still_a_candidate() {
 
 #[test]
 fn window_edge_numeric_id_is_rejected_only_when_unproven() {
-    // Disjoint windows — bytes between head and tail were dropped: a
+    // Disjoint windows — bytes between head and tail were dropped. A
     // numeric literal ending at the head's edge may be a prefix of a
     // longer id (`42` of `421`), so it is ambiguous and must not
-    // select or remove a live request.
-    let disjoint = OversizeFrame {
+    // select or remove a live request unless the byte past the edge
+    // proves the token ended.
+    let disjoint = |head_next: Option<u8>| OversizeFrame {
         head: br##"{"jsonrpc":"2.0","id":42"##.to_vec(),
         tail: br##"}"##.to_vec(),
+        head_next,
         bytes: 100,
         terminated: true,
     };
-    assert!(recover_id_candidates(&disjoint, false).is_empty());
-    assert!(recover_id_candidates(&disjoint, true).is_empty());
+    // No lookahead — the byte past the head's edge is unknown.
+    assert!(recover_id_candidates(&disjoint(None), false).is_empty());
+    assert!(recover_id_candidates(&disjoint(None), true).is_empty());
+
+    // The retained lookahead resolves the edge: `,` ends the token —
+    // `42` is the complete envelope id — while a digit proves it a
+    // prefix of `421`, which stays rejected.
+    assert_eq!(
+        recover_id_candidates(&disjoint(Some(b',')), false),
+        vec!["42".to_string()]
+    );
+    assert!(recover_id_candidates(&disjoint(Some(b'1')), false).is_empty());
+    // An exponent marker continues the token like a digit — `42e1`
+    // is one number, so the head's `42` stays a mere prefix.
+    assert!(recover_id_candidates(&disjoint(Some(b'e')), false).is_empty());
+    assert!(recover_id_candidates(&disjoint(Some(b'E')), false).is_empty());
 
     // Adjacent windows — the head's last byte and the tail's first
     // are consecutive, so the tail proves whether the token
@@ -451,6 +500,10 @@ fn window_edge_numeric_id_is_rejected_only_when_unproven() {
     let continues = oversize(br##"{"jsonrpc":"2.0","id":42"##, br##"1}"##);
     assert!(recover_id_candidates(&continues, false).is_empty());
     assert!(recover_id_candidates(&continues, true).is_empty());
+    // `e1}` continues it the same way — `42e1` is a single literal.
+    let exponent = oversize(br##"{"jsonrpc":"2.0","id":42"##, br##"e1}"##);
+    assert!(recover_id_candidates(&exponent, false).is_empty());
+    assert!(recover_id_candidates(&exponent, true).is_empty());
 
     // `,` ends the token — the head's `42` is the complete envelope id.
     let complete = oversize(br##"{"jsonrpc":"2.0","id":42"##, br##","x":1}"##);
@@ -458,6 +511,150 @@ fn window_edge_numeric_id_is_rejected_only_when_unproven() {
         recover_id_candidates(&complete, false),
         vec!["42".to_string()]
     );
+}
+
+#[test]
+fn proven_id_candidates_cover_tail_only_when_the_frame_is_whole() {
+    // The whole frame is retained — the forward scan proves the
+    // trailing `id` is the envelope member, not a nested one.
+    let whole = oversize(
+        br##"{"jsonrpc":"2.0","result":{"nested":{"id":1"##,
+        br##"}},"id":42}"##,
+    );
+    assert_eq!(recover_id_candidates_proven(&whole), vec!["42".to_string()]);
+
+    // The same trailing `id` behind a dropped middle: it could be a
+    // nested `result.id` promoted by the omitted bytes, so it must
+    // never reach `rpc_id_from_raw_id`/`wire.take`. Only the head
+    // window's `id` is proven.
+    let disjoint = OversizeFrame {
+        head: br##"{"jsonrpc":"2.0","id":7,"result":{"data":"##.to_vec(),
+        tail: br##"","id":42}"##.to_vec(),
+        head_next: None,
+        bytes: 100,
+        terminated: true,
+    };
+    assert_eq!(
+        recover_id_candidates_proven(&disjoint),
+        vec!["7".to_string()]
+    );
+
+    // An unbalanced frame whose last `}` is a *nested* close: even
+    // with the whole frame retained the forward scan sees `"id":5`
+    // sitting inside `x`, never at envelope depth.
+    let unbalanced = oversize(br##"{"result":{"x":{"id":5}"##, b"");
+    assert!(recover_id_candidates_proven(&unbalanced).is_empty());
+}
+
+#[test]
+fn response_evidence_needs_an_envelope_result_or_error() {
+    // `result`/`error` at envelope depth proves response shape.
+    let result = oversize(br##"{"jsonrpc":"2.0","result":{"x":"##, br##""}}"##);
+    assert!(recover_response_evidence(&result));
+    let error = oversize(br##"{"jsonrpc":"2.0","error":{"code":-1"##, br##"}}"##);
+    assert!(recover_response_evidence(&error));
+
+    // A request — `method`/`params`, no response member — shows no
+    // evidence, so a live `id` it happens to name is never correlated
+    // (its `method` may simply sit in the omitted middle).
+    let request = oversize(
+        br##"{"jsonrpc":"2.0","id":9,"method":"ping","params":{"##,
+        br##"}}"##,
+    );
+    assert!(!recover_response_evidence(&request));
+
+    // `"result"` as a string *value* is not a member name — the `:` is
+    // missing.
+    let value = oversize(br##"{"jsonrpc":"2.0","id":9,"note":"result"##, br##""}"##);
+    assert!(!recover_response_evidence(&value));
+
+    // A nested `result` member sits at depth ≥ 2 — not envelope shape.
+    let nested = oversize(br##"{"jsonrpc":"2.0","params":{"result":{}},"id":9}"##, b"");
+    assert!(!recover_response_evidence(&nested));
+}
+
+#[test]
+fn second_root_members_never_combine_into_frame_evidence() {
+    // Two JSON roots in the retained windows — only the first counts.
+    // A `result` member of the *second* root is not envelope evidence
+    // for this frame.
+    let multi = oversize(br##"{"id":7,"method":"ping"}{"result":{"x":1"##, br##"}}"##);
+    assert!(!recover_response_evidence(&multi));
+
+    // The tail scan anchors on the last root: an `id` belonging to an
+    // earlier root can never be promoted into this frame.
+    let earlier_root_id = oversize(
+        br##"{"jsonrpc":"2.0","result":{"pad"##,
+        br##"":"x"}}{"id":42,"ok":1}"##,
+    );
+    assert_eq!(
+        recover_id_candidates(&earlier_root_id, true),
+        vec!["42".to_string()],
+        "the last root's own `id` is a legitimate envelope member"
+    );
+    let no_last_root_id = oversize(
+        br##"{"jsonrpc":"2.0","id":7,"result":{"pad"##,
+        br##"":"x"}}{"other":1}"##,
+    );
+    // The tail's last root `{"other":1}` has no `id` — the head's `7`
+    // is the only legitimate candidate; nothing may be pulled from
+    // the tail's earlier root.
+    assert_eq!(
+        recover_id_candidates(&no_last_root_id, true),
+        vec!["7".to_string()]
+    );
+
+    // A fully retained multi-root head: the second root's `id` is not
+    // an envelope member of the first — proven recovery must stay empty.
+    let head_multi = oversize(br##"{"a":1}{"id":42}"##, b"");
+    assert!(recover_id_candidates_proven(&head_multi).is_empty());
+}
+
+/// Through the real bounded reader: an `id` literal ending exactly at
+/// the head window's edge is recovered when the retained lookahead
+/// byte is a delimiter, and stays rejected when the byte is another
+/// digit (it is then a prefix of a longer token).
+#[tokio::test]
+async fn head_edge_numeric_id_uses_retained_lookahead() {
+    use tokio::io::BufReader;
+    // `"id":42` ends on the head window's last byte (index 8191), so
+    // byte 8192 — the first dropped byte — decides whether `42` is the
+    // complete literal.
+    let oversized = |after: &str| {
+        let mut data =
+            format!("{{\"pad\":\"{}\",\"id\":42{after}}}", "x".repeat(8175),).into_bytes();
+        data.push(b'\n');
+        data
+    };
+    async fn read_oversize(data: &[u8]) -> OversizeFrame {
+        let mut r = BufReader::new(data);
+        let BoundedFrame::Oversize(f) = framing::read_frame_bounded(&mut r, 4096)
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected Oversize");
+        };
+        f
+    }
+
+    // Delimiter lookahead: `42` is the complete envelope id.
+    let data = oversized(&format!(",\"rest\":\"{}\"", "m".repeat(9000)));
+    assert_eq!(data[8192], b',');
+    let f = read_oversize(&data).await;
+    assert_eq!(f.head_next, Some(b','));
+    assert!(
+        f.head.len() + f.tail.len() < f.bytes,
+        "the windows must be disjoint for the lookahead to matter"
+    );
+    assert_eq!(recover_id_candidates(&f, false), vec!["42".to_string()]);
+
+    // Digit lookahead: `42` is a prefix of `421` — never recovered.
+    let data = oversized(&format!("1,\"rest\":\"{}\"", "m".repeat(9000)));
+    assert_eq!(data[8192], b'1');
+    let f = read_oversize(&data).await;
+    assert_eq!(f.head_next, Some(b'1'));
+    assert!(recover_id_candidates(&f, false).is_empty());
 }
 
 #[test]

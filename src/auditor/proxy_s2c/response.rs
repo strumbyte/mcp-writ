@@ -41,7 +41,37 @@ where
 {
     let ext = proxy_rpc::extract_response(value);
     let mut wire = shared.wire.lock().await;
-    let answered = wire.answered(S2C, id);
+    let mut answered = wire.answered(S2C, id);
+    // A response can race its own request's dispatch: registration
+    // precedes the forward write and `mark_dispatched` follows it, so a
+    // fast answer can arrive while the entry still reads undispatched.
+    // Wait on the dispatch outcome instead of rejecting — the mark
+    // makes the entry answerable, and any removal (rollback, reclaim,
+    // take) ends the wait the same way. The waiter registers while
+    // this task still holds the wire lock, so the transition can never
+    // be missed.
+    //
+    // The wait is bound to the registration it started on (`seq`): a
+    // pre-write rollback frees the id, and a *new* request re-registering
+    // it undispatched must neither keep this waiter parked nor resolve
+    // through `answered` — the frame answers the removed registration,
+    // never the replacement.
+    let mut waited_seq = None;
+    while answered.is_none()
+        && let Some(entry) = wire.get(C2S, id)
+        && !entry.dispatched
+        && waited_seq.is_none_or(|seq| seq == entry.seq)
+    {
+        waited_seq = Some(entry.seq);
+        let notify = wire.dispatch_changed();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        drop(wire);
+        notified.await;
+        wire = shared.wire.lock().await;
+        answered = wire.answered(S2C, id).filter(|a| Some(a.seq) == waited_seq);
+    }
     let version = wire
         .get(C2S, id)
         .map(|e| e.version)
@@ -191,35 +221,28 @@ where
                 .or_else(|| entry.as_ref().map(|e| e.method.clone()));
             let internal = answered.as_ref().map(|a| a.internal).unwrap_or(false);
             drop(wire);
-            audit_additional_requests(shared, &additional_audits, raw_id, version, true).await?;
-            proxy_rpc::audit_forwarded_decision(
-                &shared.audit,
-                S2C,
-                "response",
-                method_label.as_deref(),
-                Some(raw_id),
-                version,
-                audit_verdict,
-                shared.dry_run,
-                negotiated_extra.clone(),
-            )
-            .await?;
-            // The `forwarded=true` records just claimed this frame and
-            // each additional request inside it crossed — both failure
-            // sites reconcile all of them through one call so the
-            // corrective records' arguments cannot drift.
-            let audit_response_forward_failed = || {
-                proxy_rpc::audit_forward_failed(
-                    &shared.audit,
-                    S2C,
-                    "response",
-                    method_label.as_deref(),
-                    Some(raw_id),
-                    version,
-                    audit_verdict,
-                    shared.dry_run,
-                    negotiated_extra.clone(),
-                );
+            // The `forwarded=true` records below claim this frame and
+            // each additional request inside it crossed — every failure
+            // before the frame write reconciles the records that
+            // actually enqueued, through one argument set so the
+            // corrective records cannot drift. A mid-loop failure
+            // inside `audit_additional_requests` appends corrections
+            // for its own written prefix; the response's own record
+            // failure leaves only the additional set outstanding.
+            let audit_response_forward_failed = |response_recorded: bool| {
+                if response_recorded {
+                    proxy_rpc::audit_forward_failed(
+                        &shared.audit,
+                        S2C,
+                        "response",
+                        method_label.as_deref(),
+                        Some(raw_id),
+                        version,
+                        audit_verdict,
+                        shared.dry_run,
+                        negotiated_extra.clone(),
+                    );
+                }
                 for entry in &additional_audits {
                     proxy_rpc::audit_forward_failed(
                         &shared.audit,
@@ -234,10 +257,39 @@ where
                     );
                 }
             };
+            audit_additional_requests(shared, &additional_audits, raw_id, version, true).await?;
+            if let Err(e) = proxy_rpc::audit_forwarded_decision(
+                &shared.audit,
+                S2C,
+                "response",
+                method_label.as_deref(),
+                Some(raw_id),
+                version,
+                audit_verdict,
+                shared.dry_run,
+                negotiated_extra.clone(),
+            )
+            .await
+            {
+                // The response's own record never enqueued — only the
+                // additional requests' records claim a crossing that
+                // now never happens.
+                audit_response_forward_failed(false);
+                return Err(e);
+            }
             if on_list_path || internal {
                 let result = route_tools_list(shared, st, line, parsed, value, None).await;
-                if result.is_err() {
-                    audit_response_forward_failed();
+                // Skipped when delivery is not provably false:
+                // `DeliveryUncertain` means the frame may have crossed,
+                // and `PostDeliveryFailure` means it did — the pipeline
+                // already reconciled the later failure itself.
+                if let Err(e) = &result
+                    && !matches!(
+                        e,
+                        AuditorError::DeliveryUncertain(_) | AuditorError::PostDeliveryFailure(_)
+                    )
+                {
+                    audit_response_forward_failed(true);
                 }
                 return result;
             }
@@ -269,7 +321,12 @@ where
                     Ok(())
                 }
                 Err(e) => {
-                    audit_response_forward_failed();
+                    // Skipped for `DeliveryUncertain` — the complete
+                    // frame may still have crossed, so "not forwarded"
+                    // is unprovable (same rule as the request path).
+                    if !matches!(e, AuditorError::DeliveryUncertain(_)) {
+                        audit_response_forward_failed(true);
+                    }
                     Err(e)
                 }
             }
@@ -512,24 +569,18 @@ async fn apply_response_session_updates<W>(
         }
     }
     if shared.policy.trajectory {
-        // `succeeded=false` splits by what the verdict proves: only an
-        // MRTR `input_required` interim result establishes that this id
-        // will not execute — the original call suspends and its effects
-        // belong to the retry under a new id. Every other non-success —
+        // `succeeded=false` leaves partial side effects possible: a
         // JSON-RPC `error` (an internal error may follow partial work),
-        // `result.isError=true`, or a malformed verdict — leaves
-        // partial side effects possible: keep the unverified candidate
-        // so a following trajectory decision still prices in the
-        // call's `after` effect. (Whether a transport error can follow
-        // real effects is an assumption on the server contract —
-        // the conservative choice keeps the candidate.)
-        let verified_nonexecution = succeeded
-            || matches!(
-                crate::auditor::proxy_wire::classify_s2c(value),
-                crate::auditor::proxy_wire::S2cKind::InputRequired
-            );
-        if verified_nonexecution {
-            state.complete_pending_tool_call(id, succeeded);
+        // `result.isError=true`, a malformed verdict — and an MRTR
+        // `input_required` suspend. Nothing enforces pre-suspend
+        // purity on the tool: a call may have done work before asking
+        // for more input, and the suspend only proves the id will not
+        // complete — not that nothing ran. Keep the unverified
+        // candidate so a following trajectory decision still prices in
+        // the call's `after` effect; only a completed `result` or a
+        // registration rollback is a definite verdict.
+        if succeeded {
+            state.complete_pending_tool_call(id, true);
         } else {
             state.release_pending_tool_call_unverified(id);
         }
@@ -567,6 +618,10 @@ fn additional_request_extra(entry: &AdditionalRequestAudit) -> Option<String> {
 /// result crossed to the client; `dry_run` on a denied forward). On the
 /// forwarded path the records are send-ordered ahead of the frame, same
 /// as the response's own decision record.
+///
+/// A mid-loop failure reconciles the prefix already enqueued — those
+/// `forwarded=true` records claim a crossing that now never happens —
+/// before the error propagates, so the session still fails closed.
 async fn audit_additional_requests<W>(
     shared: &ProxyShared<W>,
     entries: &[AdditionalRequestAudit],
@@ -577,9 +632,9 @@ async fn audit_additional_requests<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    for entry in entries {
+    for (i, entry) in entries.iter().enumerate() {
         let extra = additional_request_extra(entry);
-        if forwarded {
+        let result = if forwarded {
             proxy_rpc::audit_forwarded_decision(
                 &shared.audit,
                 S2C,
@@ -591,7 +646,7 @@ where
                 shared.dry_run,
                 extra,
             )
-            .await?;
+            .await
         } else {
             proxy_rpc::audit_decision(
                 &shared.audit,
@@ -604,7 +659,25 @@ where
                 false,
                 shared.dry_run,
                 extra,
-            )?;
+            )
+        };
+        if let Err(e) = result {
+            if forwarded {
+                for enqueued in &entries[..i] {
+                    proxy_rpc::audit_forward_failed(
+                        &shared.audit,
+                        S2C,
+                        "additional-request",
+                        enqueued.method.as_deref(),
+                        Some(raw_id),
+                        version,
+                        enqueued.verdict,
+                        shared.dry_run,
+                        additional_request_extra(enqueued),
+                    );
+                }
+            }
+            return Err(e);
         }
     }
     Ok(())

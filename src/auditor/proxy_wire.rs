@@ -409,6 +409,16 @@ const MAX_MEMBER_CANDIDATES: usize = 16;
 /// `params.method` therefore cannot shadow the envelope member and
 /// mis-correlate another in-flight request.
 ///
+/// Provenance caveat: only head-window hits are *provably* depth-1 —
+/// the forward scan counts depth from the frame's first byte. The
+/// tail's backward scan anchors on whatever `}`/`]` closes the
+/// retained region; when the frame's real root close is not retained
+/// (truncation, an unterminated tail that happens to end in `}`) or
+/// the frame is malformed, that anchor can be a nested close that
+/// promotes a nested `result.id` to apparent envelope depth. A caller
+/// whose candidates will retire a live request must use
+/// [`recover_id_candidates_proven`] instead.
+///
 /// Caveat on malformed frames: the frame never passed the
 /// duplicate-key gate, so a sender can plant a second depth-1 member
 /// the scan reaches first (e.g. a forged tail-side `"id"` naming a
@@ -418,26 +428,21 @@ const MAX_MEMBER_CANDIDATES: usize = 16;
 /// denied response takes — never to forwarding uninspected content.
 /// Candidate scalar literals for `name`. `following` is the byte
 /// stream immediately after `buf` inside the frame: the tail's
-/// overlap-trimmed prefix when the retained windows meet, `None` when
-/// the dropped middle leaves `buf`'s last byte unresolvable, and
-/// `Some(&[])` at the frame's own end. A number or keyword literal
-/// that runs to the window edge is a candidate only when its end is
-/// proven — disjoint windows leave it a possible prefix, and a
-/// following byte in the token's class proves it *is* a prefix.
-fn member_literal_candidates(
-    buf: &[u8],
-    following: Option<&[u8]>,
-    name: &str,
-    reverse: bool,
-) -> Vec<String> {
-    let needle = format!("\"{name}\"").into_bytes();
-    let hits = if reverse {
-        tail_member_positions(buf, &needle)
-    } else {
-        head_member_positions(buf, &needle)
-    };
+/// overlap-trimmed prefix when the retained windows meet, the
+/// retained lookahead byte when the dropped middle otherwise leaves
+/// `buf`'s last byte unresolvable, and `Some(&[])` at the frame's own
+/// end. A number or keyword literal that runs to the window edge is
+/// a candidate only when its end is proven — a lookahead byte in the
+/// token's class proves it *is* a prefix, and a missing lookahead
+/// leaves it a possible prefix.
+fn member_literal_candidates(buf: &[u8], following: Option<&[u8]>, name: &str) -> Vec<String> {
+    // Positions are the byte just past each member name's closing
+    // quote — `member_value_literal` re-verifies the `:` and extracts
+    // the scalar. The head scan yields colon-proven, decoded member
+    // names directly.
+    let hits: Vec<usize> = head_member_positions(buf, name, following);
     hits.iter()
-        .filter_map(|&at| member_value_literal(buf, at + needle.len(), following))
+        .filter_map(|&at| member_value_literal(buf, at, following))
         .collect()
 }
 
@@ -453,42 +458,74 @@ fn literal_ends_proven(following: Option<&[u8]>, token_char: impl Fn(u8) -> bool
 
 /// Member-name positions at JSON depth 1, scanning forward from the
 /// frame's first byte — the head window always begins at depth 0, so
-/// depth is established unconditionally. A needle inside a string or a
-/// nested object is never a candidate.
-fn head_member_positions(buf: &[u8], needle: &[u8]) -> Vec<usize> {
+/// depth is established unconditionally. A nested member is never a
+/// candidate.
+///
+/// Each hit is the byte just past a member name's closing quote where
+/// `ws* ':'` is proven — inside the window or by the retained
+/// lookahead byte (`following`, `Some(&[])` at the frame's own end
+/// never supplies it). Names compare *decoded*: `"i\u0064"` is `id`
+/// and `"j\u0073onrpc"` is `jsonrpc`, so an escape-spelled envelope
+/// member still counts — while a depth-1 string that is not a member
+/// (`{"x":"id"}`) is skipped as one literal and can never consume the
+/// candidate bound ahead of later members.
+///
+/// The scan proceeds only when the first non-whitespace byte opens the
+/// root object (`{`): a scalar root (`123`, `"x"`, `true`) never opens
+/// or closes depth, so without the gate a *second* root's `{"id":…}`
+/// would scan as a depth-1 member of "the" frame. An array root is
+/// excluded the same way — array elements sit at depth 1 as values,
+/// and a malformed `["id":5]` must not yield a member literal. An
+/// incomplete `{`-root prefix still recovers normally: the gate only
+/// reads the first byte.
+fn head_member_positions(buf: &[u8], name: &str, following: Option<&[u8]>) -> Vec<usize> {
     let mut hits = Vec::new();
+    let mut i = 0usize;
+    while i < buf.len() && buf[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if buf.get(i) != Some(&b'{') {
+        return hits;
+    }
     let mut depth = 0usize;
     let mut in_string = false;
-    let mut i = 0usize;
+    // Member-key position at the root's depth: `true` after `{` opens
+    // the root and after each `,`, `false` after `:` and after any
+    // complete depth-1 string (which consumed its own slot — a name
+    // expects `:` next, a value expects `,`/`}`). Without it a
+    // malformed frame such as `{"a":"id":5}` would credit the *value*
+    // `"id"` as an envelope member on closing quote + colon alone.
+    let mut expect_member = true;
     while i < buf.len() && hits.len() < MAX_MEMBER_CANDIDATES {
         let b = buf[i];
-        if b == b'"' && buf[i..].starts_with(needle) {
-            // A needle match while the scan sits inside a string is
-            // never a member name: an odd backslash run means the `\"`
-            // is escaped interior content, and an *unescaped* `"` here
-            // is the string's own close quote — the `name` bytes after
-            // it are bare text (`"x\\"id"`), not an envelope member.
-            if in_string {
-                if preceding_slashes(buf, i).is_multiple_of(2) {
-                    in_string = false;
-                }
+        if !in_string && b == b'"' {
+            // An odd backslash run means this `"` is escaped interior
+            // content — inside a string by escape math even though the
+            // scan is nominally outside one (malformed input) — and the
+            // in-string walker takes over from the next byte.
+            if !preceding_slashes(buf, i).is_multiple_of(2) {
+                in_string = true;
                 i += 1;
                 continue;
             }
-            // Outside a string the match's opening quote must itself be
-            // unescaped — `\"id"` spells the needle's bytes while the
-            // quote is interior to a string literal (a member name like
-            // `"x\"id"`, or stray backslash garbage on a malformed
-            // frame).
-            if preceding_slashes(buf, i).is_multiple_of(2) {
-                if depth == 1 {
-                    hits.push(i);
-                }
-                i += needle.len();
-            } else {
-                in_string = true;
-                i += 1;
+            // Whole-literal handling: the string is skipped atomically
+            // so interior bytes never perturb depth or the string
+            // state, and its decoded inner bytes are the member-name
+            // comparison — an escape-spelled name still resolves.
+            let (inner, after, closed) = string_literal(buf, i);
+            if closed
+                && depth == 1
+                && expect_member
+                && json_name_eq(inner, name)
+                && colon_after(buf, after, following)
+            {
+                hits.push(after);
             }
+            if depth == 1 {
+                // Whatever slot this string filled, it is gone now.
+                expect_member = false;
+            }
+            i = after;
             continue;
         }
         if in_string {
@@ -506,9 +543,18 @@ fn head_member_positions(buf: &[u8], needle: &[u8]) -> Vec<usize> {
             continue;
         }
         match b {
-            b'"' => in_string = true,
             b'{' | b'[' => depth += 1,
-            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'}' | b']' => {
+                if depth == 1 {
+                    // The first JSON root closed — members of a second
+                    // root must never combine with this one's into a
+                    // single frame's evidence.
+                    break;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            b',' if depth == 1 => expect_member = true,
+            b':' if depth == 1 => expect_member = false,
             _ => {}
         }
         i += 1;
@@ -516,69 +562,196 @@ fn head_member_positions(buf: &[u8], needle: &[u8]) -> Vec<usize> {
     hits
 }
 
-/// Member-name positions at JSON depth 1, scanning the tail window
-/// backward from the frame's last byte. Depth is anchored at the
-/// frame's own close: the last non-whitespace byte must be `}` or `]`,
-/// and a member inside the root value sits at depth 1 relative to it.
-/// Any other tail ending — an unterminated string, a scalar cut off by
-/// EOF — leaves depth unestablished, so no candidate is trusted.
-/// Positions come back last-member-first.
-fn tail_member_positions(buf: &[u8], needle: &[u8]) -> Vec<usize> {
-    let mut hits = Vec::new();
-    let mut end = buf.len();
-    while end > 0 && buf[end - 1].is_ascii_whitespace() {
+/// The string literal opened at `open` (`buf[open] == '"'`): its inner
+/// bytes, the position just past the closing quote — `buf.len()` when
+/// the literal runs unterminated to the window edge — and whether that
+/// closing quote was found at all. An unterminated name is at best a
+/// prefix (the window may have cut a longer name, or the document may
+/// carry no closing quote before its `:`), so it is never member-name
+/// evidence.
+fn string_literal(buf: &[u8], open: usize) -> (&[u8], usize, bool) {
+    let mut j = open + 1;
+    while j < buf.len() {
+        match buf[j] {
+            b'\\' => j += 2,
+            b'"' => return (&buf[open + 1..j], j + 1, true),
+            _ => j += 1,
+        }
+    }
+    (&buf[open + 1..], buf.len(), false)
+}
+
+/// A member name's inner bytes equal `name`: byte-for-byte when no
+/// escapes appear, else compared decoded — `\uXXXX` and the
+/// single-character escapes resolve first, so `"i\u0064"` is `id`.
+/// A name that fails decode can never equal the ASCII vocabulary the
+/// callers probe (`id`, `method`, `result`, `error`, `jsonrpc`).
+fn json_name_eq(inner: &[u8], name: &str) -> bool {
+    if !inner.contains(&b'\\') {
+        return inner == name.as_bytes();
+    }
+    decode_member_name(inner).is_some_and(|d| d == name.as_bytes())
+}
+
+/// Decode a JSON string's inner bytes — `\"` `\\` `\/` `\b` `\f` `\n`
+/// `\r` `\t` and `\uXXXX`. `None` on malformed escapes, truncated
+/// `\uXXXX`, or a surrogate half (a lone surrogate cannot spell an
+/// ASCII member name).
+fn decode_member_name(inner: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(inner.len());
+    let mut i = 0usize;
+    while i < inner.len() {
+        if inner[i] == b'\\' {
+            let esc = *inner.get(i + 1)?;
+            match esc {
+                b'"' => out.push(b'"'),
+                b'\\' => out.push(b'\\'),
+                b'/' => out.push(b'/'),
+                b'b' => out.push(0x08),
+                b'f' => out.push(0x0C),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'u' => {
+                    let hex = inner.get(i + 2..i + 6)?;
+                    let cp = u16::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+                    let ch = char::from_u32(cp as u32)?;
+                    let mut enc = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut enc).as_bytes());
+                    i += 4;
+                }
+                _ => return None,
+            }
+            i += 2;
+        } else {
+            out.push(inner[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// `ws* ':'` proven at `after` — inside the window, or by the retained
+/// lookahead byte when the literal ends at the window's edge.
+fn colon_after(buf: &[u8], after: usize, following: Option<&[u8]>) -> bool {
+    let mut j = after;
+    while j < buf.len() && buf[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    match buf.get(j) {
+        Some(&b) => b == b':',
+        None => following.is_some_and(|f| f.first() == Some(&b':')),
+    }
+}
+
+/// Member-name positions (the byte just past each name's closing
+/// quote) for members of the frame's *last* complete root — the root
+/// whose close is the retained last byte. `whole` is the reassembled
+/// frame, so `whole[0]` is the frame's own first byte; `tail_start` is
+/// the offset inside it where the retained tail window begins, and
+/// only members ending inside the tail window are reported — members
+/// before it already went through the head scan's own adjudication,
+/// so the tail scan must not resurrect a literal the head rejected.
+///
+/// A `}`/`]` at the frame's end is not by itself evidence of a root
+/// close — `{"result":{…,"id":5}` ends on a nested `}` the same scan
+/// would anchor on, and a preceding `}`/`]` may itself close a nested
+/// value. The backward pass therefore only *locates* the depth-1 open
+/// the last byte could close, then proves it is a root by walking the
+/// remaining prefix: whitespace and complete root documents only, all
+/// the way to `whole[0]`. A `:`/`,`/literal/`"` between roots, an
+/// unclosed earlier root, or no anchored open at all leaves the close's
+/// root membership unproven, and no candidate is returned. With the
+/// root proven, the candidates are the *forward* scan's member hits
+/// inside it — the same member-key evidence the head scan requires —
+/// so a phantom name the backward scan would have credited (a closing
+/// quote of an earlier string reading as `"id"` on raw bytes) can
+/// never be attributed.
+fn tail_member_positions(whole: &[u8], tail_start: usize, name: &str) -> Vec<usize> {
+    let Some((root_open, _)) = last_root_span(whole) else {
+        return Vec::new();
+    };
+    head_member_positions(&whole[root_open..], name, Some(&[]))
+        .into_iter()
+        .map(|at| root_open + at)
+        .filter(|&at| at >= tail_start)
+        .rev()
+        .collect()
+}
+
+/// The frame's last complete root document, as its opening byte's
+/// position, when the retained last byte provably *is* that root's
+/// close: the forward scan — authoritative about string boundaries in
+/// a way backward pairing can never be on malformed input — must see
+/// depth return to 0 exactly at the last non-whitespace byte, and only
+/// whitespace or complete earlier roots may precede it. A `}`/`]` at
+/// the frame's end is not by itself evidence of a root close:
+/// `{"result":{…,"id":5}` ends on a nested `}` (the forward scan still
+/// sits at depth 1 there, so it yields `None`), and garbage between
+/// roots or a never-opened root is rejected the same way.
+fn last_root_span(whole: &[u8]) -> Option<(usize, usize)> {
+    let mut end = whole.len();
+    while end > 0 && whole[end - 1].is_ascii_whitespace() {
         end -= 1;
     }
-    if end == 0 || !matches!(buf[end - 1], b'}' | b']') {
-        return hits;
+    if end == 0 || !matches!(whole[end - 1], b'}' | b']') {
+        return None;
     }
-    // Relative depth anchored at the end (0 after the root close);
-    // braces inside strings do not count. Moving backward, `}`/`]`
-    // enter the region they closed (deeper), `{`/`[` leave it.
     let mut depth = 0usize;
     let mut in_string = false;
-    let mut i = end;
-    while i > 0 && hits.len() < MAX_MEMBER_CANDIDATES {
-        i -= 1;
-        let b = buf[i];
-        if b == b'"' && buf[i..].starts_with(needle) {
-            // Member name — but only when its opening quote is itself
-            // unescaped. An odd backslash run means the `\"` is interior
-            // to a string literal (a member name such as `"x\"id"`
-            // spells `\"id":` — needle plus colon — on raw bytes), so
-            // the match is string content, never an envelope member.
-            if preceding_slashes(buf, i).is_multiple_of(2) {
-                // Reaching the name's opening quote ends the literal
-                // regardless of which direction the scan arrived from
-                // (unescaped `"name"` cannot sit inside a string).
-                if depth == 1 {
-                    hits.push(i);
+    // The `{`/`[` the current root region opened with — meaningful
+    // only while `depth > 0`.
+    let mut open = None;
+    let mut i = 0usize;
+    while i < end {
+        let b = whole[i];
+        if in_string {
+            match b {
+                b'\\' => i += 2,
+                b'"' => {
+                    in_string = false;
+                    i += 1;
                 }
-                in_string = false;
-            } else {
-                in_string = true;
+                _ => i += 1,
             }
             continue;
         }
-        if in_string {
-            // An unescaped `"` moving backward out of a string is its
-            // opening quote; an odd backslash run means it was escaped
-            // and stays interior.
-            if b == b'"' && preceding_slashes(buf, i).is_multiple_of(2) {
-                in_string = false;
+        match b {
+            b'"' => {
+                // Even or odd backslash run, the bytes ahead lie inside
+                // a string: an unescaped `"` opens one, and an escaped
+                // `\"` can only appear *inside* one. The in-string arm
+                // walks to the real close (it skips `\\` escapes), so
+                // a phantom member name cannot shift the pairing.
+                in_string = true;
+                i += 1;
             }
-        } else if b == b'"' {
-            // A quote met outside a string is either a close quote
-            // (unescaped) or an escaped interior quote — the region
-            // before it is inside a string either way.
-            in_string = true;
-        } else if b == b'}' || b == b']' {
-            depth += 1;
-        } else if b == b'{' || b == b'[' {
-            depth = depth.saturating_sub(1);
+            b'{' | b'[' => {
+                if depth == 0 {
+                    open = Some(i);
+                }
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && i == end - 1 {
+                    return Some((open?, i));
+                }
+                i += 1;
+            }
+            _ => {
+                // Between roots only whitespace may appear — anything
+                // else makes the trailing close's root membership
+                // unprovable.
+                if depth == 0 && !b.is_ascii_whitespace() {
+                    return None;
+                }
+                i += 1;
+            }
         }
     }
-    hits
+    None
 }
 
 /// Count the backslash run ending just before `at` — an odd run means
@@ -618,7 +791,15 @@ fn member_value_literal(buf: &[u8], name_end: usize, following: Option<&[u8]>) -
             while i < buf.len() {
                 match buf[i] {
                     b'"' => {
-                        return Some(String::from_utf8_lossy(&buf[start..=i]).into_owned());
+                        // Strict UTF-8, never lossy: the oversized reader
+                        // retains raw bytes with no upstream validation,
+                        // so a quoted id holding invalid bytes would
+                        // otherwise surface as a candidate spelled with
+                        // U+FFFD — replacement text that never appeared
+                        // on the wire and could alias a tracked id that
+                        // legitimately contains U+FFFD (EF BF BD stays
+                        // valid here).
+                        return std::str::from_utf8(&buf[start..=i]).ok().map(str::to_owned);
                     }
                     // `\` escapes exactly one byte for the purpose of
                     // finding the close quote (`\u` hex digits cannot
@@ -676,8 +857,22 @@ fn member_value_literal(buf: &[u8], name_end: usize, following: Option<&[u8]>) -
 /// in-flight request only releases tracking — it cannot fabricate or
 /// forward verified content.
 pub(crate) fn recover_id_candidates(frame: &OversizeFrame, prefer_tail: bool) -> Vec<String> {
-    let head = member_literal_candidates(&frame.head, head_continuation(frame), "id", false);
-    let tail = member_literal_candidates(&frame.tail, Some(&[]), "id", true);
+    let head = member_literal_candidates(&frame.head, head_continuation(frame), "id");
+    // The tail scan needs the reassembled frame: it locates the open
+    // the last byte may close and must validate complete roots all the
+    // way back to the frame's first byte before any member under that
+    // close counts. On a disjoint tail the frame start is unreachable,
+    // so no tail candidate carries root-boundary evidence.
+    let whole = reassembled_frame(frame);
+    let tail: Vec<String> = whole
+        .as_deref()
+        .map(|whole| {
+            tail_member_positions(whole, frame.head.len(), "id")
+                .into_iter()
+                .filter_map(|at| member_value_literal(whole, at, Some(&[])))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut out: Vec<String> = if prefer_tail {
         tail.into_iter().chain(head).collect()
     } else {
@@ -687,16 +882,118 @@ pub(crate) fn recover_id_candidates(frame: &OversizeFrame, prefer_tail: bool) ->
     out
 }
 
+/// The whole frame, reassembled, when the head and tail windows cover
+/// every byte between them (`covered >= frame.bytes`): overlapping
+/// windows are trimmed at the seam. `None` while a middle span is
+/// dropped — the tail's anchor is then unprovable. Reassembly lets the
+/// forward scan anchor at the frame's real first byte, so tail-side
+/// members get proven depth.
+fn reassembled_frame(frame: &OversizeFrame) -> Option<Vec<u8>> {
+    let covered = frame.head.len().saturating_add(frame.tail.len());
+    if covered < frame.bytes {
+        return None;
+    }
+    let overlap = covered - frame.bytes;
+    let mut whole = Vec::with_capacity(frame.bytes);
+    whole.extend_from_slice(&frame.head);
+    whole.extend_from_slice(&frame.tail[overlap..]);
+    Some(whole)
+}
+
+/// `id` candidates that provably name an envelope member. The forward
+/// scan counts depth from the frame's first byte, so when the retained
+/// windows cover the whole frame every hit is exact; when the middle
+/// is omitted only head-window hits count — a disjoint tail's backward
+/// scan anchors on the retained region's own closing `}`/`]`, which a
+/// nested `result.id` can impersonate when the frame's real root close
+/// is not visible (truncation) or never existed (malformed input).
+/// These are the only candidates trusted to complete a client RPC;
+/// tail hits remain available to [`recover_id_candidates`] for
+/// echo-back, where a wrong guess costs a stray id on an error frame.
+pub(crate) fn recover_id_candidates_proven(frame: &OversizeFrame) -> Vec<String> {
+    if let Some(whole) = reassembled_frame(frame) {
+        member_literal_candidates(&whole, Some(&[]), "id")
+    } else {
+        member_literal_candidates(&frame.head, head_continuation(frame), "id")
+    }
+}
+
+/// `true` when the retained windows *prove* the frame carries
+/// response shape — a `result` or `error` member name at envelope
+/// depth with its `:` visible inside the window or via the retained
+/// lookahead byte. When head and tail together cover the whole frame
+/// the reassembled scan anchors depth at the frame's real first byte,
+/// so a member beginning past the head window counts too; with a
+/// dropped middle only head hits count, since a tail hit could be a
+/// nested member promoted by a dropped opener. A server *request*
+/// carries neither member at the top level, so proven evidence is
+/// what separates an oversized response — whose `id` may legitimately
+/// complete a client RPC — from a request whose `method` fell into
+/// the omitted middle.
+pub(crate) fn recover_response_evidence(frame: &OversizeFrame) -> bool {
+    if let Some(whole) = reassembled_frame(frame) {
+        // The reassembled frame is complete — a `result`/`error`
+        // member only proves response shape inside a *valid* envelope,
+        // which must also carry `jsonrpc: "2.0"`. A member-named frame
+        // without it is not a response completion anything may retire
+        // on; incomplete frames (below) keep the head-only check since
+        // the `jsonrpc` member can legitimately sit in the dropped
+        // middle. The value compares *decoded* — escape spellings such
+        // as `"2\u002e0"` resolve to the same `2.0`.
+        return envelope_response_member(&whole, Some(&[]))
+            && member_literal_candidates(&whole, Some(&[]), "jsonrpc")
+                .iter()
+                .any(|lit| {
+                    lit.strip_prefix('"')
+                        .and_then(|s| s.strip_suffix('"'))
+                        .is_some_and(|inner| json_name_eq(inner.as_bytes(), "2.0"))
+                });
+    }
+    envelope_response_member(&frame.head, head_continuation(frame))
+}
+
+/// `true` when the retained windows prove the frame is
+/// response-*shaped* — a `result`/`error` member at envelope depth —
+/// whether or not the envelope is otherwise valid. A response-shaped
+/// frame still consumed a response slot: the request it answered
+/// would wait forever if the frame were simply dropped, so
+/// attribution and fail-closed settlement run on shape, while
+/// [`recover_response_evidence`] — which additionally requires a
+/// valid `jsonrpc` member on a fully retained frame — decides what
+/// may complete an RPC outright.
+pub(crate) fn recover_response_shape(frame: &OversizeFrame) -> bool {
+    if let Some(whole) = reassembled_frame(frame) {
+        return envelope_response_member(&whole, Some(&[]));
+    }
+    envelope_response_member(&frame.head, head_continuation(frame))
+}
+
+/// A `result`/`error` member at envelope depth — the shape a frame
+/// must show to have consumed a response slot, regardless of whether
+/// its envelope is otherwise valid.
+fn envelope_response_member(buf: &[u8], following: Option<&[u8]>) -> bool {
+    envelope_member_named(buf, following, "result")
+        || envelope_member_named(buf, following, "error")
+}
+
+/// A member `name` at head-window depth 1 whose `:` is proven — inside
+/// the window, or by the byte the reader retained immediately after it
+/// (`Some(&[])` at the frame's own end is not a `:`).
+fn envelope_member_named(buf: &[u8], following: Option<&[u8]>, name: &str) -> bool {
+    !head_member_positions(buf, name, following).is_empty()
+}
+
 /// The byte stream immediately after the head window inside the frame:
 /// the tail's overlap-trimmed prefix when the two windows cover the
-/// whole frame, `None` when the dropped middle leaves the head's last
-/// byte without proven context.
+/// whole frame, else the one lookahead byte the bounded reader retains
+/// for exactly this proof — `None` only when the frame itself ended at
+/// the head boundary.
 fn head_continuation(frame: &OversizeFrame) -> Option<&[u8]> {
     let covered = frame.head.len().saturating_add(frame.tail.len());
     if covered >= frame.bytes {
         Some(&frame.tail[covered - frame.bytes..])
     } else {
-        None
+        frame.head_next.as_ref().map(std::slice::from_ref)
     }
 }
 
@@ -716,14 +1013,19 @@ pub(crate) fn oversize_extra(frame: &OversizeFrame, limit: usize) -> String {
 /// the top), then tail for completeness. `None` means the frame is
 /// treated as a response (requests always carry `method`).
 pub(crate) fn recover_method(frame: &OversizeFrame) -> Option<String> {
-    for lit in member_literal_candidates(&frame.head, head_continuation(frame), "method", false)
+    let whole = reassembled_frame(frame);
+    let tail = whole
+        .as_deref()
+        .map(|whole| {
+            tail_member_positions(whole, frame.head.len(), "method")
+                .into_iter()
+                .filter_map(|at| member_value_literal(whole, at, Some(&[])))
+        })
         .into_iter()
-        .chain(member_literal_candidates(
-            &frame.tail,
-            Some(&[]),
-            "method",
-            true,
-        ))
+        .flatten();
+    for lit in member_literal_candidates(&frame.head, head_continuation(frame), "method")
+        .into_iter()
+        .chain(tail)
     {
         // Wrap the literal in an object so a bare scalar parses as a
         // member value (the same trick `rpc_id_from_raw_id` uses).
@@ -747,7 +1049,13 @@ pub(crate) async fn write_client_frame<W: tokio::io::AsyncWrite + Unpin>(
     buf.push(b'\n');
     let mut guard = out.lock().await;
     guard.write_all(&buf).await.map_err(io_err)?;
-    guard.flush().await.map_err(io_err)?;
+    // Every byte committed — a flush failure cannot prove the frame
+    // never crossed, so the outcome is unprovable rather than a
+    // clean non-delivery.
+    guard
+        .flush()
+        .await
+        .map_err(AuditorError::DeliveryUncertain)?;
     Ok(())
 }
 
@@ -758,8 +1066,21 @@ async fn write_frame_bytes<W: tokio::io::AsyncWrite + Unpin>(
     line: &str,
 ) -> Result<(), AuditorError> {
     writer.write_all(line.as_bytes()).await.map_err(io_err)?;
-    writer.write_all(b"\n").await.map_err(io_err)?;
-    writer.flush().await.map_err(io_err)?;
+    // The document bytes committed — a newline-write failure cannot
+    // prove non-delivery: a reader that accepts a trailing unterminated
+    // document at EOF (as `read_frame_bounded` does) may still dispatch
+    // it when the pipe dies, so the outcome is unprovable either way.
+    writer
+        .write_all(b"\n")
+        .await
+        .map_err(AuditorError::DeliveryUncertain)?;
+    // Every byte committed — a flush failure cannot prove the frame
+    // never crossed, so the outcome is unprovable rather than a
+    // clean non-delivery.
+    writer
+        .flush()
+        .await
+        .map_err(AuditorError::DeliveryUncertain)?;
     Ok(())
 }
 
@@ -819,7 +1140,11 @@ pub(crate) async fn write_child_frame_epoch<W: tokio::io::AsyncWrite + Unpin>(
         Ok(r) => r,
         Err(_) => {
             guard.take();
-            Err(io_err(std::io::Error::new(
+            // The cancelled write may have committed the complete frame
+            // before expiry — the bytes that crossed are unprovable
+            // either way, so the request's arrival is uncertain rather
+            // than established non-delivery.
+            Err(AuditorError::DeliveryUncertain(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "child stdin write stalled inside the list epoch",
             )))

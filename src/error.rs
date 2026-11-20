@@ -209,6 +209,17 @@ pub enum AuditorError {
     /// "a client request violated the policy".
     VerificationFailed(String),
     Io(std::io::Error),
+    /// A frame write failed after all its bytes were committed — the
+    /// peer may still have received the complete frame. Session-fatal
+    /// like any write error, but callers must not reconcile the request
+    /// as not-forwarded or its pending call as proven non-execution.
+    DeliveryUncertain(std::io::Error),
+    /// The audited frame reached its peer, but session-required
+    /// follow-up work failed afterwards — session-fatal like any relay
+    /// error, but a `forwarded=false` reconciliation for the frame
+    /// itself would misreport a delivery that did occur. Carries the
+    /// real failure underneath.
+    PostDeliveryFailure(Box<AuditorError>),
     FrameTooLarge {
         bytes: usize,
         limit: usize,
@@ -226,6 +237,10 @@ impl fmt::Display for AuditorError {
             Self::PolicyViolation(e) => write!(f, "Policy violation: {e}"),
             Self::VerificationFailed(e) => write!(f, "Server verification failed: {e}"),
             Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::DeliveryUncertain(e) => {
+                write!(f, "frame write outcome unprovable: {e}")
+            }
+            Self::PostDeliveryFailure(e) => write!(f, "{e}"),
             Self::FrameTooLarge { bytes, limit } => {
                 write!(
                     f,
@@ -240,7 +255,11 @@ impl fmt::Display for AuditorError {
 impl std::error::Error for AuditorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(e) => Some(e),
+            Self::Io(e) | Self::DeliveryUncertain(e) => Some(e),
+            // The wrapped error itself, not the Box — the box's own
+            // `Error` impl would shadow the real source one level up
+            // and break `downcast_ref::<AuditorError>()` on the chain.
+            Self::PostDeliveryFailure(e) => Some(&**e),
             _ => None,
         }
     }

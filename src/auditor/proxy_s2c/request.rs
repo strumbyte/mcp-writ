@@ -46,12 +46,14 @@ where
             // joins `pending_elicitations`) under the same lock as the
             // registration, before the write — a completion notification
             // arriving the instant the frame lands must correlate.
+            // The entry is born undispatched — invisible to `answered`/
+            // `take` until the client write completes, so a response
+            // frame cannot retire a request the client never saw.
+            let mut tracked =
+                TrackedRequest::from_extracted(method, version, true, shared.dry_run, &ext);
+            tracked.dispatched = false;
             let registered = wire
-                .register(
-                    S2C,
-                    id.clone(),
-                    TrackedRequest::from_extracted(method, version, true, shared.dry_run, &ext),
-                )
+                .register(S2C, id.clone(), tracked)
                 .map(|()| wire.on_request_forwarded(S2C, id, method, version, &ext));
             drop(wire);
             match registered {
@@ -69,23 +71,34 @@ where
                     )
                     .await?;
                     match write_client_frame(&shared.client_out, line).await {
-                        Ok(()) => Ok(()),
+                        Ok(()) => {
+                            // The request reached the client — it may
+                            // now correlate an answer.
+                            shared.wire.lock().await.mark_dispatched(S2C, id);
+                            Ok(())
+                        }
                         // The client never saw it — drop the tracking and
                         // the side effect committed with it, and reconcile
-                        // the pre-write `forwarded=true` record.
+                        // the pre-write `forwarded=true` record. Skipped
+                        // for `DeliveryUncertain`: the complete frame may
+                        // still have crossed, so "not forwarded" is
+                        // unprovable and the request stays tracked until
+                        // the session ends on the error.
                         Err(e) => {
-                            shared.wire.lock().await.rollback_forwarded_request(undo);
-                            proxy_rpc::audit_forward_failed(
-                                &shared.audit,
-                                S2C,
-                                "request",
-                                Some(method),
-                                Some(raw_id),
-                                version,
-                                verdict,
-                                shared.dry_run,
-                                None,
-                            );
+                            if !matches!(e, AuditorError::DeliveryUncertain(_)) {
+                                shared.wire.lock().await.rollback_forwarded_request(undo);
+                                proxy_rpc::audit_forward_failed(
+                                    &shared.audit,
+                                    S2C,
+                                    "request",
+                                    Some(method),
+                                    Some(raw_id),
+                                    version,
+                                    verdict,
+                                    shared.dry_run,
+                                    None,
+                                );
+                            }
                             Err(e)
                         }
                     }

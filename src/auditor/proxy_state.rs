@@ -273,8 +273,9 @@ pub(crate) struct ProxyShared<W> {
     ///
     /// It is a `tokio::sync::Mutex` because the dispatch side holds it
     /// across an `await`; a raise site only runs the atomic swap inside
-    /// it, so no lock-order cycle exists (epoch → child_stdin on the
-    /// dispatch side; epoch alone on the raise side). The epoch-held
+    /// it, so no lock-order cycle exists (epoch → child_stdin → wire on
+    /// the dispatch side, and nothing holds wire while acquiring the
+    /// epoch; epoch alone on the raise side). The epoch-held
     /// write is bounded by `EPOCH_CHILD_WRITE_BUDGET`: the raise side
     /// is also the task draining the child's stdout, so an unbounded
     /// write into a full stdin pipe would deadlock with it. C2S-side

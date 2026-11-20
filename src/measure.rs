@@ -81,9 +81,12 @@ pub fn incr(c: &'static Counter, n: u64) {
 /// Per-thread counting window for tests. While a `CountWindow` is open
 /// on the current thread, [`incr`] also records into it — [`CountWindow::count`]
 /// then reads back only what *this thread* measured, so increments from
-/// parallel test threads or background tasks cannot inflate an
-/// exact-count assertion. Compiled only in `cfg(test)` builds; the
-/// instrumented sites' `incr` calls are unchanged either way.
+/// *other threads* cannot inflate an exact-count assertion. The
+/// isolation is per thread, not per task: a task interleaved on the
+/// same runtime thread records into the open window too, so unrelated
+/// instrumented work must stay off that thread while the window is
+/// open. Compiled only in `cfg(test)` builds; the instrumented sites'
+/// `incr` calls are unchanged either way.
 #[cfg(test)]
 pub struct CountWindow {
     counts: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<&'static str, u64>>>,

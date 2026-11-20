@@ -23,10 +23,9 @@ use crate::protocol::SupportedProtocolVersion;
 /// callers must not send a second reply — while a gate held by internal
 /// work parks the request in `held_client_list` for the S2C side to
 /// answer once that listing settles. The request template internal
-/// revalidations rebuild from (`last_list_template`) is published by the
-/// caller *before* the forward's awaits — a revalidation racing the
-/// dispatch must see this request's params — and restored if the forward
-/// unwinds, so a refused or unwritten request still cannot seed it.
+/// revalidations rebuild from (`last_list_template`) is published inside
+/// `register_and_forward` immediately before the request becomes
+/// answerable — a refused or unwritten request can never seed it.
 pub(super) async fn arm_tools_list<W>(
     shared: &ProxyShared<W>,
     view: &checker::VerifiedFrame<'_>,
@@ -209,11 +208,9 @@ async fn hold_client_list<W>(shared: &ProxyShared<W>, id: &RpcId, raw_id: &str) 
 }
 
 /// Unwind [`arm_tools_list`] when the forward never reached the server:
-/// drop the pending id and the stored request. `last_list_template` is
-/// restored by the caller — the template is published before the
-/// forward's awaits so a racing revalidation sees this request's
-/// params, so the unwind path must put the displaced value back.
-/// `list_busy`
+/// drop the pending id and the stored request. `last_list_template`
+/// needs no restore — the caller publishes it only after the forward
+/// succeeds, so nothing here displaced it. `list_busy`
 /// is not cleared here — only the S2C side ever releases the gate: a
 /// `store(false)` from this side could land underneath a revalidation
 /// queued in the meantime, stranding it. Wake the loop;

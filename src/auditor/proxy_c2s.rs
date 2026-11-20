@@ -478,17 +478,22 @@ where
             match write_child_frame(&shared.child_stdin, view.frame()).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    proxy_rpc::audit_forward_failed(
-                        &shared.audit,
-                        C2S,
-                        "notification",
-                        Some(method),
-                        None,
-                        version,
-                        verdict,
-                        shared.dry_run,
-                        None,
-                    );
+                    // Skipped for `DeliveryUncertain` — the complete
+                    // frame may still have crossed, so "not forwarded"
+                    // is unprovable.
+                    if !matches!(e, AuditorError::DeliveryUncertain(_)) {
+                        proxy_rpc::audit_forward_failed(
+                            &shared.audit,
+                            C2S,
+                            "notification",
+                            Some(method),
+                            None,
+                            version,
+                            verdict,
+                            shared.dry_run,
+                            None,
+                        );
+                    }
                     Err(e)
                 }
             }
@@ -633,7 +638,36 @@ where
 {
     let ext = proxy_rpc::extract_response(view.value());
     let mut wire = shared.wire.lock().await;
-    let answered = wire.answered(C2S, id);
+    let mut answered = wire.answered(C2S, id);
+    // A response can race its own request's dispatch: `s2c_request`
+    // registers the (S2C,id) entry before the client write and marks it
+    // dispatched only after the write lands, so a fast answer can
+    // arrive in between. Wait on the dispatch outcome instead of
+    // rejecting — the mark makes the entry answerable and any removal
+    // ends the wait the same way. The waiter registers while this task
+    // still holds the wire lock, so the transition can never be missed.
+    //
+    // The wait is bound to the registration it started on (`seq`): a
+    // pre-write rollback frees the id, and a *new* request re-registering
+    // it undispatched must neither keep this waiter parked nor resolve
+    // through `answered` — the frame answers the removed registration,
+    // never the replacement.
+    let mut waited_seq = None;
+    while answered.is_none()
+        && let Some(entry) = wire.get(S2C, id)
+        && !entry.dispatched
+        && waited_seq.is_none_or(|seq| seq == entry.seq)
+    {
+        waited_seq = Some(entry.seq);
+        let notify = wire.dispatch_changed();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        drop(wire);
+        notified.await;
+        wire = shared.wire.lock().await;
+        answered = wire.answered(C2S, id).filter(|a| Some(a.seq) == waited_seq);
+    }
     // The revision a response is judged under is the answered request's —
     // absent a tracked request, fall back to the established wire.
     let version = wire
@@ -667,17 +701,22 @@ where
             match write_child_frame(&shared.child_stdin, view.frame()).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    proxy_rpc::audit_forward_failed(
-                        &shared.audit,
-                        C2S,
-                        "response",
-                        entry.as_ref().map(|e| e.method.as_str()),
-                        Some(raw_id),
-                        version,
-                        verdict,
-                        shared.dry_run,
-                        None,
-                    );
+                    // Skipped for `DeliveryUncertain` — the complete
+                    // frame may still have crossed, so "not forwarded"
+                    // is unprovable.
+                    if !matches!(e, AuditorError::DeliveryUncertain(_)) {
+                        proxy_rpc::audit_forward_failed(
+                            &shared.audit,
+                            C2S,
+                            "response",
+                            entry.as_ref().map(|e| e.method.as_str()),
+                            Some(raw_id),
+                            version,
+                            verdict,
+                            shared.dry_run,
+                            None,
+                        );
+                    }
                     Err(e)
                 }
             }
