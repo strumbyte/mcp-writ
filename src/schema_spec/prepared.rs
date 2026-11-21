@@ -29,10 +29,16 @@
 //! bytes), the same order the per-request parse materialized
 //! transiently. Cache growth is bounded by the schema itself: at most
 //! one entry per distinct `$ref` string and per distinct `pattern`
-//! string, each O(key bytes). No new acceptance limit is introduced —
-//! a schema the old path accepted still builds (even an invalid-JSON
-//! one, which simply stores its parse error instead of failing
-//! closed at prepare).
+//! string. A `$ref` entry stays O(key bytes) — the cached outcome is
+//! an index or an error text — but a `pattern` entry retains a
+//! compiled regex whose program can be far larger than the pattern
+//! text (regex-lite's default cap is 10 MiB per program), so total
+//! retained memory scales with the number of distinct pattern
+//! strings. Every cached regex is released when the `PreparedSchema`
+//! is dropped. No new acceptance limit is introduced — a schema the
+//! old path accepted still builds (even an invalid-JSON one, which
+//! simply stores its parse error instead of failing closed at
+//! prepare).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -148,6 +154,14 @@ pub struct PreparedSchema {
     doc: Result<RawJsonOwned, Box<str>>,
     refs: LazyTable<RefOutcome>,
     patterns: LazyTable<PatternOutcome>,
+    /// `$ref` initializer invocations — the concurrency tests assert
+    /// one build per interned entry under contention.
+    #[cfg(test)]
+    ref_builds: std::sync::atomic::AtomicUsize,
+    /// `pattern` initializer invocations — same assertion as
+    /// `ref_builds`.
+    #[cfg(test)]
+    pattern_builds: std::sync::atomic::AtomicUsize,
 }
 
 impl PreparedSchema {
@@ -169,6 +183,10 @@ impl PreparedSchema {
             doc,
             refs: LazyTable::new(),
             patterns: LazyTable::new(),
+            #[cfg(test)]
+            ref_builds: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            pattern_builds: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -196,6 +214,9 @@ impl PreparedSchema {
             .expect("evaluator resolves refs only on a parsed schema");
         let slot = self.refs.intern(target);
         let outcome = slot.get_or_init(|| {
+            #[cfg(test)]
+            self.ref_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             super::resolve_local_ref(doc.value(), target)
                 .map(|v| v.index())
                 .map_err(Box::from)
@@ -217,6 +238,9 @@ impl PreparedSchema {
         let outcome = slot.get_or_init(|| {
             #[cfg(feature = "measure")]
             crate::measure::incr(&crate::measure::SCHEMA_REGEX_BUILDS, 1);
+            #[cfg(test)]
+            self.pattern_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             regex_lite::Regex::new(pat)
                 .map(Arc::new)
                 .map_err(|e| e.to_string().into())
@@ -231,6 +255,18 @@ impl PreparedSchema {
     #[cfg(test)]
     pub(crate) fn interned_counts(&self) -> (usize, usize) {
         (self.refs.len(), self.patterns.len())
+    }
+
+    /// Lazy-initializer invocations so far — interning alone wouldn't
+    /// show a build duplicated under contention, so the concurrency
+    /// tests assert one run per interned entry directly.
+    #[cfg(test)]
+    pub(crate) fn build_counts(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.ref_builds.load(Ordering::Relaxed),
+            self.pattern_builds.load(Ordering::Relaxed),
+        )
     }
 
     /// Capacity-based estimate of the bytes this form owns — the

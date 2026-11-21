@@ -409,7 +409,7 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 - [x] 評価順序、最初のエラー、Fatalと通常不一致、エラー発生段階を維持する。従来到達しない分岐の不正pattern等を起動時に一括拒否せず、評価時に同じ結果となる不正ノード表現等を用いる。
 - [x] branch・node・depth・`multipleOf`等の計算budgetは要求ごとに初期化し、cache済み構造を通っても必要な消費を行う。評価済み結果を入力間で無条件に再利用しない。
 - [x] `anyOf`／`oneOf`／`allOf`、循環・不正参照、未知keyword、`uniqueItems`、数値同値、`multipleOf`、欠落argumentsの空object扱い、入力上限を旧評価器と比較する。旧評価器は比較用のテスト範囲に一時保持し、製品の二重実装を解消する。
-- [x] schema parse・regex構築回数、準備コスト、初回要求、定常要求、メモリを比較する。遅延構築する場合は同時初回要求の重複構築や同期待ちも測る。
+- [x] schema parse・regex構築回数、準備コスト、初回要求、定常要求、メモリを比較する。遅延構築する場合は同時初回要求の重複構築や同期待ちも測る。 → prepared側の常駐量は`estimated_resident_bytes`の値で、lazy memo充填前の構造的推定（コンパイル済みregexプログラムとマッチ用スクラッチ領域は含まない）。warm済み常駐メモリの実測値としては扱わない
 
 **維持する条件:** JSON Schemaの対応範囲、`format`等のannotation扱い、既存のエラー文・順序・タイミング、MRTRの`inputResponses`をarguments schemaへ混ぜない条件を保つ。起動時一括拒否やファイル更新意味の変更を最適化として混入させない。
 

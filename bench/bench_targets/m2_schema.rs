@@ -129,25 +129,30 @@ fn request_mix(case: &Case, count: usize) -> Vec<String> {
 
 /// `BURST_THREADS` racing a first request on a fresh view — the lazy
 /// `$ref`/pattern builders dedupe under contention: after the burst
-/// each interned entry ran its build once. Every worker parks on the
-/// gate first; the extra barrier slot is this thread releasing them
-/// together, so the timer starts at the release — thread spawn and
-/// stragglers' startup stay outside `concurrent_first_ns`, and all
-/// requests hit the uninitialized caches at once.
+/// each interned entry ran its build once. Two barriers split setup
+/// from the timed window: every worker reports `ready` then parks on
+/// `release`, and this thread starts the timer only after all are
+/// parked — so `concurrent_first_ns` provably opens before any worker
+/// is released while thread spawn and stragglers' startup stay
+/// outside it. All requests hit the uninitialized caches at once.
 fn burst(prepared: &PreparedPolicy, probe: &str) -> u64 {
-    let gate = std::sync::Barrier::new(BURST_THREADS + 1);
+    let ready = std::sync::Barrier::new(BURST_THREADS + 1);
+    let release = std::sync::Barrier::new(BURST_THREADS + 1);
     let start = std::thread::scope(|s| {
         for _ in 0..BURST_THREADS {
             s.spawn(|| {
-                gate.wait();
+                ready.wait();
+                release.wait();
                 let _ = black_box(mcp_writ::auditor::checker::check_request_prepared(
                     black_box(probe),
                     black_box(prepared),
                 ));
             });
         }
-        gate.wait();
-        Instant::now()
+        ready.wait();
+        let start = Instant::now();
+        release.wait();
+        start
     });
     start.elapsed().as_nanos() as u64
 }

@@ -879,7 +879,7 @@ fn rf05b_cases() -> Vec<(&'static str, &'static str, String)> {
         ("reached unknown keyword fails", r#"{"a":1}"#,
          r#"{"properties":{"a":{"not":{}}}}"#.into()),
         ("non-string value never reaches invalid pattern", r#"{"a":5}"#,
-         r#"{"properties":{"a":{"type":"string","pattern":"["}}}"#.into()),
+         r#"{"properties":{"a":{"pattern":"["}}}"#.into()),
         ("reached invalid pattern fails", r#"{"a":"x"}"#,
          r#"{"properties":{"a":{"type":"string","pattern":"["}}}"#.into()),
         ("unreached invalid pattern on missing prop", r#"{}"#,
@@ -1035,4 +1035,10 @@ fn prepared_concurrent_first_requests_share_one_build() {
     });
     let (refs, patterns) = prepared.interned_counts();
     assert_eq!((refs, patterns), (1, 1));
+    let (ref_builds, pattern_builds) = prepared.build_counts();
+    assert_eq!(
+        (ref_builds, pattern_builds),
+        (1, 1),
+        "each lazy initializer must run exactly once across the burst"
+    );
 }
