@@ -247,8 +247,7 @@ pub struct GrantStaging(u64);
 /// One endpoint's grant state taken under a single lock — see
 /// [`DynamicAllowList::grant_view`].
 #[derive(Debug, Default)]
-#[allow(dead_code)] // consumed by the Linux/macOS flow consumers
-pub(crate) struct GrantView {
+pub struct GrantView {
     /// Names with a live grant on the endpoint, sorted.
     pub names: Vec<String>,
     /// Any live grant's qualifiers cover the asked-for flow.
@@ -279,6 +278,24 @@ fn grant_view_of(
     }
     view.names.sort();
     view
+}
+
+/// The `is_allowed*` body — the per-address qualifier scan shared by
+/// the under-lock `is_allowed` and its caller-clocked variant.
+fn is_allowed_of(
+    inner: &Inner,
+    addr: &IpAddr,
+    proto: crate::policy::EgressProto,
+    port: u16,
+    now: Instant,
+) -> bool {
+    inner.by_addr.get(addr).is_some_and(|m| {
+        m.values().any(|e| {
+            #[cfg(feature = "measure")]
+            crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
+            e.expires > now && e.quals.iter().any(|q| q.covers(proto, port))
+        })
+    })
 }
 
 /// Dynamic allow list for DNS-gate answers. Thread-safe; reaping of
@@ -346,7 +363,21 @@ impl DynamicAllowList {
         quals: &[crate::policy::GrantQual],
         expires: Instant,
     ) -> bool {
-        if expires <= Instant::now() || quals.is_empty() {
+        self.register_at_clock(name, addr, quals, expires, Instant::now())
+    }
+
+    /// [`Self::register_at`] against a caller-chosen instant — the
+    /// refusal check and the lazy reap share one clock, letting the
+    /// reference-model trace drive a monotone logical time.
+    pub(crate) fn register_at_clock(
+        &self,
+        name: &str,
+        addr: IpAddr,
+        quals: &[crate::policy::GrantQual],
+        expires: Instant,
+        now: Instant,
+    ) -> bool {
+        if expires <= now || quals.is_empty() {
             return false;
         }
         let mut inner = self.inner.lock().unwrap();
@@ -356,7 +387,7 @@ impl DynamicAllowList {
         // plain `&mut Inner` let the refresh path hold its entry while
         // the deadline heap is written alongside.
         let inner = &mut *inner;
-        reap_expired(inner, Instant::now());
+        reap_expired(inner, now);
         let key = GrantKey {
             addr,
             name: name.to_string(),
@@ -376,6 +407,7 @@ impl DynamicAllowList {
                 addr,
                 name,
             );
+            compact_deadlines(inner);
             return true;
         }
         if inner.live_total >= self.max_grants {
@@ -397,6 +429,7 @@ impl DynamicAllowList {
             },
         );
         inner.note_live_inserted(&key);
+        compact_deadlines(inner);
         true
     }
 
@@ -443,13 +476,27 @@ impl DynamicAllowList {
         quals: &[crate::policy::GrantQual],
         expires: Instant,
     ) -> bool {
-        if expires <= Instant::now() || quals.is_empty() {
+        self.register_staged_at_clock(staging, name, addr, quals, expires, Instant::now())
+    }
+
+    /// [`Self::register_staged_at`] against a caller-chosen instant —
+    /// mirrors `register_at_clock` for the staged path.
+    pub(crate) fn register_staged_at_clock(
+        &self,
+        staging: GrantStaging,
+        name: &str,
+        addr: IpAddr,
+        quals: &[crate::policy::GrantQual],
+        expires: Instant,
+        now: Instant,
+    ) -> bool {
+        if expires <= now || quals.is_empty() {
             return false;
         }
         let mut inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        reap_expired(&mut inner, Instant::now());
+        reap_expired(&mut inner, now);
         let key = GrantKey {
             addr,
             name: name.to_string(),
@@ -597,9 +644,19 @@ impl DynamicAllowList {
     /// `addr`:`port` — the IP-layer question, qualifier-aware: a grant
     /// minted under a `proto=udp` name rule never authorizes TCP.
     pub fn is_allowed(&self, addr: &IpAddr, proto: crate::policy::EgressProto, port: u16) -> bool {
-        self.is_allowed_at(addr, proto, port, Instant::now())
+        // The reference instant is sampled under the lock, as in
+        // `grant_view` — a grant that lapses between sample and
+        // acquisition must not be reported live.
+        let inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        is_allowed_of(&inner, addr, proto, port, Instant::now())
     }
 
+    /// [`Self::is_allowed`] at a caller-chosen instant — the testable
+    /// core, keeping the lookup-side expiry check independent of
+    /// reaper timing.
+    #[allow(dead_code)] // used by the RF07 tests
     pub(crate) fn is_allowed_at(
         &self,
         addr: &IpAddr,
@@ -610,13 +667,7 @@ impl DynamicAllowList {
         let inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        inner.by_addr.get(addr).is_some_and(|m| {
-            m.values().any(|e| {
-                #[cfg(feature = "measure")]
-                crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
-                e.expires > now && e.quals.iter().any(|q| q.covers(proto, port))
-            })
-        })
+        is_allowed_of(&inner, addr, proto, port, now)
     }
 
     /// One endpoint's grant state under a single lock acquisition —
@@ -626,8 +677,7 @@ impl DynamicAllowList {
     /// between a verdict's answer and its audit names. `names` is
     /// sorted — the same order [`Self::names_for`] returns — and
     /// `covered` is the same answer [`Self::is_allowed`] gives.
-    #[allow(dead_code)] // consumed by FlowGate and unotify on Linux/macOS
-    pub(crate) fn grant_view(
+    pub fn grant_view(
         &self,
         addr: &IpAddr,
         proto: crate::policy::EgressProto,
@@ -663,10 +713,10 @@ impl DynamicAllowList {
     /// Live grants on `addr` — the names that vended it, for
     /// diagnostics and reporting.
     pub fn names_for(&self, addr: &IpAddr) -> Vec<String> {
-        let now = Instant::now();
         let inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        let now = Instant::now();
         let mut names = Vec::new();
         if let Some(m) = inner.by_addr.get(addr) {
             for (name, e) in m {
@@ -685,10 +735,10 @@ impl DynamicAllowList {
     /// unioned, for consumers that evaluate flows themselves (the
     /// namespaced proxy's per-datagram check).
     pub fn quals_for(&self, addr: &IpAddr) -> Vec<crate::policy::GrantQual> {
-        let now = Instant::now();
         let inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        let now = Instant::now();
         let mut quals = Vec::new();
         if let Some(m) = inner.by_addr.get(addr) {
             for e in m.values() {
@@ -706,10 +756,10 @@ impl DynamicAllowList {
 
     /// Number of live (unexpired) grants.
     pub fn live_len(&self) -> usize {
-        let now = Instant::now();
         let inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        let now = Instant::now();
         inner
             .by_addr
             .values()
@@ -731,11 +781,14 @@ impl DynamicAllowList {
     /// snapshot without `quals` decodes as the pre-schema semantics
     /// (`tcp`, any port) — exactly what those gates minted.
     pub fn snapshot_json(&self) -> String {
-        let now = Instant::now();
-        let now_wall = SystemTime::now();
         let inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        // The reference instant is sampled under the lock like the
+        // lookups — grants that lapse before acquisition are left
+        // out of the snapshot entirely.
+        let now = Instant::now();
+        let now_wall = SystemTime::now();
         nojson::object(|o| -> std::fmt::Result {
             o.member("schema_version", "1.1")?;
             o.member("generated_at_unix_secs", unix_secs(now_wall))?;

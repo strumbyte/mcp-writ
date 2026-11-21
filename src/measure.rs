@@ -333,10 +333,11 @@ static TIMINGS: &[&Timing] = &[
 pub static AUDIT_QUEUE_BYTES: Gauge = Gauge::new("audit.queue.bytes");
 
 /// Deadline-heap entries inside `DynamicAllowList` — pending expiries
-/// plus stale generations awaiting their slot. Sampled after each
-/// lazy reap; the rebuild bound keeps it within ~2× live grants (plus
-/// a small floor), so update churn cannot grow it without limit — the
-/// retention figure RF07 bounds.
+/// plus stale generations awaiting their slot. Sampled inside
+/// `compact_deadlines`, which runs after each lazy reap and after
+/// commit/revoke batches; the rebuild bound keeps it within ~2× live
+/// grants (plus a small floor), so update churn cannot grow it
+/// without limit — the retention figure RF07 bounds.
 pub static DNS_DEADLINE_ENTRIES: Gauge = Gauge::new("dns.deadline.entries");
 
 /// All gauges, for [`snapshot`].

@@ -63,7 +63,9 @@ struct Scenario {
     /// Re-registrations on existing keys — the update churn every
     /// stale deadline entry comes from.
     updates: usize,
-    /// `is_allowed` probes run after fill and expired sleep.
+    /// `is_allowed` probes run after fill and expired sleep, then
+    /// repeated as `grant_view` probes — the flow consumers' combined
+    /// names+coverage shape — in their own timed phase.
     lookups: usize,
 }
 
@@ -188,9 +190,11 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
 
     let mut fill_ns = Vec::with_capacity(iterations);
     let mut lookup_ns = Vec::with_capacity(iterations);
+    let mut view_ns = Vec::with_capacity(iterations);
     let mut churn_ns = Vec::with_capacity(iterations);
     let mut fill_measure = String::from("{}");
     let mut lookup_measure = String::from("{}");
+    let mut view_measure = String::from("{}");
     let mut churn_measure = String::from("{}");
     let mut staged_ok = 0usize;
     // The final pass is the allocator reading — counting stays off
@@ -217,11 +221,25 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
         for (n, a) in &keys {
             black_box(al.register(n, *a, &[TCP_ANY], Duration::from_secs(300)));
         }
-        for (n, a) in &expired_keys {
-            // ~50ms TTL: minted live, lapsed by measurement time —
-            // nothing reaps staged-expired grants but the writes
-            // below, so the fill itself keeps them resident.
-            black_box(al.register(n, *a, &[TCP_ANY], Duration::from_millis(50)));
+        // Expired fixture: stage each mint, then commit — staged
+        // grants sit outside `by_addr`, so no fill write's lazy reap
+        // can touch them. The retained expired population equals the
+        // minted count no matter how long the fill itself takes (a
+        // slow build's register loop would otherwise reap the early
+        // 50ms mints mid-fill).
+        let mut expired_ok = 0usize;
+        if sc.expired > 0 {
+            let s = al.begin_staging();
+            for (n, a) in &expired_keys {
+                if al.register_staged(s, n, *a, &[TCP_ANY], Duration::from_millis(50)) {
+                    expired_ok += 1;
+                }
+            }
+            al.commit_staged(s);
+            assert_eq!(
+                expired_ok, sc.expired,
+                "expired fixture mints refused — capacity under-provisioned"
+            );
         }
         if timed {
             fill_ns.push(t.elapsed().as_nanos() as u64);
@@ -229,6 +247,14 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
         }
         if sc.expired > 0 {
             std::thread::sleep(Duration::from_millis(100));
+            // Nothing reaps between commit and measurement, so the
+            // retained table holds `live + expired` entries — the
+            // live half verified directly before the timed lookups.
+            assert_eq!(
+                al.live_len(),
+                sc.live,
+                "live fill must survive the expiry sleep"
+            );
         }
 
         // Lookups — hits concentrate on the live domain; expired
@@ -247,6 +273,28 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
         if timed {
             lookup_ns.push(t.elapsed().as_nanos() as u64);
             lookup_measure = measure_json("dns.");
+        }
+        black_box(hits);
+
+        // Combined-view lookups — the flow consumers' call shape:
+        // names and coverage from one snapshot. Both fields are
+        // consumed so the names collection and sort cannot be
+        // elided; the rng is reseeded for the identical probe order.
+        let mut rng = Rng::new(seed + it_no as u64);
+        mcp_writ::measure::reset();
+        let t = Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..sc.lookups {
+            let i = rng.next_u64() % domain;
+            let v = al.grant_view(black_box(&addr(i)), EgressProto::Tcp, 443);
+            black_box(&v.names);
+            if v.covered {
+                hits += 1;
+            }
+        }
+        if timed {
+            view_ns.push(t.elapsed().as_nanos() as u64);
+            view_measure = measure_json("dns.");
         }
         black_box(hits);
 
@@ -322,8 +370,9 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
     format!(
         "{{\"name\":{},\"live\":{},\"names_per_ip\":{},\"expired\":{},\
          \"updates\":{},\"lookups\":{},\"fill_ns\":{},\"lookup_ns\":{},\
-         \"churn_ns\":{},\"retained_bytes\":{},\"peak_bytes\":{},\
-         \"fill_measure\":{},\"lookup_measure\":{},\"churn_measure\":{}}}",
+         \"lookup_view_ns\":{},\"churn_ns\":{},\"retained_bytes\":{},\
+         \"peak_bytes\":{},\"fill_measure\":{},\"lookup_measure\":{},\
+         \"lookup_view_measure\":{},\"churn_measure\":{}}}",
         json_str(sc.name),
         sc.live,
         sc.names_per_ip,
@@ -332,6 +381,7 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
         sc.lookups,
         quantiles(&fill_ns).to_json(),
         quantiles(&lookup_ns).to_json(),
+        quantiles(&view_ns).to_json(),
         if churn_ns.is_empty() {
             "{\"count\":0}".to_string()
         } else {
@@ -341,6 +391,7 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
         peak,
         fill_measure,
         lookup_measure,
+        view_measure,
         churn_measure,
     )
 }

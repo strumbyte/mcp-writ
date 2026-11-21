@@ -801,6 +801,10 @@ impl RefList {
         true
     }
 
+    /// Commit lands every staged entry — including one whose
+    /// deadline lapsed while held: it is inserted dead, not promoted,
+    /// identical to the table (present until a reap, filtered by
+    /// expiry on every read).
     fn commit_staged(&mut self, staging: u64) {
         if let Some(entries) = self.staged.remove(&staging) {
             for (k, e) in entries {
@@ -872,7 +876,8 @@ fn assert_bookkeeping(al: &DynamicAllowList, rf: &RefList) {
                 inner
                     .deadlines
                     .iter()
-                    .any(|Reverse((_, g, a, n))| *g == e.generation
+                    .any(|Reverse((d, g, a, n))| *d == e.expires
+                        && *g == e.generation
                         && *a == *addr
                         && n.as_ref() == name.as_str()),
                 "live entry {name}@{addr} lost its deadline"
@@ -938,39 +943,38 @@ fn indexed_state_matches_flat_reference_model() {
         (EgressProto::Any, 80),
         (EgressProto::Tcp, 80),
     ];
-    let base = Instant::now();
-    // The grid hits every generated expiry exactly — the strict
-    // `expires > now` boundary must agree on both sides at the
-    // deadline instant.
-    let grid: Vec<Instant> = [
-        -1i64, 5, 20, 29, 30, 31, 44, 45, 60, 61, 74, 75, 76, 89, 90, 91, 120,
-    ]
-    .iter()
-    .map(|s| {
-        if *s < 0 {
-            base.checked_sub(Duration::from_secs(1)).unwrap()
-        } else {
-            base + Duration::from_secs(*s as u64)
-        }
-    })
-    .collect();
+    // One monotone test clock shared by both implementations: every
+    // mutating op — stage, register, reap — runs at `t`, so a
+    // simulated reap can never land behind the mint it is meant to
+    // clean up (the old grid reaps mixed simulated instants with the
+    // wall-clock `Instant::now()` inside registrations, letting time
+    // move backward). Lookups are pure queries: they are checked at
+    // `t` plus a deadline-relative spread, where stepping ahead is
+    // consistent by construction.
+    let mut t = Instant::now();
+    let offsets: [u64; 17] = [
+        0, 5, 20, 29, 30, 31, 44, 45, 60, 61, 74, 75, 76, 89, 90, 91, 120,
+    ];
     let mut rng = Xor64(0x9E37_79B9_7F4A_7C15);
     let al = DynamicAllowList::new(24);
     let mut rf = RefList::new(24);
     let mut tokens: Vec<(GrantStaging, u64)> = Vec::new();
 
-    // Expiries are either clearly past (refused identically on
-    // both sides no matter whose clock reads `now`) or well into
-    // the future — nothing sits within a millisecond of the
-    // caller's instant, so the trace stays deterministic.
-    let expiry_for = |rng: &mut Xor64| -> Instant {
+    // Expiries are either clearly past `t` (refused identically on
+    // both sides) or 30–90s ahead of it. As `t` advances, a staged
+    // token can outlive the deadline it minted — the expired-commit
+    // case both sides must land dead rather than promote.
+    let expiry_for = |rng: &mut Xor64, now: Instant| -> Instant {
         match rng.pick(8) {
-            0 => base.checked_sub(Duration::from_secs(1)).unwrap(),
-            n => base + Duration::from_secs([30, 45, 60, 60, 75, 75, 90][n - 1]),
+            0 => now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
+            n => now + Duration::from_secs([30, 45, 60, 60, 75, 75, 90][n - 1]),
         }
     };
 
     for step in 0..600 {
+        // The shared clock advances before each op — 0–700ms steps
+        // carry the trace past every generated deadline.
+        t += Duration::from_millis(rng.pick(8) as u64 * 100);
         let op = rng.pick(100);
         if op < 12 && tokens.len() < 8 {
             tokens.push((al.begin_staging(), rf.begin_staging()));
@@ -984,10 +988,10 @@ fn indexed_state_matches_flat_reference_model() {
                     let i = rng.pick(tokens.len());
                     let (tok, rtok) = tokens[i];
                     let quals = quals_pool[rng.pick(quals_pool.len())];
-                    let exp = expiry_for(&mut rng);
+                    let exp = expiry_for(&mut rng, t);
                     assert_eq!(
-                        al.register_staged_at(tok, name, addr, quals, exp),
-                        rf.register_staged_at(rtok, name, addr, quals, exp, Instant::now()),
+                        al.register_staged_at_clock(tok, name, addr, quals, exp, t),
+                        rf.register_staged_at(rtok, name, addr, quals, exp, t),
                         "register_staged diverged at step {step}"
                     );
                 }
@@ -995,10 +999,10 @@ fn indexed_state_matches_flat_reference_model() {
                 // (including shortenings) land here.
                 37..=52 => {
                     let quals = quals_pool[rng.pick(quals_pool.len())];
-                    let exp = expiry_for(&mut rng);
+                    let exp = expiry_for(&mut rng, t);
                     assert_eq!(
-                        al.register_at(name, addr, quals, exp),
-                        rf.register_at(name, addr, quals, exp, Instant::now()),
+                        al.register_at_clock(name, addr, quals, exp, t),
+                        rf.register_at(name, addr, quals, exp, t),
                         "register diverged at step {step}"
                     );
                 }
@@ -1018,18 +1022,17 @@ fn indexed_state_matches_flat_reference_model() {
                     al.revoke(name, addr);
                     rf.revoke(name, addr);
                 }
-                // A lazy reap at a grid instant — expiry-driven
+                // A lazy reap at the shared instant — expiry-driven
                 // capacity recovery, run identically on both.
                 80..=89 => {
-                    let at = grid[rng.pick(grid.len())];
-                    reap_expired(&mut al.inner.lock().unwrap(), at);
-                    rf.reap(at);
+                    reap_expired(&mut al.inner.lock().unwrap(), t);
+                    rf.reap(t);
                 }
                 _ => {}
             }
         }
         assert_bookkeeping(&al, &rf);
-        let at = grid[rng.pick(grid.len())];
+        let at = t + Duration::from_secs(offsets[rng.pick(offsets.len())]);
         for &addr in addrs.iter().chain(std::iter::once(&never_addr)) {
             for &(proto, port) in &flows {
                 let v = al.grant_view_at(&addr, proto, port, at);
@@ -1178,20 +1181,32 @@ fn deadline_heap_stays_bounded_under_update_churn() {
     }
     let inner = al.inner.lock().unwrap();
     assert!(
-        inner.deadlines.len() <= usize::max(2 * inner.live_total, DEADLINE_REBUILD_FLOOR) + 1,
+        inner.deadlines.len() <= usize::max(2 * inner.live_total, DEADLINE_REBUILD_FLOOR),
         "heap {} vs live {}",
         inner.deadlines.len(),
         inner.live_total
     );
     drop(inner);
-    // Churn across many keys tells the same story.
-    for i in 0..300u32 {
-        let a2 = IpAddr::V4(Ipv4Addr::new(192, 0, 3, (i % 200) as u8));
-        al.register("n.example", a2, &[TCP_ANY], Duration::from_secs(60));
+    // Churn across many keys tells the same story — a list sized for
+    // the whole key set so every registration is accepted (a refusal
+    // would only shrink the churn it claims to measure), and enough
+    // complete refresh rounds to push the heap past the rebuild
+    // threshold: 200 initial pushes plus rounds of 200 cross
+    // max(2*live, floor) = 400 mid-round and rebuild repeatedly.
+    let al = DynamicAllowList::new(200);
+    let addr_of = |i: u32| IpAddr::V4(Ipv4Addr::new(192, 0, 3, i as u8));
+    for i in 0..200u32 {
+        assert!(al.register("n.example", addr_of(i), &[TCP_ANY], Duration::from_secs(60)));
+    }
+    for _ in 0..3 {
+        for i in 0..200u32 {
+            assert!(al.register("n.example", addr_of(i), &[TCP_ANY], Duration::from_secs(60)));
+        }
     }
     let inner = al.inner.lock().unwrap();
+    assert_eq!(inner.live_total, 200);
     assert!(
-        inner.deadlines.len() <= usize::max(2 * inner.live_total, DEADLINE_REBUILD_FLOOR) + 1,
+        inner.deadlines.len() <= usize::max(2 * inner.live_total, DEADLINE_REBUILD_FLOOR),
         "heap {} vs live {}",
         inner.deadlines.len(),
         inner.live_total

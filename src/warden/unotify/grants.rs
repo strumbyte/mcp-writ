@@ -86,18 +86,20 @@ impl Grants {
             }
             GrantSource::SnapshotFile(_) => {
                 let now = unix_secs_now();
-                let mut names: Vec<String> = self
-                    .entries
-                    .iter()
-                    .filter(|g| g.addr == *addr && g.expires_at_unix_secs > now)
-                    .map(|g| g.name.clone())
-                    .collect();
+                // One pass over the entry set — the names and the
+                // coverage answer come from the same `now` and the
+                // same grant state, mirroring `grant_view_of`.
+                let mut names = Vec::new();
+                let mut covered = false;
+                for g in &self.entries {
+                    if g.addr == *addr && g.expires_at_unix_secs > now {
+                        names.push(g.name.clone());
+                        if !covered {
+                            covered = g.quals.iter().any(|q| q.covers(proto, port));
+                        }
+                    }
+                }
                 names.sort();
-                let covered = self.entries.iter().any(|g| {
-                    g.addr == *addr
-                        && g.expires_at_unix_secs > now
-                        && g.quals.iter().any(|q| q.covers(proto, port))
-                });
                 (names, covered)
             }
         }

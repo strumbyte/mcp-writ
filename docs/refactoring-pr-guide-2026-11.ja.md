@@ -459,14 +459,14 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 
 **タスク**
 
-- [ ] `register`・staging・commit・drop・revoke・expiry・snapshot・exportと全利用箇所を列挙し、ロック境界と名前・IP・qualifierの意味を記録する。
-- [ ] IPから名前別grantへ到達できる索引を導入する。元のキー同一性と名前別TTLを保ち、同じIPの別名を一つのTTLへ潰さない。
-- [ ] 判定に使うcovered状態と監査用の名前集合を同じロック内のsnapshotから返す内部入口を用意し、FlowGate等の利用側を更新する。既存の名前の出力順・protocol／port・DNS64のjudged endpoint・literal IP専用拒否の意味を変えない。
-- [ ] stagingにはキーごとの予約数を持たせる。token別rollbackとliveへの昇格に合わせて計数し、RF02の同一キー予約を維持する。commit前はlookup・snapshot・exportから不可視にする。
-- [ ] IP索引と予約計数を先に独立コミットにし、その後、期限キュー等の期限管理案を測定して選ぶ。期限キューを使う場合は世代を照合し、古い期限で更新済みgrantを削除しない。
-- [ ] 古い期限要素の保持が更新回数に比例して増えないよう、有界化または再構築条件を入れる。lookupでも現在時刻とexpiryを判定し、掃除の遅れを権限延長にしない。
-- [ ] 単純な参照モデルとseed固定のregister／stage／commit／drop／expire列を比較する。参照モデルは製品へ入れず、同時キー更新、期限ちょうど、TTL短縮、capacity回復を検査する。
-- [ ] live件数0・100・1,000・16,384、IP分散／集中、期限切れ率、反復更新でCPU・走査数・lock時間・保持量を測る。IP集中時のコストはそのIPの名前数に依存すると明記する。
+- [x] `register`・staging・commit・drop・revoke・expiry・snapshot・exportと全利用箇所を列挙し、ロック境界と名前・IP・qualifierの意味を記録する。 → op×lock×意味の一覧表と全consumer（gate staging系・FlowGate・unotify・namespaced stack・macOS proxy・ebpf snapshot・bench）を棚卸し → `.local/refactoring/RF07/run-2026-11-22-01/inventory.md`
+- [x] IPから名前別grantへ到達できる索引を導入する。元のキー同一性と名前別TTLを保ち、同じIPの別名を一つのTTLへ潰さない。 → `Inner.by_addr: HashMap<IpAddr, HashMap<String, GrantEntry>>`（allowlist.rs）：キー同一性は (addr,name) のまま、各 `GrantEntry.expires` が名前別TTLを保持。`same_addr_names_expire_independently` が同一IPの独立失効を確認
+- [x] 判定に使うcovered状態と監査用の名前集合を同じロック内のsnapshotから返す内部入口を用意し、FlowGate等の利用側を更新する。既存の名前の出力順・protocol／port・DNS64のjudged endpoint・literal IP専用拒否の意味を変えない。 → `grant_view`/`grant_view_at`→`GrantView{names,covered}`を単一ロック下で算出（`grant_view_of`）。`names`は`names_for`と同じソート順、`covered`は`is_allowed`と同じ答え（差分テストが両者一致を確認）。利用側更新：`FlowGate::verdict`、`unotify::Grants::view`、`supervisor`。`judged_endpoint`・`verdict_literal`（macOS）は非改変。全lookupの基準時刻をロック取得後に統一
+- [x] stagingにはキーごとの予約数を持たせる。token別rollbackとliveへの昇格に合わせて計数し、RF02の同一キー予約を維持する。commit前はlookup・snapshot・exportから不可視にする。 → `staged_counts: HashMap<GrantKey, usize>`（キー毎のhold参照数）＋`staged_new`（非live予約の逐次カウンタ）で旧`staged_new`集合のper-call再構築を置き換え。`note_live_inserted`/`note_live_removed`/`release_staged_hold`が stage/commit/drop/reap/revoke の各遷移で計数を整合。RF02テスト（`staged_same_key_*`・`staged_distinct_key_at_capacity_refused`・`staged_entry_expiring_before_commit`）全てパス、commit前の不可視性も`staged_grants_are_invisible_until_commit`/`staged_grants_absent_from_export`で維持
+- [x] IP索引と予約計数を先に独立コミットにし、その後、期限キュー等の期限管理案を測定して選ぶ。期限キューを使う場合は世代を照合し、古い期限で更新済みgrantを削除しない。 → git非操作方針により単一コミット `07e3978` だが、索引＋予約計数と期限管理は論理分割可能として戻し方を明記（notes.md「コミット分離」節：期限ヒープ除去は`reap_expired`→`retain`復帰で索引側を維持したまま可能）。期限キューは世代スタンプ付き`DeadlineHeap`（`push_deadline`発行、`reap_expired`が世代不一致popをstale skip）。`stale_deadline_never_reaps_refreshed_grant`がTTL短縮・延長双方で古い期限による誤削除がないことを確認
+- [x] 古い期限要素の保持が更新回数に比例して増えないよう、有界化または再構築条件を入れる。lookupでも現在時刻とexpiryを判定し、掃除の遅れを権限延長にしない。 → `compact_deadlines`：`deadlines.len() > max(2*live_total, DEADLINE_REBUILD_FLOOR)` で世代一致要素のみへ再構築。新gauge`DNS_DEADLINE_ENTRIES`で保持量を計測可能化。lookup・snapshotは`expires > now`を都度判定し、基準時刻は全てロック取得後。`deadline_heap_stays_bounded_under_update_churn`（600更新でbound+1以下）・`deadline_heap_compacts_on_commit_and_revoke`・`grant_expires_at_its_exact_deadline`が確認
+- [x] 単純な参照モデルとseed固定のregister／stage／commit／drop／expire列を比較する。参照モデルは製品へ入れず、同時キー更新、期限ちょうど、TTL短縮、capacity回復を検査する。 → 旧フラット実装を再現したtest-only`RefList`に対し、`indexed_state_matches_flat_reference_model`がseed`0x9E37_79B9_7F4A_7C15`・600ステップのop列を両者へ適用。各ステップ後に`assert_bookkeeping`で`live_total`/`staged_new`/`staged_counts`/deadlineカバレッジを検査し、全addr×(proto,port)グリッドで`grant_view_at`と参照`view_at`を比較（期限ちょうど・TTL短縮・同時キー更新・capacity回復を含む）
+- [x] live件数0・100・1,000・16,384、IP分散／集中、期限切れ率、反復更新でCPU・走査数・lock時間・保持量を測る。IP集中時のコストはそのIPの名前数に依存すると明記する。 → `m4_allowlist`の`SCENARIOS`行列（live_0/100/1k/16k・concentrated_16k names_per_ip=64・expired_half/most・churn_1k/16k・staged_same_key）＋`fill_measure`/`lookup_measure`（`is_allowed`プローブ）/`lookup_view_measure`（呼出側と同じ`grant_view`複合プローブ、names収集・ソート込み）/`churn_measure`＋retained/peak bytes。期限切れシナリオはstagedミントでfill中のreapに触れず、保持数=要求数を`live_len`/受理件数のassertで検証。実測（is_allowed側）：live_16kでも~0.5 scan/lookup・p50 532µs（親版は4000×16384≈65.5M scan・全体wall p50比で≈68×）、集中時は当該IPの名前数(64)に依存、churn_16kでdeadline heap 32,764≤2×16,384の有界を確認 → `.local/refactoring/RF07/run-2026-11-22-01/notes.md`・`m4_candidate.json`
 
 **検証・計測:** T-BASE、T-DNS。RF02の全ケース、同一IPの複数名、protocol／port、snapshot／exportを比較する。該当するLinux・macOSのflow利用経路も実機で確認する。M4を用いる。
 

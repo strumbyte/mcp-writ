@@ -355,6 +355,15 @@ fn snapshot_parse_and_ttl_expiry() {
     );
     assert_eq!(live.0, vec!["a.example".to_string()]);
     assert!(live.1);
+    // The same live grant reports its name under a non-covered proto
+    // — the grant exists, its qualifiers just don't authorize UDP.
+    let udp = g.view(
+        &"93.184.216.34".parse().unwrap(),
+        crate::policy::EgressProto::Udp,
+        443,
+    );
+    assert_eq!(udp.0, vec!["a.example".to_string()]);
+    assert!(!udp.1);
     // Expired grant is closed even though it is in the file.
     let stale = g.view(
         &"203.0.113.8".parse().unwrap(),
