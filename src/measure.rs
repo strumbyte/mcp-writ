@@ -298,6 +298,14 @@ pub static AUDIT_REOPEN_NS: Timing = Timing::new("audit.reopen.ns");
 /// `audit.reopen.ns` measures.
 pub static AUDIT_CONTROL_WAIT_NS: Timing = Timing::new("audit.control_wait.ns");
 
+/// Stop delay from intake closure to writer completion — the
+/// queued-commit drain plus `drain_finish`'s final flush + `sync_all`
+/// + directory sync + visibility proof. In-flight OS I/O cannot be
+/// interrupted, so this is the window a shutdown actually waits out:
+/// the RF06 figure reported to the shutdown side instead of a cut-off
+/// drain.
+pub static AUDIT_DRAIN_NS: Timing = Timing::new("audit.drain.ns");
+
 /// `PreparedPolicy::new` wall time — the once-per-finalized-policy
 /// prep cost RF05a's M2 pair compares against per-request time.
 pub static POLICY_PREPARE_NS: Timing = Timing::new("policy.prepare.ns");
@@ -311,6 +319,7 @@ static TIMINGS: &[&Timing] = &[
     &AUDIT_FLUSH_NS,
     &AUDIT_REOPEN_NS,
     &AUDIT_CONTROL_WAIT_NS,
+    &AUDIT_DRAIN_NS,
 ];
 
 // ---------------------------------------------------------------------

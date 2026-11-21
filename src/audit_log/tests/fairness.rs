@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use super::super::writer::{
     AuditClock, AuditSink, CLOCK_CHECK_RECORDS, FLUSH_PERIOD, FSYNC_PERIOD, WriterCore,
-    file_writer_task,
+    spawn_file_writer,
 };
 use super::super::*;
 use super::make_test_event;
@@ -147,6 +147,11 @@ struct FakeSink {
     needs_dir: bool,
     visible: bool,
     fail_write: bool,
+    /// A panic inside the record path — the abnormal writer exit an
+    /// `Err` return never exercises: the completion sender drops
+    /// unsent, every queued ack dies with the core, and the shutdown
+    /// side must read the dead writer as a fault, not a clean end.
+    panic_on_write: bool,
     fail_write_at: Option<usize>,
     writes_seen: usize,
     fail_flush: bool,
@@ -176,6 +181,7 @@ impl Default for FakeSink {
             needs_dir: false,
             visible: true,
             fail_write: false,
+            panic_on_write: false,
             fail_write_at: None,
             writes_seen: 0,
             fail_flush: false,
@@ -219,6 +225,9 @@ impl AuditSink for FakeSink {
             let _ = proceed.recv();
         }
         self.writes_seen += 1;
+        if self.panic_on_write {
+            panic!("scripted sink panic — an abnormal writer exit");
+        }
         if self.fail_write || self.fail_write_at == Some(self.writes_seen) {
             return Err(Self::err("write failed"));
         }
@@ -413,8 +422,8 @@ fn test_core(sink: FakeSink, clock: ManualClock) -> WriterCore<FakeSink, ManualC
     )
 }
 
-/// A file-sink logger whose writer runs `sink`/`clock` — the full
-/// queue-side API (`log`/`log_ordered`/`log_committed`/`reopen`/
+/// A file-sink logger whose writer thread runs `sink`/`clock` — the
+/// full queue-side API (`log`/`log_ordered`/`log_committed`/`reopen`/
 /// `shutdown`) against scripted parts.
 fn fake_logger(
     sink: FakeSink,
@@ -422,7 +431,7 @@ fn fake_logger(
     event_capacity: usize,
     fail_closed: bool,
 ) -> AuditLogger {
-    let (tx, rx) = mpsc::channel(event_capacity + CONTROL_QUEUE_CAPACITY);
+    let (tx, rx) = mpsc::channel(event_capacity + CONTROL_QUEUE_CAPACITY + TICK_QUEUE_RESERVE);
     let writer_failed = FailureFlag::new();
     let core = WriterCore::new(
         sink,
@@ -432,10 +441,10 @@ fn fake_logger(
         TEST_SESSION.to_string(),
         PathBuf::from(TEST_PATH),
     );
-    let writer_handle = tokio::spawn(file_writer_task(rx, core));
+    let writer_end = WriterEnd::Thread(spawn_file_writer(&tx, rx, core).unwrap());
     super::assemble_logger(
         tx,
-        writer_handle,
+        writer_end,
         fail_closed,
         event_capacity,
         QUEUE_BYTE_BUDGET,
@@ -904,7 +913,7 @@ async fn test_parked_reopen_resolves_false_at_shutdown() {
 #[tokio::test]
 async fn test_accepted_control_processed_after_caller_cancel() {
     let (op_tx, op_rx) = std::sync::mpsc::channel();
-    let (tx, rx) = mpsc::channel::<WriterItem>(4 + CONTROL_QUEUE_CAPACITY);
+    let (tx, rx) = mpsc::channel::<WriterItem>(4 + CONTROL_QUEUE_CAPACITY + TICK_QUEUE_RESERVE);
     let writer_failed = FailureFlag::new();
     let core = WriterCore::new(
         FakeSink::mirrored(op_tx),
@@ -914,7 +923,7 @@ async fn test_accepted_control_processed_after_caller_cancel() {
         TEST_SESSION.to_string(),
         PathBuf::from(TEST_PATH),
     );
-    let writer = tokio::spawn(file_writer_task(rx, core));
+    let writer = spawn_file_writer(&tx, rx, core).unwrap();
     // Queue the control item directly, then drop its reply receiver —
     // the caller is gone before the writer reaches it.
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -930,7 +939,7 @@ async fn test_accepted_control_processed_after_caller_cancel() {
     .unwrap();
     drop(reply_rx);
     drop(tx);
-    writer.await.unwrap();
+    writer.done.await.unwrap();
     let ops: Vec<(usize, SinkOp)> = op_rx.iter().collect();
     assert!(
         ops.iter()
@@ -1562,7 +1571,7 @@ async fn test_failed_send_releases_its_permits() {
     let (tx, rx) = mpsc::channel::<WriterItem>(4 + CONTROL_QUEUE_CAPACITY);
     let logger = super::assemble_logger(
         tx,
-        tokio::spawn(std::future::pending()),
+        WriterEnd::Task(tokio::spawn(std::future::pending())),
         true,
         4,
         QUEUE_BYTE_BUDGET,
@@ -1586,4 +1595,189 @@ async fn test_failed_send_releases_its_permits() {
         QUEUE_BYTE_BUDGET,
         "the byte budget releases on send failure"
     );
+}
+
+// ─── Dedicated-thread isolation and lifecycle ───────────────────────────
+
+/// The RF06 core guarantee: synchronous sink I/O lives on the
+/// writer's dedicated thread, never a runtime worker. With the writer
+/// parked inside a blocking `write`, an audit-unrelated task still
+/// progresses on the *same* single-worker runtime — under the async
+/// driver this parked the whole executor.
+#[tokio::test(flavor = "current_thread")]
+async fn test_sink_io_does_not_occupy_runtime_worker() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let sink = FakeSink {
+        write_gate: Some((entered_tx, release_rx)),
+        ..FakeSink::default()
+    };
+    let logger = fake_logger(sink, ManualClock::new(), 8, true);
+    logger.log_ordered(make_test_event()).await.unwrap();
+    gate_entered(entered_rx).await;
+    // The writer thread is parked inside the sink's blocking I/O.
+    // An audit-unrelated task on the same worker must still run —
+    // the bounded timeout converts "the worker is stuck" into a
+    // failure instead of a hang.
+    let progressed = tokio::spawn(async {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        42usize
+    });
+    let got = tokio::time::timeout(Duration::from_secs(10), progressed)
+        .await
+        .expect("an unrelated task must progress while sink I/O blocks");
+    assert_eq!(got.unwrap(), 42);
+    // The runtime's own timers keep firing too — the blocking I/O is
+    // on the writer's thread, not anywhere in the executor.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::time::sleep(Duration::from_millis(20)),
+    )
+    .await
+    .expect("timers keep firing while the writer's I/O blocks");
+    release_tx.send(()).unwrap();
+    let _ = logger.shutdown().await;
+}
+
+/// An abnormal writer exit never reports as a clean stop: the panic
+/// drops the completion sender unsent, the waiting commit's ack dies
+/// with the core so its waiter fails closed, the fault latch sets —
+/// and shutdown surfaces the dead writer instead of `Ok`. The latch
+/// must reach `failure_watch` subscribers too, not only waiters that
+/// happen to send afterwards: an idle relay learns the dead writer
+/// from the guard the thread unwinds past.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_writer_abnormal_exit_reports_failure() {
+    let logger = fake_logger(
+        FakeSink {
+            panic_on_write: true,
+            ..FakeSink::default()
+        },
+        ManualClock::new(),
+        8,
+        true,
+    );
+    let mut watch = logger.failure_watch();
+    // Fire-and-forget submission — no ack waiter exists for this
+    // record to notice the dead writer through. The panic guard
+    // latches the fault during unwind, so the watch resolves before
+    // anyone calls shutdown.
+    logger.log(make_test_event());
+    tokio::time::timeout(Duration::from_secs(10), watch.changed())
+        .await
+        .expect("failure_watch must observe the writer's abnormal exit")
+        .expect("watch sender alive");
+    assert!(
+        logger.writer_failed(),
+        "an abnormal exit must latch the fault"
+    );
+    // Whichever way the record meets the dead writer — a dropped ack
+    // or a closed channel — the fail-closed gate refuses the forward.
+    let err = logger.log_committed(make_test_event()).await.unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::AuditorError::AuditUnavailable(_)
+    ));
+    // The completion sender died with the thread — shutdown reads the
+    // dropped oneshot as the abnormal exit it is, never a clean end.
+    let err = logger.shutdown().await.unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::AuditorError::AuditUnavailable(_)
+    ));
+}
+
+/// A drain cannot be cut short: while an in-flight I/O pins the
+/// writer, the shutdown future stays pending — an incomplete drain is
+/// never reported as a completion — and the commit waiter still
+/// pending there proves an unsynced record was never acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_shutdown_waits_out_in_flight_io() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let sink = FakeSink {
+        sync_gate: Some((entered_tx, release_rx)),
+        ..FakeSink::default()
+    };
+    let logger = fake_logger(sink, ManualClock::new(), 8, true);
+    // A committed record parks the writer mid-fsync — the
+    // uninterruptible OS-I/O territory the drain must wait out.
+    let l = logger.clone();
+    let committed = tokio::spawn(async move { l.log_committed(make_test_event()).await });
+    gate_entered(entered_rx).await;
+    let mut shutdown = std::pin::pin!(logger.shutdown());
+    std::future::poll_fn(|cx| {
+        assert!(
+            shutdown.as_mut().poll(cx).is_pending(),
+            "shutdown must wait out the in-flight I/O — a cut-off drain is not a success"
+        );
+        Poll::Ready(())
+    })
+    .await;
+    assert!(
+        !committed.is_finished(),
+        "an unsynced record never reports acknowledged"
+    );
+    release_tx.send(()).unwrap();
+    // The gated I/O completes and the record commits durable before
+    // the waiter resolves. The call may still surface
+    // AuditUnavailable: shutdown already took the sender, so the
+    // post-commit availability check stays fail-closed — a closing
+    // logger never reports open.
+    if let Err(err) = committed.await.unwrap() {
+        assert!(matches!(
+            err,
+            crate::error::AuditorError::AuditUnavailable(_)
+        ));
+    }
+    shutdown.await.unwrap();
+}
+
+/// A cancelled shutdown does not consume the writer's end state —
+/// the next call resumes the same completion wait rather than finding
+/// it already taken and reporting a clean end while the drain is
+/// still gated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cancelled_shutdown_resumes_the_wait() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let sink = FakeSink {
+        sync_gate: Some((entered_tx, release_rx)),
+        ..FakeSink::default()
+    };
+    let logger = fake_logger(sink, ManualClock::new(), 8, true);
+    // Park the writer inside a committed record's fsync — the drain
+    // cannot finish until the gate releases.
+    let l = logger.clone();
+    let committed = tokio::spawn(async move { l.log_committed(make_test_event()).await });
+    gate_entered(entered_rx).await;
+    // The first shutdown attempt pends inside the completion wait;
+    // dropping the future there must leave the end state in place.
+    {
+        let mut shutdown = std::pin::pin!(logger.shutdown());
+        std::future::poll_fn(|cx| {
+            assert!(shutdown.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    }
+    // A second call resumes the same wait — had the end state been
+    // consumed, this poll would resolve `Ok` while the writer is
+    // still gated mid-I/O: a clean end reported early.
+    {
+        let mut shutdown = std::pin::pin!(logger.shutdown());
+        std::future::poll_fn(|cx| {
+            assert!(
+                shutdown.as_mut().poll(cx).is_pending(),
+                "a cancelled shutdown must not consume the end state"
+            );
+            Poll::Ready(())
+        })
+        .await;
+    }
+    release_tx.send(()).unwrap();
+    let _ = committed.await.unwrap();
+    logger.shutdown().await.unwrap();
 }

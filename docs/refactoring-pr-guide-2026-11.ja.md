@@ -431,13 +431,13 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 
 **タスク**
 
-- [ ] RF03後の受付順、制御barrier、byte permit、ACK、失敗ラッチ、停止手順を基準にする。writer所有物とasync側が必要とする結果を列挙する。
-- [ ] file sink・writer buffer・同期I/Oの所有権を一つの専用スレッドへ移す。イベントごとにスレッドやblocking taskを生成せず、loggerの寿命とwriterの寿命を対応付ける。
-- [ ] async側は有界受付と完了通知を使い、writer終了待ちの同期joinで実行workerをブロックしない。既存のbackpressureとpermit解放を維持する。
-- [ ] 受付停止 → 受理済みqueueのdrain → 最終同期・可視性確認 → ハンドル解放 → 終了結果通知の順を明示する。送信者がすべて切断した場合と明示shutdownの双方を扱う。
-- [ ] writerの異常終了、未完了ACK、回転中shutdown、低速sink、送信者cancelを検査する。失敗が全待機者へ伝わり、未同期ACKが成功にならないことを確認する。
-- [ ] 実行中のOS I/Oは任意に中断できない前提で停止遅延を報告する。timeoutで失敗ラッチを解除したり、未完了drainを成功にしたりしない。
-- [ ] RF03の順序・公平性回帰を、RF03で導入した時計・sinkの注入を変えずに新worker上で実行し、非監査heartbeat／RPCと監査同期・終了を別々に測定する。
+- [x] RF03後の受付順、制御barrier、byte permit、ACK、失敗ラッチ、停止手順を基準にする。writer所有物とasync側が必要とする結果を列挙する。 → `WriterEnd`（`audit_log.rs`）：file sink=`Thread(FileWriterSpawn{join,ticker,done})`、tracing=`Task(JoinHandle)`。writer所有物はsink・BufWriter・deadlineを`WriterCore`内に閉じ、async側の結果は完了oneshot・reply/ack・`writer_failed`ラッチのみ
+- [x] file sink・writer buffer・同期I/Oの所有権を一つの専用スレッドへ移す。イベントごとにスレッドやblocking taskを生成せず、loggerの寿命とwriterの寿命を対応付ける。 → `spawn_file_writer`＋`file_writer_thread`：`std::thread`を1本/logger（`mcp-writ-audit`名）で生成し`rx.blocking_recv()`でdrain。`WriterCore`は無改変で順序・耐久判定を共有
+- [x] async側は有界受付と完了通知を使い、writer終了待ちの同期joinで実行workerをブロックしない。既存のbackpressureとpermit解放を維持する。 → `FileWriterSpawn.done`（oneshot）を`shutdown()`が`(&mut spawn.done).await`で待機。`JoinHandle`はdetachのみで同期joinなし。queue・permit会計は非改変のためbackpressure・permit解放は同一セマンティクス
+- [x] 受付停止 → 受理済みqueueのdrain → 最終同期・可視性確認 → ハンドル解放 → 終了結果通知の順を明示する。送信者がすべて切断した場合と明示shutdownの双方を扱う。 → `file_writer_thread`：channel close→`drain_finish`（最終flush+fsync+必要時dir sync+`entry_visible`）→`drop(core)`/`drop(rx)`→`done_tx.send`の順。明示shutdownは`tx`のtake、自然終了は全sender切断。`AuditLoggerInner::drop`も同じclose経路
+- [x] writerの異常終了、未完了ACK、回転中shutdown、低速sink、送信者cancelを検査する。失敗が全待機者へ伝わり、未同期ACKが成功にならないことを確認する。 → `WriterFaultGuard`（panic unwind中に`FailureFlag::set`→`failure_watch`全購読者へ伝播）＋新規試験`test_writer_abnormal_exit_reports_failure`・`test_shutdown_waits_out_in_flight_io`・`test_cancelled_shutdown_resumes_the_wait`・`GateSink`/`write_gate`/`sync_gate`による低速sink。未完了ACKはcoreと共にdropされwaiterはfail-closedで`AuditUnavailable`
+- [x] 実行中のOS I/Oは任意に中断できない前提で停止遅延を報告する。timeoutで失敗ラッチを解除したり、未完了drainを成功にしたりしない。 → `AUDIT_DRAIN_NS`（`rx.is_closed()`初検出→`drain_finish`→ハンドル解放→`done`までの全窓）。`shutdown()`のdone待ちはtimeoutを持たず、未完了drainを成功として報告しない
+- [x] RF03の順序・公平性回帰を、RF03で導入した時計・sinkの注入を変えずに新worker上で実行し、非監査heartbeat／RPCと監査同期・終了を別々に測定する。 → fairness試験を同一`ManualClock`/`FakeSink`で`spawn_file_writer`上に移植し24/24 pass。`m3_audit`へ`heartbeat_delay_ns`・`spin_delay_ns`・`--workers`追加、workers=1 every_eventでparent spin p50 35,096µs→cand 1µs。`audit.drain.ns`と非監査遅延は別集計 → `.local/refactoring/RF06/evidence.md`
 
 **維持する条件:** 耐久ACK、親ディレクトリ同期、sink identity、失敗ラッチ、回転順序、drop／backpressure、全件drainを維持する。group commitや`--audit-sync`の同期頻度変更は含めない。
 
