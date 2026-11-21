@@ -402,14 +402,14 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 
 **タスク**
 
-- [ ] 現行評価器の順序とエラーを固定入力で採取する。RF-T01で`additionalProperties`のどのキーを拒否したかを検査できる状態にし、弱いassertionを同等性の根拠にしない。
-- [ ] 通常KDL経路のロード済みschemaと、直接APIの`@file`経路を区別する。後者のCWD内制限、symlink差替え防止、サイズ上限、更新時の再読込意味を記録し、ファイルパスだけによる無期限cacheを導入しない。
-- [ ] 不変schemaを再利用可能な表現へ変換する。local `$ref`は参照先の索引で扱い、循環を再帰展開して保持量を増やさない。patternは同じschemaの同じ定義を再利用する。
-- [ ] 構築処理の入力bytes・ノード数・保持メモリの境界を定める。従来受理したschemaを新しい準備上限で拒否しないよう、必要なら意味を保つ遅延構築を使う。同等性を保てない上限変更はこのPRから分離する。
-- [ ] 評価順序、最初のエラー、Fatalと通常不一致、エラー発生段階を維持する。従来到達しない分岐の不正pattern等を起動時に一括拒否せず、評価時に同じ結果となる不正ノード表現等を用いる。
-- [ ] branch・node・depth・`multipleOf`等の計算budgetは要求ごとに初期化し、cache済み構造を通っても必要な消費を行う。評価済み結果を入力間で無条件に再利用しない。
-- [ ] `anyOf`／`oneOf`／`allOf`、循環・不正参照、未知keyword、`uniqueItems`、数値同値、`multipleOf`、欠落argumentsの空object扱い、入力上限を旧評価器と比較する。旧評価器は比較用のテスト範囲に一時保持し、製品の二重実装を解消する。
-- [ ] schema parse・regex構築回数、準備コスト、初回要求、定常要求、メモリを比較する。遅延構築する場合は同時初回要求の重複構築や同期待ちも測る。
+- [x] 現行評価器の順序とエラーを固定入力で採取する。RF-T01で`additionalProperties`のどのキーを拒否したかを検査できる状態にし、弱いassertionを同等性の根拠にしない。
+- [x] 通常KDL経路のロード済みschemaと、直接APIの`@file`経路を区別する。後者のCWD内制限、symlink差替え防止、サイズ上限、更新時の再読込意味を記録し、ファイルパスだけによる無期限cacheを導入しない。
+- [x] 不変schemaを再利用可能な表現へ変換する。local `$ref`は参照先の索引で扱い、循環を再帰展開して保持量を増やさない。patternは同じschemaの同じ定義を再利用する。
+- [x] 構築処理の入力bytes・ノード数・保持メモリの境界を定める。従来受理したschemaを新しい準備上限で拒否しないよう、必要なら意味を保つ遅延構築を使う。同等性を保てない上限変更はこのPRから分離する。
+- [x] 評価順序、最初のエラー、Fatalと通常不一致、エラー発生段階を維持する。従来到達しない分岐の不正pattern等を起動時に一括拒否せず、評価時に同じ結果となる不正ノード表現等を用いる。
+- [x] branch・node・depth・`multipleOf`等の計算budgetは要求ごとに初期化し、cache済み構造を通っても必要な消費を行う。評価済み結果を入力間で無条件に再利用しない。
+- [x] `anyOf`／`oneOf`／`allOf`、循環・不正参照、未知keyword、`uniqueItems`、数値同値、`multipleOf`、欠落argumentsの空object扱い、入力上限を旧評価器と比較する。旧評価器は比較用のテスト範囲に一時保持し、製品の二重実装を解消する。
+- [x] schema parse・regex構築回数、準備コスト、初回要求、定常要求、メモリを比較する。遅延構築する場合は同時初回要求の重複構築や同期待ちも測る。 → prepared側の常駐量は`estimated_resident_bytes`の値で、lazy memo充填前の構造的推定（コンパイル済みregexプログラムとマッチ用スクラッチ領域は含まない）。warm済み常駐メモリの実測値としては扱わない
 
 **維持する条件:** JSON Schemaの対応範囲、`format`等のannotation扱い、既存のエラー文・順序・タイミング、MRTRの`inputResponses`をarguments schemaへ混ぜない条件を保つ。起動時一括拒否やファイル更新意味の変更を最適化として混入させない。
 
@@ -632,8 +632,8 @@ rg -n -- '--test|--features|MCP_WRIT_REQUIRE_' .github/workflows
 - [ ] 新targetをCI・Platform tests・Linux testsの該当する明示列挙とtest matrixへ登録する。9ケースは現在`manifest_fixtures`経由で[pr-checks.yml](../.github/workflows/pr-checks.yml)のGuard-rail testsでも実行されている。同workflowへ`--test common_kdl`を追加し、冒頭のCoverage記述も更新する。PRゲートから外す場合は、その判断と根拠を保証対応表に記録する。新targetの9ケースを実行してから共通helper内の旧テストmoduleを除去し、helperの関数本体は変えない。
 - [ ] `test_trajectory_omitted_leaves_behavior_unchanged`と`test_trajectory_off_allows_read_only_then_network`の本体・fixture・assertionが同一であることを再確認し、前者を削除する。[kdl_loader tests](../src/policy/kdl_loader/tests.rs)の`test_trajectory_omitted_defaults_off`は実際のKDL省略を検査するため保持する。
 - [ ] `test_apply_sandbox_noop_on_non_linux`の契約が`test_apply_sandbox_is_noop`に包含されることを確認し、前者を削除する。後者の「成功・反復成功・`sandbox_applied`がfalse」を維持し、現存する公開no-op API自体はこのPRで廃止しない。
-- [ ] schemaの`required_with_additional_properties_false_no_properties_rejects_extra`を確認する。現在は先頭の`name`の拒否で終了し、`extra`を検査していない。`additional_properties_rejected`と`required_with_additional_properties_false_no_properties_rejects_required_keys`等への保証の包含を確認して統合するか、`name`を許可したschemaにして`extra`の拒否位置を特定するケースへ修正する。採用した方針を対応表へ記録する。
-- [ ] schemaの「propertiesなし・requiredあり」の拒否は保持する。文言の一般的な部分一致だけで済ませず、移行先が意図する余分なキーを許可した場合に失敗することを確認する。製品validatorの評価順序・意味をテスト削減に合わせて変更しない。
+- [x] schemaの`required_with_additional_properties_false_no_properties_rejects_extra`を確認する。現在は先頭の`name`の拒否で終了し、`extra`を検査していない。`additional_properties_rejected`と`required_with_additional_properties_false_no_properties_rejects_required_keys`等への保証の包含を確認して統合するか、`name`を許可したschemaにして`extra`の拒否位置を特定するケースへ修正する。採用した方針を対応表へ記録する。 → RF05b commit(`df2b962`)で「`name`を許可したschemaにして`extra`の拒否位置を特定する」方を採用。`required_with_additional_properties_false_rejects_the_extra_key`へ改名し、`properties:{"name":true}`の下で`at 'extra': additional property not allowed`を断言
+- [x] schemaの「propertiesなし・requiredあり」の拒否は保持する。文言の一般的な部分一致だけで済ませず、移行先が意図する余分なキーを許可した場合に失敗することを確認する。製品validatorの評価順序・意味をテスト削減に合わせて変更しない。 → RF05b commitで`required_with_additional_properties_false_no_properties_rejects_required_keys`が`at 'name': additional property not allowed`を断言する形へ強化。削除・統合はせず拒否を保持
 - [ ] 全targetの登録名を取り直し、消えた名前と移行先をすべて説明する。新targetの9ケースが1箇所だけに登録されることと、helperを使う既存targetの動作を確認する。
 
 **既存の対象別確認コマンド**

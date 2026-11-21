@@ -204,12 +204,22 @@ pub static DUPKEY_SCAN_CALLS: Counter = Counter::new("json.dupkey.scan.calls");
 /// Object nodes visited inside the duplicate-key walk.
 pub static DUPKEY_OBJECT_NODES: Counter = Counter::new("json.dupkey.object_nodes");
 
-/// `schema_validator::validate_arguments` schema parses — the per-request
-/// `RawJson::parse(schema_str)` RF05b removes.
+/// `PreparedSchema` parses — the per-request `RawJson::parse` RF05b
+/// removes from the prepared-policy path. Bare-`Policy` requests and
+/// `@file` content changes still count here (one parse each, exactly
+/// as before); prepared requests stay at zero.
 pub static SCHEMA_PARSE_CALLS: Counter = Counter::new("schema.parse.calls");
 
+/// `PreparedSchema::new` constructions — one per schema-bearing tool at
+/// `PreparedPolicy::new`, plus one per bare-`Policy` request and per
+/// `@file` content change (the file cache keys on resolved bytes).
+pub static SCHEMA_PREPARED_BUILDS: Counter = Counter::new("schema.prepared.builds");
+
 /// `regex_lite::Regex::new` compilations inside `pattern` evaluation —
-/// the per-request regex builds RF05b removes.
+/// the per-request regex builds RF05b removes. Prepared schemas
+/// compile once per distinct `pattern` string on first reach
+/// (lazy `OnceLock`); bare-`Policy` requests still compile per
+/// evaluation.
 pub static SCHEMA_REGEX_BUILDS: Counter = Counter::new("schema.regex.builds");
 
 /// `PreparedPolicy::new` invocations — the execution-policy prep RF05a
@@ -245,6 +255,7 @@ static COUNTERS: &[&Counter] = &[
     &DUPKEY_SCAN_CALLS,
     &DUPKEY_OBJECT_NODES,
     &SCHEMA_PARSE_CALLS,
+    &SCHEMA_PREPARED_BUILDS,
     &SCHEMA_REGEX_BUILDS,
     &POLICY_PREPARE_CALLS,
     &OPAQUE_MATCHER_BUILDS,

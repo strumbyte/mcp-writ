@@ -544,8 +544,8 @@ fn check_request_inner<L: ToolIndex + ?Sized>(
     };
 
     // Step 4: Schema validation (if args_schema is defined)
-    if let Some(ref schema_ref) = hit.tool.args_schema {
-        validate_tool_args(json, &tool_name, schema_ref)?;
+    if hit.tool.args_schema.is_some() {
+        validate_tool_args(json, &tool_name, &hit)?;
     }
 
     // Step 5: MRTR siblings of `arguments` — never feed requestState to schema
@@ -793,17 +793,43 @@ pub fn tool_side_effect<L: ToolIndex + ?Sized>(index: &L, tool_name: &str) -> Op
 fn validate_tool_args(
     json: &nojson::RawJson<'_>,
     tool_name: &str,
-    schema_ref: &str,
+    hit: &ToolHit<'_>,
 ) -> Result<(), PolicyViolation> {
-    let schema_str = schema_validator::resolve_schema(schema_ref).map_err(|e| {
-        let kind = match &e {
-            schema_validator::SchemaRefError::PathTraversal(_) => {
-                DenialKind::Validation(ValidationKind::PathTraversal)
-            }
-            _ => DenialKind::Other,
-        };
-        PolicyViolation::new(tool_name, kind, e.into_reason())
-    })?;
+    let schema_ref = hit
+        .tool
+        .args_schema
+        .as_deref()
+        .expect("caller only invokes on a tool carrying args_schema");
+
+    // Pick the evaluation document for this request:
+    // - `Inline` (every KDL-loaded policy — the parser inlines `@file`
+    //   at load): the document `PreparedPolicy` parsed once is shared
+    //   by the session; no I/O ever happens here.
+    // - `File` (a `@path` spelling that reached a prepared view — only
+    //   unvalidated documents produce one, e.g. a programmatically
+    //   built `Policy`): `resolve_schema`
+    //   still runs per call — the cwd-scoped, no-follow read is the
+    //   contract — and the `File` memo keys on the resolved *bytes*,
+    //   so identical content reuses one parse while a rewrite plans
+    //   fresh. Never keyed on the path itself.
+    // - bare `Policy` lookup (the standalone path): a transient
+    //   document per call — the per-request parse it always ran.
+    let resolved;
+    let transient;
+    let cached;
+    let prepared: &crate::schema_spec::prepared::PreparedSchema = match hit.schema_plan() {
+        Some(crate::policy::prepared::ToolSchema::Inline(schema)) => schema,
+        Some(plan @ crate::policy::prepared::ToolSchema::File(_)) => {
+            resolved = resolve_schema_ref(schema_ref, tool_name)?;
+            cached = plan.file_plan(&resolved);
+            &cached
+        }
+        None => {
+            resolved = resolve_schema_ref(schema_ref, tool_name)?;
+            transient = crate::schema_spec::prepared::PreparedSchema::new(resolved);
+            &transient
+        }
+    };
 
     // MCP allows omitting `params.arguments` — the schema sees the empty
     // object, so a `required` list still fails closed while an
@@ -817,12 +843,24 @@ fn validate_tool_args(
         }
     };
 
-    schema_validator::validate_arguments(arguments, &schema_str).map_err(|e| {
+    schema_validator::validate_prepared(arguments, prepared).map_err(|e| {
         PolicyViolation::new(
             tool_name,
             DenialKind::Validation(ValidationKind::ArgumentInvalid),
             format!("schema validation failed: {e}"),
         )
+    })
+}
+
+fn resolve_schema_ref(schema_ref: &str, tool_name: &str) -> Result<String, PolicyViolation> {
+    schema_validator::resolve_schema(schema_ref).map_err(|e| {
+        let kind = match &e {
+            schema_validator::SchemaRefError::PathTraversal(_) => {
+                DenialKind::Validation(ValidationKind::PathTraversal)
+            }
+            _ => DenialKind::Other,
+        };
+        PolicyViolation::new(tool_name, kind, e.into_reason())
     })
 }
 

@@ -18,15 +18,22 @@
 //! `args_schema` applies only to `params.arguments`. The sibling
 //! `params.inputResponses` field (MRTR) is intentionally not covered —
 //! see `check_request` for its deny-by-default handling.
+//!
+//! RF05b: the schema JSON is evaluated through
+//! [`crate::schema_spec::prepared::PreparedSchema`] — a parse-once
+//! document with lazily memoized `$ref` resolutions and `pattern`
+//! compilations. The evaluator below keeps its order, errors, and
+//! per-call budgets; only the document it walks and the two
+//! schema-derived lookups moved behind the prepared form.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use nojson::{JsonValueKind, RawJson, RawJsonValue};
+use nojson::{JsonValueKind, RawJsonValue};
 
+use crate::schema_spec::prepared::PreparedSchema;
 use crate::schema_spec::{
-    MAX_SCHEMA_DEPTH, VALID_TYPES, check_unsupported_keywords, field_path, member_opt,
-    resolve_local_ref, str_val,
+    MAX_SCHEMA_DEPTH, VALID_TYPES, check_unsupported_keywords, field_path, member_opt, str_val,
 };
 
 mod decimal;
@@ -136,28 +143,50 @@ pub fn resolve_schema(schema_ref: &str) -> Result<String, SchemaRefError> {
 ///
 /// Returns `Ok(())` if the arguments satisfy the schema, or `Err` with a
 /// human-readable description of the first violation found.
+///
+/// This entry prepares a fresh [`PreparedSchema`] per call — the same
+/// per-request parse the bare `&Policy` check path always did, at the
+/// cost of one `String` copy the owned document needs. Prepared
+/// sessions route through [`validate_prepared`] instead, which shares
+/// one document and its `$ref`/`pattern` memos across requests.
 pub fn validate_arguments(arguments: RawJsonValue<'_, '_>, schema_str: &str) -> Result<(), String> {
-    #[cfg(feature = "measure")]
-    crate::measure::incr(&crate::measure::SCHEMA_PARSE_CALLS, 1);
-    let schema_json =
-        RawJson::parse(schema_str).map_err(|e| format!("invalid args_schema JSON: {e}"))?;
+    let schema = PreparedSchema::new(schema_str.to_string());
+    validate_prepared(arguments, &schema)
+}
+
+/// The per-request evaluation entry — same verdicts, error order, and
+/// budgets whether `schema` was just built for this call or has served
+/// the session for a while. A schema whose text failed to parse stores
+/// its parse error and returns it here on every call, matching the old
+/// parse-then-fail path byte for byte.
+pub(crate) fn validate_prepared(
+    arguments: RawJsonValue<'_, '_>,
+    schema: &PreparedSchema,
+) -> Result<(), String> {
+    if let Some(msg) = schema.parse_error() {
+        return Err(msg.to_string());
+    }
+    let root = schema.root().expect("parsed schema has a root value");
     let mut eval = Eval {
-        root: schema_json.value(),
+        schema,
         branch_budget: MAX_BRANCH_EVALS,
         node_budget: MAX_NODE_EVALS,
     };
-    validate_value(arguments, schema_json.value(), "", 0, &mut eval)
-        .map_err(EvalError::into_message)
+    validate_value(arguments, root, "", 0, &mut eval).map_err(EvalError::into_message)
 }
 
 // ---------------------------------------------------------------------------
 // Core recursive validator
 // ---------------------------------------------------------------------------
 
-/// Per-call evaluator state carried through the recursion.
-struct Eval<'t, 'r> {
-    /// Resolution root for same-document `$ref`s.
-    root: RawJsonValue<'t, 'r>,
+/// Per-call evaluator state carried through the recursion. The
+/// prepared schema is shared across calls — `branch_budget` and
+/// `node_budget` are drawn fresh here every call, so a shared document
+/// never carries spent budget (or a verdict) between requests.
+struct Eval<'s> {
+    /// The prepared schema being evaluated — `$ref` targets and
+    /// `pattern` regexes are resolved/compiled through its memos.
+    schema: &'s PreparedSchema,
     /// Combinator/`$ref` branch evaluations remaining.
     branch_budget: usize,
     /// `validate_value` calls and input members visited remaining.
@@ -202,7 +231,7 @@ fn spend(budget: &mut usize, limit: usize, what: &str, path: &str) -> Result<(),
     Ok(())
 }
 
-fn spend_branch(eval: &mut Eval<'_, '_>, path: &str) -> Result<(), EvalError> {
+fn spend_branch(eval: &mut Eval<'_>, path: &str) -> Result<(), EvalError> {
     spend(
         &mut eval.branch_budget,
         MAX_BRANCH_EVALS,
@@ -211,7 +240,7 @@ fn spend_branch(eval: &mut Eval<'_, '_>, path: &str) -> Result<(), EvalError> {
     )
 }
 
-fn spend_node(eval: &mut Eval<'_, '_>, path: &str) -> Result<(), EvalError> {
+fn spend_node(eval: &mut Eval<'_>, path: &str) -> Result<(), EvalError> {
     spend(&mut eval.node_budget, MAX_NODE_EVALS, "node", path)
 }
 
@@ -220,7 +249,7 @@ fn validate_value(
     schema: RawJsonValue<'_, '_>,
     path: &str,
     depth: u32,
-    eval: &mut Eval<'_, '_>,
+    eval: &mut Eval<'_>,
 ) -> Result<(), EvalError> {
     spend_node(eval, path)?;
     if depth > MAX_SCHEMA_DEPTH {
@@ -261,7 +290,10 @@ fn validate_value(
     // unsupported and fail closed.
     if let Some(ref_val) = member_opt(schema, "$ref") {
         let target = str_val(ref_val).map_err(EvalError::Fatal)?;
-        let resolved = resolve_local_ref(eval.root, &target).map_err(EvalError::Fatal)?;
+        let resolved = eval
+            .schema
+            .resolve_local(&target)
+            .map_err(EvalError::Fatal)?;
         spend_branch(eval, path)?;
         validate_value(value, resolved, path, depth + 1, eval)?;
     }
@@ -343,7 +375,7 @@ fn validate_value(
     check_numeric_constraints(value, schema, path)?;
 
     // 5. String constraints (minLength, maxLength, pattern)
-    check_string_constraints(value, schema, path)?;
+    check_string_constraints(value, schema, path, eval)?;
 
     // 6. Object-specific: required, properties, additionalProperties
     if value.kind() == JsonValueKind::Object {
@@ -591,6 +623,7 @@ fn check_string_constraints(
     value: RawJsonValue<'_, '_>,
     schema: RawJsonValue<'_, '_>,
     path: &str,
+    eval: &Eval<'_>,
 ) -> Result<(), EvalError> {
     if value.kind() != JsonValueKind::String {
         return Ok(());
@@ -623,9 +656,9 @@ fn check_string_constraints(
     }
     if let Some(pat_val) = member_opt(schema, "pattern") {
         let pat_s = str_val(pat_val).map_err(EvalError::fatal)?;
-        #[cfg(feature = "measure")]
-        crate::measure::incr(&crate::measure::SCHEMA_REGEX_BUILDS, 1);
-        let re = regex_lite::Regex::new(&pat_s).map_err(|e| {
+        // Compiled once per prepared schema per distinct pattern —
+        // the same `Fatal` text the per-request `Regex::new` produced.
+        let re = eval.schema.compiled_pattern(&pat_s).map_err(|e| {
             EvalError::Fatal(format!(
                 "at '{field}': invalid regex pattern '{pat_s}': {e}"
             ))
@@ -644,7 +677,7 @@ fn validate_object(
     schema: RawJsonValue<'_, '_>,
     path: &str,
     depth: u32,
-    eval: &mut Eval<'_, '_>,
+    eval: &mut Eval<'_>,
 ) -> Result<(), EvalError> {
     // Collect all (key, value) entries in a single pass (avoids double iteration).
     // Members count against the node budget: every combinator branch
@@ -739,7 +772,7 @@ fn validate_array(
     schema: RawJsonValue<'_, '_>,
     path: &str,
     depth: u32,
-    eval: &mut Eval<'_, '_>,
+    eval: &mut Eval<'_>,
 ) -> Result<(), EvalError> {
     let items_schema = member_opt(schema, "items");
     if let Some(items) = items_schema
@@ -933,6 +966,13 @@ fn kind_name(kind: JsonValueKind) -> &'static str {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// RF05b comparison harness — the pre-RF05b evaluator kept verbatim
+/// (per-request `RawJson::parse`, uncached `$ref`/`pattern`) so the
+/// equivalence suite can check the prepared evaluator answers every
+/// fixed input identically. Test-only; the product ships one evaluator.
+#[cfg(test)]
+mod legacy;
 
 #[cfg(test)]
 mod tests;

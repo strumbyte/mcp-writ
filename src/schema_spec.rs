@@ -535,5 +535,9 @@ fn check_keyword_shape(
     }
 }
 
+/// RF05b — the prepared (parsed-once, lazily memoized) execution form
+/// of an `args_schema` the session shares across requests.
+pub(crate) mod prepared;
+
 #[cfg(test)]
 mod tests;

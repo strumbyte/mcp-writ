@@ -236,6 +236,117 @@ pub fn emit(out_path: &Option<PathBuf>, report: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A counting global allocator shared by the measurement binaries.
+///
+/// `#[global_allocator]` must be declared in each binary's crate root,
+/// but the pass-through implementation and the counters live here so
+/// every target reads one implementation. Counting runs only while
+/// [`COUNTING`] is set, so a counted window must be self-contained:
+/// every block counted on alloc gets freed before the window closes
+/// (one freed while untracked would leak into [`OUTSTANDING`]; an
+/// untracked block freed or shrunk inside a window would underflow
+/// it), and no measurement buffer crosses the boundary. See
+/// `m2_policy`'s module docs for the full window discipline.
+pub mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// Outstanding bytes (alloc minus dealloc) and the high-water mark —
+    /// the resident/peak pair the M2 spec asks for without an
+    /// OS-specific RSS read, so the same formula runs on every bench
+    /// host.
+    pub struct Counting;
+
+    /// Whether allocation sizes are currently tracked.
+    pub static COUNTING: AtomicBool = AtomicBool::new(false);
+    /// Bytes currently allocated inside the window.
+    pub static OUTSTANDING: AtomicU64 = AtomicU64::new(0);
+    /// High-water mark of [`OUTSTANDING`].
+    pub static PEAK: AtomicU64 = AtomicU64::new(0);
+
+    impl Counting {
+        /// `OUTSTANDING` += `size` with `PEAK` raised to the new mark —
+        /// the bookkeeping for every successful grow (`alloc`,
+        /// `alloc_zeroed`, `realloc` growth). Shrinks subtract from
+        /// `OUTSTANDING` only: the mark is a high-water, never lowered.
+        fn note_growth(size: u64) {
+            let now = OUTSTANDING.fetch_add(size, Ordering::Relaxed) + size;
+            PEAK.fetch_max(now, Ordering::Relaxed);
+        }
+    }
+
+    // SAFETY: `Counting` upholds the `GlobalAlloc` contract by delegating
+    // every call to `System` — the allocator the default would have been —
+    // so blocks always round-trip alloc→realloc→dealloc through the same
+    // backend; the atomics add size bookkeeping only and never touch the
+    // memory.
+    #[allow(unsafe_code)]
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: forwards `layout` to `System` and returns its pointer
+            // verbatim; the counting below reads `layout.size()` only,
+            // never the memory `p` addresses.
+            let p = unsafe { System.alloc(layout) };
+            if !p.is_null() && COUNTING.load(Ordering::Relaxed) {
+                Self::note_growth(layout.size() as u64);
+            }
+            p
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: same pass-through as `alloc`, via the zeroed entry
+            // point the default impl would have reached only through a
+            // fresh `alloc` plus a manual memset.
+            let p = unsafe { System.alloc_zeroed(layout) };
+            if !p.is_null() && COUNTING.load(Ordering::Relaxed) {
+                Self::note_growth(layout.size() as u64);
+            }
+            p
+        }
+
+        unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // SAFETY: forwards the block, its layout, and `new_size` to
+            // `System` verbatim, keeping the backend's in-place growth —
+            // the default impl's alloc-copy-dealloc would double the
+            // block's footprint mid-call and skew the measured marks.
+            let q = unsafe { System.realloc(p, layout, new_size) };
+            // Counted on success only: a failed realloc returns null with
+            // `p`'s block still owned by the caller, so the books stay
+            // unchanged — and a shrink never raises the high-water mark.
+            if !q.is_null() && COUNTING.load(Ordering::Relaxed) {
+                let old = layout.size() as u64;
+                let new = new_size as u64;
+                if new > old {
+                    Self::note_growth(new - old);
+                } else {
+                    OUTSTANDING.fetch_sub(old - new, Ordering::Relaxed);
+                }
+            }
+            q
+        }
+
+        unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+            if COUNTING.load(Ordering::Relaxed) {
+                OUTSTANDING.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+            }
+            // SAFETY: forwards the pointer and layout the runtime supplies
+            // for a block this `alloc` returned straight to `System`; the
+            // impl adds no memory access of its own.
+            unsafe { System.dealloc(p, layout) };
+        }
+    }
+
+    /// `OUTSTANDING` — bytes live inside the counted window.
+    pub fn outstanding() -> u64 {
+        OUTSTANDING.load(Ordering::Relaxed)
+    }
+
+    /// `PEAK` — the window's high-water mark.
+    pub fn peak() -> u64 {
+        PEAK.load(Ordering::Relaxed)
+    }
+}
+
 /// A deterministic xorshift64 — the seeded-input generator for targets
 /// that randomize work order; kept local so the dependency set stays
 /// at the crates mcp-writ already builds.

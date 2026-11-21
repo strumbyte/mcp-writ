@@ -112,17 +112,26 @@ fn additional_properties_no_properties_defined_empty_object_ok() {
 #[test]
 fn required_with_additional_properties_false_no_properties_rejects_required_keys() {
     // JSON Schema: additionalProperties:false with no properties object
-    // treats every instance key as additional.
+    // treats every instance key as additional — the refusal must name
+    // the required key itself, which is what made it "additional".
     let schema = r#"{"type":"object","required":["name"],"additionalProperties":false}"#;
     let err = check(r#"{"name":"test"}"#, schema).unwrap_err();
-    assert!(err.contains("additional property"), "got: {err}");
+    assert!(
+        err.contains("at 'name': additional property not allowed"),
+        "got: {err}"
+    );
 }
 
 #[test]
-fn required_with_additional_properties_false_no_properties_rejects_extra() {
-    let schema = r#"{"type":"object","required":["name"],"additionalProperties":false}"#;
+fn required_with_additional_properties_false_rejects_the_extra_key() {
+    // `name` is covered by `properties`, so the refusal must land on
+    // `extra` specifically — not on the first member the object lists.
+    let schema = r#"{"type":"object","properties":{"name":true},"required":["name"],"additionalProperties":false}"#;
     let err = check(r#"{"name":"test","extra":"bad"}"#, schema).unwrap_err();
-    assert!(err.contains("additional property"), "got: {err}");
+    assert!(
+        err.contains("at 'extra': additional property not allowed"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -770,4 +779,266 @@ fn test_real_fetch_server_schema() {
     }"#;
     assert!(check(r#"{"url":"https://example.com","max_length":100}"#, schema).is_ok());
     assert!(check(r#"{"url":"https://x","max_length":-1}"#, schema).is_err());
+}
+
+// --- RF05b: the prepared evaluator matches the per-request one ------------
+//
+// `legacy::validate_arguments` is the pre-RF05b evaluator kept verbatim
+// for this comparison. Every case below runs three ways — legacy,
+// a freshly built `PreparedSchema`, and the same prepared document
+// evaluated a second time — and must agree on verdict *and* error
+// text, proving the shared document, memoized `$ref`s, and cached
+// patterns change nothing observable while budgets still draw fresh
+// per call.
+
+/// Evaluate `args` against a prepared schema document.
+fn check_prepared(
+    args: &str,
+    prepared: &crate::schema_spec::prepared::PreparedSchema,
+) -> Result<(), String> {
+    let json = nojson::RawJson::parse(args).expect("invalid test args JSON");
+    validate_prepared(json.value(), prepared)
+}
+
+fn check_legacy(args: &str, schema: &str) -> Result<(), String> {
+    let json = nojson::RawJson::parse(args).expect("invalid test args JSON");
+    super::legacy::validate_arguments(json.value(), schema)
+}
+
+/// (label, args, schema) — the matrix the RF05b plan requires:
+/// combinators, cyclic/broken/external refs, unknown keywords,
+/// `uniqueItems`, numeric equality, `multipleOf`, the empty-object
+/// shape of a missing `arguments`, invalid schema text, and the
+/// branch/node/depth budget boundaries.
+fn rf05b_cases() -> Vec<(&'static str, &'static str, String)> {
+    let mut defs = String::from(r##""d0":{"type":"string"}"##);
+    for i in 1..=21usize {
+        defs.push_str(&format!(
+            r##", "d{i}":{{"anyOf":[{{"$ref":"#/$defs/d{}"}},{{"$ref":"#/$defs/d{}"}}]}}"##,
+            i - 1,
+            i - 1
+        ));
+    }
+    let branch_bomb = format!(r##"{{"$defs":{{{defs}}}, "$ref":"#/$defs/d21"}}"##);
+
+    let mut chain = String::new();
+    for i in 0..(MAX_SCHEMA_DEPTH as usize + 8) {
+        chain.push_str(&format!(r##""d{i}":{{"$ref":"#/$defs/d{}"}},"##, i + 1));
+    }
+    chain.push_str(&format!(r#""d{}":true"#, MAX_SCHEMA_DEPTH + 8));
+    let depth_bomb = format!(r##"{{"$defs":{{{chain}}},"$ref":"#/$defs/d0"}}"##);
+
+    // Node-budget boundary: input members × anyOf branches crosses
+    // MAX_NODE_EVALS while branch evaluations stay under their limit —
+    // the input-limit axis the spec lists.
+    const MEMBERS: usize = 4_000;
+    const BRANCHES: usize = 4_500;
+    let mut node_input = String::from("{");
+    for i in 0..MEMBERS {
+        if i > 0 {
+            node_input.push(',');
+        }
+        node_input.push_str(&format!("\"k{i}\":0"));
+    }
+    node_input.push('}');
+    let mut any = String::new();
+    for i in 0..BRANCHES {
+        if i > 0 {
+            any.push(',');
+        }
+        any.push_str(r#"{"type":"object"}"#);
+    }
+    let node_bomb = format!(r#"{{"anyOf":[{any}]}}"#);
+
+    vec![
+        ("anyOf match", r#"{"v":"x"}"#,
+         r#"{"properties":{"v":{"anyOf":[{"type":"string"},{"type":"integer"}]}}}"#.into()),
+        ("anyOf no match, first error kept", r#"{"v":true}"#,
+         r#"{"properties":{"v":{"anyOf":[{"type":"string"},{"type":"integer"}]}}}"#.into()),
+        ("anyOf fatal behind the match", r#""x""#,
+         r#"{"anyOf":[{"type":"string"},{"not":{}}]}"#.into()),
+        ("oneOf exactly one", r#"5"#,
+         r#"{"oneOf":[{"type":"number"},{"minimum":6}]}"#.into()),
+        ("oneOf two matches rejected", r#"5"#,
+         r#"{"oneOf":[{"type":"number"},{"minimum":0}]}"#.into()),
+        ("allOf conjunctive", r#"{"s":"ab"}"#,
+         r#"{"properties":{"s":{"allOf":[{"type":"string"},{"minLength":3}]}}}"#.into()),
+        ("cyclic $ref", r#"{"a":1}"#, r##"{"$ref":"#"}"##.into()),
+        ("self-cycle through property", r#"{"x":{"x":{}}}"#,
+         r##"{"type":"object","properties":{"x":{"$ref":"#"}}}"##.into()),
+        ("broken local ref", r#"{}"#, r##"{"$ref":"#/missing"}"##.into()),
+        ("non-string $ref", r#"{}"#, r#"{"$ref":42}"#.into()),
+        ("external ref", r#"{}"#,
+         r#"{"$ref":"https://example.com/s.json"}"#.into()),
+        ("ref chain resolution", r#"{"src":"/a","dst":""}"#,
+         r##"{"$defs":{"p":{"type":"string","minLength":1}},"properties":{"src":{"$ref":"#/$defs/p"},"dst":{"$ref":"#/$defs/p"}},"required":["src"]}"##.into()),
+        ("unknown keyword at root", r#"{"a":1}"#,
+         r#"{"patternProperties":{"x":{}}}"#.into()),
+        ("unreached unknown keyword passes", r#"{}"#,
+         r#"{"properties":{"a":{"not":{}}}}"#.into()),
+        ("reached unknown keyword fails", r#"{"a":1}"#,
+         r#"{"properties":{"a":{"not":{}}}}"#.into()),
+        ("non-string value never reaches invalid pattern", r#"{"a":5}"#,
+         r#"{"properties":{"a":{"pattern":"["}}}"#.into()),
+        ("reached invalid pattern fails", r#"{"a":"x"}"#,
+         r#"{"properties":{"a":{"type":"string","pattern":"["}}}"#.into()),
+        ("unreached invalid pattern on missing prop", r#"{}"#,
+         r#"{"properties":{"a":{"type":"string","pattern":"["}}}"#.into()),
+        ("pattern shared across siblings", r#"{"a":"ok","b":"ok"}"#,
+         r#"{"properties":{"a":{"type":"string","pattern":"^[a-z]+$"},"b":{"type":"string","pattern":"^[a-z]+$"}}}"#.into()),
+        ("uniqueItems numeric equality", r#"{"xs":[0,-0.0]}"#,
+         r#"{"properties":{"xs":{"type":"array","uniqueItems":true}}}"#.into()),
+        ("uniqueItems key-order equality", r#"{"xs":[{"a":1,"b":2},{"b":2,"a":1}]}"#,
+         r#"{"properties":{"xs":{"type":"array","uniqueItems":true}}}"#.into()),
+        ("numeric equality -0.0 == 0", r#"-0.0"#, r#"{"const":0}"#.into()),
+        ("enum precision", r#"{"val":1e-17}"#,
+         r#"{"type":"object","properties":{"val":{"enum":[0.0]}}}"#.into()),
+        ("multipleOf exact decimal", r#"{"q":0.3}"#,
+         r#"{"type":"object","properties":{"q":{"type":"number","multipleOf":0.1}}}"#.into()),
+        ("multipleOf non-multiple", r#"{"q":0.35}"#,
+         r#"{"type":"object","properties":{"q":{"type":"number","multipleOf":0.1}}}"#.into()),
+        ("multipleOf malformed divisor", r#"4"#, r#"{"multipleOf":0}"#.into()),
+        ("empty object = missing arguments", r#"{}"#,
+         r#"{"type":"object","required":["path"]}"#.into()),
+        ("empty object, all optional", r#"{}"#,
+         r#"{"type":"object","properties":{"opt":{"type":"string"}}}"#.into()),
+        ("invalid schema JSON", r#"{"a":1}"#, "not json".into()),
+        ("duplicate schema keys, first wins", r#""x""#,
+         r#"{"type":"string","type":"integer"}"#.into()),
+        ("additionalProperties names the key", r#"{"name":"t","extra":1}"#,
+         r#"{"type":"object","properties":{"name":true},"additionalProperties":false}"#.into()),
+        ("boolean false schema", r#"{"a":1}"#, "false".into()),
+        ("boolean true schema", r#"{"a":1}"#, "true".into()),
+        ("non-schema JSON root", r#"{"a":1}"#, "42".into()),
+        ("branch budget boundary", r#"42"#, branch_bomb),
+        ("depth boundary via ref chain", r#"1"#, depth_bomb),
+        (
+            "node budget boundary",
+            // The matrix wants `&'static` args — a one-time leak suits
+            // a test fixture built from a loop.
+            Box::leak(node_input.into_boxed_str()) as &'static str,
+            node_bomb,
+        ),
+        ("format annotation only", r#"{"url":"not a uri"}"#,
+         r#"{"type":"object","properties":{"url":{"type":"string","format":"uri"}}}"#.into()),
+    ]
+}
+
+#[test]
+fn prepared_evaluator_matches_legacy_on_every_fixed_input() {
+    for (label, args, schema) in rf05b_cases() {
+        let expected = check_legacy(args, &schema);
+        let prepared = crate::schema_spec::prepared::PreparedSchema::new(schema.clone());
+        let first = check_prepared(args, &prepared);
+        assert_eq!(
+            first, expected,
+            "{label}: fresh prepared vs legacy ({args} vs {schema})"
+        );
+        // Second request on the same document — the path a session
+        // takes after the first call filled the `$ref`/pattern memos.
+        let steady = check_prepared(args, &prepared);
+        assert_eq!(
+            steady, expected,
+            "{label}: reused prepared vs legacy ({args} vs {schema})"
+        );
+        // A different input on the same prepared document still gets
+        // evaluated — a shared structure never carries a verdict.
+        let other = check_prepared(r#"{"zzz":0}"#, &prepared);
+        assert_eq!(
+            other,
+            check_legacy(r#"{"zzz":0}"#, &schema),
+            "{label}: cross-input prepared vs legacy"
+        );
+    }
+}
+
+#[test]
+fn prepared_memos_dedupe_refs_and_patterns() {
+    let schema = crate::schema_spec::prepared::PreparedSchema::new(
+        r##"{"$defs":{"s":{"type":"string","minLength":1}},
+             "properties":{
+                "a":{"$ref":"#/$defs/s"},
+                "b":{"$ref":"#/$defs/s"},
+                "c":{"$ref":"#/$defs/s","pattern":"^[a-z]+$"},
+                "d":{"type":"string","pattern":"^[a-z]+$"}}}"##
+            .to_string(),
+    );
+    assert!(check_prepared(r#"{"a":"x","b":"y","c":"z","d":"w"}"#, &schema).is_ok());
+    let (refs, patterns) = schema.interned_counts();
+    assert_eq!(refs, 1, "one distinct ref target must intern once");
+    assert_eq!(patterns, 1, "one distinct pattern must intern once");
+}
+
+#[test]
+fn prepared_parse_error_replays_per_call() {
+    // An invalid document keeps failing at evaluation — never a
+    // prepare-time refusal — with the old path's message verbatim.
+    let prepared = crate::schema_spec::prepared::PreparedSchema::new("not json".to_string());
+    let first = check_prepared(r#"{}"#, &prepared).unwrap_err();
+    assert_eq!(first, check_legacy(r#"{}"#, "not json").unwrap_err());
+    assert_eq!(check_prepared(r#"1"#, &prepared).unwrap_err(), first);
+}
+
+#[test]
+fn prepared_budget_draws_fresh_each_call() {
+    // Reusing the document must not carry spent budget: an input that
+    // reaches the bomb exhausts the combinator budget, while a cheap
+    // `$ref` on the same shared schema still spends its branch unit
+    // and passes on the very next call.
+    let mut defs = String::from(r##""d0":{"type":"integer"},"ok":{"type":"integer"}"##);
+    for i in 1..=21usize {
+        defs.push_str(&format!(
+            r##", "d{i}":{{"anyOf":[{{"$ref":"#/$defs/d{}"}},{{"$ref":"#/$defs/d{}"}}]}}"##,
+            i - 1,
+            i - 1
+        ));
+    }
+    let schema = format!(
+        r##"{{"$defs":{{{defs}}},"properties":{{"x":{{"$ref":"#/$defs/d21"}},"y":{{"$ref":"#/$defs/ok"}}}}}}"##
+    );
+    let prepared = crate::schema_spec::prepared::PreparedSchema::new(schema);
+    let exhausted = check_prepared(r#"{"x":0}"#, &prepared).unwrap_err();
+    assert!(
+        exhausted.contains("combinator"),
+        "first call must report combinator exhaustion: {exhausted}"
+    );
+    // A different memoized `$ref` path — one branch unit — must
+    // succeed outright on the fresh budget of this call.
+    assert_eq!(check_prepared(r#"{"y":1}"#, &prepared), Ok(()));
+}
+
+#[test]
+fn prepared_concurrent_first_requests_share_one_build() {
+    // Concurrent first evaluations intern once each and all threads
+    // observe the same verdict — `OnceLock` serializes the builders
+    // instead of duplicating them. The barrier holds the workers at
+    // the gate so all eight truly race a first evaluation — no call
+    // touches the schema before they are released.
+    let prepared = crate::schema_spec::prepared::PreparedSchema::new(
+        r##"{"$defs":{"s":{"type":"string","minLength":1}},
+                 "properties":{
+                    "a":{"$ref":"#/$defs/s","pattern":"^[a-z]+$"},
+                    "b":{"$ref":"#/$defs/s"}}}"##
+            .to_string(),
+    );
+    let gate = std::sync::Barrier::new(8);
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| {
+                gate.wait();
+                assert_eq!(
+                    check_prepared(r#"{"a":"ok","b":"fine"}"#, &prepared),
+                    Ok(())
+                );
+            });
+        }
+    });
+    let (refs, patterns) = prepared.interned_counts();
+    assert_eq!((refs, patterns), (1, 1));
+    let (ref_builds, pattern_builds) = prepared.build_counts();
+    assert_eq!(
+        (ref_builds, pattern_builds),
+        (1, 1),
+        "each lazy initializer must run exactly once across the burst"
+    );
 }

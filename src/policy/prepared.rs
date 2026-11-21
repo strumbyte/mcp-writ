@@ -34,7 +34,7 @@ pub struct ToolHit<'p> {
     pub(crate) prepared: Option<&'p PreparedTool>,
 }
 
-impl ToolHit<'_> {
+impl<'p> ToolHit<'p> {
     /// `tool.side_effect` parsed — the prepared value when the index
     /// built one, the same `parse(...).ok()` the request path ran
     /// otherwise.
@@ -60,6 +60,13 @@ impl ToolHit<'_> {
                 .resolve(self.tool.has_security_contract()),
         }
     }
+
+    /// The prepared `args_schema` plan for this tool — `None` when the
+    /// tool carries no schema or the lookup ran on a bare `Policy`
+    /// (the standalone path prepares per call, exactly as before).
+    pub(crate) fn schema_plan(&self) -> Option<&'p ToolSchema> {
+        self.prepared.and_then(|p| p.args_schema.as_ref())
+    }
 }
 
 /// Per-tool execution rules derivable from `ToolPolicy` alone — built
@@ -75,6 +82,79 @@ pub struct PreparedTool {
     pub(crate) side_effect: Option<SideEffect>,
     /// `tool.input_responses.resolve(tool.has_security_contract())`.
     pub(crate) resolved_input_responses: ResolvedInputResponses,
+    /// The `args_schema` execution plan — `None` when the tool carries
+    /// no schema. See [`ToolSchema`].
+    pub(crate) args_schema: Option<ToolSchema>,
+}
+
+/// The `args_schema` execution plan for one prepared tool — RF05b.
+///
+/// `Inline` is the shape validated policies produce: the KDL loader
+/// resolves `@file` spellings to inline JSON at load time
+/// (`Policy::inlined_schemas`), and `validate_args_schemas` refuses a
+/// `@`-spelling that survived to validation — so a prepared view sees
+/// one only on a document that skipped those steps (a programmatically
+/// built `Policy`, an unvalidated parse without a base dir). `File`
+/// covers that case without changing what a request does:
+/// the checker still calls `schema_validator::resolve_schema` per
+/// call (the cwd-scoped, no-follow read is the contract), and this
+/// single-entry memo keys on the *resolved bytes* — identical bytes
+/// reuse one parse, a rewrite yields a fresh plan. Never keyed on the
+/// path itself.
+#[derive(Debug)]
+pub enum ToolSchema {
+    /// Parsed once at `PreparedPolicy::new`; every request in the
+    /// session shares the document and its `$ref`/`pattern` memos.
+    Inline(crate::schema_spec::prepared::PreparedSchema),
+    /// Prepared lazily on the resolved bytes — see the enum docs.
+    File(std::sync::Mutex<Option<FileSchemaEntry>>),
+}
+
+/// The `File` memo slot: which bytes the cached plan was built from,
+/// plus the plan — `Arc` so a request evaluating a stale-now entry
+/// finishes on the document it started with while a rewrite swaps in
+/// the fresh one. A rewrite *replaces* the slot's entry: the
+/// displaced plan drops once its last in-flight `Arc` drains, so a
+/// long-lived `PreparedPolicy` never accumulates versions of the same
+/// `@file` schema.
+///
+/// Replacement is last-writer-wins on the resolved bytes: under
+/// concurrent divergent resolutions a stale-bytes request can
+/// displace a fresher entry. Every request still evaluates the bytes
+/// *it* resolved — the `Arc` outlives the swap — so only the memo
+/// thrashes under alternating rewrites, never the verdict.
+#[derive(Debug)]
+pub struct FileSchemaEntry {
+    content: Box<str>,
+    prepared: std::sync::Arc<crate::schema_spec::prepared::PreparedSchema>,
+}
+
+impl ToolSchema {
+    /// The prepared schema for `content` — the cache when the bytes
+    /// match the last resolution, a fresh build when they do not.
+    /// Only valid on `ToolSchema::File`; the checker guarantees it.
+    pub(crate) fn file_plan(
+        &self,
+        content: &str,
+    ) -> std::sync::Arc<crate::schema_spec::prepared::PreparedSchema> {
+        let Self::File(slot) = self else {
+            unreachable!("file_plan on a non-File ToolSchema")
+        };
+        let mut guard = slot.lock().unwrap();
+        if let Some(entry) = guard.as_ref()
+            && &*entry.content == content
+        {
+            return entry.prepared.clone();
+        }
+        let prepared = std::sync::Arc::new(crate::schema_spec::prepared::PreparedSchema::new(
+            content.to_string(),
+        ));
+        *guard = Some(FileSchemaEntry {
+            content: content.into(),
+            prepared: prepared.clone(),
+        });
+        prepared
+    }
 }
 
 /// Where a tool name sits in `policy.tools` — `first` reproduces
@@ -148,6 +228,15 @@ impl PreparedPolicy {
                 resolved_input_responses: tool
                     .input_responses
                     .resolve(tool.has_security_contract()),
+                args_schema: tool.args_schema.as_ref().map(|schema_ref| {
+                    if schema_ref.starts_with('@') {
+                        ToolSchema::File(std::sync::Mutex::new(None))
+                    } else {
+                        ToolSchema::Inline(crate::schema_spec::prepared::PreparedSchema::new(
+                            schema_ref.clone(),
+                        ))
+                    }
+                }),
             });
         }
         Self {
@@ -183,6 +272,23 @@ impl PreparedPolicy {
         for tool in &self.tools {
             if let Some(matcher) = &tool.opaque {
                 n += matcher.heap_bytes();
+            }
+            match &tool.args_schema {
+                Some(ToolSchema::Inline(schema)) => {
+                    // The `PreparedSchema` object itself sits inside
+                    // this `PreparedTool` (already in the
+                    // `tools.capacity()` count) — add only what it
+                    // owns on the heap.
+                    n += schema.estimated_resident_bytes() as usize
+                        - std::mem::size_of::<crate::schema_spec::prepared::PreparedSchema>();
+                }
+                Some(ToolSchema::File(slot)) => {
+                    if let Some(entry) = slot.lock().unwrap().as_ref() {
+                        n += entry.content.len()
+                            + entry.prepared.estimated_resident_bytes() as usize;
+                    }
+                }
+                None => {}
             }
         }
         n as u64
