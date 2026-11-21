@@ -1,4 +1,4 @@
-//! The dedicated writer tasks behind [`AuditLogger`](super::AuditLogger).
+//! The dedicated writer behind [`AuditLogger`](super::AuditLogger).
 //!
 //! ## Ordering and fairness
 //!
@@ -21,28 +21,49 @@
 //! completed send, and the permits riding in each item release on
 //! drop.
 //!
+//! ## Dedicated thread
+//!
+//! The file writer owns its sink, buffer, and deadlines on a single
+//! dedicated OS thread — never a per-event thread or blocking task —
+//! so synchronous writes and `sync_all` cannot occupy a runtime
+//! worker and stall audit-unrelated tasks. The thread drains the same
+//! queue through `blocking_recv`: admission order, bounded
+//! backpressure, and permit release are exactly the async driver's
+//! semantics, because the queue itself is unchanged. Completion is a
+//! oneshot notice the async side awaits — never a synchronous thread
+//! join on a runtime worker.
+//!
 //! ## Periodic sync
 //!
 //! The periodic flush/fsync deadlines are serviced inside the item
-//! path, not by `select!` arms that only run while the receive queue
-//! is idle: after every [`CLOCK_CHECK_RECORDS`] processed records —
-//! and after each control item — the writer consults its
-//! [`AuditClock`] and runs whatever deadlines have passed. The idle
-//! arm's `sleep_until` exists only to wake an *empty* queue on time.
-//! Starting a sync is therefore never conditioned on the queue
-//! draining — under sustained input the next bounded processing
-//! boundary is at most `CLOCK_CHECK_RECORDS` writes away.
+//! path, not by receiver-side waits that only run while the queue is
+//! idle: after every [`CLOCK_CHECK_RECORDS`] processed records — and
+//! after each control item — the writer consults its [`AuditClock`]
+//! and runs whatever deadlines have passed. Starting a sync is
+//! therefore never conditioned on the queue draining — under
+//! sustained input the next bounded processing boundary is at most
+//! `CLOCK_CHECK_RECORDS` writes away. The idle wake is the only piece
+//! that cannot live on the blocking thread — `blocking_recv` has no
+//! deadline — so a lightweight *ticker* task on the runtime armed on
+//! the writer's posted earliest deadline lands a
+//! [`WriterItem::Tick`] in the same queue when the instant passes.
+//! The tick carries no payload and occupies a small headroom reserve
+//! above the permit-accounted capacity, so it can never bounce a
+//! permit-holding send; a dropped tick costs nothing because a busy
+//! queue services deadlines at its own boundaries.
 //!
 //! The sink ([`AuditSink`]) and the clock are injected traits: the
 //! production pairing is `BufWriter<File>` plus [`TokioClock`];
 //! regression tests drive a scripted sink and a manual clock so
 //! sustained input, saturation, multiple rotations and mid-rotation
-//! shutdown are deterministic — and a blocking driver can reuse them.
+//! shutdown are deterministic — the same fixtures the async driver
+//! ran under now run on the dedicated thread unchanged.
 
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -326,10 +347,10 @@ impl AuditSink for FileSink {
 
 /// The sink- and clock-agnostic writer core: one dequeued item at a
 /// time, the durability ladder each kind requires, and the periodic
-/// deadline service a bounded processing chunk guarantees. The async
-/// driver supplies the queue and the idle wake; every ordering and
-/// durability decision lives here so a future blocking driver reuses
-/// it unchanged.
+/// deadline service a bounded processing chunk guarantees. The
+/// dedicated-thread driver supplies the queue; every ordering and
+/// durability decision lives here so the core is identical no matter
+/// which driver drains it.
 pub(super) struct WriterCore<S: AuditSink, C: AuditClock> {
     /// The sink generation currently live — tests reach it through
     /// [`WriterCore::sink`] for scripted-sink assertions.
@@ -701,53 +722,207 @@ impl<S: AuditSink, C: AuditClock> WriterCore<S, C> {
     }
 }
 
-/// The async driver over [`WriterCore`]: the queue supplies the
-/// order; the clock supplies only the idle wake — real deadline
-/// service lives in the core's boundary checks, so arm order can no
-/// longer starve a due sync.
-pub(super) async fn file_writer_task<S: AuditSink, C: AuditClock>(
+/// The spawned pieces of a file writer: the dedicated thread's join
+/// handle, the idle-wake ticker task, and the completion notice the
+/// shutdown side awaits. `join` is never waited on — it exists to own
+/// the thread's lifetime token, released by detach once `done`
+/// proves the work finished; `ticker` is a companion the retire path
+/// aborts, not an input the drain depends on.
+pub(super) struct FileWriterSpawn {
+    pub(super) join: std::thread::JoinHandle<()>,
+    pub(super) ticker: tokio::task::JoinHandle<()>,
+    pub(super) done: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Spawn the dedicated file-writer thread plus its idle-wake ticker.
+/// The thread owns the sink and the intake receiver — one thread per
+/// logger for the logger's whole life, never a thread or blocking
+/// task per event. Fails only if the OS refuses the thread spawn; the
+/// opened sink is then dropped by the caller with the writer never
+/// having existed.
+pub(super) fn spawn_file_writer<S, C>(
+    tx: &mpsc::Sender<WriterItem>,
+    rx: mpsc::Receiver<WriterItem>,
+    core: WriterCore<S, C>,
+) -> std::io::Result<FileWriterSpawn>
+where
+    S: AuditSink + 'static,
+    C: AuditClock,
+{
+    let clock = core.clock.clone();
+    // The writer's earliest deadline, reposted after every processed
+    // item — the ticker re-arms on it so an idle queue's deadline is
+    // serviced on the clock's own schedule.
+    let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(core.next_deadline());
+    // At most one tick outstanding: the flag is claimed before the
+    // send and cleared when the writer dequeues the tick, so wake
+    // traffic can never pile up inside the bounded queue.
+    let tick_pending = std::sync::Arc::new(AtomicBool::new(false));
+    let ticker = tokio::spawn(deadline_ticker(
+        clock,
+        deadline_rx,
+        tx.downgrade(),
+        tick_pending.clone(),
+    ));
+    let (done_tx, done) = tokio::sync::oneshot::channel();
+    let join = match std::thread::Builder::new()
+        .name("mcp-writ-audit".to_string())
+        .spawn(move || {
+            file_writer_thread(rx, core, deadline_tx, tick_pending, done_tx);
+        }) {
+        Ok(join) => join,
+        Err(e) => {
+            ticker.abort();
+            return Err(e);
+        }
+    };
+    Ok(FileWriterSpawn { join, ticker, done })
+}
+
+/// Latches the writer's failure flag if the thread dies without
+/// reaching its disarm point — a panic unwinding out of the driver
+/// must still notify every `failure_watch` subscriber, not just the
+/// `done` waiter: an abnormal exit is a fault whether or not anyone
+/// is currently awaiting the completion notice.
+struct WriterFaultGuard {
+    flag: FailureFlag,
+    armed: bool,
+}
+
+impl Drop for WriterFaultGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.set();
+        }
+    }
+}
+
+/// The blocking driver over [`WriterCore`], running on the writer's
+/// dedicated thread: the queue supplies the order through
+/// `blocking_recv`; the core supplies every durability decision.
+/// Channel close — all senders dropped — is the shutdown request's
+/// position: the queue drains, the terminal durable commit and
+/// visible-entry proof run, the sink handles release, and only then
+/// does `done` report the end of life. In-flight OS I/O cannot be
+/// interrupted, so nothing here is on a timeout: an incomplete drain
+/// is never reported as a completion.
+fn file_writer_thread<S: AuditSink, C: AuditClock>(
     mut rx: mpsc::Receiver<WriterItem>,
     mut core: WriterCore<S, C>,
+    deadline_tx: tokio::sync::watch::Sender<Instant>,
+    tick_pending: std::sync::Arc<AtomicBool>,
+    done_tx: tokio::sync::oneshot::Sender<()>,
 ) {
-    let clock = core.clock.clone();
-    // The idle wake: one armed sleep per deadline, re-armed only when
-    // the core's earliest deadline moves — after the arm's own service
-    // or a boundary service inside the record/control path. Under a
-    // busy queue it sits armed-but-unpolled (`biased` reaches it only
-    // when `recv` pends), so a sustained record stream costs no
-    // per-item sleep allocation either.
-    let mut sleep_deadline = core.next_deadline();
-    let mut sleep = clock.sleep_until(sleep_deadline);
-    loop {
-        tokio::select! {
-            biased;
-
-            item = rx.recv() => {
-                match item {
-                    Some(WriterItem::Record(item)) => core.handle_record(*item),
-                    Some(WriterItem::Control(req)) => core.handle_control(req),
-                    None => {
-                        core.drain_finish();
-                        return;
-                    }
-                }
-            }
-            // The idle wake only: deadline service also runs inside
-            // `handle_record` every CLOCK_CHECK_RECORDS, so this arm
-            // is what keeps an *empty* queue punctual — never what a
-            // busy queue waits on.
-            _ = sleep.as_mut() => {
+    // Armed until the driver finishes normally — unwinding past it
+    // means the writer died without its completion notice, and the
+    // fault must latch before the thread does.
+    let mut fault = WriterFaultGuard {
+        flag: core.writer_failed.clone(),
+        armed: true,
+    };
+    let mut posted = core.next_deadline();
+    // The stop delay a shutdown waits out starts at intake closure —
+    // the queued commits and the final sync all ride the window, not
+    // just `drain_finish`'s tail.
+    #[cfg(feature = "measure")]
+    let mut drain_start: Option<Instant> = None;
+    while let Some(item) = rx.blocking_recv() {
+        #[cfg(feature = "measure")]
+        if drain_start.is_none() && rx.is_closed() {
+            drain_start = Some(core.clock.now());
+        }
+        match item {
+            WriterItem::Record(item) => core.handle_record(*item),
+            WriterItem::Control(req) => core.handle_control(req),
+            // The idle wake lands here, in queue order like every
+            // other item — it carries no payload, so servicing due
+            // deadlines at its position reorders nothing.
+            WriterItem::Tick => {
+                tick_pending.store(false, Ordering::SeqCst);
                 core.service_due_deadlines();
             }
         }
-        // Re-arm the wake whenever the earliest deadline moved — a
-        // fired arm's service and a record/control boundary service
-        // both push it forward. `service_due_deadlines` always
-        // advances the schedule past `now`, so a completed arm always
-        // re-arms.
-        if core.next_deadline() != sleep_deadline {
-            sleep_deadline = core.next_deadline();
-            sleep = clock.sleep_until(sleep_deadline);
+        // Repost the earliest deadline whenever the last service
+        // moved it — the ticker re-arms on each new value, so one
+        // posted instant maps to at most the pending tick's own wait.
+        let deadline = core.next_deadline();
+        if deadline != posted {
+            posted = deadline;
+            let _ = deadline_tx.send(deadline);
+        }
+    }
+    // A close observed with an empty queue never entered the loop —
+    // the drain window is only the terminal commit then.
+    #[cfg(feature = "measure")]
+    let drain_start = drain_start.unwrap_or_else(|| core.clock.now());
+    core.drain_finish();
+    #[cfg(feature = "measure")]
+    let drain_clock = core.clock.clone();
+    // The sink's file and directory handles release ahead of the
+    // completion notice — shutdown's `done` wait observes the end
+    // result only after the drain, the final sync, and the handle
+    // release all happened.
+    drop(core);
+    drop(rx);
+    #[cfg(feature = "measure")]
+    crate::measure::observe(
+        &crate::measure::AUDIT_DRAIN_NS,
+        drain_clock
+            .now()
+            .saturating_duration_since(drain_start)
+            .as_nanos()
+            .min(u64::MAX as u128) as u64,
+    );
+    let _ = done_tx.send(());
+    // The completion notice is out — reaching here is a normal end,
+    // not a fault the flag should remember.
+    fault.armed = false;
+}
+
+/// The idle-wake companion for [`file_writer_thread`]: the writer
+/// posts its earliest deadline; when the injected clock reaches it,
+/// the ticker lands a [`WriterItem::Tick`] in the same queue so the
+/// blocking thread wakes for deadline service. The weak sender keeps
+/// the ticker from holding the channel open — the writer's drain
+/// still keys on the last real sender dropping — and upgrade failing
+/// is the all-senders-gone case, where no tick is needed anyway.
+/// Runs until the deadline watch closes (writer exit) or the task is
+/// aborted (explicit retire).
+async fn deadline_ticker<C: AuditClock>(
+    clock: C,
+    mut deadline_rx: tokio::sync::watch::Receiver<Instant>,
+    weak_tx: mpsc::WeakSender<WriterItem>,
+    tick_pending: std::sync::Arc<AtomicBool>,
+) {
+    loop {
+        let deadline = *deadline_rx.borrow_and_update();
+        tokio::select! {
+            _ = clock.sleep_until(deadline) => {
+                // Claim the single outstanding-tick slot before
+                // sending; a failed claim means a tick is already in
+                // flight, a failed send means the queue cannot take
+                // it — either way the flag returns to clear.
+                if !tick_pending.swap(true, Ordering::SeqCst) {
+                    let sent = weak_tx
+                        .upgrade()
+                        .is_some_and(|tx| tx.try_send(WriterItem::Tick).is_ok());
+                    if !sent {
+                        tick_pending.store(false, Ordering::SeqCst);
+                    }
+                }
+                // Re-arm only once the writer's service moved the
+                // deadline — re-ticking the same instant would spin,
+                // and a dropped tick already implies the busy path
+                // carries the due service.
+                if deadline_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+            changed = deadline_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -759,10 +934,11 @@ pub(super) async fn tracing_writer_task(
 ) {
     while let Some(item) = rx.recv().await {
         let WriterItem::Record(item) = item else {
-            // A control request never reaches this task — `reopen()`
-            // answers `false` before queueing on a non-file sink.
-            // A stray one must drop its reply anyway: acknowledging it
-            // would mean reporting a rotation nothing performed.
+            // Non-record items never reach this task — `reopen()`
+            // answers `false` before queueing on a non-file sink, and
+            // only the file writer's ticker posts ticks. A stray
+            // control item must drop its reply anyway: acknowledging
+            // it would mean reporting a rotation nothing performed.
             continue;
         };
         let AuditItem {

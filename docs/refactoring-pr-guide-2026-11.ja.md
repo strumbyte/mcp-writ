@@ -431,13 +431,13 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 
 **タスク**
 
-- [ ] RF03後の受付順、制御barrier、byte permit、ACK、失敗ラッチ、停止手順を基準にする。writer所有物とasync側が必要とする結果を列挙する。
-- [ ] file sink・writer buffer・同期I/Oの所有権を一つの専用スレッドへ移す。イベントごとにスレッドやblocking taskを生成せず、loggerの寿命とwriterの寿命を対応付ける。
-- [ ] async側は有界受付と完了通知を使い、writer終了待ちの同期joinで実行workerをブロックしない。既存のbackpressureとpermit解放を維持する。
-- [ ] 受付停止 → 受理済みqueueのdrain → 最終同期・可視性確認 → ハンドル解放 → 終了結果通知の順を明示する。送信者がすべて切断した場合と明示shutdownの双方を扱う。
-- [ ] writerの異常終了、未完了ACK、回転中shutdown、低速sink、送信者cancelを検査する。失敗が全待機者へ伝わり、未同期ACKが成功にならないことを確認する。
-- [ ] 実行中のOS I/Oは任意に中断できない前提で停止遅延を報告する。timeoutで失敗ラッチを解除したり、未完了drainを成功にしたりしない。
-- [ ] RF03の順序・公平性回帰を、RF03で導入した時計・sinkの注入を変えずに新worker上で実行し、非監査heartbeat／RPCと監査同期・終了を別々に測定する。
+- [x] RF03後の受付順、制御barrier、byte permit、ACK、失敗ラッチ、停止手順を基準にする。writer所有物とasync側が必要とする結果を列挙する。
+- [x] file sink・writer buffer・同期I/Oの所有権を一つの専用スレッドへ移す。イベントごとにスレッドやblocking taskを生成せず、loggerの寿命とwriterの寿命を対応付ける。
+- [x] async側は有界受付と完了通知を使い、writer終了待ちの同期joinで実行workerをブロックしない。既存のbackpressureとpermit解放を維持する。
+- [x] 受付停止 → 受理済みqueueのdrain → 最終同期・可視性確認 → ハンドル解放 → 終了結果通知の順を明示する。送信者がすべて切断した場合と明示shutdownの双方を扱う。
+- [x] writerの異常終了、未完了ACK、回転中shutdown、低速sink、送信者cancelを検査する。失敗が全待機者へ伝わり、未同期ACKが成功にならないことを確認する。
+- [x] 実行中のOS I/Oは任意に中断できない前提で停止遅延を報告する。timeoutで失敗ラッチを解除したり、未完了drainを成功にしたりしない。
+- [x] RF03の順序・公平性回帰を、RF03で導入した時計・sinkの注入を変えずに新worker上で実行し、非監査heartbeat／RPCと監査同期・終了を別々に測定する。
 
 **維持する条件:** 耐久ACK、親ディレクトリ同期、sink identity、失敗ラッチ、回転順序、drop／backpressure、全件drainを維持する。group commitや`--audit-sync`の同期頻度変更は含めない。
 

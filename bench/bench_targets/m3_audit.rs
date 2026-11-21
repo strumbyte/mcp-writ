@@ -23,6 +23,25 @@
 //! `reopen()`'s writer-side path is shared code and runs on both
 //! hosts, but the recorded OS marks which value is a product
 //! measurement vs. smoke.
+//!
+//! RF06 adds `heartbeat_delay_ns`: a fixed number of audit-unrelated
+//! tasks (`--heartbeats`, default 4) each loop a `--heartbeat-ms`
+//! sleep (default 1 ms) on the same runtime while the producers run,
+//! recording every wake's lateness. A synchronous `write`/`fsync`
+//! executed inside a runtime task parks a worker for the I/O's whole
+//! duration — audit-unrelated wakes then queue behind it and the
+//! p95/p99 tail shows it; the dedicated writer thread takes that I/O
+//! off the executor, so the same load should leave the probe's tail
+//! flat. The `--every-event` sync-mode is the slow-sink condition:
+//! every record pays a flush + `sync_all` on the writer's own
+//! execution unit. `--spins N` (default 0) adds a sharper probe:
+//! N audit-unrelated tasks looping `yield_now` and sampling every
+//! 1024th yield-to-repoll gap — worker availability directly,
+//! without the OS timer granularity the sleep probe bottoms out in.
+//! On a small `--workers` pool with constant sync I/O, an occupied
+//! worker shows up as the spin gap's tail stretching to the I/O's
+//! own length; a dedicated writer thread keeps the gaps at
+//! scheduling-jitter scale.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -57,6 +76,29 @@ fn reopen_marker(_: Option<String>) -> AuditEvent {
         Severity::Info,
         Outcome::Success,
         Action::Observed,
+    )
+}
+
+/// p50/p95/p99/max over the heartbeat-delay samples — the shared
+/// `quantiles` stops at p95 and the RF06 report needs the p99 tail.
+fn delay_quantiles(samples: &[u64]) -> String {
+    if samples.is_empty() {
+        return "null".to_string();
+    }
+    let mut s = samples.to_vec();
+    s.sort_unstable();
+    let at = |f: f64| s[((s.len() - 1) as f64 * f) as usize];
+    let sum: u128 = s.iter().map(|v| *v as u128).sum();
+    format!(
+        "{{\"count\":{},\"min_ns\":{},\"p50_ns\":{},\"p95_ns\":{},\
+         \"p99_ns\":{},\"max_ns\":{},\"mean_ns\":{}}}",
+        s.len(),
+        s[0],
+        at(0.50),
+        at(0.95),
+        at(0.99),
+        s[s.len() - 1],
+        sum / s.len() as u128
     )
 }
 
@@ -130,6 +172,20 @@ fn main() {
     // it by default so an overdue timer can actually be observed;
     // `--busy-secs 0` restores the old send-and-drain shape.
     let mut busy_secs = 7u64;
+    // Non-audit responsiveness probe: `--heartbeats` unrelated tasks
+    // each wake every `--heartbeat-ms` during the load window; their
+    // lateness is the RF06 worker-occupation signal. `--workers`
+    // sizes the runtime pool — on a pool much larger than the load
+    // one occupied worker is absorbed and the signal stays flat;
+    // a small pool is where synchronous writer I/O can actually
+    // starve unrelated wakes.
+    let mut heartbeats = 4usize;
+    let mut heartbeat_ms = 1u64;
+    // Sharper occupancy probe: `--spins N` yield-loops sampling every
+    // 1024th repoll gap — no timer granularity between the stall and
+    // the sample.
+    let mut spins = 0usize;
+    let mut workers = 0usize;
     let mut dir_arg: Option<std::path::PathBuf> = None;
     let mut it = extra.iter();
     while let Some(a) = it.next() {
@@ -142,6 +198,17 @@ fn main() {
                 busy_secs = it.next().and_then(|v| v.parse().ok()).unwrap_or(busy_secs)
             }
             "--every-event" => every_event = true,
+            "--heartbeats" => {
+                heartbeats = it.next().and_then(|v| v.parse().ok()).unwrap_or(heartbeats)
+            }
+            "--heartbeat-ms" => {
+                heartbeat_ms = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(heartbeat_ms)
+            }
+            "--workers" => workers = it.next().and_then(|v| v.parse().ok()).unwrap_or(workers),
+            "--spins" => spins = it.next().and_then(|v| v.parse().ok()).unwrap_or(spins),
             "--dir" => dir_arg = it.next().map(std::path::PathBuf::from),
             other => {
                 eprintln!("m3_audit: unknown target argument {other}");
@@ -176,10 +243,12 @@ fn main() {
         dir.join(format!("m3-bench-{}", std::process::id()))
     };
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+    rt_builder.enable_all();
+    if workers > 0 {
+        rt_builder.worker_threads(workers);
+    }
+    let rt = rt_builder.build().expect("tokio runtime");
     std::fs::create_dir_all(&run_dir).expect("temp dir");
     let log_path = run_dir.join("audit.jsonl");
 
@@ -191,6 +260,9 @@ fn main() {
         sent,
         sync_start_delay_load,
         sync_start_delay_complete,
+        heartbeat_delay,
+        spin_delay,
+        spin_stall,
         dropped,
         failed,
     ) = rt.block_on(async {
@@ -219,6 +291,39 @@ fn main() {
         let per = events / producers;
         let rem = events % producers;
         let busy = std::time::Duration::from_secs(busy_secs);
+        // The RF06 probe: audit-unrelated heartbeats looping a
+        // fixed-period sleep on the same runtime for the whole load
+        // window. Each wake records its lateness — where synchronous
+        // sink I/O runs decides whether audit work can stall these
+        // wakes at all. The stop signal interrupts the sleep itself,
+        // so teardown joins promptly instead of waiting out a full
+        // period.
+        let hb_samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let (hb_stop, _) = tokio::sync::watch::channel(false);
+        let hb_period = std::time::Duration::from_millis(heartbeat_ms.max(1));
+        let mut hb_handles = Vec::with_capacity(heartbeats);
+        for _ in 0..heartbeats {
+            let samples = hb_samples.clone();
+            let mut stop_rx = hb_stop.subscribe();
+            hb_handles.push(tokio::spawn(async move {
+                let mut expected = std::time::Instant::now() + hb_period;
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(expected.into()) => {
+                            let now = std::time::Instant::now();
+                            samples.lock().unwrap().push(
+                                now.saturating_duration_since(expected).as_nanos() as u64,
+                            );
+                            // Owed periods are not replayed — a wake
+                            // stalled past its own period already
+                            // recorded the lateness once.
+                            expected = (expected + hb_period).max(now + hb_period);
+                        }
+                        _ = stop_rx.changed() => break,
+                    }
+                }
+            }));
+        }
         let t0 = Instant::now();
         let mut handles = Vec::with_capacity(producers);
         for p in 0..producers {
@@ -235,16 +340,60 @@ fn main() {
                 sent
             }));
         }
+        // Optional spin probe: each yield requeues the task — the
+        // repoll gap is exactly "how long an unrelated runnable task
+        // waited for a free worker", the direct RF06 signal with no
+        // timer between. Every 1024th gap is sampled uniformly so the
+        // quantiles reflect the real gap distribution; gaps stalled
+        // past 100 µs are also recorded in a separate stall list so a
+        // fully blocked probe still leaves its evidence without
+        // skewing the uniform sample.
+        let sp_samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let sp_stall = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let mut sp_handles = Vec::with_capacity(spins);
+        for _ in 0..spins {
+            let samples = sp_samples.clone();
+            let stalls = sp_stall.clone();
+            let stop_rx = hb_stop.subscribe();
+            sp_handles.push(tokio::spawn(async move {
+                let mut n = 0u64;
+                while !*stop_rx.borrow() {
+                    let t = std::time::Instant::now();
+                    tokio::task::yield_now().await;
+                    let gap = t.elapsed().as_nanos() as u64;
+                    n += 1;
+                    if n & 1023 == 0 {
+                        samples.lock().unwrap().push(gap);
+                    }
+                    if gap > 100_000 {
+                        stalls.lock().unwrap().push(gap);
+                    }
+                }
+            }));
+        }
         let mut sent = 0u64;
         for h in handles {
             sent += h.await.expect("producer task");
         }
         let enqueue_ns = t0.elapsed().as_nanos() as u64;
+        // The drain window starts at production end — the probe
+        // teardown below runs while the writer keeps draining and is
+        // part of the time the queue takes to empty.
+        let t1 = Instant::now();
+        let _ = hb_stop.send(true);
+        for h in hb_handles {
+            let _ = h.await;
+        }
+        for h in sp_handles {
+            let _ = h.await;
+        }
+        let heartbeat_delay = delay_quantiles(&hb_samples.lock().unwrap());
+        let spin_delay = delay_quantiles(&sp_samples.lock().unwrap());
+        let spin_stall = delay_quantiles(&sp_stall.lock().unwrap());
 
         // Drain: the writer reports consumption through the measure
         // façade's dequeued counter; saturation drops count toward
         // sent-without-durability the same way.
-        let t1 = Instant::now();
         loop {
             let dequeued = mcp_writ::measure::snapshot()
                 .counters
@@ -322,6 +471,9 @@ fn main() {
             sent,
             sync_start_delay_load,
             sync_start_delay_complete,
+            heartbeat_delay,
+            spin_delay,
+            spin_stall,
             dropped,
             failed,
         )
@@ -331,9 +483,13 @@ fn main() {
     let report = format!(
         "{{\"target\":\"m3_audit\",\"events\":{events},\"producers\":{producers},\
          \"busy_secs\":{busy_secs},\"sent\":{sent},\
+         \"heartbeats\":{heartbeats},\"heartbeat_ms\":{heartbeat_ms},\
+         \"workers\":{workers},\"spins\":{spins},\
+         \"spin_delay_ns\":{spin_delay},\"spin_stall_ns\":{spin_stall},\
          \"sync_mode\":{},\"iterations\":{iterations},\"seed\":{seed},\
          \"os\":{},\"profile\":{},\"allow_replaceable_paths\":{opt_out},\
          \"enqueue_ns\":{enqueue_ns},\"drain_ns\":{drain_ns},\
+         \"heartbeat_delay_ns\":{heartbeat_delay},\
          \"sync_start_delay_load_ns\":{sync_start_delay_load},\
          \"sync_start_delay_load_complete\":{sync_start_delay_complete},\
          \"reopen_ns\":{},\"dropped\":{dropped},\"writer_failed\":{failed},\
