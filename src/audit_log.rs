@@ -248,7 +248,10 @@ impl AuditLogger {
     /// Spawns the dedicated writer thread the sink lives on.
     ///
     /// Must be called within a Tokio runtime context — the writer's
-    /// idle-wake ticker is a task on the calling runtime. Keep the
+    /// idle-wake ticker is a task on the calling runtime — and the
+    /// runtime's time driver must be enabled (`Builder::enable_all`
+    /// or `enable_time`): startup arms the ticker's timer before
+    /// returning and refuses a runtime that cannot run it. Keep the
     /// logger within that runtime's lifetime: if the runtime shuts
     /// down first, records still drain on the writer's thread but the
     /// periodic idle sync stops being woken.
@@ -270,8 +273,10 @@ impl AuditLogger {
     /// every record as it is written instead of buffering a tail.
     ///
     /// Like [`AuditLogger::to_file`], this must be called within a
-    /// Tokio runtime context whose lifetime covers the logger's.
-    /// Returns `Err` if the OS refuses the writer's thread spawn; the
+    /// Tokio runtime context whose lifetime covers the logger's and
+    /// whose time driver is enabled (`enable_all`/`enable_time`).
+    /// Returns `Err` if the OS refuses the writer's thread spawn or
+    /// the calling runtime cannot arm the ticker's timer; the
     /// already-opened log file is left behind — possibly empty —
     /// because it may pre-date this call and removing it could delete
     /// a log the caller still owns. Dropping every clone of the logger
@@ -831,6 +836,13 @@ impl AuditLogger {
     /// fail-closed run paths fold the error into the command's
     /// outcome/exit status.
     pub async fn shutdown(&self) -> Result<(), crate::error::AuditorError> {
+        // The end state is locked ahead of the intake close so the
+        // drain's start can be stamped in the same critical section
+        // the sender is taken in — the writer measures `audit.drain.ns`
+        // from that stamp, not from its own later `is_closed()`
+        // observation which trails whatever in-flight write kept the
+        // channel open.
+        let mut end_lock = self.inner.writer_end.lock().await;
         // Drop the sender to close the queue — the shutdown request's
         // position in the same acceptance order: everything already
         // queued, records and control alike, is drained before the
@@ -838,7 +850,20 @@ impl AuditLogger {
         // finds no live sink and never revives the writer.
         {
             let mut tx_lock = self.inner.tx.lock().unwrap();
-            tx_lock.take();
+            if tx_lock.is_some() {
+                // The first close stamps the drain's start; a retried
+                // shutdown finds no sender here and leaves the first
+                // stamp untouched.
+                #[cfg(feature = "measure")]
+                if let Some(WriterEnd::Thread(spawn)) = end_lock.as_ref() {
+                    spawn
+                        .drain_started
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(std::time::Instant::now);
+                }
+                tx_lock.take();
+            }
         }
         // Reopen calls parked on the control reserve wake to a failed
         // acquire — `reopen()` reports it as no live sink (`Ok(false)`),
@@ -856,7 +881,6 @@ impl AuditLogger {
         // cancelling this future leaves it for the next shutdown()
         // call to resume; only a completed wait removes it.
         let mut join_err = false;
-        let mut end_lock = self.inner.writer_end.lock().await;
         if let Some(end) = end_lock.as_mut() {
             match end {
                 WriterEnd::Thread(spawn) => {
@@ -920,6 +944,15 @@ impl Drop for AuditLoggerInner {
             self.writer_failed.set();
             match end {
                 WriterEnd::Thread(spawn) => {
+                    // The drop-side close is a drain start too — the
+                    // same stamp `shutdown()` writes, skipped when one
+                    // is already recorded.
+                    #[cfg(feature = "measure")]
+                    spawn
+                        .drain_started
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(std::time::Instant::now);
                     spawn.ticker.abort();
                     // Detach, never join: the thread may be parked in
                     // an uninterruptible OS I/O, and a synchronous

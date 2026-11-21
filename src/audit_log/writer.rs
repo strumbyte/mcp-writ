@@ -732,6 +732,13 @@ pub(super) struct FileWriterSpawn {
     pub(super) join: std::thread::JoinHandle<()>,
     pub(super) ticker: tokio::task::JoinHandle<()>,
     pub(super) done: tokio::sync::oneshot::Receiver<()>,
+    /// The intake-close instant the sender side records — shared with
+    /// the writer thread so `audit.drain.ns` can measure from the
+    /// close itself rather than the writer's later `is_closed()`
+    /// observation (which trails an in-flight write by that write's
+    /// whole duration). `None` until the first intake close.
+    #[cfg(feature = "measure")]
+    pub(super) drain_started: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 /// Spawn the dedicated file-writer thread plus its idle-wake ticker.
@@ -750,6 +757,19 @@ where
     C: AuditClock,
 {
     let clock = core.clock.clone();
+    // The ticker's timer arm is the one place a clock panic can hide:
+    // `sleep_until` futures panic on first poll — `TokioClock`'s does
+    // when the calling runtime has no time driver — and the spawned
+    // task's `JoinError` is never observed (retirement is `abort`,
+    // never an await). Arm once here so a timer the runtime cannot
+    // run fails the spawn instead of silently leaving the writer
+    // without its periodic idle service.
+    if !timer_armable(&clock) {
+        return Err(std::io::Error::other(
+            "audit writer idle timer failed to arm — \
+             a Tokio runtime with the time driver enabled is required",
+        ));
+    }
     // The writer's earliest deadline, reposted after every processed
     // item — the ticker re-arms on it so an idle queue's deadline is
     // serviced on the clock's own schedule.
@@ -765,10 +785,28 @@ where
         tick_pending.clone(),
     ));
     let (done_tx, done) = tokio::sync::oneshot::channel();
+    // Shared with the sender side: `shutdown()` and the logger's
+    // final drop stamp the intake's close here — the drain window
+    // then includes the wait for whatever in-flight write kept
+    // `is_closed()` from flipping.
+    #[cfg(feature = "measure")]
+    let drain_started = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
     let join = match std::thread::Builder::new()
         .name("mcp-writ-audit".to_string())
-        .spawn(move || {
-            file_writer_thread(rx, core, deadline_tx, tick_pending, done_tx);
+        .spawn({
+            #[cfg(feature = "measure")]
+            let drain_started = drain_started.clone();
+            move || {
+                file_writer_thread(
+                    rx,
+                    core,
+                    deadline_tx,
+                    tick_pending,
+                    done_tx,
+                    #[cfg(feature = "measure")]
+                    drain_started,
+                );
+            }
         }) {
         Ok(join) => join,
         Err(e) => {
@@ -776,7 +814,30 @@ where
             return Err(e);
         }
     };
-    Ok(FileWriterSpawn { join, ticker, done })
+    Ok(FileWriterSpawn {
+        join,
+        ticker,
+        done,
+        #[cfg(feature = "measure")]
+        drain_started,
+    })
+}
+
+/// One poll of the clock's own `sleep_until`, under `catch_unwind`:
+/// the arm can only panic where `tokio::time`'s timer is missing —
+/// polling a `Sleep` outside a runtime or on one built without
+/// `enable_time` — so a single poll probes exactly the failure the
+/// spawned ticker could not report. A no-op waker is enough: the
+/// probe deadline is `now`, so a working arm resolves immediately
+/// and a panicking one is caught. Constructing the future inside the
+/// same unwind boundary covers clocks that panic at build time.
+fn timer_armable<C: AuditClock>(clock: &C) -> bool {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut sleep = clock.sleep_until(clock.now());
+        sleep.as_mut().poll(&mut cx)
+    }))
+    .is_ok()
 }
 
 /// Latches the writer's failure flag if the thread dies without
@@ -812,6 +873,7 @@ fn file_writer_thread<S: AuditSink, C: AuditClock>(
     deadline_tx: tokio::sync::watch::Sender<Instant>,
     tick_pending: std::sync::Arc<AtomicBool>,
     done_tx: tokio::sync::oneshot::Sender<()>,
+    #[cfg(feature = "measure")] drain_started: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
 ) {
     // Armed until the driver finishes normally — unwinding past it
     // means the writer died without its completion notice, and the
@@ -823,7 +885,11 @@ fn file_writer_thread<S: AuditSink, C: AuditClock>(
     let mut posted = core.next_deadline();
     // The stop delay a shutdown waits out starts at intake closure —
     // the queued commits and the final sync all ride the window, not
-    // just `drain_finish`'s tail.
+    // just `drain_finish`'s tail. The writer's own `is_closed()`
+    // observation is the fallback: the sender side stamps the close
+    // itself in `drain_started`, an earlier instant whenever an
+    // in-flight write kept the channel open past the shutdown's own
+    // sender drop.
     #[cfg(feature = "measure")]
     let mut drain_start: Option<Instant> = None;
     while let Some(item) = rx.blocking_recv() {
@@ -851,10 +917,19 @@ fn file_writer_thread<S: AuditSink, C: AuditClock>(
             let _ = deadline_tx.send(deadline);
         }
     }
-    // A close observed with an empty queue never entered the loop —
-    // the drain window is only the terminal commit then.
+    // The drain window opens at the earlier of the sender's
+    // intake-close stamp and the writer's first post-close dequeue —
+    // so the time `blocking_recv` kept pulling queued work while an
+    // in-flight write held the channel open counts toward
+    // `audit.drain.ns`. A close observed with an empty queue and no
+    // stamp never entered the loop — the drain window is only the
+    // terminal commit then.
     #[cfg(feature = "measure")]
-    let drain_start = drain_start.unwrap_or_else(|| core.clock.now());
+    let drain_start = [drain_start, *drain_started.lock().unwrap()]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or_else(|| core.clock.now());
     core.drain_finish();
     #[cfg(feature = "measure")]
     let drain_clock = core.clock.clone();

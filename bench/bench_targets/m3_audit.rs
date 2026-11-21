@@ -102,6 +102,44 @@ fn delay_quantiles(samples: &[u64]) -> String {
     )
 }
 
+/// Strip the verbatim `\\?\`/`\\?\UNC\` prefix Windows `canonicalize`
+/// adds — spelled through the device namespace, every candidate looks
+/// like the share root the UNC refusal below must reject, so without
+/// the strip the auto-select skips them all and always panics.
+/// `\\?\UNC\server\share` maps back to `\\server\share`, which the
+/// refusal still sees as UNC. Rebuilds from `Component` pieces —
+/// never through `to_string_lossy` — so a name holding an unpaired
+/// WTF-16 surrogate survives instead of being mangled into U+FFFD.
+#[cfg(windows)]
+fn plain_spelling(path: std::path::PathBuf) -> std::path::PathBuf {
+    use std::ffi::OsString;
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path;
+    };
+    let head: OsString = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => format!(r"{}:\", drive as char).into(),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut head = OsString::from(r"\\");
+            head.push(server);
+            head.push(r"\");
+            head.push(share);
+            head
+        }
+        _ => return path,
+    };
+    // `head` already carries the root — pushing `RootDir` would
+    // replace the drive/share instead of joining under it.
+    let mut rebuilt = std::path::PathBuf::from(head);
+    for component in components {
+        if !matches!(component, Component::RootDir) {
+            rebuilt.push(component.as_os_str());
+        }
+    }
+    rebuilt
+}
+
 /// First candidate root every ancestor of which passes
 /// `fspriv::require_parent_write_restricted` — the test harness's
 /// `restricted_tempdir` selection re-done over public APIs (temp,
@@ -122,6 +160,10 @@ fn private_sink_dir() -> std::path::PathBuf {
         let Ok(base) = base.canonicalize() else {
             continue;
         };
+        // Device-namespace spellings must come off before the UNC
+        // refusal — `\\?\C:\...` is a plain drive path, not a share.
+        #[cfg(windows)]
+        let base = plain_spelling(base);
         #[cfg(windows)]
         if base.to_string_lossy().starts_with(r"\\") {
             continue;
@@ -308,7 +350,14 @@ fn main() {
             hb_handles.push(tokio::spawn(async move {
                 let mut expected = std::time::Instant::now() + hb_period;
                 loop {
+                    // `biased` polls the timer ahead of the stop
+                    // signal: a stop that lands while a wake is
+                    // already owed still records that last lateness
+                    // sample once — the handler pushes `expected`
+                    // past `now`, so the next poll sees the timer
+                    // pending and the stop arm breaks promptly.
                     tokio::select! {
+                        biased;
                         _ = tokio::time::sleep_until(expected.into()) => {
                             let now = std::time::Instant::now();
                             samples.lock().unwrap().push(
@@ -387,9 +436,6 @@ fn main() {
         for h in sp_handles {
             let _ = h.await;
         }
-        let heartbeat_delay = delay_quantiles(&hb_samples.lock().unwrap());
-        let spin_delay = delay_quantiles(&sp_samples.lock().unwrap());
-        let spin_stall = delay_quantiles(&sp_stall.lock().unwrap());
 
         // Drain: the writer reports consumption through the measure
         // façade's dequeued counter; saturation drops count toward
@@ -411,6 +457,12 @@ fn main() {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         let drain_ns = t1.elapsed().as_nanos() as u64;
+        // Probe analysis runs after the drain endpoint — its compute
+        // time must not count toward the measured drain window. The
+        // samples are final already: the probe tasks joined above.
+        let heartbeat_delay = delay_quantiles(&hb_samples.lock().unwrap());
+        let spin_delay = delay_quantiles(&sp_samples.lock().unwrap());
+        let spin_stall = delay_quantiles(&sp_stall.lock().unwrap());
 
         // A periodic fsync deadline passes every 5 s of writer
         // uptime, and `audit.sync.start_delay.ns` is recorded only

@@ -923,9 +923,9 @@ async fn test_accepted_control_processed_after_caller_cancel() {
         TEST_SESSION.to_string(),
         PathBuf::from(TEST_PATH),
     );
-    let writer = spawn_file_writer(&tx, rx, core).unwrap();
-    // Queue the control item directly, then drop its reply receiver —
-    // the caller is gone before the writer reaches it.
+    // Queue the control item and drop its reply receiver *before* the
+    // writer starts — the request is guaranteed to be processed with
+    // its caller already gone, not merely racing the dequeue.
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send(WriterItem::Control(ControlRequest::Reopen(ReopenRequest {
         reply: reply_tx,
@@ -938,6 +938,7 @@ async fn test_accepted_control_processed_after_caller_cancel() {
     .await
     .unwrap();
     drop(reply_rx);
+    let writer = spawn_file_writer(&tx, rx, core).unwrap();
     drop(tx);
     writer.done.await.unwrap();
     let ops: Vec<(usize, SinkOp)> = op_rx.iter().collect();
@@ -1615,6 +1616,27 @@ async fn test_sink_io_does_not_occupy_runtime_worker() {
     let logger = fake_logger(sink, ManualClock::new(), 8, true);
     logger.log_ordered(make_test_event()).await.unwrap();
     gate_entered(entered_rx).await;
+    // The wedge watchdog, on a plain OS thread outside the runtime:
+    // the regression this test detects would park the sole executor
+    // thread inside `FakeSink::write_record`'s `recv()` — a blocking
+    // wait with no wake — so every Tokio-side timeout below would
+    // sleep forever with it and `release_tx` would never fire to
+    // unwedge it. The probes' timeouts still bound a merely-slow
+    // healthy run; this bound is the one that survives the executor
+    // stopping outright — expiring before `release_tx` sends fails
+    // the whole binary rather than hanging it.
+    let (watchdog_tx, watchdog_rx) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            watchdog_rx.recv_timeout(Duration::from_secs(60))
+        {
+            eprintln!(
+                "audit writer isolation watchdog expired — the runtime's \
+                 only worker never progressed past the gated sink I/O"
+            );
+            std::process::abort();
+        }
+    });
     // The writer thread is parked inside the sink's blocking I/O.
     // An audit-unrelated task on the same worker must still run —
     // the bounded timeout converts "the worker is stuck" into a
@@ -1637,6 +1659,10 @@ async fn test_sink_io_does_not_occupy_runtime_worker() {
     )
     .await
     .expect("timers keep firing while the writer's I/O blocks");
+    // The probes passed while the writer was still gated — the gate
+    // window is over, so disarm the watchdog before releasing it.
+    drop(watchdog_tx);
+    watchdog.join().unwrap();
     release_tx.send(()).unwrap();
     let _ = logger.shutdown().await;
 }
