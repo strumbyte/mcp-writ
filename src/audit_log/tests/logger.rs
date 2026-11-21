@@ -4,16 +4,18 @@
 
 use std::path::Path;
 
+use super::super::writer::AuditSink;
 use super::super::*;
 use super::{make_test_dir, make_test_event};
 use uuid::Uuid;
 
 // ─── AuditLogger integration tests ──────────────────────────────────────
 
-/// A file-sink fixture: a real file at `path` drained by a spawned
-/// `file_writer_task` over a `FileSink`/`TokioClock` core, behind an
-/// intake queue with `event_capacity` record slots. The logger is a
-/// real file-sink logger — `reopen()` routes through the same queue.
+/// A file-sink fixture: a real file at `path` drained by the
+/// dedicated writer thread over a `FileSink`/`TokioClock` core,
+/// behind an intake queue with `event_capacity` record slots. The
+/// logger is a real file-sink logger — `reopen()` routes through the
+/// same queue.
 fn file_sink_logger(path: &Path, event_capacity: usize, fail_closed: bool) -> AuditLogger {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -21,7 +23,7 @@ fn file_sink_logger(path: &Path, event_capacity: usize, fail_closed: bool) -> Au
         .open(path)
         .unwrap();
     let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
-    let (tx, rx) = mpsc::channel(event_capacity + CONTROL_QUEUE_CAPACITY);
+    let (tx, rx) = mpsc::channel(event_capacity + CONTROL_QUEUE_CAPACITY + TICK_QUEUE_RESERVE);
     let writer_failed = FailureFlag::new();
     let session_id = generate_session_id();
     let sink = FileSink::new(
@@ -39,16 +41,215 @@ fn file_sink_logger(path: &Path, event_capacity: usize, fail_closed: bool) -> Au
         session_id.clone(),
         path.to_path_buf(),
     );
-    let writer_handle = tokio::spawn(file_writer_task(rx, core));
+    let writer_end = WriterEnd::Thread(spawn_file_writer(&tx, rx, core).unwrap());
     super::assemble_logger(
         tx,
-        writer_handle,
+        writer_end,
         fail_closed,
         event_capacity,
         QUEUE_BYTE_BUDGET,
         true,
         writer_failed,
         session_id,
+    )
+}
+
+/// A `FileSink` wrapper whose first `write_record` parks until
+/// released — the dedicated writer thread sits inside the blocking
+/// I/O, so the intake queue cannot drain while a test fills it.
+struct GateSink {
+    inner: FileSink,
+    gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+}
+
+impl AuditSink for GateSink {
+    fn write_record(&mut self, line: &[u8]) -> std::io::Result<()> {
+        if let Some((entered, proceed)) = self.gate.take() {
+            let _ = entered.send(());
+            let _ = proceed.recv();
+        }
+        self.inner.write_record(line)
+    }
+    fn flush_buffer(&mut self) -> std::io::Result<()> {
+        self.inner.flush_buffer()
+    }
+    fn sync_file(&mut self) -> std::io::Result<()> {
+        self.inner.sync_file()
+    }
+    fn needs_dir_sync(&self) -> bool {
+        self.inner.needs_dir_sync()
+    }
+    fn sync_dir(&mut self) -> std::io::Result<()> {
+        self.inner.sync_dir()
+    }
+    fn entry_visible(&self, path: &Path) -> bool {
+        self.inner.entry_visible(path)
+    }
+    fn reopen(&mut self, path: &Path) -> std::io::Result<()> {
+        self.inner.reopen(path)
+    }
+}
+
+/// The `file_sink_logger` fixture behind the write gate — returns the
+/// logger plus the gate's entered/proceed ends, so the test can hold
+/// the writer inside its first write while it fills the queue.
+fn gated_file_sink_logger(
+    path: &Path,
+    event_capacity: usize,
+    fail_closed: bool,
+) -> (
+    AuditLogger,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
+    let (tx, rx) = mpsc::channel(event_capacity + CONTROL_QUEUE_CAPACITY + TICK_QUEUE_RESERVE);
+    let writer_failed = FailureFlag::new();
+    let session_id = generate_session_id();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let sink = GateSink {
+        inner: FileSink::new(
+            writer,
+            SinkAnchor {
+                dir: None,
+                leaf: None,
+            },
+        ),
+        gate: Some((entered_tx, release_rx)),
+    };
+    let core = WriterCore::new(
+        sink,
+        TokioClock,
+        writer_failed.clone(),
+        AuditSyncMode::Buffered,
+        session_id.clone(),
+        path.to_path_buf(),
+    );
+    let writer_end = WriterEnd::Thread(spawn_file_writer(&tx, rx, core).unwrap());
+    (
+        super::assemble_logger(
+            tx,
+            writer_end,
+            fail_closed,
+            event_capacity,
+            QUEUE_BYTE_BUDGET,
+            true,
+            writer_failed,
+            session_id,
+        ),
+        entered_rx,
+        release_tx,
+    )
+}
+
+/// A `FileSink` wrapper reporting each completed sink step — name
+/// plus success — over a std channel: the drop-drain test's
+/// completion signal. The drain tail runs flush → fsync →
+/// visible-entry proof in order on the writer thread, so a
+/// successful `entry_visible` report proves the final `sync_file`
+/// already finished — the file is complete before the test reads or
+/// removes it.
+struct OpReportSink {
+    inner: FileSink,
+    ops: std::sync::mpsc::Sender<(&'static str, bool)>,
+}
+
+impl OpReportSink {
+    fn report(&self, op: &'static str, ok: bool) {
+        let _ = self.ops.send((op, ok));
+    }
+}
+
+impl AuditSink for OpReportSink {
+    fn write_record(&mut self, line: &[u8]) -> std::io::Result<()> {
+        let result = self.inner.write_record(line);
+        self.report("write_record", result.is_ok());
+        result
+    }
+    fn flush_buffer(&mut self) -> std::io::Result<()> {
+        let result = self.inner.flush_buffer();
+        self.report("flush_buffer", result.is_ok());
+        result
+    }
+    fn sync_file(&mut self) -> std::io::Result<()> {
+        let result = self.inner.sync_file();
+        self.report("sync_file", result.is_ok());
+        result
+    }
+    fn needs_dir_sync(&self) -> bool {
+        self.inner.needs_dir_sync()
+    }
+    fn sync_dir(&mut self) -> std::io::Result<()> {
+        let result = self.inner.sync_dir();
+        self.report("sync_dir", result.is_ok());
+        result
+    }
+    fn entry_visible(&self, path: &Path) -> bool {
+        let visible = self.inner.entry_visible(path);
+        self.report("entry_visible", visible);
+        visible
+    }
+    fn reopen(&mut self, path: &Path) -> std::io::Result<()> {
+        let result = self.inner.reopen(path);
+        self.report("reopen", result.is_ok());
+        result
+    }
+}
+
+/// `file_sink_logger` over `OpReportSink` — returns the logger plus
+/// the receiver the test reads as the drain's completion signal.
+fn reported_file_sink_logger(
+    path: &Path,
+    event_capacity: usize,
+    fail_closed: bool,
+) -> (AuditLogger, std::sync::mpsc::Receiver<(&'static str, bool)>) {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
+    let (tx, rx) = mpsc::channel(event_capacity + CONTROL_QUEUE_CAPACITY + TICK_QUEUE_RESERVE);
+    let writer_failed = FailureFlag::new();
+    let session_id = generate_session_id();
+    let (ops_tx, ops_rx) = std::sync::mpsc::channel();
+    let sink = OpReportSink {
+        inner: FileSink::new(
+            writer,
+            SinkAnchor {
+                dir: None,
+                leaf: None,
+            },
+        ),
+        ops: ops_tx,
+    };
+    let core = WriterCore::new(
+        sink,
+        TokioClock,
+        writer_failed.clone(),
+        AuditSyncMode::Buffered,
+        session_id.clone(),
+        path.to_path_buf(),
+    );
+    let writer_end = WriterEnd::Thread(spawn_file_writer(&tx, rx, core).unwrap());
+    (
+        super::assemble_logger(
+            tx,
+            writer_end,
+            fail_closed,
+            event_capacity,
+            QUEUE_BYTE_BUDGET,
+            true,
+            writer_failed,
+            session_id,
+        ),
+        ops_rx,
     )
 }
 
@@ -318,7 +519,25 @@ async fn test_logger_backpressure_channel_full() {
     };
     let path = dir.join("bp.jsonl");
 
-    let logger = file_sink_logger(&path, 2, true);
+    // The writer parks inside the first record's write — the queue
+    // cannot drain while the test fills it, so permit exhaustion is
+    // deterministic instead of racing the sink's write speed.
+    let (logger, entered_rx, release_tx) = gated_file_sink_logger(&path, 2, true);
+    logger.log(make_test_event());
+    // The blocking closure's receive is bounded too — the outer
+    // timeout abandons the await but cannot cancel the parked
+    // `recv()`, so without its own deadline the spawned blocking
+    // task could outlive the test still waiting on the gate.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(10))
+        }),
+    )
+    .await
+    .expect("writer must reach the write gate")
+    .expect("spawn_blocking")
+    .expect("gate sender");
 
     for _ in 0..64 {
         logger.log(make_test_event());
@@ -329,6 +548,7 @@ async fn test_logger_backpressure_channel_full() {
     );
     assert!(logger.ensure_available().is_err());
 
+    release_tx.send(()).unwrap();
     let _ = logger.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -341,7 +561,21 @@ async fn test_logger_channel_full_best_effort_stays_available() {
     };
     let path = dir.join("bp.jsonl");
 
-    let logger = file_sink_logger(&path, 2, false);
+    // The writer parks inside the first record's write — the queue
+    // cannot drain while the submissions land, so the counted drops
+    // below are deterministic instead of racing the sink's speed.
+    let (logger, entered_rx, release_tx) = gated_file_sink_logger(&path, 2, false);
+    logger.log(make_test_event());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(10))
+        }),
+    )
+    .await
+    .expect("writer must reach the write gate")
+    .expect("spawn_blocking")
+    .expect("gate sender");
 
     for _ in 0..64 {
         logger.log(make_test_event());
@@ -364,6 +598,7 @@ async fn test_logger_channel_full_best_effort_stays_available() {
         "a saturated channel must leave a counted drop"
     );
 
+    release_tx.send(()).unwrap();
     let _ = logger.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -506,6 +741,65 @@ async fn test_logger_bounds_wire_fields() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+/// Dropping the logger without `shutdown()` is still a real stop
+/// position: the channel close tells the dedicated writer thread to
+/// drain, so the queued records reach the file even though nothing
+/// awaited — the drain is not aborted like the old task kill.
+#[tokio::test]
+async fn test_logger_drop_still_drains() {
+    let Some(dir) = make_test_dir("audit_drop_drain") else {
+        crate::testutil::skip_unless_required("no write-restricted root for audit fixture");
+        return;
+    };
+    let path = dir.join("drop.jsonl");
+    let ops_rx = {
+        let (logger, ops_rx) = reported_file_sink_logger(&path, 8, true);
+        for _ in 0..4 {
+            logger.log(make_test_event());
+        }
+        drop(logger);
+        ops_rx
+    };
+    // The drain finishes on the writer thread after the logger is
+    // gone. Its tail is flush → fsync → the visible-entry proof, so
+    // the sink's own `entry_visible` report — arrived after a
+    // successful `sync_file` — is the test's completion signal: the
+    // file is durably complete before it is read or removed. Every
+    // reported op must carry a success — a failed tail op means the
+    // drain did not really finish. A deadline bounds the wait;
+    // expiring is a drain failure, not a slow poll.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut saw_flush = false;
+    let mut saw_sync = false;
+    loop {
+        match ops_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok((op, ok)) => {
+                assert!(ok, "drain op {op} must report success");
+                match op {
+                    "flush_buffer" => saw_flush = true,
+                    "sync_file" => saw_sync = true,
+                    "entry_visible" => break,
+                    _ => {}
+                }
+            }
+            Err(e) => panic!("the dropped logger's drain did not finish: {e}"),
+        }
+    }
+    assert!(
+        saw_flush && saw_sync,
+        "the drain's final entry check must follow its flush and sync_file"
+    );
+    let lines = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert_eq!(
+        lines, 4,
+        "the dropped logger's drain must still commit the queued records"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The byte budget is the aggregate bound the count cap misses: a queue
 /// full of oversized records must refuse (counted drop) and latch the
 /// fail-closed fault — not grow memory unboundedly.
@@ -521,11 +815,11 @@ async fn test_logger_byte_budget_fail_closed() {
     // Park the receiver so the budget stays consumed — the byte
     // accounting is queue-side, so no writer task is needed.
     let rx = Some(rx);
-    let writer_handle = tokio::spawn(async move {});
+    let writer_end = WriterEnd::Task(tokio::spawn(async move {}));
     // One record (~300 wire bytes) fits the 600 budget; a second cannot.
     let logger = super::assemble_logger(
         tx,
-        writer_handle,
+        writer_end,
         true,
         64,
         600,

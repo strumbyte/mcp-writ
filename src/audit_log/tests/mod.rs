@@ -42,13 +42,14 @@ fn make_test_event() -> AuditEvent {
 }
 
 /// Assemble an `AuditLogger` from parts the test controls — the
-/// writer-level tests drive the channel ends and writer task directly
-/// instead of going through `to_file`, so fail-closed mode, the record
-/// slot bound, and the byte budget stay test-tunable.
+/// writer-level tests drive the channel ends and the writer's spawn
+/// set directly instead of going through `to_file`, so fail-closed
+/// mode, the record slot bound, and the byte budget stay
+/// test-tunable.
 #[expect(clippy::too_many_arguments)]
 fn assemble_logger(
     tx: mpsc::Sender<WriterItem>,
-    writer_handle: tokio::task::JoinHandle<()>,
+    writer_end: WriterEnd,
     fail_closed: bool,
     event_capacity: usize,
     byte_budget: usize,
@@ -61,7 +62,7 @@ fn assemble_logger(
             tx: std::sync::Mutex::new(Some(tx)),
             file_sink,
             session_id,
-            writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
+            writer_end: tokio::sync::Mutex::new(Some(writer_end)),
             fail_closed,
             dropped: AtomicU64::new(0),
             writer_failed,

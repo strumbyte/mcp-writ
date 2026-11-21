@@ -20,10 +20,13 @@ pub use sink_guard::{
     audit_sink_write_conflict, policy_source_write_conflict, report_write_conflict,
     snapshot_write_conflict,
 };
-use writer::{FileSink, SinkAnchor, TokioClock, WriterCore, file_writer_task, tracing_writer_task};
+use writer::{
+    FileSink, FileWriterSpawn, SinkAnchor, TokioClock, WriterCore, spawn_file_writer,
+    tracing_writer_task,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// AuditLogger (mpsc channel + dedicated writer task)
+// AuditLogger (mpsc channel + dedicated writer thread)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Record slots in the writer's bounded queue — enforced by the
@@ -79,9 +82,17 @@ pub enum AuditSyncMode {
 /// record stream can never starve control submission of queue space.
 const CONTROL_QUEUE_CAPACITY: usize = 4;
 
+/// Headroom above the permit-accounted capacity for the writer's own
+/// wake items: a [`WriterItem::Tick`] carries no permit, so without
+/// headroom a saturated queue could bounce the deadline wake — and a
+/// queued tick must never push a permit-holding `try_send` into
+/// `Full`. At most one tick is outstanding at a time, so two slots
+/// bound it with margin.
+const TICK_QUEUE_RESERVE: usize = 2;
+
 /// Total bounded capacity of the writer's intake queue — records plus
-/// the control reserve.
-const QUEUE_CAPACITY: usize = EVENT_QUEUE_CAPACITY + CONTROL_QUEUE_CAPACITY;
+/// the control reserve plus the tick headroom.
+const QUEUE_CAPACITY: usize = EVENT_QUEUE_CAPACITY + CONTROL_QUEUE_CAPACITY + TICK_QUEUE_RESERVE;
 
 /// One queued audit record. The oneshot half is set only by
 /// [`AuditLogger::log_committed`]: the writer signals it after the
@@ -113,13 +124,19 @@ enum WriterItem {
     // the record variant's size.
     Record(Box<AuditItem>),
     Control(ControlRequest),
+    /// The deadline wake the writer's ticker companion posts when the
+    /// earliest periodic deadline passes — payloadless, in queue
+    /// order, serviced by running whatever deadlines are due. It
+    /// holds no permit and occupies a [`TICK_QUEUE_RESERVE`] slot, so
+    /// it can never displace a record or control item.
+    Tick,
 }
 
 enum ControlRequest {
     Reopen(ReopenRequest),
 }
 
-/// Builds the `audit.reopened` record inside the writer task — the
+/// Builds the `audit.reopened` record inside the writer — the
 /// argument is `Some(error)` on a failed reopen and `None` on success,
 /// so the same factory produces both the success and the failure
 /// marker. Running it in-band keeps the marker ahead of every
@@ -183,6 +200,22 @@ pub struct AuditLogger {
     inner: std::sync::Arc<AuditLoggerInner>,
 }
 
+/// What `shutdown()` waits on once the intake closes — the writer's
+/// end-of-life notice. The file sink runs on a dedicated OS thread:
+/// its completion arrives over a oneshot the async side awaits, never
+/// a synchronous thread join on a runtime worker. The tracing sink
+/// stays an ordinary task — stderr delivery carries none of the
+/// durable-sink guarantees the file writer is isolated for.
+enum WriterEnd {
+    /// The dedicated file-writer thread's spawn set: the completion
+    /// oneshot, the join handle (ownership token — the oneshot is the
+    /// completion channel, so the handle is released by detach, never
+    /// joined), and the idle-wake ticker retired with the writer.
+    Thread(FileWriterSpawn),
+    /// The tracing writer's ordinary task.
+    Task(tokio::task::JoinHandle<()>),
+}
+
 struct AuditLoggerInner {
     tx: std::sync::Mutex<Option<mpsc::Sender<WriterItem>>>,
     /// `true` while this logger drives a live file sink — the only
@@ -192,7 +225,7 @@ struct AuditLoggerInner {
     /// `None`.
     file_sink: bool,
     session_id: String,
-    writer_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    writer_end: tokio::sync::Mutex<Option<WriterEnd>>,
     fail_closed: bool,
     dropped: AtomicU64,
     writer_failed: FailureFlag,
@@ -212,7 +245,16 @@ struct AuditLoggerInner {
 
 impl AuditLogger {
     /// Create a logger that appends JSONL to a file.
-    /// Spawns a dedicated writer task on the tokio runtime.
+    /// Spawns the dedicated writer thread the sink lives on.
+    ///
+    /// Must be called within a Tokio runtime context — the writer's
+    /// idle-wake ticker is a task on the calling runtime — and the
+    /// runtime's time driver must be enabled (`Builder::enable_all`
+    /// or `enable_time`): startup arms the ticker's timer before
+    /// returning and refuses a runtime that cannot run it. Keep the
+    /// logger within that runtime's lifetime: if the runtime shuts
+    /// down first, records still drain on the writer's thread but the
+    /// periodic idle sync stops being woken.
     pub fn to_file(path: &Path) -> Result<Self, std::io::Error> {
         Self::to_file_with_fail_closed(path, true)
     }
@@ -229,6 +271,17 @@ impl AuditLogger {
     /// Create a file logger with an explicit sync mode —
     /// [`AuditSyncMode::EveryEvent`] is the `--audit-sync` path, syncing
     /// every record as it is written instead of buffering a tail.
+    ///
+    /// Like [`AuditLogger::to_file`], this must be called within a
+    /// Tokio runtime context whose lifetime covers the logger's and
+    /// whose time driver is enabled (`enable_all`/`enable_time`).
+    /// Returns `Err` if the OS refuses the writer's thread spawn or
+    /// the calling runtime cannot arm the ticker's timer; the
+    /// already-opened log file is left behind — possibly empty —
+    /// because it may pre-date this call and removing it could delete
+    /// a log the caller still owns. Dropping every clone of the logger
+    /// without `shutdown()` closes the intake and lets the writer
+    /// drain on its own thread; a leaked logger leaks that thread.
     pub fn to_file_with_options(
         path: &Path,
         fail_closed: bool,
@@ -257,7 +310,7 @@ impl AuditLogger {
             session_id.clone(),
             path.to_path_buf(),
         );
-        let writer_handle = tokio::spawn(file_writer_task(rx, core));
+        let writer_end = WriterEnd::Thread(spawn_file_writer(&tx, rx, core)?);
         let bytes_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET));
         #[cfg(feature = "measure")]
         crate::measure::register_queue_budget(QUEUE_BYTE_BUDGET as u64, &bytes_budget);
@@ -266,7 +319,7 @@ impl AuditLogger {
                 tx: std::sync::Mutex::new(Some(tx)),
                 file_sink: true,
                 session_id,
-                writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
+                writer_end: tokio::sync::Mutex::new(Some(writer_end)),
                 fail_closed,
                 dropped: AtomicU64::new(0),
                 writer_failed,
@@ -292,7 +345,11 @@ impl AuditLogger {
         let writer_failed = FailureFlag::new();
         // stderr delivery cannot prove a durable write — a fail-closed
         // logger's completion waiters must not be acknowledged here.
-        let writer_handle = tokio::spawn(tracing_writer_task(rx, !fail_closed, session_id.clone()));
+        let writer_end = WriterEnd::Task(tokio::spawn(tracing_writer_task(
+            rx,
+            !fail_closed,
+            session_id.clone(),
+        )));
         let bytes_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET));
         #[cfg(feature = "measure")]
         crate::measure::register_queue_budget(QUEUE_BYTE_BUDGET as u64, &bytes_budget);
@@ -301,7 +358,7 @@ impl AuditLogger {
                 tx: std::sync::Mutex::new(Some(tx)),
                 file_sink: false,
                 session_id,
-                writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
+                writer_end: tokio::sync::Mutex::new(Some(writer_end)),
                 fail_closed,
                 dropped: AtomicU64::new(0),
                 writer_failed,
@@ -566,7 +623,7 @@ impl AuditLogger {
                         "audit log channel closed".into(),
                     ));
                 }
-                // A dropped sender (writer task dead) fails the wait —
+                // A dropped sender (writer dead) fails the wait —
                 // fail closed rather than forward unaudited traffic.
                 if ack_rx.await.is_err() {
                     self.inner.writer_failed.set();
@@ -759,11 +816,17 @@ impl AuditLogger {
     }
 
     /// Gracefully shutdown the logger.
-    /// Closes the channel and waits for the writer task to complete.
+    /// Closes the channel and waits for the writer's end-of-life
+    /// notice — for the file sink, the dedicated thread's drain,
+    /// terminal sync, and handle release. In-flight OS I/O cannot be
+    /// interrupted: the wait has no timeout, so a slow sink delays
+    /// this call rather than being cut off and misreported.
     ///
     /// Returns `Err` when the terminal flush failed *and* this logger is
-    /// fail-closed: the writer task did not join cleanly or
-    /// `writer_failed` was latched anywhere in the sink's life (a
+    /// fail-closed: the writer never reported its end-of-life notice
+    /// (a dead thread's dropped completion sender, a join error on the
+    /// tracing task) or `writer_failed` was latched anywhere in the
+    /// sink's life (a
     /// write/sync fault, a dropped commit waiter, a saturated
     /// fail-closed channel). A best-effort sink reports `Ok` for the
     /// same state — its failures stay latched on `writer_failed` for
@@ -773,6 +836,13 @@ impl AuditLogger {
     /// fail-closed run paths fold the error into the command's
     /// outcome/exit status.
     pub async fn shutdown(&self) -> Result<(), crate::error::AuditorError> {
+        // The end state is locked ahead of the intake close so the
+        // drain's start can be stamped in the same critical section
+        // the sender is taken in — the writer measures `audit.drain.ns`
+        // from that stamp, not from its own later `is_closed()`
+        // observation which trails whatever in-flight write kept the
+        // channel open.
+        let mut end_lock = self.inner.writer_end.lock().await;
         // Drop the sender to close the queue — the shutdown request's
         // position in the same acceptance order: everything already
         // queued, records and control alike, is drained before the
@@ -780,7 +850,20 @@ impl AuditLogger {
         // finds no live sink and never revives the writer.
         {
             let mut tx_lock = self.inner.tx.lock().unwrap();
-            tx_lock.take();
+            if tx_lock.is_some() {
+                // The first close stamps the drain's start; a retried
+                // shutdown finds no sender here and leaves the first
+                // stamp untouched.
+                #[cfg(feature = "measure")]
+                if let Some(WriterEnd::Thread(spawn)) = end_lock.as_ref() {
+                    spawn
+                        .drain_started
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(std::time::Instant::now);
+                }
+                tx_lock.take();
+            }
         }
         // Reopen calls parked on the control reserve wake to a failed
         // acquire — `reopen()` reports it as no live sink (`Ok(false)`),
@@ -788,15 +871,35 @@ impl AuditLogger {
         // already hold a permit.
         self.inner.control_slots.close();
 
-        // Wait for the writer task to complete
+        // Wait for the writer's end-of-life notice. The file writer's
+        // oneshot resolves only after its drain, terminal sync, and
+        // handle release — the async side awaits it rather than
+        // joining the thread synchronously, so an uninterruptible
+        // in-flight OS I/O is waited out, never cut off and reported.
+        // A dropped sender is a dead writer: a fault, not a clean end.
+        // The end state stays in the mutex while the wait runs —
+        // cancelling this future leaves it for the next shutdown()
+        // call to resume; only a completed wait removes it.
         let mut join_err = false;
-        let mut handle_lock = self.inner.writer_handle.lock().await;
-        if let Some(handle) = handle_lock.take()
-            && let Err(e) = handle.await
-        {
-            self.inner.writer_failed.set();
-            join_err = true;
-            tracing::error!("Writer task join error: {e}");
+        if let Some(end) = end_lock.as_mut() {
+            match end {
+                WriterEnd::Thread(spawn) => {
+                    spawn.ticker.abort();
+                    if (&mut spawn.done).await.is_err() {
+                        self.inner.writer_failed.set();
+                        join_err = true;
+                        tracing::error!("Audit writer thread stopped before signaling completion");
+                    }
+                }
+                WriterEnd::Task(handle) => {
+                    if let Err(e) = handle.await {
+                        self.inner.writer_failed.set();
+                        join_err = true;
+                        tracing::error!("Writer task join error: {e}");
+                    }
+                }
+            }
+            end_lock.take();
         }
         if self.inner.fail_closed && (self.inner.writer_failed.get() || join_err) {
             Err(crate::error::AuditorError::AuditUnavailable(format!(
@@ -812,18 +915,55 @@ impl AuditLogger {
 
 impl Drop for AuditLoggerInner {
     fn drop(&mut self) {
-        // Abort the writer task if it's still running.
-        // This means shutdown() was not called — buffered events may be lost.
-        if let Ok(mut handle_lock) = self.writer_handle.try_lock()
-            && let Some(handle) = handle_lock.take()
+        // This means shutdown() was not called. Closing the intake is
+        // the writer's stop request — the same "all senders gone"
+        // queue-end position as shutdown(): the file-writer thread
+        // drains the queue and exits on its own. In-flight OS I/O
+        // cannot be interrupted, so the drain continues in the
+        // background; anything still buffered if the process exits
+        // first is lost.
+        if let Ok(mut tx_lock) = self.tx.lock() {
+            tx_lock.take();
+        }
+        // Wake every waiter the drain itself cannot reach: a reopen
+        // parked on the control reserve resolves to "no live sink",
+        // and producers parked on record slots or the byte budget
+        // fail the acquire instead of hanging on a dead logger.
+        self.control_slots.close();
+        self.event_slots.close();
+        self.bytes_budget.close();
+        if let Ok(mut end_lock) = self.writer_end.try_lock()
+            && let Some(end) = end_lock.take()
         {
             tracing::warn!(
                 "AuditLogger dropped without shutdown(); \
-                 aborting writer task — buffered events may be lost. \
+                 the writer's drain continues on its own thread — \
+                 buffered events may be lost if the process exits first. \
                  Call AuditLogger::shutdown().await for graceful flush."
             );
             self.writer_failed.set();
-            handle.abort();
+            match end {
+                WriterEnd::Thread(spawn) => {
+                    // The drop-side close is a drain start too — the
+                    // same stamp `shutdown()` writes, skipped when one
+                    // is already recorded.
+                    #[cfg(feature = "measure")]
+                    spawn
+                        .drain_started
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(std::time::Instant::now);
+                    spawn.ticker.abort();
+                    // Detach, never join: the thread may be parked in
+                    // an uninterruptible OS I/O, and a synchronous
+                    // join inside a drop could stall a runtime worker.
+                    drop(spawn.join);
+                    drop(spawn.done);
+                }
+                // The tracing task has no drain contract — abort is
+                // the same end the pre-thread writer had.
+                WriterEnd::Task(handle) => handle.abort(),
+            }
         }
     }
 }
