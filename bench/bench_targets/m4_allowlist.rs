@@ -189,6 +189,7 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
     let mut fill_ns = Vec::with_capacity(iterations);
     let mut lookup_ns = Vec::with_capacity(iterations);
     let mut churn_ns = Vec::with_capacity(iterations);
+    let mut fill_measure = String::from("{}");
     let mut lookup_measure = String::from("{}");
     let mut churn_measure = String::from("{}");
     let mut staged_ok = 0usize;
@@ -207,6 +208,7 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
         } else {
             0
         };
+        mcp_writ::measure::reset();
         let t = Instant::now();
         // Headroom covers every reservation a scenario can mint —
         // `staged_same_key` stages STAGED_KEYS new keys on top of
@@ -223,6 +225,7 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
         }
         if timed {
             fill_ns.push(t.elapsed().as_nanos() as u64);
+            fill_measure = measure_json("dns.");
         }
         if sc.expired > 0 {
             std::thread::sleep(Duration::from_millis(100));
@@ -320,7 +323,7 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
         "{{\"name\":{},\"live\":{},\"names_per_ip\":{},\"expired\":{},\
          \"updates\":{},\"lookups\":{},\"fill_ns\":{},\"lookup_ns\":{},\
          \"churn_ns\":{},\"retained_bytes\":{},\"peak_bytes\":{},\
-         \"lookup_measure\":{},\"churn_measure\":{}}}",
+         \"fill_measure\":{},\"lookup_measure\":{},\"churn_measure\":{}}}",
         json_str(sc.name),
         sc.live,
         sc.names_per_ip,
@@ -336,6 +339,7 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
         },
         retained,
         peak,
+        fill_measure,
         lookup_measure,
         churn_measure,
     )
