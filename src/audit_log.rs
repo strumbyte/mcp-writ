@@ -136,7 +136,7 @@ enum ControlRequest {
     Reopen(ReopenRequest),
 }
 
-/// Builds the `audit.reopened` record inside the writer task — the
+/// Builds the `audit.reopened` record inside the writer — the
 /// argument is `Some(error)` on a failed reopen and `None` on success,
 /// so the same factory produces both the success and the failure
 /// marker. Running it in-band keeps the marker ahead of every
@@ -246,6 +246,12 @@ struct AuditLoggerInner {
 impl AuditLogger {
     /// Create a logger that appends JSONL to a file.
     /// Spawns the dedicated writer thread the sink lives on.
+    ///
+    /// Must be called within a Tokio runtime context — the writer's
+    /// idle-wake ticker is a task on the calling runtime. Keep the
+    /// logger within that runtime's lifetime: if the runtime shuts
+    /// down first, records still drain on the writer's thread but the
+    /// periodic idle sync stops being woken.
     pub fn to_file(path: &Path) -> Result<Self, std::io::Error> {
         Self::to_file_with_fail_closed(path, true)
     }
@@ -262,6 +268,15 @@ impl AuditLogger {
     /// Create a file logger with an explicit sync mode —
     /// [`AuditSyncMode::EveryEvent`] is the `--audit-sync` path, syncing
     /// every record as it is written instead of buffering a tail.
+    ///
+    /// Like [`AuditLogger::to_file`], this must be called within a
+    /// Tokio runtime context whose lifetime covers the logger's.
+    /// Returns `Err` if the OS refuses the writer's thread spawn; the
+    /// already-opened log file is left behind — possibly empty —
+    /// because it may pre-date this call and removing it could delete
+    /// a log the caller still owns. Dropping every clone of the logger
+    /// without `shutdown()` closes the intake and lets the writer
+    /// drain on its own thread; a leaked logger leaks that thread.
     pub fn to_file_with_options(
         path: &Path,
         fail_closed: bool,
@@ -603,7 +618,7 @@ impl AuditLogger {
                         "audit log channel closed".into(),
                     ));
                 }
-                // A dropped sender (writer task dead) fails the wait —
+                // A dropped sender (writer dead) fails the wait —
                 // fail closed rather than forward unaudited traffic.
                 if ack_rx.await.is_err() {
                     self.inner.writer_failed.set();
@@ -803,8 +818,10 @@ impl AuditLogger {
     /// this call rather than being cut off and misreported.
     ///
     /// Returns `Err` when the terminal flush failed *and* this logger is
-    /// fail-closed: the writer task did not join cleanly or
-    /// `writer_failed` was latched anywhere in the sink's life (a
+    /// fail-closed: the writer never reported its end-of-life notice
+    /// (a dead thread's dropped completion sender, a join error on the
+    /// tracing task) or `writer_failed` was latched anywhere in the
+    /// sink's life (a
     /// write/sync fault, a dropped commit waiter, a saturated
     /// fail-closed channel). A best-effort sink reports `Ok` for the
     /// same state — its failures stay latched on `writer_failed` for
