@@ -73,9 +73,9 @@ impl FlowGate {
         // grant on the v4 the proxy will dial, so a later CONNECT to
         // the same spelling finds it under the judged form.
         let endpoint = self.evaluator.judged_endpoint(dest);
-        let names = self.grants.names_for(&endpoint);
-        let covered = self.grants.is_allowed(&endpoint, proto, port);
-        self.evaluator.evaluate(&dest, proto, port, &names, covered)
+        let view = self.grants.grant_view(&endpoint, proto, port);
+        self.evaluator
+            .evaluate(&dest, proto, port, &view.names, view.covered)
     }
 
     /// Verdict for a connect whose destination arrived as a raw IP
