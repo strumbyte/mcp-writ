@@ -148,37 +148,38 @@ fn gated_file_sink_logger(
     )
 }
 
-/// A `FileSink` wrapper reporting each completed sink step over a
-/// std channel — the drop-drain test's completion signal. The drain
-/// tail runs flush → fsync → visible-entry proof in order on the
-/// writer thread, so an `entry_visible` report proves the final
-/// `sync_file` already finished — the file is complete before the
-/// test reads or removes it.
+/// A `FileSink` wrapper reporting each completed sink step — name
+/// plus success — over a std channel: the drop-drain test's
+/// completion signal. The drain tail runs flush → fsync →
+/// visible-entry proof in order on the writer thread, so a
+/// successful `entry_visible` report proves the final `sync_file`
+/// already finished — the file is complete before the test reads or
+/// removes it.
 struct OpReportSink {
     inner: FileSink,
-    ops: std::sync::mpsc::Sender<&'static str>,
+    ops: std::sync::mpsc::Sender<(&'static str, bool)>,
 }
 
 impl OpReportSink {
-    fn report(&self, op: &'static str) {
-        let _ = self.ops.send(op);
+    fn report(&self, op: &'static str, ok: bool) {
+        let _ = self.ops.send((op, ok));
     }
 }
 
 impl AuditSink for OpReportSink {
     fn write_record(&mut self, line: &[u8]) -> std::io::Result<()> {
         let result = self.inner.write_record(line);
-        self.report("write_record");
+        self.report("write_record", result.is_ok());
         result
     }
     fn flush_buffer(&mut self) -> std::io::Result<()> {
         let result = self.inner.flush_buffer();
-        self.report("flush_buffer");
+        self.report("flush_buffer", result.is_ok());
         result
     }
     fn sync_file(&mut self) -> std::io::Result<()> {
         let result = self.inner.sync_file();
-        self.report("sync_file");
+        self.report("sync_file", result.is_ok());
         result
     }
     fn needs_dir_sync(&self) -> bool {
@@ -186,17 +187,17 @@ impl AuditSink for OpReportSink {
     }
     fn sync_dir(&mut self) -> std::io::Result<()> {
         let result = self.inner.sync_dir();
-        self.report("sync_dir");
+        self.report("sync_dir", result.is_ok());
         result
     }
     fn entry_visible(&self, path: &Path) -> bool {
         let visible = self.inner.entry_visible(path);
-        self.report("entry_visible");
+        self.report("entry_visible", visible);
         visible
     }
     fn reopen(&mut self, path: &Path) -> std::io::Result<()> {
         let result = self.inner.reopen(path);
-        self.report("reopen");
+        self.report("reopen", result.is_ok());
         result
     }
 }
@@ -207,7 +208,7 @@ fn reported_file_sink_logger(
     path: &Path,
     event_capacity: usize,
     fail_closed: bool,
-) -> (AuditLogger, std::sync::mpsc::Receiver<&'static str>) {
+) -> (AuditLogger, std::sync::mpsc::Receiver<(&'static str, bool)>) {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -762,22 +763,31 @@ async fn test_logger_drop_still_drains() {
     // The drain finishes on the writer thread after the logger is
     // gone. Its tail is flush → fsync → the visible-entry proof, so
     // the sink's own `entry_visible` report — arrived after a
-    // `sync_file` — is the test's completion signal: the file is
-    // durably complete before it is read or removed. A deadline
-    // bounds the wait; expiring is a drain failure, not a slow poll.
+    // successful `sync_file` — is the test's completion signal: the
+    // file is durably complete before it is read or removed. Every
+    // reported op must carry a success — a failed tail op means the
+    // drain did not really finish. A deadline bounds the wait;
+    // expiring is a drain failure, not a slow poll.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut saw_flush = false;
     let mut saw_sync = false;
     loop {
         match ops_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
-            Ok("sync_file") => saw_sync = true,
-            Ok("entry_visible") => break,
-            Ok(_) => {}
+            Ok((op, ok)) => {
+                assert!(ok, "drain op {op} must report success");
+                match op {
+                    "flush_buffer" => saw_flush = true,
+                    "sync_file" => saw_sync = true,
+                    "entry_visible" => break,
+                    _ => {}
+                }
+            }
             Err(e) => panic!("the dropped logger's drain did not finish: {e}"),
         }
     }
     assert!(
-        saw_sync,
-        "the drain's final entry check must follow its sync_file"
+        saw_flush && saw_sync,
+        "the drain's final entry check must follow its flush and sync_file"
     );
     let lines = std::fs::read_to_string(&path)
         .unwrap_or_default()
