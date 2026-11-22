@@ -547,15 +547,7 @@ impl DynamicAllowList {
         let mut inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        register_at_of(
-            &mut inner,
-            self.max_grants,
-            name,
-            addr,
-            quals,
-            expires,
-            now,
-        )
+        register_at_of(&mut inner, self.max_grants, name, addr, quals, expires, now)
     }
 
     /// Begin a staging token for one resolution's mint. Grants
