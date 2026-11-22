@@ -200,9 +200,33 @@ pub fn glob_base(spelling: &str) -> Option<&str> {
         }
         break;
     }
-    if p.is_empty() || p.contains(['*', '?']) {
+    // The wildcard scan skips a Windows `\\?\` verbatim prefix: its `?`
+    // is namespace syntax, never a glob component. The spelled form is
+    // kept whole rather than re-spelled without the prefix — a stripped
+    // `\\?\…\audit.` would resolve to the *different* object `…\audit`
+    // (non-verbatim resolution normalizes the trailing dot), and
+    // `\\?\Volume{guid}\…` would degrade to a relative path resolved
+    // against the cwd. Keeping the prefix lets `canonicalize` resolve
+    // the same object the caller pins or mounts.
+    if p.is_empty() || p[verbatim_prefix_len(p)..].contains(['*', '?']) {
         None
     } else {
         Some(p)
     }
+}
+
+/// Byte length of a `\\?\` verbatim prefix, or 0 — only the NT
+/// backslash form (`canonicalize`'s output spelling and the form the
+/// Win32/NT object manager treats as verbatim) is skipped; a `/`-spelled
+/// variant keeps its components visible to the wildcard check.
+/// `\\?\UNC\…` is covered by the `\\?\` form: the `UNC\server\share`
+/// body still names literal components.
+#[cfg(target_os = "windows")]
+fn verbatim_prefix_len(s: &str) -> usize {
+    usize::from(s.starts_with(r"\\?\")) * 4
+}
+
+#[cfg(not(target_os = "windows"))]
+fn verbatim_prefix_len(_s: &str) -> usize {
+    0
 }

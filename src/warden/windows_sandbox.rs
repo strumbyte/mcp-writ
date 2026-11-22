@@ -771,34 +771,64 @@ mod tests {
     use super::*;
     use crate::policy::default_policy;
 
+    /// The prerequisite every spawn in this module shares: a throwaway
+    /// AppContainer profile must be creatable — `CreateAppContainerProfile`
+    /// is the privilege/capability-sensitive call the launch relies on, and
+    /// its drop removes the profile again. Probed once per test binary; a
+    /// failure is a missing prerequisite reported through
+    /// `skip_unless_required` (a failure under the require gate), never a
+    /// launch verdict. Beyond it every spawn below is `expect`ed — a spawn,
+    /// wait, or read that fails after the prerequisite held is a real test
+    /// failure, not a skip.
+    fn require_appcontainer() -> bool {
+        static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PROBE.get_or_init(|| {
+            match crate::warden::windows_profile::AppContainerSandbox::new("probe") {
+                Ok(sandbox) => {
+                    drop(sandbox);
+                    true
+                }
+                Err(e) => {
+                    crate::testutil::skip_unless_required(&format!(
+                        "AppContainer profile creation unavailable: {e}"
+                    ));
+                    false
+                }
+            }
+        })
+    }
+
     #[test]
     fn test_spawn_sandboxed_with_default_policy() {
+        if !require_appcontainer() {
+            return;
+        }
         let policy = default_policy();
         let mut grants = Vec::new();
-        let result = spawn_sandboxed(
+        let child = spawn_sandboxed(
             &policy,
             None,
             "cmd.exe",
             &["/c".to_string(), "echo hello".to_string()],
             &SpawnOptions::default(),
             &mut grants,
-        );
-        match result {
-            Ok(child) => {
-                let status = child.wait().expect("should wait");
-                // Process ran successfully inside the sandbox
-                assert!(status.success());
-            }
-            Err(e) => {
-                // On some Windows versions, sandbox creation may require elevation
-                eprintln!("Sandbox spawn failed (may need elevation): {e}");
-            }
-        }
+        )
+        .map_err(WinSpawnError::into_warden_error)
+        .expect("sandboxed spawn must succeed once the AppContainer probe passed");
+        let status = child.wait().expect("should wait");
+        // Process ran successfully inside the sandbox
+        assert!(status.success());
     }
 
+    /// A write under an ungranted path must be denied — with a positive
+    /// control first: the same spawn, same fixture dir, granted
+    /// read-write, must leave its file, so the later absence is the
+    /// sandbox's denial and not a fixture that never ran.
     #[test]
     fn test_sandbox_blocks_write_outside_allowed() {
-        let policy = default_policy();
+        if !require_appcontainer() {
+            return;
+        }
         // Policy has no read_write paths → all writes should be blocked.
         // The redirect target is unquoted — argv-escaped `\"` does not
         // survive `cmd /c` parsing — and a `>` filename ends at the
@@ -807,14 +837,53 @@ mod tests {
         // path and the deny assertion would hold vacuously.
         let tmp = std::env::temp_dir().join(format!("mcp_writ_deny_{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         if tmp.to_string_lossy().contains(char::is_whitespace) {
-            eprintln!("fixture path contains whitespace; skipping");
+            crate::testutil::skip_unless_required("fixture path contains whitespace");
             return;
         }
         std::fs::create_dir_all(&tmp).expect("fixture dir");
+        let allowed_file = tmp.join("allowed.txt");
         let test_file = tmp.join("denied.txt");
 
+        // Positive control — the grant makes the fixture dir writable
+        // inside the container, proving the workload ran and the write
+        // path works before the denial is judged.
+        let mut granted_policy = default_policy();
+        granted_policy
+            .fs
+            .read_write
+            .push(tmp.to_string_lossy().into_owned());
         let mut grants = Vec::new();
-        if let Ok(child) = spawn_sandboxed(
+        let control = spawn_sandboxed(
+            &granted_policy,
+            None,
+            "cmd.exe",
+            &[
+                "/c".to_string(),
+                format!("echo ok > {}", allowed_file.display()),
+            ],
+            &SpawnOptions::default(),
+            &mut grants,
+        )
+        .map_err(WinSpawnError::into_warden_error)
+        .expect("granted control spawn must succeed once the probe passed");
+        control.wait().expect("granted control must be waitable");
+        // Release the control before the denial probe — `wait` only
+        // joins the process; the sandbox (and its granted ACE) lives
+        // until the child drops. AppContainer profile names are unique
+        // per launch so a stale ACE could never reach a different
+        // SID, but dropping the grant here keeps the deny verdict
+        // independent of how profile naming evolves — the scope
+        // pattern `acl_grant_allows_write_and_drop_restores_denial`
+        // uses for the same reason.
+        drop(control);
+        assert!(
+            allowed_file.exists(),
+            "write to a granted path must succeed — the fixture is broken otherwise"
+        );
+
+        let policy = default_policy();
+        let mut grants = Vec::new();
+        let probe = spawn_sandboxed(
             &policy,
             None,
             "cmd.exe",
@@ -824,20 +893,22 @@ mod tests {
             ],
             &SpawnOptions::default(),
             &mut grants,
-        ) {
-            let _ = child.wait();
-            let blocked = !test_file.exists();
-            let _ = std::fs::remove_dir_all(&tmp);
-            assert!(blocked, "sandbox should block writes outside allowed paths");
-        } else {
-            let _ = std::fs::remove_dir_all(&tmp);
-        }
+        )
+        .map_err(WinSpawnError::into_warden_error)
+        .expect("deny probe spawn must succeed once the probe passed");
+        probe.wait().expect("deny probe must be waitable");
+        let blocked = !test_file.exists();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(blocked, "sandbox should block writes outside allowed paths");
     }
 
     #[test]
     fn restricted_env_does_not_inherit_sentinel_and_uses_private_tmp() {
         use std::io::Read;
 
+        if !require_appcontainer() {
+            return;
+        }
         let _env = crate::warden::env::lock_process_env();
         let sentinel_key = "MCP_WRIT_R04_SENTINEL";
         // Safety: test-only process env; unique key unused by product code.
@@ -855,7 +926,7 @@ mod tests {
         };
         let policy = default_policy();
         let mut grants = Vec::new();
-        let result = spawn_sandboxed(
+        let mut child = spawn_sandboxed(
             &policy,
             None,
             "cmd.exe",
@@ -865,39 +936,34 @@ mod tests {
             ],
             &opts,
             &mut grants,
+        )
+        .map_err(WinSpawnError::into_warden_error)
+        .expect("sandboxed spawn must succeed once the probe passed");
+        drop(child.stdin.take());
+        let mut stdout = child.stdout.take().expect("stdout");
+        child.wait().expect("the env probe child must be waitable");
+        let mut buf = String::new();
+        stdout.read_to_string(&mut buf).expect(
+            "the child's response must be captured — a lost response cannot prove non-inheritance",
         );
-        match result {
-            Ok(mut child) => {
-                drop(child.stdin.take());
-                let mut stdout = child.stdout.take().expect("stdout");
-                let _ = child.wait();
-                let mut buf = String::new();
-                let _ = stdout.read_to_string(&mut buf);
-                let lower = buf.to_ascii_lowercase();
-                assert!(
-                    !lower.contains("inherited"),
-                    "restricted env must not inherit sentinel, got {buf:?}"
-                );
-                // Two private-temp outcomes are both correct: our TMP/TEMP
-                // override points at `tmp`, but once LOCALAPPDATA is in the
-                // block (required for AppContainer spawn) CreateProcessW
-                // remaps TMP/TEMP to the container-private `Packages\<name>\
-                // AC\Temp` — a private temp directory managed by the OS.
-                let tmp_s = tmp.to_string_lossy().to_ascii_lowercase();
-                let container_tmp = buf
-                    .to_ascii_lowercase()
-                    .contains("\\appdata\\local\\packages\\mcp-writ-cmd_exe-");
-                assert!(
-                    lower.contains(&tmp_s)
-                        || buf.contains(&*tmp.to_string_lossy())
-                        || container_tmp,
-                    "child TEMP must be a private tmpdir {tmp_s} or the AppContainer AC\\Temp, got {buf:?}"
-                );
-            }
-            Err(e) => {
-                eprintln!("Sandbox spawn failed (may need elevation): {e}");
-            }
-        }
+        let lower = buf.to_ascii_lowercase();
+        assert!(
+            !lower.contains("inherited"),
+            "restricted env must not inherit sentinel, got {buf:?}"
+        );
+        // Two private-temp outcomes are both correct: our TMP/TEMP
+        // override points at `tmp`, but once LOCALAPPDATA is in the
+        // block (required for AppContainer spawn) CreateProcessW
+        // remaps TMP/TEMP to the container-private `Packages\<name>\
+        // AC\Temp` — a private temp directory managed by the OS.
+        let tmp_s = tmp.to_string_lossy().to_ascii_lowercase();
+        let container_tmp = buf
+            .to_ascii_lowercase()
+            .contains("\\appdata\\local\\packages\\mcp-writ-cmd_exe-");
+        assert!(
+            lower.contains(&tmp_s) || buf.contains(&*tmp.to_string_lossy()) || container_tmp,
+            "child TEMP must be a private tmpdir {tmp_s} or the AppContainer AC\\Temp, got {buf:?}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -914,9 +980,12 @@ mod tests {
     /// test skips when TEMP is not.
     #[test]
     fn acl_grant_allows_write_and_drop_restores_denial() {
+        if !require_appcontainer() {
+            return;
+        }
         let tmp = std::env::temp_dir().join(format!("mcp_writ_acl_{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         if tmp.to_string_lossy().contains(char::is_whitespace) {
-            eprintln!("fixture path contains whitespace; skipping");
+            crate::testutil::skip_unless_required("fixture path contains whitespace");
             return;
         }
         std::fs::create_dir_all(&tmp).expect("fixture dir");
@@ -933,30 +1002,24 @@ mod tests {
                 .read_write
                 .push(tmp.to_string_lossy().into_owned());
             let mut grants = Vec::new();
-            match spawn_sandboxed(
+            let child = spawn_sandboxed(
                 &policy,
                 None,
                 "cmd.exe",
                 &["/c".to_string(), write(&probe_granted)],
                 &SpawnOptions::default(),
                 &mut grants,
-            ) {
-                Ok(child) => {
-                    let _ = child.wait();
-                    // The grant must be visible as a verified per-path
-                    // entry in the apply record.
-                    assert!(grants.iter().any(|g| {
-                        matches!(&g.subject, GrantSubject::FsPath { path, .. }
-                            if path == &tmp.to_string_lossy())
-                            && g.state == ControlState::Verified
-                    }));
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(&tmp);
-                    eprintln!("Sandbox spawn failed (may need elevation): {e}");
-                    return;
-                }
-            }
+            )
+            .map_err(WinSpawnError::into_warden_error)
+            .expect("granted-phase spawn must succeed once the probe passed");
+            child.wait().expect("the granted child must be waitable");
+            // The grant must be visible as a verified per-path
+            // entry in the apply record.
+            assert!(grants.iter().any(|g| {
+                matches!(&g.subject, GrantSubject::FsPath { path, .. }
+                    if path == &tmp.to_string_lossy())
+                    && g.state == ControlState::Verified
+            }));
         }
         assert!(
             probe_granted.exists(),
@@ -964,21 +1027,23 @@ mod tests {
         );
 
         // Phase 2 — same spawn without the grant must be denied again:
-        // the restored DACL no longer carries the container ACE.
+        // the restored DACL no longer carries the container ACE. A spawn
+        // error here cannot prove restore, so it fails the test.
         let probe_restored = tmp.join("restored.txt");
         {
             let policy = default_policy();
             let mut grants = Vec::new();
-            if let Ok(child) = spawn_sandboxed(
+            let child = spawn_sandboxed(
                 &policy,
                 None,
                 "cmd.exe",
                 &["/c".to_string(), write(&probe_restored)],
                 &SpawnOptions::default(),
                 &mut grants,
-            ) {
-                let _ = child.wait();
-            }
+            )
+            .map_err(WinSpawnError::into_warden_error)
+            .expect("deny-phase spawn must succeed once the probe passed");
+            child.wait().expect("the deny child must be waitable");
         }
         let leaked = probe_restored.exists();
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1004,25 +1069,28 @@ mod tests {
     fn sandboxed_workload_cannot_spawn_children() {
         use std::io::Read;
 
+        if !require_appcontainer() {
+            return;
+        }
         let policy = default_policy();
         let mut grants = Vec::new();
-        let Ok(mut child) = spawn_sandboxed(
+        let mut child = spawn_sandboxed(
             &policy,
             None,
             "cmd.exe",
             &["/c".to_string(), "cmd /c echo CHILD_OK".to_string()],
             &SpawnOptions::default(),
             &mut grants,
-        ) else {
-            eprintln!("Sandbox spawn failed (may need elevation); skipping spawn-denial check");
-            return;
-        };
+        )
+        .map_err(WinSpawnError::into_warden_error)
+        .expect("sandboxed spawn must succeed once the probe passed");
         let mut out = String::new();
-        let _ = child
+        child
             .stdout
             .take()
             .expect("stdout")
-            .read_to_string(&mut out);
+            .read_to_string(&mut out)
+            .expect("the child's response must be captured — an unread stream cannot prove denial");
         let status = child.wait().expect("wait");
         assert!(
             !out.contains("CHILD_OK"),
@@ -1040,19 +1108,21 @@ mod tests {
     /// `None` while the process still runs — without forcing a kill.
     #[test]
     fn try_wait_reports_running_and_natural_exit() {
+        if !require_appcontainer() {
+            return;
+        }
         let policy = default_policy();
         let mut grants = Vec::new();
-        let Ok(child) = spawn_sandboxed(
+        let child = spawn_sandboxed(
             &policy,
             None,
             "cmd.exe",
             &["/c".to_string(), "exit /b 7".to_string()],
             &SpawnOptions::default(),
             &mut grants,
-        ) else {
-            eprintln!("Sandbox spawn failed (may need elevation); skipping try_wait check");
-            return;
-        };
+        )
+        .map_err(WinSpawnError::into_warden_error)
+        .expect("sandboxed spawn must succeed once the probe passed");
         let mut status = None;
         for _ in 0..100 {
             match child.try_wait() {
@@ -1070,26 +1140,27 @@ mod tests {
         // is killed — deterministic, unlike timer-based sleepers that
         // die early inside a container without console input.
         let mut grants = Vec::new();
-        if let Ok(running) = spawn_sandboxed(
+        let running = spawn_sandboxed(
             &policy,
             None,
             "cmd.exe",
             &["/q".to_string()],
             &SpawnOptions::default(),
             &mut grants,
-        ) {
-            assert!(running.try_wait().expect("try_wait").is_none());
-            running.kill().expect("kill");
-            let mut observed = false;
-            for _ in 0..100 {
-                if matches!(running.try_wait(), Ok(Some(_))) {
-                    observed = true;
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+        )
+        .map_err(WinSpawnError::into_warden_error)
+        .expect("second spawn must succeed once the probe passed");
+        assert!(running.try_wait().expect("try_wait").is_none());
+        running.kill().expect("kill");
+        let mut observed = false;
+        for _ in 0..100 {
+            if matches!(running.try_wait(), Ok(Some(_))) {
+                observed = true;
+                break;
             }
-            assert!(observed, "killed child never reported an exit status");
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        assert!(observed, "killed child never reported an exit status");
     }
 
     /// The `WardenError` a caller receives keeps the fine-grained

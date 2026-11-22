@@ -530,53 +530,12 @@ async fn real_main() {
     {
         Ok(l) => l,
         Err(e) => {
-            use mcp_writ::runtime::launch::LaunchError;
             // Every launch failure carries the plan plus a `failed`
             // result — a `--report` write records exactly that, never an
             // empty success. The same report goes to stderr for every
             // variant, so a failure is diagnosable without --report too.
-            let report = match e {
-                LaunchError::ResolveCommand {
-                    command,
-                    source,
-                    report,
-                } => {
-                    eprintln!("Error: cannot resolve command '{command}': {source}");
-                    report
-                }
-                LaunchError::VerifyServerHashes {
-                    server_name,
-                    source,
-                    report,
-                } => {
-                    eprintln!("Supply chain verification failed for '{server_name}': {source}");
-                    report
-                }
-                LaunchError::BindLaunchedWorkload { source, report } => {
-                    eprintln!("Supply chain verification failed: {source}");
-                    report
-                }
-                LaunchError::ReverifyBeforeSpawn { source, report } => {
-                    eprintln!("Supply chain verification failed at spawn: {source}");
-                    report
-                }
-                LaunchError::Spawn {
-                    argv,
-                    source,
-                    report,
-                } => {
-                    let command_name = argv.first().map(String::as_str).unwrap_or("(empty)");
-                    eprintln!("Error: failed to spawn MCP server '{command_name}': {source}");
-                    report
-                }
-                LaunchError::TakeIo { mut child, report } => {
-                    eprintln!("Error: failed to capture child process stdin/stdout");
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    drop(child);
-                    report
-                }
-            };
+            eprintln!("{}", e.describe());
+            let report = e.into_report().await;
             eprintln!("launch report: {}", report.to_json());
             if let Some(path) = &args.report {
                 match report.write_to(path) {
@@ -591,17 +550,7 @@ async fn real_main() {
             }
             // The launch already emitted `server.error`; close the guard
             // bracket with the same failed outcome the report carries.
-            lifecycle::guard_stopped(
-                &audit_logger,
-                &session_audit,
-                "failed",
-                Some(1),
-                report.result.as_ref().and_then(|r| r.detail.as_deref()),
-            );
-            // The launch already failed — a terminal audit fault cannot
-            // lower the result further.
-            let _ = audit_logger.shutdown().await;
-            std::process::exit(1);
+            lifecycle::launch_failed_exit(&audit_logger, &session_audit, &report).await;
         }
     };
 
@@ -616,18 +565,16 @@ async fn real_main() {
         );
         // A session whose report cannot be recorded must not exit
         // successfully — kill the just-spawned child and fail now.
-        let mut child = launched.child;
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        drop(child);
-        launched.auditor_handle.abort();
-        let outcome = mcp_writ::enforcement::LaunchOutcome {
-            status: "failed",
-            detail: Some(format!("failed to write launch report: {e}")),
-            exit_code: Some(1),
-        };
-        let _ =
-            lifecycle::teardown(&audit_logger, &launched.session_audit, "killed", &outcome).await;
+        launched
+            .abort(
+                &audit_logger,
+                mcp_writ::enforcement::LaunchOutcome {
+                    status: "failed",
+                    detail: Some(format!("failed to write launch report: {e}")),
+                    exit_code: Some(1),
+                },
+            )
+            .await;
         std::process::exit(1);
     }
     let report_target = args

@@ -144,7 +144,12 @@ async fn legacy_dispatch_refuses_udp_allow_under_deny_all() {
     .await
     .err()
     .expect("a UDP allow under deny-all must refuse on the legacy dispatch");
-    let LaunchError::Spawn { source, report, .. } = err else {
+    let LaunchError {
+        kind: LaunchErrorKind::Spawn { source, .. },
+        report,
+        ..
+    } = err
+    else {
         panic!("expected LaunchError::Spawn");
     };
     assert!(
@@ -207,7 +212,12 @@ async fn explicit_request_uses_selection_not_the_legacy_gate() {
     .await
     .err()
     .expect("a policy no route satisfies must refuse pre-spawn");
-    let LaunchError::Spawn { report, .. } = err else {
+    let LaunchError {
+        kind: LaunchErrorKind::Spawn { .. },
+        report,
+        ..
+    } = err
+    else {
         panic!("expected LaunchError::Spawn");
     };
     let detail = report
@@ -223,4 +233,204 @@ async fn explicit_request_uses_selection_not_the_legacy_gate() {
         !detail.contains("linux egress policy refused"),
         "detail: {detail}"
     );
+}
+
+/// `TakeIo` carries the already-spawned child — `into_report` must run
+/// the kill → wait → drop sequence exactly once, so a stdio failure
+/// can never leave the workload running behind a `failed` report.
+#[tokio::test]
+async fn into_report_reaps_the_take_io_child() {
+    let warden = Warden::new(Policy::default());
+    // A sleeper that stays alive until killed: `cmd /q` blocks reading
+    // our stdin pipe on Windows, `cat` does the same on Unix. The exe
+    // is spelled absolute — this spawn API takes a resolved program,
+    // not a PATH lookup.
+    // The spawn API takes an argv[0]-inclusive vector — `argv[0]` is
+    // the process name, `argv[1..]` the real arguments (`argv[0]` alone
+    // is used verbatim as the command line's first token; an empty
+    // vector is refused outright).
+    #[cfg(windows)]
+    let (exe, argv) = (
+        crate::trusted_path::system32_path("cmd.exe")
+            .expect("cmd.exe must resolve from the system directory"),
+        // `/d` disables cmd's AutoRun commands — a registered AutoRun
+        // could otherwise change how the fixture reads stdin — and
+        // `/q` turns echo off. With no command to run, cmd then blocks
+        // on our stdin pipe.
+        vec!["cmd.exe".to_string(), "/d".to_string(), "/q".to_string()],
+    );
+    #[cfg(unix)]
+    let (exe, argv) = (
+        std::path::PathBuf::from("/bin/cat"),
+        vec!["cat".to_string()],
+    );
+    let attempt = warden.spawn_unsandboxed_async_exe_with_report(
+        &exe,
+        &argv,
+        &crate::warden::SpawnOptions::default(),
+        "test",
+        false,
+    );
+    let child = attempt.outcome.expect("unsandboxed spawn must succeed");
+    let pid = child.id().expect("spawned child must carry a pid");
+    // A `SYNCHRONIZE`-only handle to the *original* process object,
+    // opened before cleanup hands the child to the error — after
+    // `into_report` its signaled state tells whether that process
+    // exited, which reopen-by-pid can never prove (a reused pid or a
+    // surviving stray handle would still open).
+    #[cfg(windows)]
+    let exit_probe = take_io_test_exit_probe(pid);
+    // The fixture must be alive *and* blocked before cleanup — a child
+    // that already exited would let `into_report` pass without proving
+    // anything about a live workload's reap.
+    #[cfg(unix)]
+    assert!(
+        take_io_test_process_alive(pid),
+        "the fixture child must be alive before into_report"
+    );
+    #[cfg(windows)]
+    assert!(
+        !exit_probe.exited(),
+        "the fixture child must be running (unsignaled) before into_report"
+    );
+
+    let logger = AuditLogger::to_tracing();
+    let fail = FailCtx {
+        audit_logger: &logger,
+        launch_id: uuid::Uuid::new_v4(),
+        target: ExecutionTarget::native(),
+        policy_context: None,
+        dry_run: false,
+        backend: warden.sandbox_backend(),
+        component: "test",
+    };
+    let report = fail.fail(
+        warden.enforcement_plan(
+            None,
+            "",
+            &crate::warden::SpawnOptions::default(),
+            Some("test"),
+            false,
+        ),
+        Vec::new(),
+        LaunchIdentity::for_launch(&argv, &[]).finish(),
+        "stdio capture failed".to_string(),
+    );
+    let err = fail.err(
+        LaunchErrorKind::TakeIo {
+            child: Box::new(child),
+            keeps: SessionKeeps {
+                _spawn_pin: None,
+                #[cfg(all(unix, not(target_os = "linux")))]
+                _exec_staging: None,
+            },
+        },
+        report,
+    );
+    // Bound the cleanup itself: the TakeIo child blocks on stdin, so a
+    // broken reap would hang here rather than fail. On timeout the
+    // fixture is terminated through a fresh pid-level handle —
+    // independent of whatever `into_report` left behind — so the test
+    // fails without leaving a stray child running.
+    let report =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), err.into_report()).await {
+            Ok(report) => report,
+            Err(_) => {
+                take_io_test_force_kill(pid);
+                panic!("into_report did not reap the TakeIo child within 30s");
+            }
+        };
+    assert_eq!(
+        report.result.as_ref().map(|r| r.status),
+        Some("failed"),
+        "the TakeIo report must still record the launch as failed"
+    );
+
+    // `into_report` ran kill → wait → drop — the original process object
+    // must already be signaled *now*. Checking the pre-cleanup probe
+    // immediately proves the reap happened inside cleanup; an exit that
+    // lands afterwards must not satisfy the assertion.
+    #[cfg(unix)]
+    assert!(
+        !take_io_test_process_alive(pid),
+        "the TakeIo child (pid {pid}) is still running after into_report"
+    );
+    #[cfg(windows)]
+    assert!(
+        exit_probe.exited(),
+        "the TakeIo child (pid {pid}) is still running after into_report"
+    );
+}
+
+/// Whether `pid` still names a live process: signal-0 probe — a reaped
+/// child fails it.
+#[cfg(unix)]
+fn take_io_test_process_alive(pid: u32) -> bool {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Pid-level termination independent of the child object — the escape
+/// hatch when the bounded `into_report` times out, so a wedged fixture
+/// can never outlive the failing test.
+#[cfg(unix)]
+fn take_io_test_force_kill(pid: u32) {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+/// Windows counterpart — a fresh `PROCESS_TERMINATE` handle on the pid,
+/// not any handle the child object or the probe owns.
+#[cfg(windows)]
+fn take_io_test_force_kill(pid: u32) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }) else {
+        return;
+    };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        let _ = TerminateProcess(handle, 1);
+        let _ = CloseHandle(handle);
+    }
+}
+
+/// A `SYNCHRONIZE` handle opened on the child *before* cleanup — its
+/// signaled state afterwards is the exit verdict, which reopen-by-pid
+/// can never prove (a reused pid or a surviving stray handle would
+/// still open).
+#[cfg(windows)]
+struct TakeIoExitProbe(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+fn take_io_test_exit_probe(pid: u32) -> TakeIoExitProbe {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
+        .expect("the just-spawned child must open with SYNCHRONIZE access");
+    TakeIoExitProbe(handle)
+}
+
+#[cfg(windows)]
+impl TakeIoExitProbe {
+    /// `true` once the original process object is signaled — i.e. the
+    /// child actually terminated. Independent of pid reuse and of any
+    /// handle the warden itself still holds.
+    fn exited(&self) -> bool {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TakeIoExitProbe {
+    fn drop(&mut self) {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
 }

@@ -47,6 +47,10 @@
 //!                         `-p` publish evidence
 //!     sleep <secs>        install SIGINT/SIGTERM handlers, sleep, print
 //!                         `SIGNAL=<n>` when signalled — stop/kill delivery
+//!     cap-check <name>    `CAP:<name>=0|1` from /proc/self/status CapEff —
+//!                         whether a `--cap-add` grant actually reached the
+//!                         container's effective set (a silently-accepted
+//!                         flag leaves the bit clear)
 //!
 //! MCP tools (runner-wrapped mode — same names/semantics as the shared
 //! kata probe so deny legs attribute identically):
@@ -1021,6 +1025,30 @@ fn cmd_mem_probe() -> i32 {
     0
 }
 
+/// `/proc/self/status` `CapEff` bit test — proves whether a `--cap-add`
+/// grant actually reached the container's effective capability set. The
+/// CLI's exit code cannot distinguish "flag honored" from "flag silently
+/// accepted and dropped"; the bit can.
+fn cmd_cap_check(name: &str) -> i32 {
+    let bit: u64 = match name {
+        "sys_admin" => 21,
+        other => {
+            eprintln!("unknown capability: {other}");
+            return 2;
+        }
+    };
+    match u64::from_str_radix(status_field("CapEff").trim_start_matches("0x"), 16) {
+        Ok(eff) => {
+            println!("CAP:{name}={}", u8::from(eff & (1 << bit) != 0));
+            0
+        }
+        Err(_) => {
+            println!("CAP:{name}=unreadable");
+            1
+        }
+    }
+}
+
 fn run_argv(cmd: &str, args: &[String]) -> i32 {
     match cmd {
         "stdio-echo" => cmd_stdio_echo(),
@@ -1048,6 +1076,7 @@ fn run_argv(cmd: &str, args: &[String]) -> i32 {
         "net-listen" => cmd_net_listen(args.first().map(|s| s.as_str()).unwrap_or("8080")),
         "sleep" => cmd_sleep(args.first().map(|s| s.as_str()).unwrap_or("300")),
         "mem-probe" => cmd_mem_probe(),
+        "cap-check" => cmd_cap_check(args.first().map(|s| s.as_str()).unwrap_or("")),
         other => {
             eprintln!("unknown probe command: {other}");
             2

@@ -440,9 +440,13 @@ fn test_root() -> PathBuf {
 /// take `C:\host\dir:C:\guest\dir` — forward slashes are accepted on both
 /// sides but kept Windows-native for the -v parser.
 fn session_dirs() -> SessionDirs {
+    session_dirs_in(&test_root())
+}
+
+fn session_dirs_in(parent: &Path) -> SessionDirs {
     let root = tempfile::Builder::new()
         .prefix("mcp_writ_hyperv_run_")
-        .tempdir_in(test_root())
+        .tempdir_in(parent)
         .expect("session tempdir");
     let policy = root.path().join("policydir");
     let workspace = root.path().join("workspace");
@@ -462,6 +466,220 @@ fn session_dirs() -> SessionDirs {
         report,
         share,
     }
+}
+
+/// Session dirs for the `run-image` legs under a write-restricted
+/// ancestry. `run-image` pins `--log-dir` and walks every ancestor for
+/// untrusted replace access — a dev checkout's `target/` grants it
+/// (`Authenticated Users: Modify` by construction), so the launch's
+/// mount gate refuses the scratch root the harness sessions use. The
+/// user profile admits write only to the owner and trusted services.
+fn run_image_session_dirs() -> SessionDirs {
+    let profile = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .expect("USERPROFILE must be set for the run-image session dirs");
+    let parent = profile.join(".mcp-writ").join("hyperv-tests");
+    std::fs::create_dir_all(&parent).expect("create run-image session root");
+    let dirs = session_dirs_in(&parent);
+    // The launch mounts only the contract channels, so the mount-scoped
+    // policy variant replaces the copied harness policy — see
+    // `policy-run-image.kdl` for why in-image grants cannot resolve on
+    // a Windows guest.
+    std::fs::copy(
+        fixtures_dir().join("policy-run-image.kdl"),
+        dirs.policy.join("policy.kdl"),
+    )
+    .expect("copy run-image policy");
+    // The allowed-write leg targets `sub/` inside the writable audit
+    // mount — `dirs.logs` is that bind's actual host source (the launch
+    // pins and mounts it as-is), so the dir must exist before launch
+    // for the guest to see it. The guest sees the host object's DACL
+    // through the bind, and the workload's AppContainer SID has no ACE
+    // on `sub/` — without a grant every write dies at the DACL layer
+    // and mount mode is never reached. A host-side `ALL APPLICATION
+    // PACKAGES` ACE — a group the non-LPAC token keeps — makes DACL
+    // allow the write, and `verify_sid_write_grant` asserts that ACE
+    // on `sub/` so "guest DACL allows it" is verified, not assumed.
+    std::fs::create_dir_all(dirs.logs.join("sub")).expect("create audit-mount sub");
+    grant_all_app_packages(&dirs.logs.join("sub"));
+    // The policy mount's host source is NOT `dirs.policy`: the runner
+    // exports the bound policy into its private launch staging dir and
+    // binds that read-only (`runner.rs` `policy_share_host`). Leg 5's
+    // matching `sub/` + ACE prep therefore happens in the session
+    // against the daemon-recorded mount `Source`, not here.
+    dirs
+}
+
+/// Grant `ALL APPLICATION PACKAGES` modify on `dir`, spelled as a SID
+/// so the grant is locale-independent. The outcome is verified through
+/// the security-descriptor API rather than icacls's localized output —
+/// the command's exit status is checked, then the DACL is walked for
+/// the trustee's write-allowing ACE.
+#[cfg(windows)]
+fn grant_all_app_packages(dir: &Path) {
+    let out = StdCommand::new("icacls")
+        .arg(dir)
+        .args(["/grant", "*S-1-15-2-1:(OI)(CI)(M)"])
+        .output()
+        .expect("icacls must spawn on a Windows host");
+    assert!(
+        out.status.success(),
+        "icacls grant on {} failed: {}{}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    verify_sid_write_grant(dir, "S-1-15-2-1");
+}
+
+/// `GetNamedSecurityInfoW`'s heap allocation and any SID built by
+/// `ConvertStringSidToSidW` are `LocalFree`d on every path.
+#[cfg(windows)]
+struct LocalFreeGuard(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for LocalFreeGuard {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.0)));
+        }
+    }
+}
+
+/// Structured proof that `dir`'s DACL carries an access-allowed ACE
+/// handing the `sddl` trustee write rights — `GetNamedSecurityInfoW` +
+/// `GetAce` + `EqualSid`, no localized tool output involved.
+#[cfg(windows)]
+fn verify_sid_write_grant(dir: &Path, sddl: &str) {
+    use std::ffi::c_void;
+
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, PSECURITY_DESCRIPTOR, PSID,
+    };
+    use windows::core::HSTRING;
+
+    let mut trustee = PSID(std::ptr::null_mut());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { ConvertStringSidToSidW(&HSTRING::from(sddl), &mut trustee) }
+        .expect("the SDDL trustee SID must parse");
+    let _trustee_guard = LocalFreeGuard(trustee.0);
+
+    let name = dir.to_string_lossy();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        GetNamedSecurityInfoW(
+            &HSTRING::from(name.as_ref()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+    }
+    .ok()
+    .unwrap_or_else(|e| panic!("GetNamedSecurityInfoW on {}: {e}", dir.display()));
+    let _sd_guard = LocalFreeGuard(sd.0);
+    assert!(
+        !dacl.is_null(),
+        "a null DACL is unrestricted — the fixture dir must carry a real DACL"
+    );
+    let mut info = ACL_SIZE_INFORMATION::default();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        GetAclInformation(
+            dacl,
+            &mut info as *mut _ as *mut c_void,
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .expect("GetAclInformation on the fixture dir DACL");
+
+    // An (M) grant expands to specific rights; FILE_WRITE_DATA (0x2,
+    // FILE_ADD_FILE on a directory) is the bit the create_file leg
+    // needs. Only ACEs that apply to `dir` itself count — an
+    // inherit-only ACE grants children, not this object.
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
+    const INHERIT_ONLY_ACE: u8 = 0x08;
+    const FILE_WRITE_DATA_BIT: u32 = 0x2;
+    let acl_end = dacl.cast::<u8>().wrapping_add(info.AclBytesInUse as usize);
+    let mut granted = false;
+    for i in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { GetAce(dacl, i, &mut ace) }.expect("GetAce inside the DACL bounds");
+        let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+        if ace.is_null()
+            || ace.cast::<u8>() < dacl.cast::<u8>()
+            || ace
+                .cast::<u8>()
+                .wrapping_add(size_of::<ACCESS_ALLOWED_ACE>())
+                > acl_end
+        {
+            continue;
+        }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let (ace_type, ace_flags, mask) =
+            unsafe { ((*ace).Header.AceType, (*ace).Header.AceFlags, (*ace).Mask) };
+        if ace_type != ACCESS_ALLOWED_ACE_TYPE
+            || ace_flags & INHERIT_ONLY_ACE != 0
+            || mask & FILE_WRITE_DATA_BIT == 0
+        {
+            continue;
+        }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let sid = unsafe { PSID(&raw const (*ace).SidStart as *mut c_void) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if unsafe { EqualSid(sid, trustee) }.is_ok() {
+            granted = true;
+            break;
+        }
+    }
+    assert!(
+        granted,
+        "the {sddl} write-allowing ACE is missing from {}'s DACL",
+        dir.display()
+    );
+}
+
+#[cfg(not(windows))]
+fn grant_all_app_packages(_dir: &Path) {}
+
+/// Extract one mount's `RW`/`Source` fields from a
+/// `{{range .Mounts}}Dest|RW|Source;{{end}}` listing — slash/case-
+/// normalized because inspect echoes the `-v` spelling the launch
+/// passed.
+fn mount_entry<'m>(mounts: &'m str, guest_path: &str) -> Option<(&'m str, &'m str)> {
+    let want = guest_path.replace('/', "\\");
+    mounts
+        .split(';')
+        .filter_map(|m| {
+            let mut fields = m.split('|');
+            Some((fields.next()?, fields.next()?, fields.next()?))
+        })
+        .find(|(dest, ..)| dest.replace('/', "\\").eq_ignore_ascii_case(&want))
+        .map(|(_, rw, source)| (rw, source))
+}
+
+fn mount_rw(mounts: &str, guest_path: &str) -> Option<bool> {
+    mount_entry(mounts, guest_path).map(|(rw, _)| rw.trim() == "true")
+}
+
+/// The bind's host `Source` — for the product's policy mount this is
+/// the runner's private launch staging dir, not the harness policy dir
+/// the `--policy` file came from.
+fn mount_source(mounts: &str, guest_path: &str) -> Option<PathBuf> {
+    mount_entry(mounts, guest_path).map(|(_, s)| PathBuf::from(s.trim()))
 }
 
 /// `-v` argument `host:guest`. `display()` emits `C:\…`-style paths on
@@ -527,6 +745,20 @@ fn spawn_hyperv_session(
             "{}=C:\\run\\mcp-secure\\report",
             guest_report::REPORT_OUT_ENV
         ),
+        // `MCP_WRIT_SHARE_ROOTS` is the launch channel the product's
+        // `container_run_args` fills from the mount list — the harness
+        // replicates that contract by hand. Every tool-arg path under a
+        // listed root skips the replaceable-ancestry walk, which the
+        // utility VM's C:\ root DACL could never pass. `C:\share` and
+        // the in-image dirs the legs exercise (`C:\writ-deny`,
+        // `C:\Windows`) are declared for the same reason: a denied leg
+        // must reach the DACL layer to record `os error 5`, and only
+        // the guest workload — never the host — could retarget them.
+        // `C:\mcp-secure`/`C:\probe`/`C:\etc\mcp-secure` cover the image
+        // content the launch binds (entrypoint exe, runner dir, policy
+        // tree).
+        "-e",
+        "MCP_WRIT_SHARE_ROOTS=C:\\workspace;C:\\share;C:\\writ-deny;C:\\Windows;C:\\mcp-secure;C:\\probe;C:\\etc\\mcp-secure",
     ]);
     cmd.args([
         "-v",
@@ -943,13 +1175,26 @@ async fn hyperv_vm_stdio_session() {
         text_of(8)
     );
     // spawn_child records whichever way the guest behaves; the durable
-    // expectation is the observed denial under these launch conditions —
-    // see `windows_sandbox`'s descendant note.
+    // guarantee is containment inheritance, not spawn denial — the
+    // launch sets no child-process policy, and the host leg's denial is
+    // an inherited-cwd accident the utility VM does not reproduce. The
+    // leg must first be a real tool result — an RPC error here would
+    // satisfy the escape check vacuously. Then only two outcomes count:
+    // the permitted spawn refusal, or a spawned descendant whose denied
+    // write provably left no file (`child_txt=false` — the probe checks
+    // the path itself, so no stderr wording is parsed).
+    let spawn_leg = text_of(9);
     assert!(
-        !text_of(9).contains("CHILD_OK"),
-        "a descendant must not run inside the container under the warden's \
-         launch conditions: {}",
-        text_of(9)
+        spawn_leg.contains("\"result\""),
+        "spawn_child must return a tool result, not an RPC error: {spawn_leg}"
+    );
+    assert!(
+        spawn_leg.contains("spawn failed:")
+            || (spawn_leg.contains("spawn ok:")
+                && spawn_leg.contains("child_txt=false")
+                && !spawn_leg.contains("CHILD_ESCAPE")),
+        "a descendant that escaped containment would leave \
+         C:\\writ-deny\\child.txt or type CHILD_ESCAPE back: {spawn_leg}"
     );
     // The probe lists every `MCP_*` variable in its own environment —
     // an empty list checks the whole surface, not just the two sentinel
@@ -1272,6 +1517,8 @@ async fn hyperv_wrap_image_product_path() {
         "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n\
          COPY hyperv-probe.exe C:/probe/hyperv-probe.exe\n\
          COPY vcruntime140.dll C:/probe/vcruntime140.dll\n\
+         WORKDIR C:/writ-deny\n\
+         WORKDIR C:/\n\
          ENTRYPOINT [\"C:/probe/hyperv-probe.exe\"]\n",
     )
     .expect("payload Dockerfile");
@@ -1292,7 +1539,16 @@ async fn hyperv_wrap_image_product_path() {
     let out = timeout(
         Duration::from_secs(3600),
         Command::new(env!("CARGO_BIN_EXE_mcp-writ"))
-            .args(["wrap-image", "--engine", "docker", "--runner-binary"])
+            .args([
+                "wrap-image",
+                "--engine",
+                "docker",
+                // The payload below is a locally built tag-only image;
+                // the base-pin rule targets registry pulls, so the leg
+                // opts in like the run-image helper does.
+                "--allow-mutable-tag",
+                "--runner-binary",
+            ])
             .arg(&runner)
             .arg("--crt-dll")
             .arg(&crt)
@@ -1305,6 +1561,10 @@ async fn hyperv_wrap_image_product_path() {
                 wrapped_tag,
                 payload_tag,
             ])
+            // The fixture policy sits under a dev checkout — a
+            // user-writable ancestor the trusted-source gate refuses;
+            // same waiver used for `.local` in development docs.
+            .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -1540,6 +1800,10 @@ fn spawn_run_image(
         &runner.to_string_lossy(),
         image,
     ])
+    // The staged policy/log/report dirs live under a dev checkout's
+    // target dir — user-writable ancestors the trusted-source gate
+    // would refuse. Same waiver the development docs use for `.local`.
+    .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
@@ -1627,7 +1891,7 @@ async fn run_image_hyperv_stdio_session() {
         return;
     };
 
-    let dirs = blocking(session_dirs).await;
+    let dirs = blocking(run_image_session_dirs).await;
     let host_report = dirs.report.join("host-launch-report.json");
     let t0 = Instant::now();
     let (mut child, stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "docker", &runner);
@@ -1675,12 +1939,55 @@ async fn run_image_hyperv_stdio_session() {
         "a vmwp.exe worker must exist while the product-launched unit runs"
     );
 
+    // Engine-level mount-mode evidence, independent of any write
+    // outcome: the product mounts the policy share `writable: false`
+    // (oci.rs maps that to `:ro`), and the daemon's recorded .Mounts is
+    // the authoritative account — the policy bind must read `RW=false`
+    // and the audit bind `RW=true`. A policy mount recorded writable
+    // would make leg 5's failure attributable to the DACL, not the
+    // mount; this check pins the attribution before the legs run.
+    let mounts = inspect_field(
+        &cid,
+        "{{range .Mounts}}{{.Destination}}|{{.RW}}|{{.Source}};{{end}}",
+    )
+    .await
+    .expect("docker inspect .Mounts must enumerate the launch's binds");
+    assert_eq!(
+        mount_rw(&mounts, "C:\\etc\\mcp-secure"),
+        Some(false),
+        "the policy bind must be recorded read-only: {mounts}"
+    );
+    assert_eq!(
+        mount_rw(&mounts, "C:\\var\\log\\mcp-secure"),
+        Some(true),
+        "the audit bind must be recorded writable: {mounts}"
+    );
+
+    // Leg 5's DACL-allow evidence must live on the bind's *actual* host
+    // source — the product mounts its private launch staging dir as the
+    // policy share (`runner.rs` `policy_share_host`), not `dirs.policy`,
+    // which is only where `--policy` read the kdl from. Prepare `sub/`
+    // inside the discovered source and grant the same verified `ALL
+    // APPLICATION PACKAGES` write ACE the audit mount carries, so the
+    // guest DACL permits the write and only the read-only mount's own
+    // enforcement can refuse it.
+    let policy_sub = mount_source(&mounts, "C:\\etc\\mcp-secure")
+        .expect("docker inspect must name the policy bind's host Source")
+        .join("sub");
+    std::fs::create_dir_all(&policy_sub).expect("create `sub` inside the mounted policy source");
+    grant_all_app_packages(&policy_sub);
+
     // Guest-side probe legs through the product path's stdio relay.
-    // `C:/workspace` is a host bind in the harness session but NOT in
-    // the product launch (run-image mounts only the contract channels:
-    // policy dir, log dir, report dir) — the write legs use
-    // `C:/Windows/Temp`, which the fixture policy grants and the image
-    // carries.
+    // `run-image` mounts only the contract channels (policy dir, audit
+    // dir, report dir, staged runner), and the mount-scoped policy
+    // variant scopes every tool fs pattern beneath those roots — an
+    // in-image dir under the container-writable `C:\` can never pass
+    // the guest's replaceable-ancestry gate (the mount contract is what
+    // makes a guest path boundary-stable). The legs therefore exercise
+    // enforcement through the mounts: an allowed write inside the audit
+    // mount's `sub/`, a mount-layer deny against the read-only policy
+    // mount, a real read of the mounted policy, plus the same
+    // RPC/capability/tool-gate legs the harness session runs.
     wire.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
         .await;
     // Same ordering proof as the harness session: waiting on our own
@@ -1695,31 +2002,42 @@ async fn run_image_hyperv_stdio_session() {
         "tools/list must return the probe's tool inventory, got: {list}"
     );
     let legs: &[(i64, &str, &str)] = &[
-        (1, "vm_identity", "{\"path\":\"C:/Windows/Temp\"}"),
+        (1, "vm_identity", "{\"path\":\"C:/etc/mcp-secure\"}"),
         (
             2,
             "create_file",
-            "{\"path\":\"C:/Windows/Temp/hyperv-run-image.txt\",\"content\":\"hyperv\"}",
+            "{\"path\":\"C:/var/log/mcp-secure/sub/run-image-ok.txt\",\"content\":\"hyperv\"}",
         ),
         (
             3,
             "read_file",
-            "{\"path\":\"C:/Windows/Temp/hyperv-run-image.txt\"}",
+            "{\"path\":\"C:/etc/mcp-secure/policy.kdl\"}",
         ),
         // Secret-overlay deny at the RPC layer.
-        (4, "read_file", "{\"path\":\"C:/Windows/Temp/.ssh/id_rsa\"}"),
-        // AppContainer DACL deny — in-image path, never granted.
+        (
+            4,
+            "read_file",
+            "{\"path\":\"C:/etc/mcp-secure/.ssh/id_rsa\"}",
+        ),
+        // Mount-mode deny — the auditor grants `sub/**` and the
+        // verified `ALL APPLICATION PACKAGES` ACE on the mounted
+        // source's `sub/` makes the guest DACL permit the write, so
+        // only the read-only mount's enforcement can refuse it. Leg 2
+        // is the same write shape through a writable mount (the product
+        // cannot express a writable *policy* mount — `writable: false`
+        // is the enforced contract), and the daemon's recorded `RW`
+        // flags were asserted before these legs ran.
         (
             5,
             "create_file",
-            "{\"path\":\"C:/writ-deny/evil.txt\",\"content\":\"x\"}",
+            "{\"path\":\"C:/etc/mcp-secure/sub/evil.txt\",\"content\":\"x\"}",
         ),
         // AppContainer capability deny — no network SIDs granted.
         // `addr` is omitted — the probe defaults to 192.0.2.1:80 —
         // because a `read_only` tool carrying a host/URL argument is
         // refused by the auditor before the capability check can engage.
-        (6, "net_probe", "{\"path\":\"C:/Windows/Temp\"}"),
-        (7, "env_probe", "{\"path\":\"C:/Windows/Temp\"}"),
+        (6, "net_probe", "{\"path\":\"C:/etc/mcp-secure\"}"),
+        (7, "env_probe", "{\"path\":\"C:/etc/mcp-secure\"}"),
         // Auditor tool gate.
         (8, "exec_shell", "{\"cmd\":\"id\"}"),
     ];
@@ -1748,13 +2066,17 @@ async fn run_image_hyperv_stdio_session() {
         "the in-guest warden must apply AppContainer+Job: {ident}"
     );
     assert!(
-        text_of(2).contains("created C:/Windows/Temp/hyperv-run-image.txt"),
-        "write inside the granted temp dir must succeed: {}",
+        text_of(2).contains("created C:/var/log/mcp-secure/sub/run-image-ok.txt"),
+        "write inside the granted audit-mount subtree must succeed: {}",
         text_of(2)
     );
     assert!(
-        text_of(3).contains("opened C:/Windows/Temp/hyperv-run-image.txt"),
-        "read inside the granted temp dir must succeed: {}",
+        dirs.logs.join("sub").join("run-image-ok.txt").is_file(),
+        "the audit-mount write must be host-visible through the bind"
+    );
+    assert!(
+        text_of(3).contains("opened C:/etc/mcp-secure/policy.kdl"),
+        "read of the mounted policy must succeed: {}",
         text_of(3)
     );
     assert!(
@@ -1762,10 +2084,26 @@ async fn run_image_hyperv_stdio_session() {
         "secret paths must deny at the RPC layer: {}",
         text_of(4)
     );
+    // Mount-mode evidence stacked three ways: the daemon recorded the
+    // policy bind `RW=false` at session start, leg 2 ran the same
+    // `create_file` shape through a writable mount and landed the file
+    // on the host, and `verify_sid_write_grant` proved the guest DACL
+    // permits this write on the mounted source's `sub/` — the read-only
+    // mount's own enforcement is the only remaining refuser. A
+    // misconfigured writable mount would let the write land as a
+    // host-visible file.
     assert!(
-        text_of(5).contains("os error 5"),
-        "write to the ungranted in-image dir must hit the DACL deny: {}",
+        text_of(5).contains("evil.txt") && text_of(5).contains("failed"),
+        "the tool-level write into the read-only policy mount must fail \
+         at the mount layer: {}",
         text_of(5)
+    );
+    // The host-side absence check inspects the same source the bind
+    // serves — the runner's staging dir, not `dirs.policy`.
+    assert!(
+        !policy_sub.join("evil.txt").exists(),
+        "a writable-by-mistake policy mount would let the DACL-permitted \
+         write through — evil.txt must stay absent on the mounted source"
     );
     assert!(
         text_of(6).contains("os error 10013"),
@@ -1893,7 +2231,7 @@ async fn run_image_hyperv_external_kill_cleans_up() {
         return;
     };
 
-    let dirs = blocking(session_dirs).await;
+    let dirs = blocking(run_image_session_dirs).await;
     let host_report = dirs.report.join("host-kill-report.json");
     let (mut child, _stderr_drain) =
         spawn_run_image(&image, &dirs, &host_report, "docker", &runner);
@@ -2010,7 +2348,7 @@ async fn run_image_hyperv_refusal_leaves_nothing_running() {
     // The stderr must name one of those designed refusal points so the
     // test cannot pass on an unrelated failure.
     const DESIGNED_REFUSALS: &[&str] = &[
-        "engine not available on PATH: podman",
+        "engine not available on PATH: 'podman'",
         "the podman endpoint is a remote ssh host",
         "points at a remote daemon",
         "failed to inspect image",

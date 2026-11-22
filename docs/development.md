@@ -110,11 +110,14 @@ sandboxed child. Current coverage and known gaps:
 | Windows | `windows-latest` CI, `go-runtime` workflow (sandboxed Go fixture), local Windows 11 (build 26200) | AppContainer profile create/delete, capability and DACL grant paths, sandboxed spawn tests | Other Windows builds/editions; hosts where the user cannot create AppContainer profiles |
 
 Required permissions: Windows tests need a user environment that can create and
-remove AppContainer profiles (a restricted agent sandbox may not allow it). On
-hosts without that permission, the Windows spawn tests log the spawn failure
-and pass without exercising the sandboxed path — treat a green run there as
-unverified for OS enforcement. macOS tests need `sandbox-exec` on `PATH`.
-No test may widen its privileges to pass.
+remove AppContainer profiles (a restricted agent sandbox may not allow it). The
+spawn tests probe that prerequisite once per binary — a throwaway profile
+create/delete — and report its absence through `skip_unless_required`: a `SKIP`
+line normally, a failure under `MCP_WRIT_REQUIRE_E2E_TESTS=1`. Once the probe
+passes, any spawn, wait, or response failure fails the test — a green run on a
+host without the permission shows the probes as skipped, so it is unverified
+for OS enforcement rather than verified. macOS tests need `sandbox-exec` on
+`PATH`. No test may widen its privileges to pass.
 
 After a macOS upgrade, re-run `cargo test --locked --lib warden::` on the target
 host and record the OS version on which `sandbox-exec` enforcement was last

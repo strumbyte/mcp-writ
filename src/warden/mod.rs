@@ -397,7 +397,7 @@ pub(crate) use env::spawn_env_pairs;
 /// returns the snapshot so `launch` reuses it for the audit details.
 /// `env_block_applies` is the cheap `Option` predicate behind
 /// `spawn_env_pairs`. Ungated: both are called on every target.
-pub(crate) use env::{env_block_applies, warn_env_allowlist_gaps};
+pub(crate) use env::{EnvContractReport, env_block_applies, warn_env_allowlist_gaps};
 
 pub struct Warden {
     policy: Policy,

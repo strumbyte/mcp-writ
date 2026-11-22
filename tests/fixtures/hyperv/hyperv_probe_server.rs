@@ -20,8 +20,9 @@
 //!                                no network capability, so a denial shows
 //!                                the AppContainer capability check
 //!   spawn_child  {}              child-process creation attempt under the
-//!                                warden's launch conditions (descendant
-//!                                restriction evidence)
+//!                                warden's launch conditions — a spawned
+//!                                descendant's denied write proves the
+//!                                container token/job were inherited
 //!   env_probe    {}              environment surface (restricted env
 //!                                evidence: stripped MCP_* / sentinel vars)
 //!
@@ -602,15 +603,21 @@ fn tool_net_probe(args: &J) -> String {
     }
 }
 
-/// Descendant creation under the launch conditions the warden sets.
-/// Mirrors `windows_sandbox`'s `sandboxed_workload_cannot_spawn_children`
-/// observation: an AppContainer child launched through this pipeline
-/// inherits a working directory outside its grants, has no console, and
-/// receives only the stdio pipe handles — the inner `cmd` launch is
-/// denied. The leg records whichever way the guest actually behaves.
+/// Descendant containment under the launch conditions the warden sets.
+/// Descendant *creation* is not policy-blocked — the launch applies no
+/// child-process policy, and whether `cmd` even starts is substrate
+/// luck (the host leg's denial comes from an inherited cwd outside the
+/// grants, which the utility VM does not reproduce). The durable
+/// guarantee is inheritance: a descendant that runs must carry the same
+/// AppContainer token and job membership, so its denied write fails the
+/// same as the parent's — a child that escaped containment would write
+/// `CHILD_ESCAPE` successfully.
 fn tool_spawn_child() -> String {
     match std::process::Command::new("cmd.exe")
-        .args(["/c", "echo CHILD_OK"])
+        .args([
+            "/c",
+            "echo CHILD_ESCAPE > C:\\writ-deny\\child.txt && type C:\\writ-deny\\child.txt",
+        ])
         // `output()` defaults stdin to `Stdio::null`, which opens the NUL
         // device — denied under some AppContainer profiles before the
         // spawn is even attempted. A pipe mirrors the warden's launch
@@ -621,8 +628,13 @@ fn tool_spawn_child() -> String {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
+            // The escape verdict is the *file* — a denied descendant
+            // write leaves no `child.txt` regardless of how cmd phrases
+            // the refusal (locale, stream placement). `stdout` carrying
+            // CHILD_ESCAPE is the same fact from the `type` side.
+            let child_txt = std::path::Path::new(r"C:\writ-deny\child.txt").exists();
             format!(
-                "spawn ok: status={} stdout={:?} stderr={:?}",
+                "spawn ok: status={} stdout={:?} stderr={:?} child_txt={child_txt}",
                 out.status.code().map_or("?".into(), |c| c.to_string()),
                 stdout.trim(),
                 stderr.trim()

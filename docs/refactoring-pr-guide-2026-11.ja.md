@@ -510,18 +510,18 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 
 **タスク**
 
-- [ ] `LaunchConfig`・`LaunchError`・launch結果の全呼出元を一覧化する。host、guest、選択されたnative機構、container／VM adapterのどこまでが同じ経路を使うかを図または表で示す。
-- [ ] resolve、verify、bind、直前reverify、sandbox準備、spawn、stdio取得、auditor開始、report公開、待機・終了の各段階を表にする。各失敗で子が起動したか、stdio公開済みか、audit／report、pin・ACL・子孫・一時物の所有者と回収者を記録する。
-- [ ] 最初のコミットは段階ごとの関数抽出に限定し、順序と入出力を保つ。次に準備済みpolicy・既存VerifiedWorkload・spawn後リソース・sessionの所有権を移す。差分が大きければPRを分けるが、各PRでhost／guest全呼出元をビルド・検証可能にする。
-- [ ] spawn境界の直前再検証とpin保持を実行経路へ結び付ける。型名で検証済みと呼ぶだけで確認を省略せず、Windowsではspawn後も必要な期間pinを保持する。
-- [ ] 共通の失敗report生成とcleanupを集約する。監査失敗、report書込失敗、stdio取得失敗のときに、既に起動した子を成功状態で残したり、二重にwait／releaseしたりしない。
-- [ ] Linux内部helperがruntimeのworker生成前に単一スレッドで起動する順序、hostとcontainer PID1のsignal処理差、ACL復元・Job／cgroup・ハンドル寿命を維持する。プロセス管理方式とsandbox選択アルゴリズムは変更しない。
-- [ ] 段階表の失敗箇所を代表ケースで発生させ、旧新で外部結果と残存物を比較する。RF-T02の有効なprobeと子孫回収検証を使い、単にcargoの成功件数で保証しない。
-- [ ] 共通経路を使う変更対象backendの実機結果を揃える。未検証backendを残したまま共有経路の移行完了としない。変更対象はcontainer、Windows Sandbox、WSLC、Kata、Apple container、Hyper-V等のtest matrixで確認する。
+- [x] `LaunchConfig`・`LaunchError`・launch結果の全呼出元を一覧化する。host、guest、選択されたnative機構、container／VM adapterのどこまでが同じ経路を使うかを図または表で示す。
+- [x] resolve、verify、bind、直前reverify、sandbox準備、spawn、stdio取得、auditor開始、report公開、待機・終了の各段階を表にする。各失敗で子が起動したか、stdio公開済みか、audit／report、pin・ACL・子孫・一時物の所有者と回収者を記録する。
+- [x] 最初のコミットは段階ごとの関数抽出に限定し、順序と入出力を保つ。次に準備済みpolicy・既存VerifiedWorkload・spawn後リソース・sessionの所有権を移す。差分が大きければPRを分けるが、各PRでhost／guest全呼出元をビルド・検証可能にする。
+- [x] spawn境界の直前再検証とpin保持を実行経路へ結び付ける。型名で検証済みと呼ぶだけで確認を省略せず、Windowsではspawn後も必要な期間pinを保持する。
+- [x] 共通の失敗report生成とcleanupを集約する。監査失敗、report書込失敗、stdio取得失敗のときに、既に起動した子を成功状態で残したり、二重にwait／releaseしたりしない。
+- [x] Linux内部helperがruntimeのworker生成前に単一スレッドで起動する順序、hostとcontainer PID1のsignal処理差、ACL復元・Job／cgroup・ハンドル寿命を維持する。プロセス管理方式とsandbox選択アルゴリズムは変更しない。
+- [x] 段階表の失敗箇所を代表ケースで発生させ、旧新で外部結果と残存物を比較する。RF-T02の有効なprobeと子孫回収検証を使い、単にcargoの成功件数で保証しない。
+- [ ] 共通経路を使う変更対象backendの実機結果を揃える。未検証backendを残したまま共有経路の移行完了としない。変更対象はcontainer、Windows Sandbox、WSLC、Kata、Apple container、Hyper-V等のtest matrixで確認する。（検証状況: Hyper-V 17/17・WSLC capability map・container_e2e 16/16（Docker Desktop Linux engine・実Landlock経路）・windows_isolation_e2e/windows_probe_e2e 各22/22・Windows Sandbox mswsb/AppContainer legは実機済み。Windows Sandbox VM tierは昇格下でも`wsb start`が0x80070002を返しDisposableClientVM payload未展開・修復経路なしで本機検証不能。Kata・Apple container・native Linux/macOSは対応ホストなしで未検証のまま残存）
 
 **検証・計測:** T-BASE、T-LAUNCH、T-REPORT、T-AUDIT、T-PROTOCOL。native Linux x86-64／AArch64、Windows、macOSと変更対象backend、Go fixtureの互換性を確認する。M5で準備・初回応答・停止・残存リソースを比較する。
 
-**完了条件:** 呼出側の前提と重複した失敗処理が減り、各資源の所有者と回収経路が説明できる。全変更経路の機能・セキュリティを維持し、性能が後退しない。速度向上自体は採用条件にしない。
+**完了条件:** 呼出側の前提と重複した失敗処理が減り、各資源の所有者と回収経路が説明できる。全変更経路の機能・セキュリティを維持し、性能が後退しない。速度向上自体は採用条件にしない。失敗段階表の各行は、本PRの検証範囲で自然に誘発できるものを実行して結果を記録する。auditor relay起動失敗とstdio取得失敗は安全に誘発する手段がないため「未検証（レビュー確認のみ）」と明記し、検証済み件数には数えない——この2件の実行検証はRF-T06の完了条件に引き継ぐ。
 
 **移行・戻し方:** 抽出・所有権移管の順に独立コミットとし、依存順の逆順で戻す。稼働sessionの途中で所有者を差し替えず、停止・drain・子孫回収後に切り替える。RF01〜RF03およびRF-T02の修正は保持する。
 
@@ -811,6 +811,25 @@ cargo test --locked --lib go_runtime_syscalls_are_mapped_but_not_implicitly_allo
 **検証・完了条件:** 同じSHAに対し必要な保証集合が少なくとも一度実行され、未実行・不明・失敗がgreenへ変わらない。手動実行とreleaseの実行責任が維持され、時間削減を実測できる。参照結果の照合が複雑になりすぎる場合は、共通jobへの集約範囲を縮めるか採用を保留する。
 
 **戻し方:** CI統合を戻す場合は旧job・呼出元・required status・artifactを一組で復元する。証跡参照が機能しないときは検証を実行する経路へ戻す。RF-T01・RF-T03のtarget名とRF-T02の失敗判定は現在の構成に合わせて維持する。
+
+<a id="rf-t06"></a>
+
+### RF-T06 launch失敗段階のfault-injection検証
+
+**目的・依存:** RF09の段階表で、自然発生させる安全な手段がなくレビュー確認に留まった失敗箇所を、制御された故障注入で実行検証する。RF09完了後に実施する。製品の外部契約は変えない。
+
+**現状・主な変更先:** RF09で`Launched::abort`と`FailCtx`に集約した失敗経路のうち、post-launch `--report`書込失敗と`TakeIo`子回収は実probeで検証済みだが、auditor relay起動失敗とstdio取得失敗は本ホストで安全に誘発する手段がなくレビュー確認のまま残っている。対象は[runtime/launch.rs](../src/runtime/launch.rs)の`into_session`周辺と、それを使う`tests`／probe fixture。
+
+**タスク**
+
+- [ ] auditor起動失敗・stdio取得失敗を、`#[cfg(test)]`等のテスト専用ビルド経路にある注入点で確実に誘発する方法を決める。環境変数・フラグ等で本番経路の注入を有効化する手段は設けない。probeにrunnerバイナリが必要なら、注入点を含む専用のテスト用runnerを別途用意し、製品runnerは使わない。
+- [ ] 誘発した各失敗について、既に起動した子が成功状態で残らないこと、reportが`failed`+該当stageを記録すること、pin・ACL・子孫・一時物の回収が二重実行されないことを旧新で比較する。
+- [ ] `TakeIo`／`into_report`系の既存検証と合わせ、段階表の全失敗行が「実probe」または「注入probe」で検証済みとなる対応表を残す。注入に依存しない段階は自然誘発のままにする。
+- [ ] 注入点がOFFの通常経路の外部結果（exit・audit列・report）が注入導入前と一致することを確認する。
+
+**検証・完了条件:** 段階表の全失敗箇所に実行証拠があり、`MCP_WRIT_REQUIRE_E2E_TESTS=1`下でskipがない。RF09が未検証として記録したauditor relay起動失敗とstdio取得失敗の2件は、本PRで注入probeを実行して記録するまで失敗段階表を完了とみなさない。注入機構自体が無効時に副作用を持たないこと。
+
+**戻し方:** 注入点とprobeを一組で戻せる単位にする。検証用の緩和を製品経路に残さない。
 
 ### テスト整理PRの共通終了手順
 

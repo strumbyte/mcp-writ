@@ -1,0 +1,96 @@
+// Fixture policy for the `run-image` Hyper-V legs
+// (run_image_hyperv_* in tests/hyperv_vm_e2e.rs). Same enforcement
+// surface as policy.kdl, but every tool fs pattern is scoped beneath
+// the guest contract's host-mounted roots — on a Windows guest the
+// in-image dirs sit under a container-writable `C:\`, which the
+// runner's replaceable-ancestry gate correctly refuses, so only the
+// mounted contract paths are authorizable:
+//   C:\etc\mcp-secure        policy mount (read-only)
+//   C:\var\log\mcp-secure    audit mount (writable)
+//   C:\run\mcp-secure\report report mount (writable)
+// The writable mounts also carry the audit sink / launch report, so a
+// write grant may only name the `sub/` subtree the harness pre-creates
+// — a grant covering audit.jsonl or report.json itself would trip the
+// launch's sink/report write-conflict guards by design.
+policy version=1
+
+defaults {
+    filesystem {
+        secret-overlay #true
+        // Read coverage for the mounted contract dirs and the runner
+        // install dir (ambient ALL_APPLICATION_PACKAGES access also
+        // covers them; the DACL layer records the intent).
+        allow "C:/etc/mcp-secure" mode="read"
+        allow "C:/probe" mode="read"
+        allow "C:/mcp-secure" mode="read"
+        // The workload's writable area inside the audit mount — the
+        // `sub/` subtree never covers audit.jsonl itself.
+        allow "C:/var/log/mcp-secure/sub" mode="write"
+    }
+    network {
+        deny host="*"
+    }
+    // Declaring the block (even empty) is what switches the child to the
+    // restricted allow-list env: PATH plus the Windows-required plumbing
+    // set only — MCP_* control variables never reach the workload.
+    environment {
+    }
+}
+
+// Per-tool `filesystem` blocks replace the inherited `defaults` write
+// grants — a bare read_only tool would inherit the `sub` write grant
+// and fail the side_effect consistency check.
+server "hyperv-probe" {
+    tool "read_file" side_effect="read_only" {
+        filesystem {
+            allow "C:/etc/mcp-secure/**"
+            allow "C:/var/log/mcp-secure/**"
+        }
+    }
+    tool "vm_identity" side_effect="read_only" {
+        filesystem {
+            allow "C:/etc/mcp-secure/**"
+        }
+    }
+    tool "env_probe" side_effect="read_only" {
+        filesystem {
+            allow "C:/etc/mcp-secure/**"
+        }
+    }
+    tool "create_file" side_effect="write" {
+        filesystem {
+            allow "C:/etc/mcp-secure/**"
+            allow "C:/var/log/mcp-secure/**"
+            // The allowed-write leg lands in the audit mount's `sub/`
+            // subtree; the deny leg targets the read-only policy
+            // mount's `sub/` — granted by the auditor so the write
+            // reaches the mount layer's kernel refusal.
+            allow "C:/var/log/mcp-secure/sub/**" mode="write"
+            allow "C:/etc/mcp-secure/sub/**" mode="write"
+        }
+    }
+    // Declared read_only but its implementation attempts a TCP connect —
+    // the auditor passes it, so only the AppContainer capability check
+    // can stop it. That is the point of the leg. An fs-restricted tool
+    // must carry a path argument, hence `path`.
+    tool "net_probe" side_effect="read_only" {
+        filesystem {
+            allow "C:/etc/mcp-secure/**"
+        }
+    }
+    tool "spawn_child" side_effect="write" {
+        filesystem {
+            allow "C:/etc/mcp-secure/**"
+            allow "C:/var/log/mcp-secure/**"
+            allow "C:/var/log/mcp-secure/sub/**" mode="write"
+        }
+    }
+    tool "exit_child" side_effect="write" {
+        filesystem {
+            allow "C:/etc/mcp-secure/**"
+            allow "C:/var/log/mcp-secure/**"
+            allow "C:/var/log/mcp-secure/sub/**" mode="write"
+        }
+    }
+    tool "exec_shell" deny=#true
+}

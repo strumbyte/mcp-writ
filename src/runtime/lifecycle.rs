@@ -20,7 +20,7 @@ use crate::audit_log::{
     Action, AuditEvent, AuditLogger, EventType, Outcome, PolicyAuditContext, Severity,
     encode_audit_field_value,
 };
-use crate::enforcement::LaunchOutcome;
+use crate::enforcement::{LaunchOutcome, LaunchReport};
 use crate::policy::Policy;
 
 /// Identity shared by every audit record of one launch.
@@ -335,6 +335,29 @@ pub async fn teardown(
         outcome.detail.as_deref(),
     );
     logger.shutdown().await
+}
+
+/// The shared tail of a `LaunchError` caller's failure path: close the
+/// guard bracket with `status=failed` under the same outcome detail the
+/// report carries, flush and stop the logger, and exit 1 — so a failed
+/// launch's bracket cannot drift from its report and every caller
+/// terminates identically.
+pub async fn launch_failed_exit(
+    logger: &AuditLogger,
+    ctx: &SessionAuditContext,
+    report: &LaunchReport,
+) -> ! {
+    guard_stopped(
+        logger,
+        ctx,
+        "failed",
+        Some(1),
+        report.result.as_ref().and_then(|r| r.detail.as_deref()),
+    );
+    // The launch already failed — a terminal audit fault cannot lower
+    // the result further.
+    let _ = logger.shutdown().await;
+    std::process::exit(1);
 }
 
 /// Bracketed lifecycle record for a failure that precedes the session

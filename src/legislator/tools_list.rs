@@ -1979,7 +1979,9 @@ mod tests {
 
     /// Create a directory symlink/junction — privileges are not always
     /// available (Windows needs SeCreateSymbolicLinkPrivilege or dev
-    /// mode), so callers skip on `Err`.
+    /// mode), so callers report `Err` through `skip_unless_required`:
+    /// a missing prerequisite, never a silent pass, and a failure
+    /// under the require gate.
     #[cfg(unix)]
     fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
         std::os::unix::fs::symlink(target, link)
@@ -2002,7 +2004,7 @@ mod tests {
         std::fs::write(real.join(".env"), b"K=1").unwrap();
         let link = dir.path().join("link");
         if symlink_dir(&real, &link).is_err() {
-            eprintln!("symlink fixture unavailable — skipping");
+            crate::testutil::skip_unless_required("symlink fixture unavailable");
             return;
         }
         let mut budget = SECRET_SCAN_MAX_ENTRIES;
@@ -2039,7 +2041,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("app.py"), b"x").unwrap();
         if symlink_dir(&target, &root.join("link")).is_err() {
-            eprintln!("symlink fixture unavailable — skipping");
+            crate::testutil::skip_unless_required("symlink fixture unavailable");
             return;
         }
         let mut budget = SECRET_SCAN_MAX_ENTRIES;
@@ -2066,7 +2068,7 @@ mod tests {
         let missing = dir.path().join("missing-target");
         let link = dir.path().join("dangling");
         if symlink_dir(&missing, &link).is_err() {
-            eprintln!("symlink fixture unavailable — skipping");
+            crate::testutil::skip_unless_required("symlink fixture unavailable");
             return;
         }
         let mut budget = SECRET_SCAN_MAX_ENTRIES;
@@ -2083,7 +2085,7 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         let link = dir.path().join("link");
         if symlink_dir(&real, &link).is_err() {
-            eprintln!("symlink fixture unavailable — skipping");
+            crate::testutil::skip_unless_required("symlink fixture unavailable");
             return;
         }
         let mut budget = SECRET_SCAN_MAX_ENTRIES;

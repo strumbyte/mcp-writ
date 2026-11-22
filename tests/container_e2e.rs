@@ -323,9 +323,34 @@ async fn container_kernel_below_landlock_v4(engine: &str) -> bool {
 
 /// Create a temporary directory for test artifacts.
 fn create_temp_dir() -> std::io::Result<PathBuf> {
-    let temp_dir = std::env::temp_dir().join(format!("mcp-writ-test-{}", unique_hex_id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
+    // On Windows a user %TEMP% can carry untrusted AppContainer-SID ACEs
+    // that the launch's trusted-source gate refuses by design — the
+    // write-restricted profile root keeps launched policy/share paths
+    // acceptable without waiving the gate. Docker build contexts work
+    // the same under either root.
+    let base = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .map(|p| p.join(".mcp-writ").join("container-tests"))
+            .unwrap_or_else(std::env::temp_dir)
+    } else {
+        std::env::temp_dir()
+    };
+    let temp_dir = base.join(format!("mcp-writ-test-{}", unique_hex_id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     std::fs::create_dir_all(&temp_dir)?;
     Ok(temp_dir)
+}
+
+/// Owns a test-created directory and removes it on drop. The runner
+/// build context (with its vendored dependency tree) and the
+/// extracted-binary output dir live under the trusted profile root —
+/// not OS temp — so nothing reaps them unless a guard is held.
+struct TestDirGuard(PathBuf);
+
+impl Drop for TestDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Generate a unique hex string from the current nanosecond timestamp.
@@ -500,7 +525,10 @@ fn verify_runner_caps_marker(binary: PathBuf) -> Result<PathBuf, String> {
 /// check — a plain debug/release build links glibc dynamically and
 /// takes the in-Docker static build below. On other platforms (macOS,
 /// Windows) the binary is always built inside a Docker container.
-async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
+/// Returns the runner path plus the output-dir guard the caller must
+/// keep alive until its binary consumer finishes — `None` when the
+/// native binary was used and nothing was staged.
+async fn get_linux_runner(engine: &str) -> Result<(PathBuf, Option<TestDirGuard>), String> {
     let native = runner_binary_path();
     if is_elf_binary(&native) {
         // A statically linked native runner is usable as-is. Anything
@@ -508,7 +536,7 @@ async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
         // through the in-Docker static build or the guest launch path
         // refuses it before the container starts.
         match mcp_writ::container::common::analyze_runner_binary(&native) {
-            Ok(_) => return verify_runner_caps_marker(native),
+            Ok(_) => return verify_runner_caps_marker(native).map(|p| (p, None)),
             Err(e) => eprintln!(
                 "[container_e2e] host runner rejected ({e}) — \
                  building a static runner in Docker"
@@ -520,7 +548,11 @@ async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
     // build inside Docker with a static CRT so the result is a
     // statically linked ELF.
     let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let temp_dir = create_temp_dir().map_err(|e| format!("temp dir: {e}"))?;
+    // The guard owns the build context — including the vendored
+    // dependency tree — so every early return below (vendor failure,
+    // docker build failure, extraction failure) still cleans it.
+    let build_dir = TestDirGuard(create_temp_dir().map_err(|e| format!("temp dir: {e}"))?);
+    let temp_dir = build_dir.0.clone();
 
     // Vendor dependencies (runs on host, uses local cargo cache)
     let vendor_dir = temp_dir.join("vendor");
@@ -554,12 +586,15 @@ async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
     std::fs::copy(project_dir.join("Cargo.lock"), temp_dir.join("Cargo.lock"))
         .map_err(|e| format!("copy Cargo.lock: {e}"))?;
 
-    // The root manifest lists `fuzz` as a workspace member, so its
-    // manifest (and the target sources it points at) must exist in the
-    // context or cargo fails workspace resolution before compiling.
-    let fuzz_dir = temp_dir.join("fuzz");
-    std::fs::create_dir_all(&fuzz_dir).map_err(|e| format!("mkdir fuzz: {e}"))?;
-    copy_dir_recursive(&project_dir.join("fuzz"), &fuzz_dir)?;
+    // The root manifest lists `fuzz` and `bench` as workspace members,
+    // so their manifests (and the target sources they point at) must
+    // exist in the context or cargo fails workspace resolution before
+    // compiling.
+    for member in ["fuzz", "bench"] {
+        let member_dir = temp_dir.join(member);
+        std::fs::create_dir_all(&member_dir).map_err(|e| format!("mkdir {member}: {e}"))?;
+        copy_dir_recursive(&project_dir.join(member), &member_dir)?;
+    }
 
     // Write Dockerfile — `+crt-static` on the GNU target produces a
     // statically linked (static-pie) runner, which the guest launch path
@@ -571,6 +606,7 @@ COPY vendor/ /vendor/
 COPY src/ src/
 COPY examples/ examples/
 COPY fuzz/ fuzz/
+COPY bench/ bench/
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p .cargo && \
     printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "/vendor"\n' > .cargo/config.toml && \
@@ -603,10 +639,11 @@ RUN mkdir -p .cargo && \
         ));
     }
 
-    // Extract binary from the build image.
-    // NOTE: output_dir is intentionally NOT cleaned up here because
-    // the caller needs the binary. The OS temp dir cleanup handles it.
-    let output_dir = create_temp_dir().map_err(|e| format!("output dir: {e}"))?;
+    // Extract binary from the build image. The output dir is returned
+    // to the caller inside a guard — it lives under the trusted profile
+    // root (not OS temp), so the caller's guard, held until its binary
+    // consumer finishes, is the only cleanup owner.
+    let output_dir = TestDirGuard(create_temp_dir().map_err(|e| format!("output dir: {e}"))?);
     let container_name = unique_image_name("extract");
     let _ = Command::new(engine)
         .args(["create", "--name", &container_name, &build_image])
@@ -618,7 +655,7 @@ RUN mkdir -p .cargo && \
             &format!(
                 "{container_name}:/build/target/x86_64-unknown-linux-gnu/release/mcp-secure-runner"
             ),
-            &output_dir.to_string_lossy(),
+            &output_dir.0.to_string_lossy(),
         ])
         .output()
         .await
@@ -638,15 +675,15 @@ RUN mkdir -p .cargo && \
         return Err("failed to extract binary from Docker image".to_string());
     }
 
-    let binary = output_dir.join("mcp-secure-runner");
+    let binary = output_dir.0.join("mcp-secure-runner");
     if !binary.exists() {
         return Err("binary not found after extraction".to_string());
     }
 
-    // Cleanup temp build dir (keep output_dir with binary)
-    let _ = std::fs::remove_dir_all(&temp_dir);
-
-    verify_runner_caps_marker(binary)
+    // build_dir drops here and removes the whole build context
+    // (vendor tree included); output_dir moves to the caller, whose
+    // guard drops it once the binary's consumer is done.
+    verify_runner_caps_marker(binary).map(|p| (p, Some(output_dir)))
 }
 
 /// Build a minimal base image with echo_server.sh as entrypoint.
@@ -897,8 +934,8 @@ async fn test_container_build_and_run_allowed_tool() {
     };
 
     // Get a Linux-compatible runner binary
-    let runner_path = match get_linux_runner(engine).await {
-        Ok(p) => p,
+    let (runner_path, _runner_dir) = match get_linux_runner(engine).await {
+        Ok(v) => v,
         Err(e) => {
             common::skip_container_test(&format!("failed to get Linux runner: {e}"));
             return;
@@ -976,8 +1013,8 @@ async fn test_container_run_blocked_tool() {
     };
 
     // Get a Linux-compatible runner binary
-    let runner_path = match get_linux_runner(engine).await {
-        Ok(p) => p,
+    let (runner_path, _runner_dir) = match get_linux_runner(engine).await {
+        Ok(v) => v,
         Err(e) => {
             common::skip_container_test(&format!("failed to get Linux runner: {e}"));
             return;
@@ -1074,8 +1111,8 @@ async fn test_container_entrypoint_cmd_preserved() {
     };
 
     // Get a Linux-compatible runner binary
-    let runner_path = match get_linux_runner(engine).await {
-        Ok(p) => p,
+    let (runner_path, _runner_dir) = match get_linux_runner(engine).await {
+        Ok(v) => v,
         Err(e) => {
             common::skip_container_test(&format!("failed to get Linux runner: {e}"));
             return;
@@ -1133,8 +1170,8 @@ async fn test_container_run_image_guest_report_attached() {
         return;
     };
 
-    let runner_path = match get_linux_runner(engine).await {
-        Ok(p) => p,
+    let (runner_path, _runner_dir) = match get_linux_runner(engine).await {
+        Ok(v) => v,
         Err(e) => {
             common::skip_container_test(&format!("failed to get Linux runner: {e}"));
             return;

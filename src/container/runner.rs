@@ -921,6 +921,10 @@ async fn run_image_inner(
             // form is walked ancestor-by-ancestor, so a configured path
             // that reaches its object through a symlink inside the
             // share refuses even when the resolved target sits outside.
+            // `canonicalize` spells the dir `\\?\`-verbatim on Windows;
+            // `resolve_grant_spelling` keeps that spelling intact — the
+            // prefix's `?` is namespace syntax, not a glob — so the
+            // resolved form names the same object the pin holds.
             let Some(log_resolved) =
                 crate::fsoverlap::resolve_grant_spelling(&canonical.to_string_lossy())
             else {

@@ -630,74 +630,17 @@ async fn main() {
     {
         Ok(l) => l,
         Err(e) => {
-            use mcp_writ::runtime::launch::LaunchError;
-            let report = match e {
-                LaunchError::ResolveCommand {
-                    command,
-                    source,
-                    report,
-                } => {
-                    eprintln!("mcp-secure-runner: cannot resolve command '{command}': {source}");
-                    report
-                }
-                LaunchError::VerifyServerHashes {
-                    server_name,
-                    source,
-                    report,
-                } => {
-                    eprintln!(
-                        "mcp-secure-runner: supply chain verification failed for '{server_name}': {source}"
-                    );
-                    report
-                }
-                LaunchError::BindLaunchedWorkload { source, report } => {
-                    eprintln!("mcp-secure-runner: supply chain verification failed: {source}");
-                    report
-                }
-                LaunchError::ReverifyBeforeSpawn { source, report } => {
-                    eprintln!(
-                        "mcp-secure-runner: supply chain verification failed at spawn: {source}"
-                    );
-                    report
-                }
-                LaunchError::Spawn {
-                    argv,
-                    source,
-                    report,
-                } => {
-                    eprintln!(
-                        "mcp-secure-runner: failed to spawn child process '{}' ({} args): {source}",
-                        argv.first().map(String::as_str).unwrap_or("(empty)"),
-                        argv.len()
-                    );
-                    report
-                }
-                LaunchError::TakeIo { mut child, report } => {
-                    eprintln!("mcp-secure-runner: failed to capture child stdin/stdout");
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    drop(child);
-                    report
-                }
-            };
+            eprintln!("{}", e.describe());
+            let mut report = e.into_report().await;
             // The carried plan/observations plus the runner identity are
             // the guest's record of this launch — sent through the
             // dedicated channel, never through the MCP stdout relay.
-            let mut report = *report;
             report.guest_runner = Some(runner_identity());
             eprintln!("mcp-secure-runner: launch report: {}", report.to_json());
             write_guest_report(report_dir.as_deref(), &report);
             // The launch already emitted `server.error`; close the guard
             // bracket with the same failed outcome the report carries.
-            lifecycle::guard_stopped(
-                &audit_logger,
-                &session_audit,
-                "failed",
-                Some(1),
-                report.result.as_ref().and_then(|r| r.detail.as_deref()),
-            );
-            let _ = audit_logger.shutdown().await;
-            std::process::exit(1);
+            lifecycle::launch_failed_exit(&audit_logger, &session_audit, &report).await;
         }
     };
 

@@ -30,12 +30,19 @@ ARG RUNNER_CAPS=
 # /var/log/mcp-secure, /run/mcp-secure/report): on Windows they resolve
 # root-relative to the CWD drive, so WORKDIR C:/ lands them under C:\.
 COPY mcp-secure-runner.exe C:/mcp-secure/mcp-secure-runner.exe
-COPY hyperv-probe.exe C:/mcp-secure/hyperv-probe.exe
+# The probe lives under C:/probe, NOT beside the runner: `run-image
+# --runner-binary` bind-mounts a staged directory over C:/mcp-secure on
+# Windows guests (engines bind directories, not files), which would
+# shadow a workload placed there. The wrap-image leg's payload uses the
+# same layout, and the policy's `C:/probe` read grant exists for it.
+COPY hyperv-probe.exe C:/probe/hyperv-probe.exe
 # Server Core does not ship the MSVC CRT — the guest would fail loader
 # lock with STATUS_DLL_NOT_FOUND (0xC0000135). App-local placement next
 # to the exes is the supported redistribution form; the test copies the
-# host's vcruntime140.dll into the build context.
+# host's vcruntime140.dll into the build context. Both the runner and
+# the probe import it.
 COPY vcruntime140.dll C:/mcp-secure/vcruntime140.dll
+COPY vcruntime140.dll C:/probe/vcruntime140.dll
 COPY policy.kdl C:/etc/mcp-secure/policy.kdl
 
 # In-image deny-zone: `C:\writ-deny` exists (WORKDIR creates it) but is
@@ -47,7 +54,7 @@ WORKDIR C:/
 # The workload the runner restores. MCP_WRIT_* channel vars are baked
 # empty so an image default can never divert a launch; the launch still
 # passes MCP_WRIT_SERVER / MCP_WRIT_LAUNCH_ID / MCP_WRIT_REPORT_OUT.
-ENV MCP_ORIG_ENTRYPOINT="[\"C:/mcp-secure/hyperv-probe.exe\"]" \
+ENV MCP_ORIG_ENTRYPOINT="[\"C:/probe/hyperv-probe.exe\"]" \
     MCP_ORIG_CMD="" \
     MCP_WRIT_ENV="" \
     MCP_WRIT_SERVER="" \

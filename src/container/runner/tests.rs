@@ -476,13 +476,13 @@ fn log_share_refuses_artifact_through_plain_spelled_share_link() {
     // `a_link` lands on a share-local link whose own target resolves
     // outside — `read_link` returns the *plain* `C:\…` spelling the
     // link was created with, under a `\\?\`-prefixed share root.
-    if symlink_dir(&plain_real, plain_share.join("L2")).is_err()
-        || symlink_dir(plain_share.join("L2"), aparent.join("a_link")).is_err()
+    if let Err(e) = symlink_dir(&plain_real, plain_share.join("L2"))
+        .and_then(|()| symlink_dir(plain_share.join("L2"), aparent.join("a_link")))
     {
-        eprintln!(
-            "skipping: directory symlink creation needs privilege \
-             (developer mode or SeCreateSymbolicLinkPrivilege)"
-        );
+        crate::testutil::skip_unless_required(&format!(
+            "directory symlink creation unavailable (developer mode or \
+             SeCreateSymbolicLinkPrivilege): {e}"
+        ));
         return;
     }
     let spelled = aparent.join("a_link").join("mcp-secure-runner");
@@ -541,6 +541,82 @@ fn current_exe_failure_aborts_launch() {
     // is not what is under test.
     push_current_exe(&mut sensitive, Ok(PathBuf::from("mcp-writ"))).unwrap();
     assert_eq!(sensitive.len(), 1);
+}
+
+/// `canonicalize` spells every artifact `\\?\`-verbatim on Windows —
+/// a policy inside the log share must still conflict when both sides
+/// reach the check verbatim-spelled. `resolve_grant_spelling` keeps
+/// the verbatim prefix, so the fallback comparison resolves links
+/// rather than stopping at the spelled form.
+#[cfg(windows)]
+#[test]
+fn log_share_detects_nested_policy_through_verbatim_spellings() {
+    let dir = tempfile::tempdir().unwrap();
+    let share = dir.path().join("share");
+    let sub = share.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let policy = sub.join("policy.kdl");
+    std::fs::write(&policy, b"policy").unwrap();
+    let log_resolved =
+        crate::fsoverlap::resolve_grant_spelling(&share.canonicalize().unwrap().to_string_lossy())
+            .expect("a canonicalized dir must resolve");
+    let artifact = std::fs::canonicalize(&policy).unwrap();
+    assert!(
+        artifact.to_string_lossy().starts_with(r"\\?\"),
+        "fixture must produce a verbatim spelling: {}",
+        artifact.display()
+    );
+    assert!(
+        log_share_conflicts_artifact(&log_resolved, &artifact),
+        "a policy nested beneath the verbatim log dir must conflict"
+    );
+}
+
+/// A verbatim `\\?\…\audit.` component names a *different* object than
+/// its normalized sibling `…\audit` — non-verbatim resolution strips
+/// the trailing dot. The overlap check must keep the verbatim spelling
+/// so a mount of `audit.` is compared against `audit.`, never the
+/// normalized `audit`: a policy inside `audit.` conflicts with that
+/// mount, and the sibling `audit` mount must not conflate the two.
+#[cfg(windows)]
+#[test]
+fn log_share_verbatim_audit_dot_dir_is_not_normalized_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap(); // `\\?\…` verbatim
+    let audit_dot = PathBuf::from(format!(r"{}\audit.", base.display()));
+    std::fs::create_dir(&audit_dot).expect("create the literal `audit.` dir");
+    let audit_plain = PathBuf::from(format!(r"{}\audit", base.display()));
+    std::fs::create_dir(&audit_plain).expect("create the sibling `audit` dir");
+    let policy = audit_dot.join("policy.kdl");
+    std::fs::write(&policy, b"policy").unwrap();
+    let artifact = std::fs::canonicalize(&policy).unwrap();
+    assert!(
+        artifact.to_string_lossy().contains(r"audit.\"),
+        "fixture must keep the literal `audit.` component: {}",
+        artifact.display()
+    );
+
+    let audit_dot_resolved = crate::fsoverlap::resolve_grant_spelling(&audit_dot.to_string_lossy())
+        .expect("a verbatim dir must resolve");
+    assert!(
+        audit_dot_resolved.to_string_lossy().contains("audit."),
+        "resolution must preserve the `audit.` component, got {}",
+        audit_dot_resolved.display()
+    );
+    assert!(
+        log_share_conflicts_artifact(&audit_dot_resolved, &artifact),
+        "a policy inside the verbatim `audit.` mount must conflict — \
+         the check may not inspect the normalized `audit` instead"
+    );
+    // Distinct objects stay distinct: a mount of `audit` does not
+    // cover a policy inside `audit.`, and vice versa.
+    let audit_plain_resolved =
+        crate::fsoverlap::resolve_grant_spelling(&audit_plain.to_string_lossy())
+            .expect("the plain sibling must resolve");
+    assert!(
+        !log_share_conflicts_artifact(&audit_plain_resolved, &artifact),
+        "`audit` and `audit.` are different objects — no conflation"
+    );
 }
 
 #[test]

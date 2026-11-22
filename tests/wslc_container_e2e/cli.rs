@@ -247,13 +247,49 @@ async fn wslc_cli_capability_map() {
             false,
             true,
         ),
+        // wslc ≥3.0.5 accepts `--cap-add` and functionally applies it
+        // (measured: CapEff gains bit 21 = CAP_SYS_ADMIN). The contract
+        // is "refused outright OR granted for real" — a silently
+        // accepted flag that never reaches the capability set is the
+        // failure this must catch. The product's validated line starts
+        // at 3.0.1, so versions where the flag does not exist are in
+        // scope: below 3.0.5 the leg keeps the prior contract — the
+        // flag must be *refused*, which an unnoticed acceptance would
+        // violate. An unparsable version gets the refusal expectation
+        // too: a newer wslc that accepts would then fail loudly rather
+        // than drift past the record.
+        if mcp_writ::container::windows_probe::parse_wslc_version(&wslc_version_text())
+            .is_some_and(|v| v >= (3, 0, 5))
+        {
+            mk(
+                "cap-add-sysadmin",
+                &["--cap-add", "SYS_ADMIN"],
+                &["cap-check", "sys_admin"],
+                "CAP:sys_admin=1",
+                true,
+                false,
+            )
+        } else {
+            mk(
+                "refuse-cap-add",
+                &["--cap-add", "SYS_ADMIN"],
+                &["exit-code", "0"],
+                "",
+                false,
+                true,
+            )
+        },
+        // Baseline for the leg above: without the flag the bit must be
+        // clear, otherwise `CAP:sys_admin=1` proves nothing about
+        // `--cap-add`. Also `required` — a default-granted SYS_ADMIN is
+        // a security-relevant substrate change.
         mk(
-            "refuse-cap-add",
-            &["--cap-add", "SYS_ADMIN"],
-            &["exit-code", "0"],
-            "",
-            false,
+            "cap-default-no-sysadmin",
+            &[],
+            &["cap-check", "sys_admin"],
+            "CAP:sys_admin=0",
             true,
+            false,
         ),
         mk(
             "refuse-device",
@@ -279,8 +315,12 @@ async fn wslc_cli_capability_map() {
             false,
             true,
         ),
+        // `--restart` became a real wslc option (≥3.0.5), but `probe_run`
+        // always passes `--rm` and wslc refuses the conflict — which is
+        // exactly the product guarantee: a launch built on `--rm` can
+        // never carry a restart policy. The leg still must refuse.
         mk(
-            "refuse-restart",
+            "refuse-restart-with-rm",
             &["--restart", "always"],
             &["exit-code", "0"],
             "",
