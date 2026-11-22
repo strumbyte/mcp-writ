@@ -486,11 +486,11 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 
 **タスク**
 
-- [ ] summaryがreason等の表示文字列を意味判定に使う箇所と、その生成側を一覧化する。まず該当項目だけに範囲を限定する。
-- [ ] Landlockの完全適用・部分適用・未適用等の事実と、未観測／Unknown・失敗を表せる内部型を決める。OSから得ていない値をintentから補って成功としない。
-- [ ] 生成側で観測事実を持たせ、machine reportとhuman reasonをそこから別々に生成する。説明文の変更が機械結果に影響しないようにする。
-- [ ] 既存のreportフィールド、値、順序が契約化されている出力、Unknown、降格、未適用、失敗を固定fixtureで比較する。時刻・UUIDは対応付け、親子IDやauditとの相関は検査する。
-- [ ] 文字列分類を削除し、型未設定の分岐がUnknownまたは既存の失敗へ安全に落ちることを確認する。全control IDやJSON schemaの同時刷新はしない。
+- [x] summaryがreason等の表示文字列を意味判定に使う箇所と、その生成側を一覧化する。まず該当項目だけに範囲を限定する。 → 意味判定は`EnforcementSummary::build`の`restriction`導出1箇所のみ（`reason.find(RESTRICT_SELF_REPORTED)`+prefix判定）。生成側は`warden/plan/linux.rs`のLandlock backed control observation。`weakened_os_tokens`等他箇所は`ControlState`参照で範囲外と確認
+- [x] Landlockの完全適用・部分適用・未適用等の事実と、未観測／Unknown・失敗を表せる内部型を決める。OSから得ていない値をintentから補って成功としない。 → `enforcement::RestrictionLevel`（`FullyEnforced`/`PartiallyEnforced`/`NotEnforced`）＋`EnforcementObservation.restriction: Option<RestrictionLevel>`。`None`が未観測・`NO_RULESET`・`NOT_RUN`・不明コード・非Landlock機構をカバーし、`landlock_fact()`は`ApplySnapshot.landlock`の実測値のみ変換——plan intentからの補完経路は存在しない
+- [x] 生成側で観測事実を持たせ、machine reportとhuman reasonをそこから別々に生成する。説明文の変更が機械結果に影響しないようにする。 → `linux_stage_outcome`が`(state, fact, reason)`を返し、factは`landlock_fact`、reasonは`RestrictionLevel::reason_marker()`が従来文言をそのままレンダリング。`enforcement::tests::summary_restriction_ignores_reason_text`で文言変更時の機械結果同一、marker風文字列のみではnullになることを固定
+- [x] 既存のreportフィールド、値、順序が契約化されている出力、Unknown、降格、未適用、失敗を固定fixtureで比較する。時刻・UUIDは対応付け、親子IDやauditとの相関は検査する。 → `summary_to_json_shape`が`enforcement`memberのJSON形状・値・順序を固定。Linux観測側は`warden::plan::tests::linux_observations`の`restriction_of`でFULL→Verified+fact、PARTIAL→降格+fact、NOT_ENFORCED→NotApplied+fact、失敗stage→Failed+fact、`NO_RULESET`/`NOT_RUN`/record欠落・不整合→Unknown+fact無しを固定。reportとauditは同一`plan`/`observations`からの生成で相関は既存構造のまま。lib 2606件・`pr03_corpus_matches_reference`等の既存fixture全緑
+- [x] 文字列分類を削除し、型未設定の分岐がUnknownまたは既存の失敗へ安全に落ちることを確認する。全control IDやJSON schemaの同時刷新はしない。 → `RESTRICT_SELF_REPORTED`/`LANDLOCK_*_ENFORCED`定数ごと削除しrgで残存0を確認。`landlock_fact`の`_`アームとrecord欠落・不整合の早いreturnは`None`→`restriction: null`。control ID・外部JSON・`enforcement.backend`値は不変
 
 **検証・計測:** T-BASE、T-REPORT、生成側OSのT-LAUNCH。表示文だけを変えた入力で機械結果が同じことを検査する。変更箇所のreport生成とM5で性能非後退を確認する。
 

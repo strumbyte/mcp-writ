@@ -431,6 +431,7 @@ fn observation(report: &mut LaunchReport, id: &'static str, state: ControlState,
         state,
         basis: ObservationBasis::VerificationRun,
         phase: ControlPhase::Session,
+        restriction: None,
         reason: Some(detail.into()),
     });
 }

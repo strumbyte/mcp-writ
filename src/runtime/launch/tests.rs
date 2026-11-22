@@ -6,6 +6,7 @@ fn obs(control: &'static str, state: ControlState) -> EnforcementObservation {
         state,
         basis: ObservationBasis::MechanismResult,
         phase: ControlPhase::Spawn,
+        restriction: None,
         reason: None,
     }
 }

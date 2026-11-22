@@ -126,6 +126,7 @@ fn observation(
         state,
         basis,
         phase,
+        restriction: None,
         reason,
     }
 }

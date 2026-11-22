@@ -367,6 +367,7 @@ fn linux_plan_grants_come_from_the_same_build() {
 #[cfg(target_os = "linux")]
 mod linux_observations {
     use super::*;
+    use crate::enforcement::RestrictionLevel;
     use crate::warden::linux_spawn::{ApplySnapshot, landlock_level, stage};
 
     fn full_record() -> ApplySnapshot {
@@ -393,6 +394,10 @@ mod linux_observations {
         obs.iter().find(|o| o.control == id).unwrap().state
     }
 
+    fn restriction_of(obs: &[EnforcementObservation], id: &str) -> Option<RestrictionLevel> {
+        obs.iter().find(|o| o.control == id).unwrap().restriction
+    }
+
     #[test]
     fn full_apply_reads_verified_even_with_allow_degraded() {
         // allow_degraded tolerates degradation; a kernel-reported
@@ -401,6 +406,18 @@ mod linux_observations {
         let obs = os_spawn_observations(&policy(), &controls(), Some(&full_record()), None, None);
         for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
             assert_eq!(state_of(&obs, id), ControlState::Verified, "{id}");
+        }
+        // The kernel-reported level rides the Landlock-backed controls
+        // as a typed fact; non-Landlock mechanisms carry none.
+        for id in ["os.fs", "os.net.outbound"] {
+            assert_eq!(
+                restriction_of(&obs, id),
+                Some(RestrictionLevel::FullyEnforced),
+                "{id}"
+            );
+        }
+        for id in ["os.privileges", "os.syscalls"] {
+            assert_eq!(restriction_of(&obs, id), None, "{id}");
         }
     }
 
@@ -416,13 +433,18 @@ mod linux_observations {
         assert_eq!(state_of(&obs, "os.fs"), ControlState::PartiallyApplied);
         assert_eq!(state_of(&obs, "os.privileges"), ControlState::Verified);
         assert_eq!(state_of(&obs, "os.syscalls"), ControlState::Verified);
+        assert_eq!(
+            restriction_of(&obs, "os.fs"),
+            Some(RestrictionLevel::PartiallyEnforced)
+        );
     }
 
     #[test]
     fn pre_v4_kernel_network_rules_read_not_applied() {
         // Landlock network rules exist since ABI v4: on an older
         // kernel the port rules were never enforceable, so the net
-        // control reads NotApplied while fs is PartiallyApplied.
+        // control reads NotApplied while fs is PartiallyApplied. The
+        // kernel still reported the level — the fact records it.
         let snap = ApplySnapshot {
             landlock: landlock_level::PARTIAL,
             landlock_abi: 1,
@@ -431,6 +453,10 @@ mod linux_observations {
         let obs = os_spawn_observations(&policy(), &controls(), Some(&snap), None, None);
         assert_eq!(state_of(&obs, "os.net.outbound"), ControlState::NotApplied);
         assert_eq!(state_of(&obs, "os.fs"), ControlState::PartiallyApplied);
+        assert_eq!(
+            restriction_of(&obs, "os.net.outbound"),
+            Some(RestrictionLevel::PartiallyEnforced)
+        );
     }
 
     #[test]
@@ -444,12 +470,19 @@ mod linux_observations {
         assert_eq!(state_of(&obs, "os.fs"), ControlState::NotApplied);
         assert_eq!(state_of(&obs, "os.net.outbound"), ControlState::NotApplied);
         assert_eq!(state_of(&obs, "os.syscalls"), ControlState::Verified);
+        assert_eq!(
+            restriction_of(&obs, "os.fs"),
+            Some(RestrictionLevel::NotEnforced)
+        );
+        assert_eq!(restriction_of(&obs, "os.syscalls"), None);
     }
 
     #[test]
     fn failed_stage_marks_that_control_failed_and_later_unreached() {
         // The Landlock gate refused a partial ruleset: nnp completed,
-        // the Landlock stage failed, seccomp never ran.
+        // the Landlock stage failed, seccomp never ran. The recorded
+        // level still rides the failed Landlock controls — it is the
+        // fact the gate refused on.
         let snap = ApplySnapshot {
             stage: stage::NO_NEW_PRIVS,
             landlock: landlock_level::PARTIAL,
@@ -465,6 +498,16 @@ mod linux_observations {
         assert_eq!(state_of(&obs, "os.syscalls"), ControlState::Failed);
         let reason = &obs.iter().find(|o| o.control == "os.fs").unwrap().reason;
         assert!(reason.as_deref().unwrap().contains("PartiallyEnforced"));
+        assert_eq!(
+            restriction_of(&obs, "os.fs"),
+            Some(RestrictionLevel::PartiallyEnforced)
+        );
+        assert_eq!(
+            restriction_of(&obs, "os.net.outbound"),
+            Some(RestrictionLevel::PartiallyEnforced)
+        );
+        // A control past the failed stage carries no level.
+        assert_eq!(restriction_of(&obs, "os.syscalls"), None);
     }
 
     #[test]
@@ -489,6 +532,10 @@ mod linux_observations {
             .clone()
             .unwrap();
         assert!(reason.contains("spawn"));
+        assert_eq!(
+            restriction_of(&obs, "os.fs"),
+            Some(RestrictionLevel::FullyEnforced)
+        );
     }
 
     #[test]
@@ -498,6 +545,7 @@ mod linux_observations {
         let obs = os_spawn_observations(&policy(), &controls, None, None, None);
         for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
             assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
+            assert_eq!(restriction_of(&obs, id), None, "{id}");
         }
         // Page present but never written past stage 0 — the spawn
         // somehow returned anyway (child killed mid-pipeline).
@@ -508,6 +556,7 @@ mod linux_observations {
         let obs = os_spawn_observations(&policy(), &controls, Some(&snap), None, None);
         for id in ["os.fs", "os.net.outbound", "os.syscalls"] {
             assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
+            assert_eq!(restriction_of(&obs, id), None, "{id}");
         }
     }
 
@@ -523,6 +572,7 @@ mod linux_observations {
         let obs = os_spawn_observations(&policy(), &controls(), Some(&snap), None, None);
         for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
             assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
+            assert_eq!(restriction_of(&obs, id), None, "{id}");
         }
 
         // An honest record always has stage == failed_stage - 1: a
@@ -539,6 +589,24 @@ mod linux_observations {
         let obs = os_spawn_observations(&policy(), &controls(), Some(&snap), Some(&err), None);
         for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
             assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
+            assert_eq!(restriction_of(&obs, id), None, "{id}");
+        }
+    }
+
+    #[test]
+    fn no_ruleset_and_unrecorded_levels_carry_no_fact() {
+        // `NO_RULESET` is "nothing was applied", not a level — and a
+        // stage that ran without storing a status is unobserved. Both
+        // must not produce a restriction claim.
+        for landlock in [landlock_level::NO_RULESET, landlock_level::NOT_RUN, 0xff] {
+            let snap = ApplySnapshot {
+                landlock,
+                ..full_record()
+            };
+            let obs = os_spawn_observations(&policy(), &controls(), Some(&snap), None, None);
+            for id in ["os.fs", "os.net.outbound"] {
+                assert_eq!(restriction_of(&obs, id), None, "landlock={landlock} {id}");
+            }
         }
     }
 }

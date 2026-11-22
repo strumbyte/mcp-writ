@@ -49,26 +49,13 @@ pub use model::{
     FsAccess, GrantOrigin, GrantSubject, GuestReportLink, GuestReportState, GuestRunnerIdentity,
     IdentityKind, IdentityPin, IsolationRecord, LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome,
     LaunchReport, ObservationBasis, PinCheck, PinRole, PlannedControl, ProcessGrant,
-    ToolDisposition,
+    RestrictionLevel, ToolDisposition,
 };
 pub use plan::{PLAN_REPORT_SCHEMA_VERSION, PlanCheck, PlanCheckStatus, PlanReport, PlanStatus};
 pub use summary::{
     ControlOutcome, EnforcementSummary, GrantStateCounts, PSEC_SPEC_SCHEMA_VERSION, PsecSummary,
     SKIPPED_GRANT_SUMMARY_CAP, SandboxBackend,
 };
-
-/// Marker prefix `warden::plan::linux` writes into Landlock-backed
-/// control observation reasons — `restrict_self reported <level>` —
-/// followed by the kernel-reported `RulesetStatus` name. The summary
-/// scanner reads the same prefix back: the wording is a producer/consumer
-/// contract, so the constants below are the only spellings.
-pub(crate) const RESTRICT_SELF_REPORTED: &str = "restrict_self reported ";
-
-/// `RulesetStatus` level names as they appear after
-/// [`RESTRICT_SELF_REPORTED`] in an observation reason.
-pub(crate) const LANDLOCK_FULLY_ENFORCED: &str = "FullyEnforced";
-pub(crate) const LANDLOCK_PARTIALLY_ENFORCED: &str = "PartiallyEnforced";
-pub(crate) const LANDLOCK_NOT_ENFORCED: &str = "NotEnforced";
 
 #[cfg(test)]
 mod tests;

@@ -206,6 +206,7 @@ impl HostRunRec {
             state,
             basis,
             phase,
+            restriction: None,
             reason,
         });
     }
@@ -1271,6 +1272,7 @@ async fn run_image_inner(
         state: ControlState::Unknown,
         basis: ObservationBasis::NotObserved,
         phase: ControlPhase::Session,
+        restriction: None,
         reason: Some(
             "guest-side enforcement runs inside the guest (a container, or a \
              VM under --isolation kata); the host does not observe it (the \

@@ -368,6 +368,46 @@ impl EnforcementPlan {
     }
 }
 
+/// The Landlock enforcement level the kernel reported for a launch's
+/// `restrict_self` — the typed fact an [`EnforcementObservation`]
+/// carries so machine consumers never have to read the human `reason`
+/// back into a result. `state` keeps the per-control outcome
+/// (`Verified`/`Unknown`/`Failed`/…); this level is what `restrict_self`
+/// itself reported, present only where a Landlock-backed mechanism
+/// recorded one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestrictionLevel {
+    /// `RulesetStatus::FullyEnforced` — every requested rule applied.
+    FullyEnforced,
+    /// `RulesetStatus::PartiallyEnforced` — the kernel enforced a
+    /// subset of the requested rules.
+    PartiallyEnforced,
+    /// `RulesetStatus::NotEnforced` — the ruleset applied nothing.
+    NotEnforced,
+}
+
+impl RestrictionLevel {
+    /// The `enforcement.restriction` member spelling on audit records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FullyEnforced => "fully_enforced",
+            Self::PartiallyEnforced => "partially_enforced",
+            Self::NotEnforced => "not_enforced",
+        }
+    }
+
+    /// The `restrict_self reported <RulesetStatus>` wording an
+    /// observation `reason` uses for this level. Display text only —
+    /// machine consumers read the typed field, never this string.
+    pub fn reason_marker(self) -> &'static str {
+        match self {
+            Self::FullyEnforced => "restrict_self reported FullyEnforced",
+            Self::PartiallyEnforced => "restrict_self reported PartiallyEnforced",
+            Self::NotEnforced => "restrict_self reported NotEnforced",
+        }
+    }
+}
+
 /// The observed outcome of applying one control — where it was taken and
 /// on what evidence. Observations exist only for outcomes that required a
 /// runtime check; construction-time decisions (`NotApplicable`,
@@ -379,6 +419,15 @@ pub struct EnforcementObservation {
     pub state: ControlState,
     pub basis: ObservationBasis,
     pub phase: ControlPhase,
+    /// The kernel-reported restriction level recorded for this
+    /// observation's mechanism — `Some` only when a Landlock-backed
+    /// control's apply reported a `RulesetStatus`. `None` covers every
+    /// unobserved case (no apply record, the stage never ran or stored
+    /// no status, no ruleset, a non-Landlock mechanism, another
+    /// platform) and is never completed from plan intent into a claim.
+    /// Machine consumers (`enforcement.restriction`) read this field;
+    /// `reason` is the human half of the same fact.
+    pub restriction: Option<RestrictionLevel>,
     pub reason: Option<String>,
 }
 

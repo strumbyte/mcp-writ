@@ -911,6 +911,7 @@ pub async fn launch(
                 state: ControlState::Unknown,
                 basis: ObservationBasis::NotObserved,
                 phase: ControlPhase::Session,
+                restriction: None,
                 reason: rpc_reason.clone(),
             });
         }
@@ -1123,6 +1124,7 @@ fn identity_observation(identity: &CodeIdentity) -> EnforcementObservation {
         state: ControlState::Verified,
         basis: ObservationBasis::VerificationRun,
         phase: ControlPhase::Build,
+        restriction: None,
         reason: Some(reason),
     }
 }
@@ -1136,6 +1138,7 @@ fn identity_observation_failed(detail: &str) -> EnforcementObservation {
         state: ControlState::Failed,
         basis: ObservationBasis::VerificationRun,
         phase: ControlPhase::Build,
+        restriction: None,
         reason: Some(detail.to_string()),
     }
 }
