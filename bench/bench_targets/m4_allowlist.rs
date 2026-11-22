@@ -163,6 +163,21 @@ const SCENARIOS: &[Scenario] = &[
     },
 ];
 
+/// `measure::reset` zeroes the deadline gauge along with the
+/// counters, but the heap it samples survives the phase boundary —
+/// re-seed the gauge from its last retained reading so the read-only
+/// phases' snapshots report the queue the table actually holds.
+fn reset_keeping_deadline_gauge() {
+    let retained = mcp_writ::measure::snapshot()
+        .gauges
+        .iter()
+        .find(|(name, _)| *name == mcp_writ::measure::DNS_DEADLINE_ENTRIES.name)
+        .map(|(_, v)| *v)
+        .unwrap_or(0);
+    mcp_writ::measure::reset();
+    mcp_writ::measure::set(&mcp_writ::measure::DNS_DEADLINE_ENTRIES, retained);
+}
+
 /// The fill + expired-sleep + lookup + churn cycle for one scenario,
 /// phase-timed and phase-instrumented. Returns the report fragment.
 fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> String {
@@ -258,10 +273,12 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
         }
 
         // Lookups — hits concentrate on the live domain; expired
-        // addresses scan their dead names then deny.
+        // addresses scan their dead names then deny. The read-only
+        // phases keep the deadline gauge across the reset: the heap
+        // still holds what the fill left in it.
         let mut rng = Rng::new(seed + it_no as u64);
         let domain = ((distinct_addrs + sc.expired) as u64).max(1) * 2;
-        mcp_writ::measure::reset();
+        reset_keeping_deadline_gauge();
         let t = Instant::now();
         let mut hits = 0usize;
         for _ in 0..sc.lookups {
@@ -281,7 +298,7 @@ fn run_scenario(sc: &Scenario, iterations: usize, warmup: usize, seed: u64) -> S
         // consumed so the names collection and sort cannot be
         // elided; the rng is reseeded for the identical probe order.
         let mut rng = Rng::new(seed + it_no as u64);
-        mcp_writ::measure::reset();
+        reset_keeping_deadline_gauge();
         let t = Instant::now();
         let mut hits = 0usize;
         for _ in 0..sc.lookups {

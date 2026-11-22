@@ -94,6 +94,12 @@ struct Inner {
 /// small tables from rebuilding on every other write.
 const DEADLINE_REBUILD_FLOOR: usize = 256;
 
+/// Sparse-bucket bound shared by the reap and revoke removals: a
+/// kept inner map shrinks once its allocation exceeds this multiple
+/// of its population — the bucket stays, but not an allocation still
+/// sized for names already gone.
+const BUCKET_SHRINK_FACTOR: usize = 4;
+
 /// The deadline queue's element: a grant's expiry, the generation it
 /// was pushed under, and the key it reaps. `Reverse` orders the heap
 /// earliest-deadline-first.
@@ -181,14 +187,7 @@ fn reap_expired(inner: &mut Inner, now: Instant) {
         if stale {
             continue;
         }
-        let empty = {
-            let m = inner.by_addr.get_mut(&addr).unwrap();
-            m.remove(&*name);
-            m.is_empty()
-        };
-        if empty {
-            inner.by_addr.remove(&addr);
-        }
+        remove_from_bucket(inner, addr, &name);
         inner.note_live_removed(&GrantKey {
             addr,
             name: name.into_string(),
@@ -227,6 +226,26 @@ fn compact_deadlines(inner: &mut Inner) {
         &crate::measure::DNS_DEADLINE_ENTRIES,
         inner.deadlines.len() as u64,
     );
+}
+
+/// Remove `name` from `addr`'s bucket — `true` when a grant left.
+/// The empty bucket drops out of `by_addr` entirely; a kept one
+/// shrinks once its capacity outgrows `BUCKET_SHRINK_FACTOR`, the
+/// same policy on both removal paths so a concentrated address's
+/// map cannot retain an allocation sized for names already gone.
+fn remove_from_bucket(inner: &mut Inner, addr: IpAddr, name: &str) -> bool {
+    let Some(m) = inner.by_addr.get_mut(&addr) else {
+        return false;
+    };
+    if m.remove(name).is_none() {
+        return false;
+    }
+    if m.is_empty() {
+        inner.by_addr.remove(&addr);
+    } else if m.capacity() > m.len().saturating_mul(BUCKET_SHRINK_FACTOR) {
+        m.shrink_to_fit();
+    }
+    true
 }
 
 /// Release the token's whole staged bucket — the drop half shared by
@@ -298,6 +317,137 @@ fn is_allowed_of(
     })
 }
 
+/// The `register_at*` body run under the table lock — refusal, lazy
+/// reap, and the refresh-or-insert all at `now`, the instant the
+/// caller chose: sampled under the lock by `register_at`, injected by
+/// `register_at_clock`.
+fn register_at_of(
+    inner: &mut Inner,
+    max_grants: usize,
+    name: &str,
+    addr: IpAddr,
+    quals: &[crate::policy::GrantQual],
+    expires: Instant,
+    now: Instant,
+) -> bool {
+    if expires <= now || quals.is_empty() {
+        return false;
+    }
+    // Reborrow the `&mut Inner` once — field-split borrows let the
+    // refresh path hold its entry while the deadline heap is written
+    // alongside.
+    let inner = &mut *inner;
+    reap_expired(inner, now);
+    let key = GrantKey {
+        addr,
+        name: name.to_string(),
+    };
+    if let Some(e) = inner.by_addr.get_mut(&addr).and_then(|m| m.get_mut(name)) {
+        // A fresh answer for the same name→addr replaces the
+        // grant's expiry and scope — a longer-lived answer renews
+        // it, a shorter one is the resolver's newer truth and
+        // wins too. The bumped generation strands the old
+        // deadline in the heap as a skip-on-pop stale entry.
+        e.expires = expires;
+        e.quals = quals.to_vec();
+        e.generation = push_deadline(
+            &mut inner.deadlines,
+            &mut inner.next_deadline_gen,
+            expires,
+            addr,
+            name,
+        );
+        compact_deadlines(inner);
+        return true;
+    }
+    if inner.live_total >= max_grants {
+        return false;
+    }
+    let generation = push_deadline(
+        &mut inner.deadlines,
+        &mut inner.next_deadline_gen,
+        expires,
+        addr,
+        name,
+    );
+    inner.by_addr.entry(addr).or_default().insert(
+        key.name.clone(),
+        GrantEntry {
+            expires,
+            generation,
+            quals: quals.to_vec(),
+        },
+    );
+    inner.note_live_inserted(&key);
+    compact_deadlines(inner);
+    true
+}
+
+/// The `register_staged_at*` body run under the table lock — same
+/// refusals and lazy reap as `register_at_of`, at the caller's `now`,
+/// but the grant lands in the staged set instead of the live table.
+#[expect(clippy::too_many_arguments)] // mirrors the method's parameter list
+fn register_staged_at_of(
+    inner: &mut Inner,
+    max_grants: usize,
+    staging: GrantStaging,
+    name: &str,
+    addr: IpAddr,
+    quals: &[crate::policy::GrantQual],
+    expires: Instant,
+    now: Instant,
+) -> bool {
+    if expires <= now || quals.is_empty() {
+        return false;
+    }
+    reap_expired(inner, now);
+    let key = GrantKey {
+        addr,
+        name: name.to_string(),
+    };
+    // A re-registration inside the same token refreshes in place —
+    // still invisible until commit.
+    if let Some(e) = inner
+        .staged
+        .get_mut(&staging.0)
+        .and_then(|entries| entries.get_mut(&key))
+    {
+        e.expires = expires;
+        e.quals = quals.to_vec();
+        return true;
+    }
+    // Capacity counts live grants plus staged keys that would add
+    // a *new* key on commit — a staged refresh of a live key adds
+    // nothing, and two tokens staging the same key share one
+    // reservation: re-staging a key another token already holds
+    // merges into that reservation on commit, so it consumes no
+    // further headroom and must not be refused by a full table.
+    // `staged_new` tracks that unique-set count incrementally —
+    // the per-call staged-set rebuild it replaced.
+    if let Some(c) = inner.staged_counts.get_mut(&key) {
+        *c += 1;
+    } else if !inner.live_has(&key) {
+        if inner.live_total + inner.staged_new >= max_grants {
+            return false;
+        }
+        inner.staged_new += 1;
+        inner.staged_counts.insert(key.clone(), 1);
+    } else {
+        // First staged hold of a live key — tracked so reaping or
+        // revoking the live grant restores the reservation.
+        inner.staged_counts.insert(key.clone(), 1);
+    }
+    inner.staged.entry(staging.0).or_default().insert(
+        key,
+        GrantEntry {
+            expires,
+            generation: 0,
+            quals: quals.to_vec(),
+        },
+    );
+    true
+}
+
 /// Dynamic allow list for DNS-gate answers. Thread-safe; reaping of
 /// expired grants runs lazily inside the mutating calls, so the table
 /// stays bounded without a sweeper task.
@@ -355,7 +505,9 @@ impl DynamicAllowList {
     }
 
     /// Register with an absolute expiry — the testable core of
-    /// [`Self::register`].
+    /// [`Self::register`]. The reference instant is sampled under the
+    /// lock, as in `is_allowed` — the refusal check and the lazy reap
+    /// run at the instant the table is actually examined.
     pub(crate) fn register_at(
         &self,
         name: &str,
@@ -363,12 +515,24 @@ impl DynamicAllowList {
         quals: &[crate::policy::GrantQual],
         expires: Instant,
     ) -> bool {
-        self.register_at_clock(name, addr, quals, expires, Instant::now())
+        let mut inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        register_at_of(
+            &mut inner,
+            self.max_grants,
+            name,
+            addr,
+            quals,
+            expires,
+            Instant::now(),
+        )
     }
 
     /// [`Self::register_at`] against a caller-chosen instant — the
     /// refusal check and the lazy reap share one clock, letting the
     /// reference-model trace drive a monotone logical time.
+    #[allow(dead_code)] // used by the RF07 tests
     pub(crate) fn register_at_clock(
         &self,
         name: &str,
@@ -383,54 +547,15 @@ impl DynamicAllowList {
         let mut inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        // Reborrow through the guard once — field-split borrows on a
-        // plain `&mut Inner` let the refresh path hold its entry while
-        // the deadline heap is written alongside.
-        let inner = &mut *inner;
-        reap_expired(inner, now);
-        let key = GrantKey {
-            addr,
-            name: name.to_string(),
-        };
-        if let Some(e) = inner.by_addr.get_mut(&addr).and_then(|m| m.get_mut(name)) {
-            // A fresh answer for the same name→addr replaces the
-            // grant's expiry and scope — a longer-lived answer renews
-            // it, a shorter one is the resolver's newer truth and
-            // wins too. The bumped generation strands the old
-            // deadline in the heap as a skip-on-pop stale entry.
-            e.expires = expires;
-            e.quals = quals.to_vec();
-            e.generation = push_deadline(
-                &mut inner.deadlines,
-                &mut inner.next_deadline_gen,
-                expires,
-                addr,
-                name,
-            );
-            compact_deadlines(inner);
-            return true;
-        }
-        if inner.live_total >= self.max_grants {
-            return false;
-        }
-        let generation = push_deadline(
-            &mut inner.deadlines,
-            &mut inner.next_deadline_gen,
-            expires,
-            addr,
+        register_at_of(
+            &mut inner,
+            self.max_grants,
             name,
-        );
-        inner.by_addr.entry(addr).or_default().insert(
-            key.name.clone(),
-            GrantEntry {
-                expires,
-                generation,
-                quals: quals.to_vec(),
-            },
-        );
-        inner.note_live_inserted(&key);
-        compact_deadlines(inner);
-        true
+            addr,
+            quals,
+            expires,
+            now,
+        )
     }
 
     /// Begin a staging token for one resolution's mint. Grants
@@ -467,7 +592,9 @@ impl DynamicAllowList {
     }
 
     /// [`Self::register_staged`] with an absolute expiry — the testable
-    /// core, mirroring `register_at`.
+    /// core, mirroring `register_at`: the reference instant is sampled
+    /// under the lock so the refusal check and the lazy reap share the
+    /// instant the table is examined at.
     pub(crate) fn register_staged_at(
         &self,
         staging: GrantStaging,
@@ -476,11 +603,24 @@ impl DynamicAllowList {
         quals: &[crate::policy::GrantQual],
         expires: Instant,
     ) -> bool {
-        self.register_staged_at_clock(staging, name, addr, quals, expires, Instant::now())
+        let mut inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        register_staged_at_of(
+            &mut inner,
+            self.max_grants,
+            staging,
+            name,
+            addr,
+            quals,
+            expires,
+            Instant::now(),
+        )
     }
 
     /// [`Self::register_staged_at`] against a caller-chosen instant —
     /// mirrors `register_at_clock` for the staged path.
+    #[allow(dead_code)] // used by the RF07 tests
     pub(crate) fn register_staged_at_clock(
         &self,
         staging: GrantStaging,
@@ -496,52 +636,16 @@ impl DynamicAllowList {
         let mut inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        reap_expired(&mut inner, now);
-        let key = GrantKey {
+        register_staged_at_of(
+            &mut inner,
+            self.max_grants,
+            staging,
+            name,
             addr,
-            name: name.to_string(),
-        };
-        // A re-registration inside the same token refreshes in place —
-        // still invisible until commit.
-        if let Some(e) = inner
-            .staged
-            .get_mut(&staging.0)
-            .and_then(|entries| entries.get_mut(&key))
-        {
-            e.expires = expires;
-            e.quals = quals.to_vec();
-            return true;
-        }
-        // Capacity counts live grants plus staged keys that would add
-        // a *new* key on commit — a staged refresh of a live key adds
-        // nothing, and two tokens staging the same key share one
-        // reservation: re-staging a key another token already holds
-        // merges into that reservation on commit, so it consumes no
-        // further headroom and must not be refused by a full table.
-        // `staged_new` tracks that unique-set count incrementally —
-        // the per-call staged-set rebuild it replaced.
-        if let Some(c) = inner.staged_counts.get_mut(&key) {
-            *c += 1;
-        } else if !inner.live_has(&key) {
-            if inner.live_total + inner.staged_new >= self.max_grants {
-                return false;
-            }
-            inner.staged_new += 1;
-            inner.staged_counts.insert(key.clone(), 1);
-        } else {
-            // First staged hold of a live key — tracked so reaping or
-            // revoking the live grant restores the reservation.
-            inner.staged_counts.insert(key.clone(), 1);
-        }
-        inner.staged.entry(staging.0).or_default().insert(
-            key,
-            GrantEntry {
-                expires,
-                generation: 0,
-                quals: quals.to_vec(),
-            },
-        );
-        true
+            quals,
+            expires,
+            now,
+        )
     }
 
     /// Activate every grant staged under `staging` — the audit record
@@ -620,15 +724,7 @@ impl DynamicAllowList {
         let mut inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        let removed = if let Some(m) = inner.by_addr.get_mut(&addr) {
-            let removed = m.remove(name).is_some();
-            if m.is_empty() {
-                inner.by_addr.remove(&addr);
-            }
-            removed
-        } else {
-            false
-        };
+        let removed = remove_from_bucket(&mut inner, addr, name);
         if removed {
             inner.note_live_removed(&GrantKey {
                 addr,

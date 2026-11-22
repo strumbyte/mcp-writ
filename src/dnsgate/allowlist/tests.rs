@@ -576,10 +576,10 @@ fn export_to_tmp_suffixed_destination_stays_atomic() {
 fn export_to_symlink_destination_does_not_write_through() {
     // A symlink planted at the destination must be replaced by the
     // rename, never followed: the link target keeps its contents.
-    let dir = std::env::temp_dir()
-        .join("mcp_writ_test")
-        .join(format!("export_link_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    // The fixture dir is the product's owner-only tempdir — a
+    // security-operation test must not stage in a shared,
+    // pre-creatable temp path.
+    let dir = crate::fspriv::create_private_tempdir("export_link").unwrap();
     let victim = dir.join("victim");
     std::fs::write(&victim, "keep-me").unwrap();
     let dest = dir.join("allowlist.json");
@@ -616,10 +616,7 @@ fn export_to_failed_create_touches_nothing() {
         eprintln!("SKIP: root bypasses the 0o555 mode — cannot exercise EACCES");
         return;
     }
-    let dir = std::env::temp_dir()
-        .join("mcp_writ_test")
-        .join(format!("export_ro_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::fspriv::create_private_tempdir("export_ro").unwrap();
     let dest = dir.join("allowlist.json");
     std::fs::write(&dest, "pre-existing").unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -645,10 +642,7 @@ fn export_to_failed_create_touches_nothing() {
 #[test]
 fn export_to_uses_restrictive_mode() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir()
-        .join("mcp_writ_test")
-        .join(format!("export_mode_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::fspriv::create_private_tempdir("export_mode").unwrap();
     let dest = dir.join("allowlist.json");
     let al = DynamicAllowList::new(16);
     al.register(
