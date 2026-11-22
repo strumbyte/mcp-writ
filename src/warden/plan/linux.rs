@@ -182,6 +182,16 @@ pub(crate) fn os_spawn_observations(
         .collect()
 }
 
+/// Controls whose mechanism consults the launch's Landlock apply —
+/// the observations that carry the kernel-reported
+/// [`RestrictionLevel`] fact.
+fn landlock_backed(id: &str) -> bool {
+    matches!(
+        id,
+        "os.fs" | "os.net.outbound" | "os.ipc.unix" | "os.ipc.signal"
+    )
+}
+
 /// The typed restriction fact an apply record carries: the
 /// kernel-reported `RulesetStatus` level when one was recorded.
 /// `NOT_RUN` (the stage stored no status), `NO_RULESET` (nothing was
@@ -196,6 +206,24 @@ fn landlock_fact(snap: &linux_spawn::ApplySnapshot) -> Option<RestrictionLevel> 
         landlock_level::NOT_ENFORCED => Some(RestrictionLevel::NotEnforced),
         _ => None,
     }
+}
+
+/// The restriction fact a failed pipeline's observation may carry.
+/// The Landlock stage stores the kernel status before the gate can
+/// refuse (`linux_spawn` writes `landlock` ahead of `failed_stage`), so
+/// the level is still fact for controls whose own stage failed later
+/// or never ran. Two pairings cannot be produced honestly and report
+/// none: `FULL` beside a *Landlock-stage* failure (the gate always
+/// passes `FullyEnforced`), and any stored status where the Landlock
+/// stage was never entered.
+fn failed_landlock_fact(snap: &linux_spawn::ApplySnapshot) -> Option<RestrictionLevel> {
+    use super::super::linux_spawn::stage;
+    if snap.failed_stage < stage::LANDLOCK {
+        return None;
+    }
+    landlock_fact(snap).filter(|l| {
+        snap.failed_stage != stage::LANDLOCK || !matches!(l, RestrictionLevel::FullyEnforced)
+    })
 }
 
 /// The fixed pipeline stage a control's mechanism occupies — same order
@@ -271,18 +299,12 @@ fn linux_control_observation(
             ControlPhase::Spawn,
             Some(linux_stage_failure_reason(snap)),
         );
-        // The Landlock stage records its kernel level before the gate
-        // refuses, so a failed apply still carries what `restrict_self`
-        // reported — the same levels the reason names. A `FULL` beside
-        // a recorded failure is not an honest combination and reports
-        // none.
-        if my_stage == linux_spawn::stage::LANDLOCK {
-            o.restriction = landlock_fact(snap).filter(|l| {
-                matches!(
-                    l,
-                    RestrictionLevel::PartiallyEnforced | RestrictionLevel::NotEnforced
-                )
-            });
+        // A Landlock-backed control carries the level the apply
+        // recorded even when its own stage is the one that failed —
+        // the scope its mechanism consults was applied (or refused by
+        // the gate) independently of where the pipeline stopped.
+        if landlock_backed(c.id) {
+            o.restriction = failed_landlock_fact(snap);
         }
         return o;
     }
@@ -308,7 +330,7 @@ fn linux_control_observation(
     }
 
     if snap.failed_stage != linux_spawn::stage::NONE {
-        return observation(
+        let mut o = observation(
             c.id,
             ControlState::Failed,
             ObservationBasis::MechanismResult,
@@ -318,6 +340,13 @@ fn linux_control_observation(
                 snap.errno
             )),
         );
+        // A control past the failed stage still carries the recorded
+        // level when its mechanism consults Landlock — the fact belongs
+        // to the launch's apply, not to where the pipeline stopped.
+        if landlock_backed(c.id) {
+            o.restriction = failed_landlock_fact(snap);
+        }
+        return o;
     }
 
     observation(
@@ -391,12 +420,12 @@ fn linux_stage_outcome(
 ) -> (ControlState, Option<RestrictionLevel>, String) {
     use super::super::linux_spawn::landlock_level;
     // The kernel-reported level is a fact of the launch's Landlock
-    // apply; only controls whose mechanism consults it carry the fact —
-    // the same observations whose reason reports the level. Mechanisms
-    // that never query Landlock record none.
-    let level = match id {
-        "os.fs" | "os.net.outbound" | "os.ipc.unix" | "os.ipc.signal" => landlock_fact(snap),
-        _ => None,
+    // apply; only controls whose mechanism consults it carry the fact.
+    // Mechanisms that never query Landlock record none.
+    let level = if landlock_backed(id) {
+        landlock_fact(snap)
+    } else {
+        None
     };
     let requested = |base: String| match requested_rights {
         Some(r) => format!("{base}; requested: {r}"),

@@ -506,8 +506,87 @@ mod linux_observations {
             restriction_of(&obs, "os.net.outbound"),
             Some(RestrictionLevel::PartiallyEnforced)
         );
-        // A control past the failed stage carries no level.
+        // A control past the failed stage still carries the recorded
+        // level when its mechanism consults Landlock; a pure seccomp
+        // mechanism carries none.
         assert_eq!(restriction_of(&obs, "os.syscalls"), None);
+        let mut deny_all = policy();
+        deny_all.network.outbound.deny_all_others = true;
+        let controls = os_controls(&deny_all, WindowsNativeMechanism::AppContainer);
+        let obs = os_spawn_observations(&deny_all, &controls, Some(&snap), Some(&err), None);
+        assert_eq!(
+            restriction_of(&obs, "os.ipc.unix"),
+            Some(RestrictionLevel::PartiallyEnforced)
+        );
+        assert_eq!(restriction_of(&obs, "os.syscalls"), None);
+    }
+
+    #[test]
+    fn later_stage_failure_keeps_an_honest_full_level() {
+        // Seccomp failed after Landlock applied cleanly: the FULL
+        // status was honestly recorded before the failure, so it
+        // rides the Landlock-backed controls — including the one at
+        // the failed stage.
+        let snap = ApplySnapshot {
+            stage: stage::DEMOTE,
+            failed_stage: stage::SECCOMP,
+            errno: libc::EPERM,
+            ..full_record()
+        };
+        let err = std::io::Error::from_raw_os_error(libc::EPERM);
+        let mut deny_all = policy();
+        deny_all.network.outbound.deny_all_others = true;
+        let controls = os_controls(&deny_all, WindowsNativeMechanism::AppContainer);
+        let obs = os_spawn_observations(&deny_all, &controls, Some(&snap), Some(&err), None);
+        assert_eq!(state_of(&obs, "os.fs"), ControlState::Verified);
+        assert_eq!(state_of(&obs, "os.ipc.unix"), ControlState::Failed);
+        assert_eq!(state_of(&obs, "os.syscalls"), ControlState::Failed);
+        assert_eq!(
+            restriction_of(&obs, "os.fs"),
+            Some(RestrictionLevel::FullyEnforced)
+        );
+        assert_eq!(
+            restriction_of(&obs, "os.ipc.unix"),
+            Some(RestrictionLevel::FullyEnforced)
+        );
+        assert_eq!(restriction_of(&obs, "os.syscalls"), None);
+    }
+
+    #[test]
+    fn dishonest_level_pairings_carry_no_fact() {
+        let err = std::io::Error::from_raw_os_error(libc::EACCES);
+        let mut deny_all = policy();
+        deny_all.network.outbound.deny_all_others = true;
+        let controls = os_controls(&deny_all, WindowsNativeMechanism::AppContainer);
+
+        // The gate always passes `FullyEnforced` — a FULL status beside
+        // a Landlock-stage failure cannot be produced honestly.
+        let snap = ApplySnapshot {
+            stage: stage::NO_NEW_PRIVS,
+            landlock: landlock_level::FULL,
+            failed_stage: stage::LANDLOCK,
+            errno: libc::EACCES,
+            ..full_record()
+        };
+        let obs = os_spawn_observations(&deny_all, &controls, Some(&snap), Some(&err), None);
+        assert_eq!(state_of(&obs, "os.fs"), ControlState::Failed);
+        for id in ["os.fs", "os.net.outbound", "os.ipc.unix"] {
+            assert_eq!(restriction_of(&obs, id), None, "{id}");
+        }
+
+        // The Landlock stage was never entered — a stored status on
+        // such a record is fabricated, not observed.
+        let snap = ApplySnapshot {
+            stage: stage::NONE,
+            landlock: landlock_level::FULL,
+            failed_stage: stage::NO_NEW_PRIVS,
+            errno: libc::EACCES,
+            ..full_record()
+        };
+        let obs = os_spawn_observations(&deny_all, &controls, Some(&snap), Some(&err), None);
+        for id in ["os.fs", "os.net.outbound", "os.ipc.unix"] {
+            assert_eq!(restriction_of(&obs, id), None, "{id}");
+        }
     }
 
     #[test]
