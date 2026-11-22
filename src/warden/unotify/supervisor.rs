@@ -465,8 +465,9 @@ impl Loop {
                     SockProto::Datagram => crate::policy::EgressProto::Udp,
                     SockProto::Other | SockProto::Unknown => crate::policy::EgressProto::Any,
                 };
-                let grant_names = self.grants.live_names(&dest);
-                let grant_covered = self.grants.has_grant(&dest, flow_proto, port);
+                // Names and coverage come from one grant snapshot —
+                // the verdict and its audit names stay consistent.
+                let (grant_names, grant_covered) = self.grants.view(&dest, flow_proto, port);
                 let verdict =
                     self.evaluator
                         .evaluate(&dest, flow_proto, port, &grant_names, grant_covered);

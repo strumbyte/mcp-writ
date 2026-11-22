@@ -348,13 +348,37 @@ fn snapshot_parse_and_ttl_expiry() {
     ));
     std::fs::write(&path, &body).unwrap();
     let mut g = Grants::new(GrantSource::SnapshotFile(path.clone()));
-    let live = g.live_names(&"93.184.216.34".parse().unwrap());
-    assert_eq!(live, vec!["a.example".to_string()]);
+    let live = g.view(
+        &"93.184.216.34".parse().unwrap(),
+        crate::policy::EgressProto::Tcp,
+        443,
+    );
+    assert_eq!(live.0, vec!["a.example".to_string()]);
+    assert!(live.1);
+    // The same live grant reports its name under a non-covered proto
+    // — the grant exists, its qualifiers just don't authorize UDP.
+    let udp = g.view(
+        &"93.184.216.34".parse().unwrap(),
+        crate::policy::EgressProto::Udp,
+        443,
+    );
+    assert_eq!(udp.0, vec!["a.example".to_string()]);
+    assert!(!udp.1);
     // Expired grant is closed even though it is in the file.
-    assert!(g.live_names(&"203.0.113.8".parse().unwrap()).is_empty());
+    let stale = g.view(
+        &"203.0.113.8".parse().unwrap(),
+        crate::policy::EgressProto::Tcp,
+        443,
+    );
+    assert!(stale.0.is_empty() && !stale.1);
     // A missing file is an empty grant set (fail closed).
     std::fs::remove_file(&path).unwrap();
-    assert!(g.live_names(&"93.184.216.34".parse().unwrap()).is_empty());
+    let gone = g.view(
+        &"93.184.216.34".parse().unwrap(),
+        crate::policy::EgressProto::Tcp,
+        443,
+    );
+    assert!(gone.0.is_empty() && !gone.1);
     // Garbage degrades to empty, never a guess.
     assert!(parse_snapshot("not json").is_empty());
     assert!(parse_snapshot(r#"{"schema_version":"1.0"}"#).is_empty());

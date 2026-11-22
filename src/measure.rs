@@ -332,8 +332,16 @@ static TIMINGS: &[&Timing] = &[
 /// failed sends, cancelled producers) rather than only enqueue edges.
 pub static AUDIT_QUEUE_BYTES: Gauge = Gauge::new("audit.queue.bytes");
 
+/// Deadline-heap entries inside `DynamicAllowList` — pending expiries
+/// plus stale generations awaiting their slot. Sampled inside
+/// `compact_deadlines`, which runs after each lazy reap and after
+/// commit/revoke batches; the rebuild bound keeps it within ~2× live
+/// grants (plus a small floor), so update churn cannot grow it
+/// without limit — the retention figure RF07 bounds.
+pub static DNS_DEADLINE_ENTRIES: Gauge = Gauge::new("dns.deadline.entries");
+
 /// All gauges, for [`snapshot`].
-static GAUGES: &[&Gauge] = &[&AUDIT_QUEUE_BYTES];
+static GAUGES: &[&Gauge] = &[&AUDIT_QUEUE_BYTES, &DNS_DEADLINE_ENTRIES];
 
 /// Registered audit byte-budget semaphores — `(capacity, weak ref)`
 /// per live logger. [`AUDIT_QUEUE_BYTES`] is derived from these at

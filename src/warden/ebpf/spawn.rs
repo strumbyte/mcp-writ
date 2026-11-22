@@ -116,10 +116,11 @@ fn primary_gid_for(uid: u32) -> Result<u32, String> {
             return Ok(gid);
         }
     }
-    Err(format!(
-        "cannot resolve a primary gid for uid {uid} — set SUDO_GID or pass \
+    Err(
+        "cannot resolve a primary gid for the invoking uid — set SUDO_GID or pass \
          --privileged-workload"
-    ))
+            .to_string(),
+    )
 }
 
 /// Spawn `argv` under the Linux sandbox pipeline plus the cgroup-eBPF

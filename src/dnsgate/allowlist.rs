@@ -16,7 +16,8 @@
 //! a snapshot goes stale the moment it is written, and re-checking
 //! expiry is what keeps the TTL contract intact.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -26,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// One name→address grant keyed separately so a name's re-resolution
 /// refreshes only its own grants and two names can share an address
 /// without merging each other's expiries.
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct GrantKey {
     addr: IpAddr,
     name: String,
@@ -34,6 +35,11 @@ struct GrantKey {
 
 struct GrantEntry {
     expires: Instant,
+    /// Deadline-heap generation — bumped on every expiry write so a
+    /// heap entry superseded by a refresh can never remove the
+    /// updated grant. Staged entries carry 0; a real generation is
+    /// assigned when they land live.
+    generation: u64,
     /// The proto/port qualifiers under which the grant was minted —
     /// the allow rules that covered the name decide what the resolved
     /// address may carry (a `proto=udp` name rule authorizes only UDP
@@ -44,20 +50,403 @@ struct GrantEntry {
 }
 
 struct Inner {
-    grants: HashMap<GrantKey, GrantEntry>,
+    /// Live grants indexed by address then name — the IP-layer lookup
+    /// walks only the judged endpoint's own names instead of the
+    /// whole table. The (address, name) pair stays the grant key and
+    /// keeps its own TTL: two names on one address remain separate
+    /// entries with separate expiries, and the audit trail can still
+    /// say which policy name covered an address.
+    by_addr: HashMap<IpAddr, HashMap<String, GrantEntry>>,
+    /// Entries in `by_addr`, unreaped expired ones included — the
+    /// live figure `max_grants` bounds (the old `grants.len()`).
+    live_total: usize,
     /// Grants minted by in-flight resolutions whose audit record has
     /// not committed yet — one bucket per staging token so concurrent
     /// resolutions never share visibility. Staged entries occupy
     /// capacity but are invisible to `is_allowed`, `names_for`,
     /// `quals_for`, `live_len`, snapshots and exports until
-    /// `commit_staged` moves them into `grants`.
-    staged: HashMap<u64, Vec<(GrantKey, GrantEntry)>>,
+    /// `commit_staged` moves them live. Keyed by grant key so a
+    /// re-registration inside the same token refreshes in place.
+    staged: HashMap<u64, HashMap<GrantKey, GrantEntry>>,
+    /// Tokens holding a staged copy of each key. Keys stay tracked
+    /// while live too: if the live grant is later reaped or revoked,
+    /// its remaining staged copies resume counting as new-key
+    /// reservations — the same accounting the per-call `staged_new`
+    /// rebuild produced.
+    staged_counts: HashMap<GrantKey, usize>,
+    /// Count of `staged_counts` keys that are not live — the unique
+    /// new-key reservations the staged capacity check adds to
+    /// `live_total`. Incrementally maintained on every stage,
+    /// commit, drop, reap, or revoke transition.
+    staged_new: usize,
+    /// Live-grant expiry deadlines, earliest first. Refreshing a
+    /// grant pushes a new entry with a bumped generation; stale
+    /// entries are skipped on pop, and the heap is rebuilt once it
+    /// outgrows the live set so update churn cannot grow it
+    /// unboundedly.
+    deadlines: DeadlineHeap,
+    /// Generation source for `deadlines` staleness checks.
+    next_deadline_gen: u64,
+}
+
+/// Stale-deadline slack the heap tolerates before `reap_expired`
+/// rebuilds it — rebuilds are O(live) so a floor keeps churn on
+/// small tables from rebuilding on every other write.
+const DEADLINE_REBUILD_FLOOR: usize = 256;
+
+/// Sparse-bucket bound shared by the reap and revoke removals: a
+/// kept inner map shrinks once its allocation exceeds this multiple
+/// of its population — the bucket stays, but not an allocation still
+/// sized for names already gone.
+const BUCKET_SHRINK_FACTOR: usize = 4;
+
+/// The deadline queue's element: a grant's expiry, the generation it
+/// was pushed under, and the key it reaps. `Reverse` orders the heap
+/// earliest-deadline-first.
+type DeadlineHeap = BinaryHeap<Reverse<(Instant, u64, IpAddr, Box<str>)>>;
+
+impl Inner {
+    /// Whether `key` names a live grant — the raw map check the
+    /// capacity semantics use (unexpired entries count too).
+    fn live_has(&self, key: &GrantKey) -> bool {
+        self.by_addr
+            .get(&key.addr)
+            .is_some_and(|m| m.contains_key(&key.name))
+    }
+
+    /// `key` became live — bumps `live_total` and, while staged holds
+    /// of it remain, drops the key from the new-key reservation count.
+    fn note_live_inserted(&mut self, key: &GrantKey) {
+        self.live_total += 1;
+        if self.staged_counts.contains_key(key) {
+            self.staged_new -= 1;
+        }
+    }
+
+    /// `key` stopped being live — any staged holds it still has
+    /// resume counting as a new-key reservation.
+    fn note_live_removed(&mut self, key: &GrantKey) {
+        self.live_total -= 1;
+        if self.staged_counts.contains_key(key) {
+            self.staged_new += 1;
+        }
+    }
+
+    /// One staged hold of `key` released (commit or drop). When the
+    /// last hold of a not-live key goes, the key stops counting
+    /// against capacity.
+    fn release_staged_hold(&mut self, key: &GrantKey) {
+        let Some(c) = self.staged_counts.get_mut(key) else {
+            return;
+        };
+        *c -= 1;
+        if *c == 0 {
+            self.staged_counts.remove(key);
+            if !self.live_has(key) {
+                self.staged_new -= 1;
+            }
+        }
+    }
+}
+
+/// Queue the grant's next deadline under the heap's freshest
+/// generation — the stale check an older queued entry fails.
+/// Field-split so a live entry's mutable borrow can stay open
+/// alongside the heap write.
+fn push_deadline(
+    deadlines: &mut DeadlineHeap,
+    next_deadline_gen: &mut u64,
+    expires: Instant,
+    addr: IpAddr,
+    name: &str,
+) -> u64 {
+    let generation = *next_deadline_gen;
+    *next_deadline_gen += 1;
+    deadlines.push(Reverse((expires, generation, addr, name.into())));
+    generation
+}
+
+/// Reap every live grant whose deadline passed — the lazy expiry the
+/// per-write `retain` scan did, now driven by the deadline heap.
+/// Stale heap entries (superseded by a refresh, or their key already
+/// gone) skip on pop via the generation check; the heap is rebuilt
+/// once stale mass outgrows the live set so update churn cannot grow
+/// it unboundedly.
+fn reap_expired(inner: &mut Inner, now: Instant) {
+    while inner
+        .deadlines
+        .peek()
+        .is_some_and(|Reverse((expires, ..))| *expires <= now)
+    {
+        let Reverse((_, generation, addr, name)) = inner.deadlines.pop().unwrap();
+        let stale = inner
+            .by_addr
+            .get(&addr)
+            .and_then(|m| m.get(&*name))
+            .is_none_or(|e| e.generation != generation);
+        if stale {
+            continue;
+        }
+        remove_from_bucket(inner, addr, &name);
+        inner.note_live_removed(&GrantKey {
+            addr,
+            name: name.into_string(),
+        });
+    }
+    compact_deadlines(inner);
+}
+
+/// Drop heap entries whose generation no longer matches their live
+/// grant once the heap outgrows the live set — the bound that keeps
+/// update churn, bulk commits, and revocations from retaining stale
+/// deadlines in proportion to operation count. Entries whose
+/// generation still matches their key's live grant stay queued, so
+/// a refreshed deadline is never compacted away.
+fn compact_deadlines(inner: &mut Inner) {
+    if inner.deadlines.len()
+        > inner
+            .live_total
+            .saturating_mul(2)
+            .max(DEADLINE_REBUILD_FLOOR)
+    {
+        let old = std::mem::take(&mut inner.deadlines);
+        inner.deadlines = old
+            .into_iter()
+            .filter(|Reverse((_, generation, addr, name))| {
+                inner
+                    .by_addr
+                    .get(addr)
+                    .and_then(|m| m.get(&**name))
+                    .is_some_and(|e| e.generation == *generation)
+            })
+            .collect();
+    }
+    #[cfg(feature = "measure")]
+    crate::measure::set(
+        &crate::measure::DNS_DEADLINE_ENTRIES,
+        inner.deadlines.len() as u64,
+    );
+}
+
+/// Remove `name` from `addr`'s bucket — `true` when a grant left.
+/// The empty bucket drops out of `by_addr` entirely; a kept one
+/// shrinks once its capacity outgrows `BUCKET_SHRINK_FACTOR`, the
+/// same policy on both removal paths so a concentrated address's
+/// map cannot retain an allocation sized for names already gone.
+fn remove_from_bucket(inner: &mut Inner, addr: IpAddr, name: &str) -> bool {
+    let Some(m) = inner.by_addr.get_mut(&addr) else {
+        return false;
+    };
+    if m.remove(name).is_none() {
+        return false;
+    }
+    if m.is_empty() {
+        inner.by_addr.remove(&addr);
+    } else if m.capacity() > m.len().saturating_mul(BUCKET_SHRINK_FACTOR) {
+        m.shrink_to_fit();
+    }
+    true
+}
+
+/// Release the token's whole staged bucket — the drop half shared by
+/// `drop_staged` and its unwind-safe variant.
+fn drop_staged_bucket(inner: &mut Inner, staging: &GrantStaging) {
+    if let Some(entries) = inner.staged.remove(&staging.0) {
+        for key in entries.into_keys() {
+            inner.release_staged_hold(&key);
+        }
+    }
 }
 
 /// Staging token for one resolution's not-yet-committed grants — see
 /// [`DynamicAllowList::begin_staging`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GrantStaging(u64);
+
+/// One endpoint's grant state taken under a single lock — see
+/// [`DynamicAllowList::grant_view`].
+#[derive(Debug, Default)]
+pub struct GrantView {
+    /// Names with a live grant on the endpoint, sorted.
+    pub names: Vec<String>,
+    /// Any live grant's qualifiers cover the asked-for flow.
+    pub covered: bool,
+}
+
+/// The `grant_view*` body — names and coverage computed from the
+/// locked table at `now`.
+fn grant_view_of(
+    inner: &Inner,
+    addr: &IpAddr,
+    proto: crate::policy::EgressProto,
+    port: u16,
+    now: Instant,
+) -> GrantView {
+    let mut view = GrantView::default();
+    if let Some(m) = inner.by_addr.get(addr) {
+        for (name, e) in m {
+            #[cfg(feature = "measure")]
+            crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
+            if e.expires > now {
+                view.names.push(name.clone());
+                if !view.covered {
+                    view.covered = e.quals.iter().any(|q| q.covers(proto, port));
+                }
+            }
+        }
+    }
+    view.names.sort();
+    view
+}
+
+/// The `is_allowed*` body — the per-address qualifier scan shared by
+/// the under-lock `is_allowed` and its caller-clocked variant.
+fn is_allowed_of(
+    inner: &Inner,
+    addr: &IpAddr,
+    proto: crate::policy::EgressProto,
+    port: u16,
+    now: Instant,
+) -> bool {
+    inner.by_addr.get(addr).is_some_and(|m| {
+        m.values().any(|e| {
+            #[cfg(feature = "measure")]
+            crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
+            e.expires > now && e.quals.iter().any(|q| q.covers(proto, port))
+        })
+    })
+}
+
+/// The `register_at*` body run under the table lock — refusal, lazy
+/// reap, and the refresh-or-insert all at `now`, the instant the
+/// caller chose: sampled under the lock by `register_at`, injected by
+/// `register_at_clock`.
+fn register_at_of(
+    inner: &mut Inner,
+    max_grants: usize,
+    name: &str,
+    addr: IpAddr,
+    quals: &[crate::policy::GrantQual],
+    expires: Instant,
+    now: Instant,
+) -> bool {
+    if expires <= now || quals.is_empty() {
+        return false;
+    }
+    // Reborrow the `&mut Inner` once — field-split borrows let the
+    // refresh path hold its entry while the deadline heap is written
+    // alongside.
+    let inner = &mut *inner;
+    reap_expired(inner, now);
+    let key = GrantKey {
+        addr,
+        name: name.to_string(),
+    };
+    if let Some(e) = inner.by_addr.get_mut(&addr).and_then(|m| m.get_mut(name)) {
+        // A fresh answer for the same name→addr replaces the
+        // grant's expiry and scope — a longer-lived answer renews
+        // it, a shorter one is the resolver's newer truth and
+        // wins too. The bumped generation strands the old
+        // deadline in the heap as a skip-on-pop stale entry.
+        e.expires = expires;
+        e.quals = quals.to_vec();
+        e.generation = push_deadline(
+            &mut inner.deadlines,
+            &mut inner.next_deadline_gen,
+            expires,
+            addr,
+            name,
+        );
+        compact_deadlines(inner);
+        return true;
+    }
+    if inner.live_total >= max_grants {
+        return false;
+    }
+    let generation = push_deadline(
+        &mut inner.deadlines,
+        &mut inner.next_deadline_gen,
+        expires,
+        addr,
+        name,
+    );
+    inner.by_addr.entry(addr).or_default().insert(
+        key.name.clone(),
+        GrantEntry {
+            expires,
+            generation,
+            quals: quals.to_vec(),
+        },
+    );
+    inner.note_live_inserted(&key);
+    compact_deadlines(inner);
+    true
+}
+
+/// The `register_staged_at*` body run under the table lock — same
+/// refusals and lazy reap as `register_at_of`, at the caller's `now`,
+/// but the grant lands in the staged set instead of the live table.
+#[expect(clippy::too_many_arguments)] // mirrors the method's parameter list
+fn register_staged_at_of(
+    inner: &mut Inner,
+    max_grants: usize,
+    staging: GrantStaging,
+    name: &str,
+    addr: IpAddr,
+    quals: &[crate::policy::GrantQual],
+    expires: Instant,
+    now: Instant,
+) -> bool {
+    if expires <= now || quals.is_empty() {
+        return false;
+    }
+    reap_expired(inner, now);
+    let key = GrantKey {
+        addr,
+        name: name.to_string(),
+    };
+    // A re-registration inside the same token refreshes in place —
+    // still invisible until commit.
+    if let Some(e) = inner
+        .staged
+        .get_mut(&staging.0)
+        .and_then(|entries| entries.get_mut(&key))
+    {
+        e.expires = expires;
+        e.quals = quals.to_vec();
+        return true;
+    }
+    // Capacity counts live grants plus staged keys that would add
+    // a *new* key on commit — a staged refresh of a live key adds
+    // nothing, and two tokens staging the same key share one
+    // reservation: re-staging a key another token already holds
+    // merges into that reservation on commit, so it consumes no
+    // further headroom and must not be refused by a full table.
+    // `staged_new` tracks that unique-set count incrementally —
+    // the per-call staged-set rebuild it replaced.
+    if let Some(c) = inner.staged_counts.get_mut(&key) {
+        *c += 1;
+    } else if !inner.live_has(&key) {
+        if inner.live_total + inner.staged_new >= max_grants {
+            return false;
+        }
+        inner.staged_new += 1;
+        inner.staged_counts.insert(key.clone(), 1);
+    } else {
+        // First staged hold of a live key — tracked so reaping or
+        // revoking the live grant restores the reservation.
+        inner.staged_counts.insert(key.clone(), 1);
+    }
+    inner.staged.entry(staging.0).or_default().insert(
+        key,
+        GrantEntry {
+            expires,
+            generation: 0,
+            quals: quals.to_vec(),
+        },
+    );
+    true
+}
 
 /// Dynamic allow list for DNS-gate answers. Thread-safe; reaping of
 /// expired grants runs lazily inside the mutating calls, so the table
@@ -80,8 +469,13 @@ impl DynamicAllowList {
     pub fn new(max_grants: usize) -> Self {
         Self {
             inner: Mutex::new(Inner {
-                grants: HashMap::new(),
+                by_addr: HashMap::new(),
+                live_total: 0,
                 staged: HashMap::new(),
+                staged_counts: HashMap::new(),
+                staged_new: 0,
+                deadlines: BinaryHeap::new(),
+                next_deadline_gen: 1,
             }),
             export_lock: Mutex::new(()),
             max_grants,
@@ -111,7 +505,9 @@ impl DynamicAllowList {
     }
 
     /// Register with an absolute expiry — the testable core of
-    /// [`Self::register`].
+    /// [`Self::register`]. The reference instant is sampled under the
+    /// lock, as in `is_allowed` — the refusal check and the lazy reap
+    /// run at the instant the table is actually examined.
     pub(crate) fn register_at(
         &self,
         name: &str,
@@ -119,37 +515,39 @@ impl DynamicAllowList {
         quals: &[crate::policy::GrantQual],
         expires: Instant,
     ) -> bool {
-        if expires <= Instant::now() || quals.is_empty() {
+        let mut inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        register_at_of(
+            &mut inner,
+            self.max_grants,
+            name,
+            addr,
+            quals,
+            expires,
+            Instant::now(),
+        )
+    }
+
+    /// [`Self::register_at`] against a caller-chosen instant — the
+    /// refusal check and the lazy reap share one clock, letting the
+    /// reference-model trace drive a monotone logical time.
+    #[allow(dead_code)] // used by the RF07 tests
+    pub(crate) fn register_at_clock(
+        &self,
+        name: &str,
+        addr: IpAddr,
+        quals: &[crate::policy::GrantQual],
+        expires: Instant,
+        now: Instant,
+    ) -> bool {
+        if expires <= now || quals.is_empty() {
             return false;
         }
         let mut inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        inner.grants.retain(|_, e| e.expires > Instant::now());
-        let key = GrantKey {
-            addr,
-            name: name.to_string(),
-        };
-        if let Some(e) = inner.grants.get_mut(&key) {
-            // A fresh answer for the same name→addr replaces the
-            // grant's expiry and scope — a longer-lived answer renews
-            // it, a shorter one is the resolver's newer truth and
-            // wins too.
-            e.expires = expires;
-            e.quals = quals.to_vec();
-            return true;
-        }
-        if inner.grants.len() >= self.max_grants {
-            return false;
-        }
-        inner.grants.insert(
-            key,
-            GrantEntry {
-                expires,
-                quals: quals.to_vec(),
-            },
-        );
-        true
+        register_at_of(&mut inner, self.max_grants, name, addr, quals, expires, now)
     }
 
     /// Begin a staging token for one resolution's mint. Grants
@@ -186,7 +584,9 @@ impl DynamicAllowList {
     }
 
     /// [`Self::register_staged`] with an absolute expiry — the testable
-    /// core, mirroring `register_at`.
+    /// core, mirroring `register_at`: the reference instant is sampled
+    /// under the lock so the refusal check and the lazy reap share the
+    /// instant the table is examined at.
     pub(crate) fn register_staged_at(
         &self,
         staging: GrantStaging,
@@ -195,60 +595,49 @@ impl DynamicAllowList {
         quals: &[crate::policy::GrantQual],
         expires: Instant,
     ) -> bool {
-        if expires <= Instant::now() || quals.is_empty() {
+        let mut inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        register_staged_at_of(
+            &mut inner,
+            self.max_grants,
+            staging,
+            name,
+            addr,
+            quals,
+            expires,
+            Instant::now(),
+        )
+    }
+
+    /// [`Self::register_staged_at`] against a caller-chosen instant —
+    /// mirrors `register_at_clock` for the staged path.
+    #[allow(dead_code)] // used by the RF07 tests
+    pub(crate) fn register_staged_at_clock(
+        &self,
+        staging: GrantStaging,
+        name: &str,
+        addr: IpAddr,
+        quals: &[crate::policy::GrantQual],
+        expires: Instant,
+        now: Instant,
+    ) -> bool {
+        if expires <= now || quals.is_empty() {
             return false;
         }
         let mut inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        inner.grants.retain(|_, e| e.expires > Instant::now());
-        let key = GrantKey {
+        register_staged_at_of(
+            &mut inner,
+            self.max_grants,
+            staging,
+            name,
             addr,
-            name: name.to_string(),
-        };
-        // A re-registration inside the same token refreshes in place —
-        // still invisible until commit.
-        if let Some((_, e)) = inner
-            .staged
-            .get_mut(&staging.0)
-            .and_then(|entries| entries.iter_mut().find(|(k, _)| *k == key))
-        {
-            e.expires = expires;
-            e.quals = quals.to_vec();
-            return true;
-        }
-        // Capacity counts live grants plus staged keys that would add
-        // a *new* key on commit — a staged refresh of a live key adds
-        // nothing, and two tokens staging the same key share one
-        // reservation: re-staging a key another token already holds
-        // merges into that reservation on commit, so it consumes no
-        // further headroom and must not be refused by a full table.
-        if !inner.grants.contains_key(&key) {
-            let staged_new: HashSet<&GrantKey> = inner
-                .staged
-                .values()
-                .flatten()
-                .map(|(k, _)| {
-                    #[cfg(feature = "measure")]
-                    crate::measure::incr(&crate::measure::DNS_STAGED_SCAN_ENTRIES, 1);
-                    k
-                })
-                .filter(|k| !inner.grants.contains_key(*k))
-                .collect();
-            if !staged_new.contains(&key)
-                && inner.grants.len() + staged_new.len() >= self.max_grants
-            {
-                return false;
-            }
-        }
-        inner.staged.entry(staging.0).or_default().push((
-            key,
-            GrantEntry {
-                expires,
-                quals: quals.to_vec(),
-            },
-        ));
-        true
+            quals,
+            expires,
+            now,
+        )
     }
 
     /// Activate every grant staged under `staging` — the audit record
@@ -260,10 +649,34 @@ impl DynamicAllowList {
         let mut inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        let inner = &mut *inner;
         if let Some(entries) = inner.staged.remove(&staging.0) {
-            for (key, entry) in entries {
-                inner.grants.insert(key, entry);
+            for (key, mut entry) in entries {
+                inner.release_staged_hold(&key);
+                entry.generation = push_deadline(
+                    &mut inner.deadlines,
+                    &mut inner.next_deadline_gen,
+                    entry.expires,
+                    key.addr,
+                    &key.name,
+                );
+                if inner
+                    .by_addr
+                    .entry(key.addr)
+                    .or_default()
+                    .insert(key.name.clone(), entry)
+                    .is_none()
+                {
+                    // A staged key staying held by other tokens stops
+                    // counting as a new-key reservation once it lands
+                    // live — `note_live_inserted` folds that in.
+                    inner.note_live_inserted(&key);
+                }
             }
+            // The batch pushed one deadline per key, stranding the
+            // superseded ones — check the heap bound once here
+            // rather than leaving it for the next register.
+            compact_deadlines(inner);
         }
     }
 
@@ -275,7 +688,7 @@ impl DynamicAllowList {
         let mut inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        inner.staged.remove(&staging.0);
+        drop_staged_bucket(&mut inner, &staging);
     }
 
     /// [`Self::drop_staged`] for unwinding paths — the same removal,
@@ -290,7 +703,7 @@ impl DynamicAllowList {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        inner.staged.remove(&staging.0);
+        drop_staged_bucket(&mut inner, &staging);
     }
 
     /// Remove the grant for exactly `(name, addr)` — the rollback half
@@ -303,19 +716,35 @@ impl DynamicAllowList {
         let mut inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        inner.grants.remove(&GrantKey {
-            addr,
-            name: name.to_string(),
-        });
+        let removed = remove_from_bucket(&mut inner, addr, name);
+        if removed {
+            inner.note_live_removed(&GrantKey {
+                addr,
+                name: name.to_string(),
+            });
+            // The live count the heap bound derives from just
+            // shrank — a stranded deadline leaves with its grant.
+            compact_deadlines(&mut inner);
+        }
     }
 
     /// Whether a live grant authorizes a flow of `proto` to
     /// `addr`:`port` — the IP-layer question, qualifier-aware: a grant
     /// minted under a `proto=udp` name rule never authorizes TCP.
     pub fn is_allowed(&self, addr: &IpAddr, proto: crate::policy::EgressProto, port: u16) -> bool {
-        self.is_allowed_at(addr, proto, port, Instant::now())
+        // The reference instant is sampled under the lock, as in
+        // `grant_view` — a grant that lapses between sample and
+        // acquisition must not be reported live.
+        let inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        is_allowed_of(&inner, addr, proto, port, Instant::now())
     }
 
+    /// [`Self::is_allowed`] at a caller-chosen instant — the testable
+    /// core, keeping the lookup-side expiry check independent of
+    /// reaper timing.
+    #[allow(dead_code)] // used by the RF07 tests
     pub(crate) fn is_allowed_at(
         &self,
         addr: &IpAddr,
@@ -326,30 +755,66 @@ impl DynamicAllowList {
         let inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        inner.grants.iter().any(|(k, e)| {
-            #[cfg(feature = "measure")]
-            crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
-            k.addr == *addr && e.expires > now && e.quals.iter().any(|q| q.covers(proto, port))
-        })
+        is_allowed_of(&inner, addr, proto, port, now)
+    }
+
+    /// One endpoint's grant state under a single lock acquisition —
+    /// the live names that vended it (audit detail) and whether any
+    /// of their qualifiers cover the `proto`/`port` flow. Both halves
+    /// come from the same snapshot, so a commit cannot interleave
+    /// between a verdict's answer and its audit names. `names` is
+    /// sorted — the same order [`Self::names_for`] returns — and
+    /// `covered` is the same answer [`Self::is_allowed`] gives.
+    pub fn grant_view(
+        &self,
+        addr: &IpAddr,
+        proto: crate::policy::EgressProto,
+        port: u16,
+    ) -> GrantView {
+        // The reference instant is sampled under the lock so the
+        // expiry check runs against the same state the verdict reads
+        // — a grant that lapses between sample and acquisition must
+        // not be reported live.
+        let inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        grant_view_of(&inner, addr, proto, port, Instant::now())
+    }
+
+    /// [`Self::grant_view`] at a caller-chosen instant — the testable
+    /// core, and the lookup-side expiry check kept independent of
+    /// reaper timing.
+    #[allow(dead_code)] // used by `grant_view` and the RF07 tests
+    pub(crate) fn grant_view_at(
+        &self,
+        addr: &IpAddr,
+        proto: crate::policy::EgressProto,
+        port: u16,
+        now: Instant,
+    ) -> GrantView {
+        let inner = self.inner.lock().unwrap();
+        #[cfg(feature = "measure")]
+        let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        grant_view_of(&inner, addr, proto, port, now)
     }
 
     /// Live grants on `addr` — the names that vended it, for
     /// diagnostics and reporting.
     pub fn names_for(&self, addr: &IpAddr) -> Vec<String> {
-        let now = Instant::now();
         let inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        let mut names: Vec<String> = inner
-            .grants
-            .iter()
-            .filter(|(k, e)| {
+        let now = Instant::now();
+        let mut names = Vec::new();
+        if let Some(m) = inner.by_addr.get(addr) {
+            for (name, e) in m {
                 #[cfg(feature = "measure")]
                 crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
-                k.addr == *addr && e.expires > now
-            })
-            .map(|(k, _)| k.name.clone())
-            .collect();
+                if e.expires > now {
+                    names.push(name.clone());
+                }
+            }
+        }
         names.sort();
         names
     }
@@ -358,20 +823,20 @@ impl DynamicAllowList {
     /// unioned, for consumers that evaluate flows themselves (the
     /// namespaced proxy's per-datagram check).
     pub fn quals_for(&self, addr: &IpAddr) -> Vec<crate::policy::GrantQual> {
-        let now = Instant::now();
         let inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
-        let mut quals: Vec<crate::policy::GrantQual> = inner
-            .grants
-            .iter()
-            .filter(|(k, e)| {
+        let now = Instant::now();
+        let mut quals = Vec::new();
+        if let Some(m) = inner.by_addr.get(addr) {
+            for e in m.values() {
                 #[cfg(feature = "measure")]
                 crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
-                k.addr == *addr && e.expires > now
-            })
-            .flat_map(|(_, e)| e.quals.iter().copied())
-            .collect();
+                if e.expires > now {
+                    quals.extend_from_slice(&e.quals);
+                }
+            }
+        }
         quals.sort();
         quals.dedup();
         quals
@@ -379,13 +844,14 @@ impl DynamicAllowList {
 
     /// Number of live (unexpired) grants.
     pub fn live_len(&self) -> usize {
-        let now = Instant::now();
         let inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        let now = Instant::now();
         inner
-            .grants
+            .by_addr
             .values()
+            .flat_map(|m| m.values())
             .filter(|e| {
                 #[cfg(feature = "measure")]
                 crate::measure::incr(&crate::measure::DNS_SCAN_ENTRIES, 1);
@@ -403,37 +869,45 @@ impl DynamicAllowList {
     /// snapshot without `quals` decodes as the pre-schema semantics
     /// (`tcp`, any port) — exactly what those gates minted.
     pub fn snapshot_json(&self) -> String {
-        let now = Instant::now();
-        let now_wall = SystemTime::now();
         let inner = self.inner.lock().unwrap();
         #[cfg(feature = "measure")]
         let _lock_hold = crate::measure::Timer::new(&crate::measure::DNS_LOCK_NS);
+        // The reference instant is sampled under the lock like the
+        // lookups — grants that lapse before acquisition are left
+        // out of the snapshot entirely.
+        let now = Instant::now();
+        let now_wall = SystemTime::now();
         nojson::object(|o| -> std::fmt::Result {
             o.member("schema_version", "1.1")?;
             o.member("generated_at_unix_secs", unix_secs(now_wall))?;
             o.member(
                 "entries",
                 nojson::array(|a| {
-                    for (k, e) in inner.grants.iter().filter(|(_, e)| e.expires > now) {
-                        let expires_wall = now_wall + e.expires.saturating_duration_since(now);
-                        let addr = k.addr.to_string();
-                        a.element(nojson::object(|e2| {
-                            e2.member("name", k.name.as_str())?;
-                            e2.member("addr", addr.as_str())?;
-                            e2.member("expires_at_unix_secs", unix_secs(expires_wall))?;
-                            e2.member(
-                                "quals",
-                                nojson::array(|qa| {
-                                    for q in &e.quals {
-                                        qa.element(nojson::object(|qo| {
-                                            qo.member("proto", q.proto.as_str())?;
-                                            qo.member("port", q.port)
-                                        }))?;
-                                    }
-                                    Ok(())
-                                }),
-                            )
-                        }))?;
+                    for (addr, names) in &inner.by_addr {
+                        for (name, e) in names {
+                            if e.expires <= now {
+                                continue;
+                            }
+                            let expires_wall = now_wall + e.expires.saturating_duration_since(now);
+                            let addr = addr.to_string();
+                            a.element(nojson::object(|e2| {
+                                e2.member("name", name.as_str())?;
+                                e2.member("addr", addr.as_str())?;
+                                e2.member("expires_at_unix_secs", unix_secs(expires_wall))?;
+                                e2.member(
+                                    "quals",
+                                    nojson::array(|qa| {
+                                        for q in &e.quals {
+                                            qa.element(nojson::object(|qo| {
+                                                qo.member("proto", q.proto.as_str())?;
+                                                qo.member("port", q.port)
+                                            }))?;
+                                        }
+                                        Ok(())
+                                    }),
+                                )
+                            }))?;
+                        }
                     }
                     Ok(())
                 }),
@@ -494,669 +968,4 @@ fn unix_secs(t: SystemTime) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::Ipv4Addr;
-
-    const TCP_ANY: crate::policy::GrantQual = crate::policy::GrantQual::TCP_ANY;
-
-    #[test]
-    fn register_and_query() {
-        let al = DynamicAllowList::new(16);
-        let addr = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
-        assert!(al.register("www.example.com", addr, &[TCP_ANY], Duration::from_secs(60)));
-        assert!(al.is_allowed(&addr, crate::policy::EgressProto::Tcp, 443));
-        // A TCP_ANY grant never authorizes UDP.
-        assert!(!al.is_allowed(&addr, crate::policy::EgressProto::Udp, 53));
-        assert!(!al.is_allowed(
-            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            crate::policy::EgressProto::Tcp,
-            443
-        ));
-        assert_eq!(al.names_for(&addr), vec!["www.example.com"]);
-        assert_eq!(al.live_len(), 1);
-    }
-
-    /// Staged grants carry the mint→commit ordering: invisible to every
-    /// consumer until `commit_staged`, discarded by `drop_staged`.
-    #[test]
-    fn staged_grants_are_invisible_until_commit() {
-        let al = DynamicAllowList::new(16);
-        let a = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
-        let s = al.begin_staging();
-        assert!(al.register_staged(s, "x.example", a, &[TCP_ANY], Duration::from_secs(60)));
-        // Not yet committed: no consumer may see the authority.
-        assert!(!al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert!(al.names_for(&a).is_empty());
-        assert!(al.quals_for(&a).is_empty());
-        assert_eq!(al.live_len(), 0);
-        assert!(!al.snapshot_json().contains("x.example"));
-
-        al.commit_staged(s);
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert_eq!(al.names_for(&a), vec!["x.example"]);
-        assert_eq!(al.live_len(), 1);
-    }
-
-    /// Commit failure path: `drop_staged` removes only the staged set —
-    /// a live grant an earlier committed resolution vended stays.
-    #[test]
-    fn drop_staged_leaves_committed_grants() {
-        let al = DynamicAllowList::new(16);
-        let a = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
-        assert!(al.register("y.example", a, &[TCP_ANY], Duration::from_secs(60)));
-
-        let s = al.begin_staging();
-        // A staged refresh of the live key does not disturb it...
-        assert!(al.register_staged(s, "y.example", a, &[TCP_ANY], Duration::from_secs(120)));
-        // ...and a new staged key stays invisible.
-        let b = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35));
-        assert!(al.register_staged(s, "y.example", b, &[TCP_ANY], Duration::from_secs(60)));
-        assert!(!al.is_allowed(&b, crate::policy::EgressProto::Tcp, 443));
-
-        al.drop_staged(s);
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert!(!al.is_allowed(&b, crate::policy::EgressProto::Tcp, 443));
-        assert_eq!(al.live_len(), 1);
-    }
-
-    /// Two resolutions for the same name stage independently: one
-    /// commit must not activate the other's still-pending grants.
-    #[test]
-    fn staging_tokens_are_isolated() {
-        let al = DynamicAllowList::new(16);
-        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        let s1 = al.begin_staging();
-        let s2 = al.begin_staging();
-        assert!(al.register_staged(s1, "n.example", a, &[TCP_ANY], Duration::from_secs(60)));
-        assert!(al.register_staged(s2, "n.example", a, &[TCP_ANY], Duration::from_secs(90)));
-
-        al.commit_staged(s2);
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        // s1's drop removes its own staged copy only.
-        al.drop_staged(s1);
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-    }
-
-    /// Two resolutions racing the same name→addr under a full table
-    /// must both stage: the second token re-reserves the key the first
-    /// already holds — the reservation merges into one live grant on
-    /// commit, so it consumes no new capacity.
-    #[test]
-    fn staged_same_key_two_tokens_at_capacity() {
-        let al = DynamicAllowList::new(1);
-        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
-        let s1 = al.begin_staging();
-        let s2 = al.begin_staging();
-        assert!(al.register_staged_at(
-            s1,
-            "dup.example",
-            a,
-            &[TCP_ANY],
-            Instant::now() + Duration::from_secs(60)
-        ));
-        assert!(al.register_staged_at(
-            s2,
-            "dup.example",
-            a,
-            &[TCP_ANY],
-            Instant::now() + Duration::from_secs(90)
-        ));
-        // Neither reservation is visible before commit.
-        assert!(!al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert!(al.names_for(&a).is_empty());
-        assert_eq!(al.live_len(), 0);
-        assert!(!al.snapshot_json().contains("dup.example"));
-
-        al.commit_staged(s1);
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert_eq!(al.live_len(), 1);
-        // s2's leftover staged copy drops without touching the grant
-        // s1 committed.
-        al.drop_staged(s2);
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert_eq!(al.live_len(), 1);
-    }
-
-    /// The stored RF02 reproducer's shape — capacity 2 holding one
-    /// live grant: both tokens reserve the shared key, `commit:s1`
-    /// publishes it once, `drop:s2` removes only s2's hold
-    /// (tests/fixtures/refactoring/rf02/capacity1_duplicate.json).
-    #[test]
-    fn staged_same_key_two_tokens_one_live() {
-        let al = DynamicAllowList::new(2);
-        let live = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        let staged_addr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
-        assert!(al.register("live.example", live, &[TCP_ANY], Duration::from_secs(60)));
-        let s1 = al.begin_staging();
-        let s2 = al.begin_staging();
-        assert!(al.register_staged(
-            s1,
-            "x.example",
-            staged_addr,
-            &[TCP_ANY],
-            Duration::from_secs(60)
-        ));
-        assert!(al.register_staged(
-            s2,
-            "x.example",
-            staged_addr,
-            &[TCP_ANY],
-            Duration::from_secs(60)
-        ));
-        assert_eq!(al.live_len(), 1);
-        al.commit_staged(s1);
-        assert_eq!(al.live_len(), 2);
-        assert!(al.is_allowed(&staged_addr, crate::policy::EgressProto::Tcp, 443));
-        al.drop_staged(s2);
-        assert_eq!(al.live_len(), 2);
-        assert!(al.is_allowed(&staged_addr, crate::policy::EgressProto::Tcp, 443));
-    }
-
-    /// Either drop/commit order publishes the shared key once — a
-    /// token's cancellation never removes a reservation another token
-    /// still holds, and a second commit on the same key is a refresh.
-    #[test]
-    fn staged_same_key_drop_then_commit_and_reverse_commit() {
-        // Drop the first stager, then commit the second.
-        let al = DynamicAllowList::new(1);
-        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
-        let s1 = al.begin_staging();
-        let s2 = al.begin_staging();
-        assert!(al.register_staged(s1, "ord.example", a, &[TCP_ANY], Duration::from_secs(60)));
-        assert!(al.register_staged(s2, "ord.example", a, &[TCP_ANY], Duration::from_secs(90)));
-        al.drop_staged(s1);
-        al.commit_staged(s2);
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert_eq!(al.live_len(), 1);
-
-        // Commit in reverse registration order — the second commit
-        // refreshes the same key (TTL/scope update), still one grant.
-        let al = DynamicAllowList::new(1);
-        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12));
-        let s1 = al.begin_staging();
-        let s2 = al.begin_staging();
-        assert!(al.register_staged(s1, "ord.example", a, &[TCP_ANY], Duration::from_secs(60)));
-        assert!(al.register_staged(s2, "ord.example", a, &[TCP_ANY], Duration::from_secs(90)));
-        al.commit_staged(s2);
-        al.commit_staged(s1);
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert_eq!(al.live_len(), 1);
-    }
-
-    /// A staged refresh of a *live* key never needs headroom — at
-    /// capacity 1 the refresh stages and its commit replaces expiry
-    /// and scope, the same update `register` performs in place.
-    #[test]
-    fn staged_refresh_of_live_key_at_capacity() {
-        let al = DynamicAllowList::new(1);
-        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
-        let udp53 = crate::policy::GrantQual {
-            proto: crate::policy::EgressProto::Udp,
-            port: Some(53),
-        };
-        assert!(al.register("svc.example", a, &[TCP_ANY], Duration::from_secs(60)));
-        let s = al.begin_staging();
-        assert!(al.register_staged(s, "svc.example", a, &[udp53], Duration::from_secs(120)));
-        // The refresh is invisible until commit — the live grant still
-        // carries its original scope.
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert!(!al.is_allowed(&a, crate::policy::EgressProto::Udp, 53));
-        al.commit_staged(s);
-        assert!(!al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Udp, 53));
-        assert_eq!(al.quals_for(&a), vec![udp53]);
-        assert_eq!(al.live_len(), 1);
-    }
-
-    /// Move every entry staged under `token` into the past — the
-    /// resolution's answer aged out between mint and audit commit.
-    /// Registration still needs a future deadline (`register_staged_at`
-    /// refuses an already-lapsed one), so the expiry is rewound after
-    /// the fact instead of racing the real clock.
-    fn expire_staged(al: &DynamicAllowList, token: GrantStaging) {
-        let mut inner = al.inner.lock().unwrap();
-        let past = Instant::now()
-            .checked_sub(Duration::from_secs(60))
-            .unwrap_or_else(Instant::now);
-        for (_, e) in inner.staged.get_mut(&token.0).unwrap() {
-            e.expires = past;
-        }
-    }
-
-    /// A reservation that expires while staged commits as the
-    /// resolver's newer truth — landing the lapsed expiry closes the
-    /// key rather than letting stale authority linger.
-    #[test]
-    fn staged_entry_expiring_before_commit() {
-        let al = DynamicAllowList::new(16);
-        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 30));
-        // An unexpired reservation commits normally.
-        let s = al.begin_staging();
-        assert!(al.register_staged_at(
-            s,
-            "ttl.example",
-            a,
-            &[TCP_ANY],
-            Instant::now() + Duration::from_secs(60)
-        ));
-        al.commit_staged(s);
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        // A reservation whose answer lapsed before commit lands the
-        // newer truth — the expired entry overwrites the live grant.
-        let s = al.begin_staging();
-        assert!(al.register_staged_at(
-            s,
-            "ttl.example",
-            a,
-            &[TCP_ANY],
-            Instant::now() + Duration::from_secs(60)
-        ));
-        expire_staged(&al, s);
-        al.commit_staged(s);
-        assert!(!al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert_eq!(al.live_len(), 0);
-
-        // The same overwrite applies to a staged refresh of a live
-        // key: an unexpired refresh renews the grant, an expired one
-        // closes it.
-        let b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 31));
-        assert!(al.register("live.example", b, &[TCP_ANY], Duration::from_secs(300)));
-        let s = al.begin_staging();
-        assert!(al.register_staged_at(
-            s,
-            "live.example",
-            b,
-            &[TCP_ANY],
-            Instant::now() + Duration::from_secs(120)
-        ));
-        al.commit_staged(s);
-        assert!(al.is_allowed(&b, crate::policy::EgressProto::Tcp, 443));
-        let s = al.begin_staging();
-        assert!(al.register_staged_at(
-            s,
-            "live.example",
-            b,
-            &[TCP_ANY],
-            Instant::now() + Duration::from_secs(120)
-        ));
-        expire_staged(&al, s);
-        al.commit_staged(s);
-        assert!(!al.is_allowed(&b, crate::policy::EgressProto::Tcp, 443));
-        assert_eq!(al.live_len(), 0);
-    }
-
-    /// Shared-key reservations share one reservation; *distinct* keys
-    /// still count separately — a different name on the same address
-    /// or a different address under the same name must be refused
-    /// once every unique key is spoken for.
-    #[test]
-    fn staged_distinct_key_at_capacity_refused() {
-        let al = DynamicAllowList::new(1);
-        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 40));
-        let b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 41));
-        let s1 = al.begin_staging();
-        let s2 = al.begin_staging();
-        assert!(al.register_staged(s1, "n.example", a, &[TCP_ANY], Duration::from_secs(60)));
-        // Same key again from s2 — shares s1's reservation.
-        assert!(al.register_staged(s2, "n.example", a, &[TCP_ANY], Duration::from_secs(60)));
-        // A different name on the same address is a different key.
-        assert!(!al.register_staged(s2, "m.example", a, &[TCP_ANY], Duration::from_secs(60)));
-        // A different address under the same name is a different key.
-        assert!(!al.register_staged(s2, "n.example", b, &[TCP_ANY], Duration::from_secs(60)));
-        // The refusals stage nothing: s2 commits only its shared copy.
-        al.commit_staged(s2);
-        assert_eq!(al.live_len(), 1);
-        assert_eq!(al.names_for(&a), vec!["n.example"]);
-        al.drop_staged(s1);
-    }
-
-    /// Uncommitted reservations stay invisible to the exported
-    /// snapshot too — `export_to` serializes the same live-only view
-    /// `snapshot_json` produces.
-    #[test]
-    fn staged_grants_absent_from_export() {
-        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
-            .join("mcp_writ_test")
-            .join(format!("export_staged_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("allowlist.json");
-        let al = DynamicAllowList::new(16);
-        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50));
-        al.register("live.example", a, &[TCP_ANY], Duration::from_secs(60));
-        let s = al.begin_staging();
-        assert!(al.register_staged(
-            s,
-            "pending.example",
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 51)),
-            &[TCP_ANY],
-            Duration::from_secs(60)
-        ));
-        al.export_to(&dest).unwrap();
-        let body = std::fs::read_to_string(&dest).unwrap();
-        assert!(body.contains("live.example"));
-        assert!(!body.contains("pending.example"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Direct registration counts live grants only — it never
-    /// consults the staged set. Callers do not mix the two modes on
-    /// one list (the gate stages, the CONNECT proxy registers), so
-    /// this overlap is a contract pin, not a production path.
-    #[test]
-    fn register_ignores_staged_capacity() {
-        let al = DynamicAllowList::new(1);
-        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 60));
-        let b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 61));
-        let s = al.begin_staging();
-        assert!(al.register_staged(s, "staged.example", a, &[TCP_ANY], Duration::from_secs(60)));
-        assert!(al.register("direct.example", b, &[TCP_ANY], Duration::from_secs(60)));
-        assert_eq!(al.live_len(), 1);
-        al.drop_staged(s);
-    }
-
-    /// `drop_staged_unwind_safe` must not panic on a poisoned lock —
-    /// `StagingGuard` runs it inside `Drop`, where a second panic
-    /// during unwind would abort the process. The bucket discard is
-    /// memory-safe even on possibly-inconsistent state.
-    #[test]
-    fn drop_staged_unwind_safe_tolerates_a_poisoned_lock() {
-        let al = std::sync::Arc::new(DynamicAllowList::new(4));
-        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 70));
-        let s = al.begin_staging();
-        assert!(al.register_staged(s, "p.example", a, &[TCP_ANY], Duration::from_secs(60)));
-        // Poison the lock: a thread panics while holding it.
-        let al2 = al.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = al2.inner.lock().unwrap();
-            panic!("intentional poison");
-        })
-        .join();
-        assert!(al.inner.lock().is_err(), "lock must be poisoned");
-        // No panic — and the stranded bucket is still discarded.
-        al.drop_staged_unwind_safe(s);
-        let inner = al.inner.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(inner.staged.is_empty());
-    }
-
-    /// Rollback for the fail-closed ordering contract: a grant minted
-    /// before its audit record committed is revoked when the commit
-    /// fails — the revoked key no longer authorizes.
-    #[test]
-    fn revoke_removes_only_the_named_grant() {
-        let al = DynamicAllowList::new(16);
-        let a = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
-        let b = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35));
-        assert!(al.register("x.example", a, &[TCP_ANY], Duration::from_secs(60)));
-        assert!(al.register("x.example", b, &[TCP_ANY], Duration::from_secs(60)));
-        assert!(al.register("y.example", a, &[TCP_ANY], Duration::from_secs(60)));
-
-        al.revoke("x.example", a);
-        // The address stays authorized: `y.example` independently vended
-        // it, and that grant carries its own committed audit record.
-        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
-        assert_eq!(al.names_for(&a), vec!["y.example"]);
-        // The other addr under the revoked name survives — the key is
-        // (name, addr).
-        assert!(al.is_allowed(&b, crate::policy::EgressProto::Tcp, 443));
-        // Once every name→a grant is revoked the address no longer
-        // authorizes — the rollback property the DNS gate relies on.
-        al.revoke("y.example", a);
-        assert!(
-            !al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443),
-            "last grant for an addr must close it"
-        );
-        // Revoking an absent key is a no-op.
-        al.revoke("x.example", a);
-        al.revoke("absent.example", a);
-        assert_eq!(al.live_len(), 1);
-    }
-
-    #[test]
-    fn qualifier_scopes_the_grant() {
-        let al = DynamicAllowList::new(16);
-        let addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
-        let udp53 = crate::policy::GrantQual {
-            proto: crate::policy::EgressProto::Udp,
-            port: Some(53),
-        };
-        assert!(al.register("ns.example", addr, &[udp53], Duration::from_secs(60)));
-        assert!(al.is_allowed(&addr, crate::policy::EgressProto::Udp, 53));
-        assert!(!al.is_allowed(&addr, crate::policy::EgressProto::Udp, 5353));
-        assert!(!al.is_allowed(&addr, crate::policy::EgressProto::Tcp, 53));
-        // A grant with no quals is never recorded.
-        assert!(!al.register("none.example", addr, &[], Duration::from_secs(60)));
-        assert_eq!(al.quals_for(&addr), vec![udp53]);
-    }
-
-    #[test]
-    fn expiry_closes_the_grant() {
-        let al = DynamicAllowList::new(16);
-        let addr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        let now = Instant::now();
-        assert!(al.register_at("a.example", addr, &[TCP_ANY], now + Duration::from_secs(5)));
-        assert!(al.is_allowed_at(
-            &addr,
-            crate::policy::EgressProto::Tcp,
-            443,
-            now + Duration::from_secs(4)
-        ));
-        assert!(!al.is_allowed_at(
-            &addr,
-            crate::policy::EgressProto::Tcp,
-            443,
-            now + Duration::from_secs(6)
-        ));
-        assert_eq!(al.live_len(), 1); // lazily reaped, not eagerly
-    }
-
-    #[test]
-    fn zero_ttl_is_never_recorded() {
-        let al = DynamicAllowList::new(16);
-        let addr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
-        assert!(!al.register("a.example", addr, &[TCP_ANY], Duration::ZERO));
-        assert!(!al.is_allowed(&addr, crate::policy::EgressProto::Tcp, 443));
-    }
-
-    #[test]
-    fn capacity_refuses_grants() {
-        let al = DynamicAllowList::new(1);
-        let a1 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        let a2 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
-        assert!(al.register("a.example", a1, &[TCP_ANY], Duration::from_secs(60)));
-        assert!(!al.register("b.example", a2, &[TCP_ANY], Duration::from_secs(60)));
-        // The same name→addr pair still refreshes under a full table.
-        assert!(al.register("a.example", a1, &[TCP_ANY], Duration::from_secs(120)));
-        assert!(al.is_allowed(&a1, crate::policy::EgressProto::Tcp, 443));
-        assert!(!al.is_allowed(&a2, crate::policy::EgressProto::Tcp, 443));
-    }
-
-    #[test]
-    fn snapshot_serializes_live_entries() {
-        let al = DynamicAllowList::new(16);
-        let addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-        al.register("svc.example", addr, &[TCP_ANY], Duration::from_secs(300));
-        let json = al.snapshot_json();
-        let parsed = nojson::RawJson::parse(&json).unwrap();
-        let entries_member = parsed.value().to_member("entries").unwrap();
-        let entries: Vec<_> = entries_member
-            .required()
-            .unwrap()
-            .to_array()
-            .unwrap()
-            .collect();
-        assert_eq!(entries.len(), 1);
-        let entry = entries[0];
-        assert_eq!(
-            entry
-                .to_member("name")
-                .unwrap()
-                .required()
-                .unwrap()
-                .to_unquoted_string_str()
-                .unwrap(),
-            "svc.example"
-        );
-        assert_eq!(
-            entry
-                .to_member("addr")
-                .unwrap()
-                .required()
-                .unwrap()
-                .to_unquoted_string_str()
-                .unwrap(),
-            "203.0.113.7"
-        );
-        let exp: u64 = entry
-            .to_member("expires_at_unix_secs")
-            .unwrap()
-            .required()
-            .unwrap()
-            .as_number_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        assert!(exp > now && exp <= now + 300);
-    }
-
-    #[test]
-    fn two_names_can_share_one_address() {
-        let al = DynamicAllowList::new(16);
-        let addr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
-        al.register("a.example", addr, &[TCP_ANY], Duration::from_secs(60));
-        al.register("b.example", addr, &[TCP_ANY], Duration::from_secs(30));
-        let mut names = al.names_for(&addr);
-        names.sort();
-        assert_eq!(names, vec!["a.example", "b.example"]);
-    }
-
-    #[test]
-    fn export_to_tmp_suffixed_destination_stays_atomic() {
-        // A destination already spelled `x.tmp` must not collide with
-        // its own temp path — the temp name is a suffix on the whole
-        // name (`x.tmp.tmp`), never a replacement extension.
-        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
-            .join("mcp_writ_test")
-            .join(format!("export_tmp_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("allowlist.tmp");
-        let al = DynamicAllowList::new(16);
-        al.register(
-            "a.example",
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)),
-            &[TCP_ANY],
-            Duration::from_secs(60),
-        );
-        al.export_to(&dest).unwrap();
-        let body = std::fs::read_to_string(&dest).unwrap();
-        assert!(body.contains("a.example"));
-        // The temp file was consumed by the rename — the destination
-        // (itself spelled `.tmp`) is the only entry left.
-        let names: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(
-            names,
-            vec![dest.file_name().unwrap().to_os_string()],
-            "no temp residue expected"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn export_to_symlink_destination_does_not_write_through() {
-        // A symlink planted at the destination must be replaced by the
-        // rename, never followed: the link target keeps its contents.
-        let dir = std::env::temp_dir()
-            .join("mcp_writ_test")
-            .join(format!("export_link_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let victim = dir.join("victim");
-        std::fs::write(&victim, "keep-me").unwrap();
-        let dest = dir.join("allowlist.json");
-        std::os::unix::fs::symlink(&victim, &dest).unwrap();
-
-        let al = DynamicAllowList::new(16);
-        al.register(
-            "a.example",
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)),
-            &[TCP_ANY],
-            Duration::from_secs(60),
-        );
-        al.export_to(&dest).unwrap();
-
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep-me");
-        let meta = std::fs::symlink_metadata(&dest).unwrap();
-        assert!(meta.is_file(), "dest must be a regular file, not a link");
-        assert!(
-            std::fs::read_to_string(&dest)
-                .unwrap()
-                .contains("a.example")
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// When the temp create itself fails (unwritable directory), the
-    /// destination and siblings must be left untouched — cleanup only
-    /// runs on a file this call created.
-    #[cfg(unix)]
-    #[test]
-    fn export_to_failed_create_touches_nothing() {
-        use std::os::unix::fs::PermissionsExt;
-        if crate::fspriv::running_as_root() {
-            eprintln!("SKIP: root bypasses the 0o555 mode — cannot exercise EACCES");
-            return;
-        }
-        let dir = std::env::temp_dir()
-            .join("mcp_writ_test")
-            .join(format!("export_ro_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("allowlist.json");
-        std::fs::write(&dest, "pre-existing").unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-        let al = DynamicAllowList::new(16);
-        al.register(
-            "a.example",
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)),
-            &[TCP_ANY],
-            Duration::from_secs(60),
-        );
-        assert!(al.export_to(&dest).is_err());
-        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "pre-existing");
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
-
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The exported file must not inherit an over-permissive umask —
-    /// an allowlist snapshot is a security artifact.
-    #[cfg(unix)]
-    #[test]
-    fn export_to_uses_restrictive_mode() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir()
-            .join("mcp_writ_test")
-            .join(format!("export_mode_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("allowlist.json");
-        let al = DynamicAllowList::new(16);
-        al.register(
-            "a.example",
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)),
-            &[TCP_ANY],
-            Duration::from_secs(60),
-        );
-        al.export_to(&dest).unwrap();
-        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "export mode was {mode:o}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
+mod tests;

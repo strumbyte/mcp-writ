@@ -65,46 +65,42 @@ impl Grants {
         }
     }
 
-    /// Live grant names covering `addr` — the TTL check against the
-    /// caller's own clock is what keeps the snapshot's expiry contract.
-    pub(super) fn live_names(&mut self, addr: &IpAddr) -> Vec<String> {
-        self.refresh_snapshot();
-        match &self.source {
-            GrantSource::None => Vec::new(),
-            GrantSource::InProcess(list) => list.names_for(addr),
-            GrantSource::SnapshotFile(_) => {
-                let now = unix_secs_now();
-                let mut names: Vec<String> = self
-                    .entries
-                    .iter()
-                    .filter(|g| g.addr == *addr && g.expires_at_unix_secs > now)
-                    .map(|g| g.name.clone())
-                    .collect();
-                names.sort();
-                names
-            }
-        }
-    }
-
-    /// Whether a live grant authorizes a `proto`/`port` flow to `addr`
-    /// — the qualifier-aware half of `live_names`.
-    pub(super) fn has_grant(
+    /// Both halves of one flow check from the same grant state: the
+    /// live grant names covering `addr` (audit detail) and whether any
+    /// of their qualifiers authorize the `proto`/`port` flow. The TTL
+    /// check against the caller's own clock is what keeps the
+    /// snapshot's expiry contract — one acquisition keeps a verdict's
+    /// answer and its audit names consistent.
+    pub(super) fn view(
         &mut self,
         addr: &IpAddr,
         proto: crate::policy::EgressProto,
         port: u16,
-    ) -> bool {
+    ) -> (Vec<String>, bool) {
         self.refresh_snapshot();
         match &self.source {
-            GrantSource::None => false,
-            GrantSource::InProcess(list) => list.is_allowed(addr, proto, port),
+            GrantSource::None => (Vec::new(), false),
+            GrantSource::InProcess(list) => {
+                let v = list.grant_view(addr, proto, port);
+                (v.names, v.covered)
+            }
             GrantSource::SnapshotFile(_) => {
                 let now = unix_secs_now();
-                self.entries.iter().any(|g| {
-                    g.addr == *addr
-                        && g.expires_at_unix_secs > now
-                        && g.quals.iter().any(|q| q.covers(proto, port))
-                })
+                // One pass over the entry set — the names and the
+                // coverage answer come from the same `now` and the
+                // same grant state, mirroring `grant_view_of`.
+                let mut names = Vec::new();
+                let mut covered = false;
+                for g in &self.entries {
+                    if g.addr == *addr && g.expires_at_unix_secs > now {
+                        names.push(g.name.clone());
+                        if !covered {
+                            covered = g.quals.iter().any(|q| q.covers(proto, port));
+                        }
+                    }
+                }
+                names.sort();
+                (names, covered)
             }
         }
     }
