@@ -621,7 +621,7 @@ async fn main() {
             // workload whose declared grant can never apply.
             linux_mechanism: None,
             dns_upstream: None,
-            component: "mcp-secure-runner",
+            component: mcp_writ::runtime::launch::Emitter::Guest,
             max_frame_bytes,
         },
         &audit_logger,

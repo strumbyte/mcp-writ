@@ -603,8 +603,9 @@ const SECRET_CARVE_MAX_GRANTS: usize = 4_096;
 
 /// A plain spelling for a policy-bound path: `canonicalize` returns
 /// `\\?\`-verbatim paths on Windows, and every downstream comparison
-/// is spelled — `resolve_grant_spelling` reads the `?` as a wildcard,
-/// and the LPAC/deny coverage checks compare literal strings. The
+/// is spelled — the LPAC/deny coverage checks compare literal strings,
+/// while `resolve_grant_spelling` skips the prefix when scanning for
+/// wildcards (the `?` there is namespace syntax, not a glob). The
 /// carve emits only paths reachable beneath the parent, so stripping
 /// the prefix keeps the object identity while restoring the form the
 /// backends compare.

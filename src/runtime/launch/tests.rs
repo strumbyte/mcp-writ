@@ -136,7 +136,7 @@ async fn legacy_dispatch_refuses_udp_allow_under_deny_all() {
             windows_mechanism: None,
             linux_mechanism: None,
             dns_upstream: None,
-            component: "test",
+            component: Emitter::Host,
             max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
         },
         &logger,
@@ -204,7 +204,7 @@ async fn explicit_request_uses_selection_not_the_legacy_gate() {
             windows_mechanism: None,
             linux_mechanism: Some(crate::execution::LinuxMechanismRequest::Auto),
             dns_upstream: None,
-            component: "test",
+            component: Emitter::Host,
             max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
         },
         &logger,
@@ -302,7 +302,7 @@ async fn into_report_reaps_the_take_io_child() {
         policy_context: None,
         dry_run: false,
         backend: warden.sandbox_backend(),
-        component: "test",
+        component: Emitter::Host,
     };
     let report = fail.fail(
         warden.enforcement_plan(

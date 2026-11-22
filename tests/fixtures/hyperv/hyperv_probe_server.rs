@@ -21,8 +21,11 @@
 //!                                the AppContainer capability check
 //!   spawn_child  {}              child-process creation attempt under the
 //!                                warden's launch conditions — a spawned
-//!                                descendant's denied write proves the
-//!                                container token/job were inherited
+//!                                descendant is checked for the inherited
+//!                                AppContainer token + membership in the
+//!                                workload's own job (PID-list proof),
+//!                                its denied write, and its comm state
+//!                                against a verified endpoint
 //!   env_probe    {}              environment surface (restricted env
 //!                                evidence: stripped MCP_* / sentinel vars)
 //!
@@ -277,6 +280,8 @@ mod ffi {
     pub const TOKEN_USER: DWORD = 1;
     /// TOKEN_INFORMATION_CLASS::TokenGroups.
     pub const TOKEN_GROUPS: DWORD = 2;
+    /// JOBOBJECTINFOCLASS::JobObjectBasicProcessIdList.
+    pub const JOB_OBJECT_BASIC_PROCESS_ID_LIST: i32 = 3;
 
     /// RTL_OSVERSIONINFOW (OSVERSIONINFOW without the EX tail).
     #[repr(C)]
@@ -317,11 +322,27 @@ mod ffi {
         pub token_app_container: PSID,
     }
 
+    /// JOBOBJECT_BASIC_PROCESS_ID_LIST — the PIDs of every process
+    /// assigned to the queried job and its nested child jobs.
+    #[repr(C)]
+    pub struct JOBOBJECT_BASIC_PROCESS_ID_LIST_ {
+        pub number_of_assigned_processes: DWORD,
+        pub number_of_process_ids_in_list: DWORD,
+        pub process_id_list: [usize; 1],
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         pub fn GetCurrentProcess() -> HANDLE;
         pub fn CloseHandle(h: HANDLE) -> BOOL;
         pub fn IsProcessInJob(process: HANDLE, job: HANDLE, result: *mut BOOL) -> BOOL;
+        pub fn QueryInformationJobObject(
+            job: HANDLE,
+            class: i32,
+            info: *mut core::ffi::c_void,
+            len: DWORD,
+            retlen: *mut DWORD,
+        ) -> BOOL;
         pub fn GetComputerNameW(buffer: LPWSTR, size: *mut DWORD) -> BOOL;
         pub fn GetLastError() -> DWORD;
     }
@@ -608,40 +629,234 @@ fn tool_net_probe(args: &J) -> String {
 /// child-process policy, and whether `cmd` even starts is substrate
 /// luck (the host leg's denial comes from an inherited cwd outside the
 /// grants, which the utility VM does not reproduce). The durable
-/// guarantee is inheritance: a descendant that runs must carry the same
-/// AppContainer token and job membership, so its denied write fails the
-/// same as the parent's — a child that escaped containment would write
-/// `CHILD_ESCAPE` successfully.
+/// guarantee is inheritance, checked three ways:
+///
+/// 1. A spawned descendant's denied write — a child that escaped
+///    containment would write `CHILD_ESCAPE` successfully.
+/// 2. The descendant's *own* token and job state — the same
+///    `GetTokenInformation(TokenIsAppContainer)`/`IsProcessInJob`
+///    queries `token_facts` runs for the workload, run on the child's
+///    process handle, plus `child_warden_job`: the child's PID looked
+///    up in this job's own process-ID list — membership in *the* job
+///    the launch assigned, not "any job". The denied write alone does
+///    not prove them. The descendant is held on a `set /p` read of the
+///    parent's stdin pipe until these queries finish — a job's PID
+///    list drops exited members, so querying a cmd that already ran
+///    to completion would flake on scheduling alone.
+/// 3. Communication — see `comm_leg`.
 fn tool_spawn_child() -> String {
+    let mut parts = Vec::new();
     match std::process::Command::new("cmd.exe")
         .args([
             "/c",
-            "echo CHILD_ESCAPE > C:\\writ-deny\\child.txt && type C:\\writ-deny\\child.txt",
+            "echo CHILD_ESCAPE > C:\\writ-deny\\child.txt && type C:\\writ-deny\\child.txt & set /p W=",
         ])
         // `output()` defaults stdin to `Stdio::null`, which opens the NUL
         // device — denied under some AppContainer profiles before the
         // spawn is even attempted. A pipe mirrors the warden's launch
         // conditions (explicit stdio pipe handles, no NUL dependency).
         .stdin(std::process::Stdio::piped())
+        // Piped so `wait_with_output` captures what the descendant
+        // wrote — spawned with inherited stdio the `Output` comes back
+        // empty and a typed-back CHILD_ESCAPE would go unrecorded.
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Interrogate the descendant's own security context — the
+            // token/job facts, not just their visible effects. The
+            // child is parked on `set /p` reading our pipe, so it is
+            // still alive (and still in the job's PID list) here.
+            let facts = descendant_facts(&child);
+            // Closing the write end releases `set /p` on EOF so the
+            // descendant can exit and `wait_with_output` can reap it.
+            drop(child.stdin.take());
+            match child.wait_with_output() {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    // The escape verdict is the *file* — a denied
+                    // descendant write leaves no `child.txt` regardless
+                    // of how cmd phrases the refusal (locale, stream
+                    // placement). `stdout` carrying CHILD_ESCAPE is the
+                    // same fact from the `type` side.
+                    let child_txt =
+                        std::path::Path::new(r"C:\writ-deny\child.txt").exists();
+                    parts.push(format!(
+                        "spawn ok: status={} stdout={:?} stderr={:?} child_txt={child_txt} {facts}",
+                        out.status.code().map_or("?".into(), |c| c.to_string()),
+                        stdout.trim(),
+                        stderr.trim()
+                    ));
+                }
+                Err(e) => parts.push(format!("spawn ok(no-output): {facts} wait={e}")),
+            }
+        }
+        Err(e) => parts.push(format!("spawn failed: {e}")),
+    }
+    parts.push(comm_leg());
+    parts.join(" ")
+}
+
+/// The spawned descendant's own AppContainer-token and job-membership
+/// facts — the same queries `token_facts` runs for the workload, taken
+/// on the child's still-open process handle (the process object keeps
+/// them readable even after the descendant exits).
+fn descendant_facts(child: &std::process::Child) -> String {
+    use std::os::windows::io::AsRawHandle;
+    let handle = child.as_raw_handle() as ffi::HANDLE;
+    unsafe {
+        let mut token: ffi::HANDLE = 0;
+        let ac = if ffi::OpenProcessToken(handle, ffi::TOKEN_QUERY, &mut token) != 0 {
+            let mut is_ac: ffi::DWORD = 0;
+            let mut retlen: ffi::DWORD = 0;
+            let r = ffi::GetTokenInformation(
+                token,
+                ffi::TOKEN_IS_APP_CONTAINER,
+                (&mut is_ac as *mut ffi::DWORD).cast(),
+                std::mem::size_of::<ffi::DWORD>() as u32,
+                &mut retlen,
+            );
+            ffi::CloseHandle(token);
+            if r != 0 {
+                (is_ac != 0).to_string()
+            } else {
+                format!("gle{}", ffi::GetLastError())
+            }
+        } else {
+            format!("open-gle{}", ffi::GetLastError())
+        };
+        let mut in_job: ffi::BOOL = 0;
+        let job = if ffi::IsProcessInJob(handle, 0, &mut in_job) != 0 {
+            (in_job != 0).to_string()
+        } else {
+            format!("gle{}", ffi::GetLastError())
+        };
+        let warden_job = in_own_job(child.id());
+        format!("child_token_ac={ac} child_job={job} child_warden_job={warden_job}")
+    }
+}
+
+/// Whether `pid` sits in this process's *own* job — the one the warden
+/// assigned the workload to, counting its nested child jobs. This is
+/// the job-specific evidence `IsProcessInJob(.., NULL, ..)` cannot
+/// give: "in some job somewhere" vs "in the job the launch put us in".
+/// The warden's job carries `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` only —
+/// no `BREAKAWAY` flags — so a descendant cannot leave it at all
+/// (`CREATE_BREAKAWAY_FROM_JOB` would fail), but this check proves
+/// membership directly rather than trusting that enforcement.
+fn in_own_job(pid: u32) -> String {
+    unsafe {
+        let mut cap = 64usize;
+        loop {
+            // `usize` elements so the buffer's alignment satisfies the
+            // ULONG_PTR `ProcessIdList` — a `u8` vec would be align-1.
+            // The trailing +4 covers the two-DWORD header.
+            let mut buf = vec![0usize; cap + 4];
+            let mut retlen: ffi::DWORD = 0;
+            if ffi::QueryInformationJobObject(
+                0,
+                ffi::JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * std::mem::size_of::<usize>()) as ffi::DWORD,
+                &mut retlen,
+            ) == 0
+            {
+                return format!("gle{}", ffi::GetLastError());
+            }
+            let list = &*buf
+                .as_ptr()
+                .cast::<ffi::JOBOBJECT_BASIC_PROCESS_ID_LIST_>();
+            let n = list.number_of_process_ids_in_list as usize;
+            if n < list.number_of_assigned_processes as usize {
+                cap = list.number_of_assigned_processes as usize;
+                continue;
+            }
+            let ids = std::slice::from_raw_parts(list.process_id_list.as_ptr(), n);
+            return ids.contains(&(pid as usize)).to_string();
+        }
+    }
+}
+
+/// The communication half of descendant containment. The parent
+/// workload owns a *listening* loopback endpoint — a succeeded `bind`
+/// is the endpoint's existence proof, so a later connect failure is
+/// never "endpoint unavailable": it is the capability gate's verdict.
+/// The parent's own connect is the control probing the substrate's
+/// intra-package loopback posture (`ok`, or the gate's `fail:<code>`
+/// where the package grants no network capability at all). The
+/// descendant — this binary re-spawned in `--net-check` mode — then
+/// attempts the package endpoint plus an outbound target. A contained
+/// descendant inherits the parent's exact comm posture (the same gate
+/// verdict on loopback, WSAEACCES/10013 outbound — the same deny
+/// leg-8's `net_probe` asserts); an escaped descendant diverges:
+/// outbound TCP leaves without the 10013 pre-route deny.
+fn comm_leg() -> String {
+    // `bind` + `local_addr` success is the endpoint's existence proof.
+    // When either fails the loopback leg is unverifiable
+    // (`comm_control=unavailable`), but the descendant's outbound
+    // check is independent — its 10013 verdict fires before routing —
+    // so it still runs against a dead loopback port.
+    let bound = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr().map(|a| (l, a)));
+    let (control, loop_addr, _listener) = match bound {
+        Ok((l, addr)) => {
+            // The connect handshake completes against a listening
+            // socket with no `accept` — the backlog holds the
+            // connections until the listener drops.
+            let control = match std::net::TcpStream::connect(addr) {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("fail:{}", e.raw_os_error().unwrap_or_default()),
+            };
+            (control, addr.to_string(), Some(l))
+        }
+        Err(e) => (
+            format!("unavailable:{e}"),
+            "127.0.0.1:9".to_string(),
+            None,
+        ),
+    };
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return format!("comm_control={control} child_net=exe:{e}"),
+    };
+    match std::process::Command::new(exe)
+        .args(["--net-check", &loop_addr, "192.0.2.1:80"])
+        .stdin(std::process::Stdio::piped())
         .output()
     {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            // The escape verdict is the *file* — a denied descendant
-            // write leaves no `child.txt` regardless of how cmd phrases
-            // the refusal (locale, stream placement). `stdout` carrying
-            // CHILD_ESCAPE is the same fact from the `type` side.
-            let child_txt = std::path::Path::new(r"C:\writ-deny\child.txt").exists();
-            format!(
-                "spawn ok: status={} stdout={:?} stderr={:?} child_txt={child_txt}",
-                out.status.code().map_or("?".into(), |c| c.to_string()),
-                stdout.trim(),
-                stderr.trim()
-            )
+            format!("comm_control={control} {}", stdout.trim())
         }
-        Err(e) => format!("spawn failed: {e}"),
+        Err(e) => format!("comm_control={control} child_net=spawn:{e}"),
     }
+}
+
+/// `--net-check <package-addr> <outbound-addr>` — the descendant half
+/// of `comm_leg`. Connects to both and prints the per-target result:
+/// `ok` on handshake, `denied:<code>` when the failure is the
+/// AppContainer capability gate (WSAEACCES/10013 — a denial that fired
+/// before routing, so endpoint reachability is irrelevant), `fail:<c>`
+/// otherwise.
+fn mode_net_check(args: &[String]) {
+    let connect = |raw: &str| match raw.parse::<std::net::SocketAddr>() {
+        Ok(sa) => {
+            match std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(2)) {
+                Ok(_) => "ok".to_string(),
+                Err(e) => match e.raw_os_error() {
+                    Some(10013) => format!("denied:{}", e.raw_os_error().unwrap_or_default()),
+                    Some(c) => format!("fail:{c}"),
+                    None => format!("fail:{e}"),
+                },
+            }
+        }
+        Err(e) => format!("fail:addr:{e}"),
+    };
+    let loop_res = args.first().map_or("fail:no-addr".into(), |a| connect(a));
+    let out_res = args.get(1).map_or("fail:no-addr".into(), |a| connect(a));
+    println!("child_net_loop={loop_res} child_net_out={out_res}");
 }
 
 /// The environment the child actually received — `restrict_environment`
@@ -689,6 +904,14 @@ fn tools_list() -> &'static str {
 // ─── main loop ───────────────────────────────────────────────────────
 
 fn main() {
+    // Descendant mode for `comm_leg` — argv takes precedence over the
+    // JSON-RPC loop: a `--net-check` re-spawn of this binary connects
+    // and exits instead of serving tools.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("--net-check") {
+        mode_net_check(&argv[2..]);
+        return;
+    }
     let stdin = io::stdin();
     let stdout = io::stdout();
     for line in stdin.lock().lines() {

@@ -519,7 +519,7 @@ async fn real_main() {
                 .linux_mechanism
                 .or(Some(mcp_writ::execution::LinuxMechanismRequest::Auto)),
             dns_upstream: args.dns_upstream,
-            component: "mcp-writ",
+            component: mcp_writ::runtime::launch::Emitter::Host,
             max_frame_bytes: args
                 .max_frame_bytes
                 .unwrap_or(mcp_writ::framing::DEFAULT_MAX_FRAME_BYTES),

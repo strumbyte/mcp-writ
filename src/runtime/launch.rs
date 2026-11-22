@@ -21,6 +21,28 @@ use crate::verifier::hash::{self, VerifyError};
 use crate::verifier::identity::LaunchIdentity;
 use crate::warden::{RunningChild, Warden, WardenReport};
 
+/// The binary a launch's records are emitted by. Selects both the
+/// `guard.*` audit stamp and the stderr wording
+/// [`LaunchError::describe`] renders, so the wording can never silently
+/// follow a renamed component string.
+#[derive(Clone, Copy, Debug)]
+pub enum Emitter {
+    /// The host `mcp-writ` CLI.
+    Host,
+    /// The in-guest `mcp-secure-runner`.
+    Guest,
+}
+
+impl Emitter {
+    /// The component name stamped onto `guard.*` lifecycle records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "mcp-writ",
+            Self::Guest => "mcp-secure-runner",
+        }
+    }
+}
+
 /// Per-binary inputs to [`launch`].
 ///
 /// Callers resolve policy loading, `bind_to_server`, `FailOn`, and audit-log
@@ -87,9 +109,9 @@ pub struct LaunchConfig {
     /// `nameserver` in `/etc/resolv.conf`; the selection records what
     /// was resolved.
     pub dns_upstream: Option<std::net::SocketAddr>,
-    /// Emitting binary for `guard.*` lifecycle records
-    /// (`mcp-writ` on the host, `mcp-secure-runner` in the guest).
-    pub component: &'static str,
+    /// Emitting binary for `guard.*` lifecycle records — also selects
+    /// the stderr wording [`LaunchError::describe`] renders.
+    pub component: Emitter,
     /// `--max-frame-bytes` — the JSON-RPC frame cap both relay
     /// directions enforce (`framing::DEFAULT_MAX_FRAME_BYTES` when the
     /// caller did not override). The in-guest runner resolves it from
@@ -257,23 +279,23 @@ pub struct LaunchError {
     /// the caller never matches variants just to reach it.
     pub report: Box<LaunchReport>,
     /// The emitting binary — `describe` renders its stderr wording.
-    component: &'static str,
+    component: Emitter,
 }
 
 impl LaunchError {
     /// The stderr line for this failure, rendered in the emitting
-    /// binary's wording. `mcp-secure-runner` prefixes every line with
+    /// binary's wording. [`Emitter::Guest`] prefixes every line with
     /// its component name and uses lowercase stage text; the host `run`
     /// prefixes non-hash stages `Error: ` while the hash stages keep
     /// their standalone `Supply chain verification failed…` form.
     pub fn describe(&self) -> String {
-        let guest = self.component == "mcp-secure-runner";
+        let guest = matches!(self.component, Emitter::Guest);
         match &self.kind {
             LaunchErrorKind::ResolveCommand { command, source } => {
                 if guest {
                     format!(
                         "{}: cannot resolve command '{command}': {source}",
-                        self.component
+                        self.component.as_str()
                     )
                 } else {
                     format!("Error: cannot resolve command '{command}': {source}")
@@ -286,7 +308,7 @@ impl LaunchError {
                 if guest {
                     format!(
                         "{}: supply chain verification failed for '{server_name}': {source}",
-                        self.component
+                        self.component.as_str()
                     )
                 } else {
                     format!("Supply chain verification failed for '{server_name}': {source}")
@@ -296,7 +318,7 @@ impl LaunchError {
                 if guest {
                     format!(
                         "{}: supply chain verification failed: {source}",
-                        self.component
+                        self.component.as_str()
                     )
                 } else {
                     format!("Supply chain verification failed: {source}")
@@ -306,7 +328,7 @@ impl LaunchError {
                 if guest {
                     format!(
                         "{}: supply chain verification failed at spawn: {source}",
-                        self.component
+                        self.component.as_str()
                     )
                 } else {
                     format!("Supply chain verification failed at spawn: {source}")
@@ -317,7 +339,7 @@ impl LaunchError {
                 if guest {
                     format!(
                         "{}: failed to spawn child process '{command_name}' ({} args): {source}",
-                        self.component,
+                        self.component.as_str(),
                         argv.len()
                     )
                 } else {
@@ -326,7 +348,10 @@ impl LaunchError {
             }
             LaunchErrorKind::TakeIo { .. } => {
                 if guest {
-                    format!("{}: failed to capture child stdin/stdout", self.component)
+                    format!(
+                        "{}: failed to capture child stdin/stdout",
+                        self.component.as_str()
+                    )
                 } else {
                     "Error: failed to capture child process stdin/stdout".to_string()
                 }
@@ -368,7 +393,7 @@ struct FailCtx<'a> {
     policy_context: Option<PolicyAuditContext>,
     dry_run: bool,
     backend: SandboxBackend,
-    component: &'static str,
+    component: Emitter,
 }
 
 impl FailCtx<'_> {
@@ -1318,7 +1343,7 @@ impl<'a> PreparedLaunch<'a> {
         let session_audit = crate::runtime::lifecycle::SessionAuditContext {
             launch_id: self.fail.launch_id,
             policy: self.fail.policy_context.clone(),
-            component: self.fail.component,
+            component: self.fail.component.as_str(),
         };
         // The audited session opens: `session.started` brackets the relay's
         // lifetime, `server.connected` records the spawn inside it. Both

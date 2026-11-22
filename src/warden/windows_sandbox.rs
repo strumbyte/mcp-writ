@@ -773,28 +773,59 @@ mod tests {
 
     /// The prerequisite every spawn in this module shares: a throwaway
     /// AppContainer profile must be creatable — `CreateAppContainerProfile`
-    /// is the privilege/capability-sensitive call the launch relies on, and
-    /// its drop removes the profile again. Probed once per test binary; a
-    /// failure is a missing prerequisite reported through
-    /// `skip_unless_required` (a failure under the require gate), never a
-    /// launch verdict. Beyond it every spawn below is `expect`ed — a spawn,
-    /// wait, or read that fails after the prerequisite held is a real test
+    /// is the privilege/capability-sensitive call the launch relies on.
+    /// Probed once per test binary through the raw API so the *HRESULT*
+    /// classifies the failure (a `WardenError` would have flattened the
+    /// code into its `detail` text): only a recognized prerequisite gap
+    /// is reported through `skip_unless_required` (a failure under the
+    /// require gate), never a launch verdict. Any other probe error is
+    /// a broken test environment and fails the test outright. Beyond
+    /// the probe every spawn below is `expect`ed — a spawn, wait, or
+    /// read that fails after the prerequisite held is a real test
     /// failure, not a skip.
     fn require_appcontainer() -> bool {
+        use windows::Win32::Security::FreeSid;
+        use windows::Win32::Security::Isolation::{
+            CreateAppContainerProfile, DeleteAppContainerProfile,
+        };
+
+        /// HRESULT_FROM_WIN32 of the recognized prerequisite gaps:
+        /// `0x80070005` E_ACCESSDENIED and `0x80070522`
+        /// ERROR_PRIVILEGE_NOT_HELD (a restricted agent/limited user
+        /// cannot create profiles — the documented host requirement),
+        /// `0x80070032` ERROR_NOT_SUPPORTED (feature unavailable on
+        /// this host). Everything else — OOM, API misuse, service
+        /// faults — is unexpected and must not be skippable.
+        const PREREQUISITE_CODES: [u32; 3] = [0x8007_0005, 0x8007_0522, 0x8007_0032];
+
         static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *PROBE.get_or_init(|| {
-            match crate::warden::windows_profile::AppContainerSandbox::new("probe") {
-                Ok(sandbox) => {
-                    drop(sandbox);
-                    true
-                }
+            let name = windows::core::HSTRING::from(format!(
+                "mcp-writ-prereq-probe-{}",
+                std::process::id()
+            ));
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let sid = match unsafe { CreateAppContainerProfile(&name, &name, &name, None) } {
+                Ok(sid) => sid,
                 Err(e) => {
-                    crate::testutil::skip_unless_required(&format!(
-                        "AppContainer profile creation unavailable: {e}"
-                    ));
-                    false
+                    if PREREQUISITE_CODES.contains(&(e.code().0 as u32)) {
+                        crate::testutil::skip_unless_required(&format!(
+                            "AppContainer profile creation unavailable: {e}"
+                        ));
+                        return false;
+                    }
+                    panic!(
+                        "unexpected AppContainer probe failure — not a known \
+                         prerequisite gap, the test environment is broken: {e}"
+                    );
                 }
+            };
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                let _ = DeleteAppContainerProfile(&name);
+                let _ = FreeSid(sid);
             }
+            true
         })
     }
 

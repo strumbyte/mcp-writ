@@ -670,17 +670,17 @@ cargo test --locked --test kdl_policy_e2e --test policy_check_e2e --test manifes
 
 **タスク**
 
-- [ ] 各テストのspawn／wait／read失敗と早期returnを一覧化する。OS機能、権限、fixture、TEMPの空白などの前提をspawn前に検査し、既知の前提不足だけを`skip_unless_required`等へ渡す。任意のspawnエラーをskipへ変換する修正にはしない。
-- [ ] `MCP_WRIT_REQUIRE_E2E_TESTS=1`では前提不足を失敗とする。前提を満たした後の起動失敗、応答不正、read／wait失敗、タイムアウトはゲートの有無にかかわらず失敗とする。fixtureの引用・cwdの不備をアクセス拒否と取り違えない。
-- [ ] 否定probeは、同じ操作が許可された条件では成功する対照を持たせる。拒否側ではfixtureが操作まで到達した証拠、操作のエラー、プロセスの終了状態を確認する。表示言語依存のstderr部分一致だけを唯一の根拠にせず、必要ならprobeで安定した結果を返す。
-- [ ] ACL復元テストの第2段階の`if let Ok(child)`を除き、起動と応答を必須にする。第1段階の成功、grant記録、第2段階のアクセス拒否、元のACLへの復元、残存資源を確認する。共有ディレクトリへ恒久的なgrantを残さない。
-- [ ] 子プロセス禁止を前提にした旧ケースを置換する前に、許可cwd・適切なstdioで子を確実に起動するfixtureを用意する。子の作成成功を確認したうえで、同じtoken・Jobの隔離制約、禁止ファイルと通信へのアクセス拒否を実動作で検査する。通信の対照には動作確認済みのローカルendpoint等を用い、相手不在による失敗を拒否の証拠にしない。
-- [ ] 親終了時の製品cleanupとJob解放で子孫が回収されることを確認する。親が先に終了して子だけが継続するfixtureを含め、子の自然終了では通らない条件にする。PID等で存続と消滅を追跡し、テスト自身が失敗した場合も作成したプロセス・ACL・一時物を回収する。
-- [ ] 代替の実機ケースが通ってから`sandboxed_workload_cannot_spawn_children`を置換する。golden reportの`gc_killed`だけで代替しない。AppContainer／Jobの子作成と、Hyper-V等の別backendのprocess limit契約を混同しない。
-- [ ] tools-listの`carve_root_symlink_resolves_to_real_tree`、`carve_skips_symlink_entries`、`carve_unresolvable_reparse_root_fails_closed`、`carve_dir_refuses_reparse_root`のsymlink作成失敗returnを共通の前提判定に寄せる。既存のgrant／秘密パス／fail-closedのassertionは保持する。
-- [ ] container runnerの`log_share_refuses_artifact_through_plain_spelled_share_link`も同じ方針へ直す。このケースはWindows専用である。tools-listは対応するLinux・macOS・Windows、runnerはWindowsで実行し、Unix側の別形状の既存ケースも残す。テストを通す目的で自動昇格やsandbox緩和を加えない。
-- [ ] 変更した判定経路ごとに代表的な前提不足・起動失敗・応答不正・タイムアウトを制御して与え、必須ゲート下で失敗することを確認する。全live testに同じ故障の直積を追加せず、共通判定と固有のprobe経路を必要な範囲で検査する。
-- [ ] 修正したコードと同じPRで、development.mdの「Windows spawn失敗をログに出してpassする」という現状説明を更新する。既知の前提不足のみ明示skip、必須ゲート下では失敗、前提成立後の予期しないspawn／probe失敗は常に失敗、という区別を記す。検証済みOSの範囲と前提権限も維持し、skipされた経路を保証済みと記載しない。
+- [x] 各テストのspawn／wait／read失敗と早期returnを一覧化する。OS機能、権限、fixture、TEMPの空白などの前提をspawn前に検査し、既知の前提不足だけを`skip_unless_required`等へ渡す。任意のspawnエラーをskipへ変換する修正にはしない。 → `.local/refactoring/RF09/run-2026-11-22-01/inventory.md`（RF09コミットで実施）、`require_appcontainer()` が `AppContainerSandbox::new` を1回probeし前提不足のみ `skip_unless_required` へ（`windows_sandbox.rs`）
+- [x] `MCP_WRIT_REQUIRE_E2E_TESTS=1`では前提不足を失敗とする。前提を満たした後の起動失敗、応答不正、read／wait失敗、タイムアウトはゲートの有無にかかわらず失敗とする。fixtureの引用・cwdの不備をアクセス拒否と取り違えない。 → `skip_unless_required` はゲート下で panic（`testutil.rs`）、`require_appcontainer` は生 `CreateAppContainerProfile` の HRESULT を分類し既知の前提不足（E_ACCESSDENIED/PRIVILEGE_NOT_HELD/NOT_SUPPORTED）のみ skip・予期しないエラーは panic、probe通過後の spawn/wait/read は全て `expect`／`panic`
+- [x] 否定probeは、同じ操作が許可された条件では成功する対照を持たせる。拒否側ではfixtureが操作まで到達した証拠、操作のエラー、プロセスの終了状態を確認する。表示言語依存のstderr部分一致だけを唯一の根拠にせず、必要ならprobeで安定した結果を返す。 → `test_sandbox_blocks_write_outside_allowed` に read_write 付与の陽性対照を追加（成功確認後に `drop(control)` で deny probe 評価）
+- [x] ACL復元テストの第2段階の`if let Ok(child)`を除き、起動と応答を必須にする。第1段階の成功、grant記録、第2段階のアクセス拒否、元のACLへの復元、残存資源を確認する。共有ディレクトリへ恒久的なgrantを残さない。 → `acl_grant_allows_write_and_drop_restores_denial` で phase1/2 spawn 必須化、grant 記録と `!leaked` の復元確認、fixture cleanup を実装
+- [x] 子プロセス禁止を前提にした旧ケースを置換する前に、許可cwd・適切なstdioで子を確実に起動するfixtureを用意する。子の作成成功を確認したうえで、同じtoken・Jobの隔離制約、禁止ファイルと通信へのアクセス拒否を実動作で検査する。通信の対照には動作確認済みのローカルendpoint等を用い、相手不在による失敗を拒否の証拠にしない。 → hyperv leg-9 `tool_spawn_child`（`tests/fixtures/hyperv/hyperv_probe_server.rs`）が子 spawn 成功を確認後に 3 経路で containment 継承を検証: denied-write の `child_txt=false`・子自身の token/Job を `GetTokenInformation(TokenIsAppContainer)`/`IsProcessInJob` で直接照合（`child_token_ac=true`/`child_job=true`）に加え workload 自身の Job の PID リストで `child_warden_job=true` を検証（Job 固有・BREAKAWAY 不可の担保）、通信経路（親の listen 済み loopback endpoint への子 connect は親の `comm_control` と同一 verdict を要求、outbound connect は `child_net_out=denied:10013` = WSAEACCES capability 拒否を必須 — error code が pre-route 拒否を示すため endpoint 未到達の失敗とは区別される）。`hyperv_vm_stdio_session` 実機 pass
+- [ ] 親終了時の製品cleanupとJob解放で子孫が回収されることを確認する。親が先に終了して子だけが継続するfixtureを含め、子の自然終了では通らない条件にする。PID等で存続と消滅を追跡し、テスト自身が失敗した場合も作成したプロセス・ACL・一時物を回収する。 （残存: `run_image_hyperv_external_kill_cleans_up` は unit kill → 製品 teardown を検証済みだが、「親終了後も子孫が継続する」orphan fixture は未追加）
+- [x] 代替の実機ケースが通ってから`sandboxed_workload_cannot_spawn_children`を置換する。golden reportの`gc_killed`だけで代替しない。AppContainer／Jobの子作成と、Hyper-V等の別backendのprocess limit契約を混同しない。 → 代替実機ケース（hyperv leg-9 containment 継承検証）が 17/17 pass 後に、unit test は「本 launch 条件下での観測拒否」へ doc 明確化し spawn/read/wait を必須化 — 保証過剰主張を除去
+- [x] tools-listの`carve_root_symlink_resolves_to_real_tree`、`carve_skips_symlink_entries`、`carve_unresolvable_reparse_root_fails_closed`、`carve_dir_refuses_reparse_root`のsymlink作成失敗returnを共通の前提判定に寄せる。既存のgrant／秘密パス／fail-closedのassertionは保持する。 → 4件とも `skip_unless_required` へ統一（`tools_list.rs`）
+- [x] container runnerの`log_share_refuses_artifact_through_plain_spelled_share_link`も同じ方針へ直す。このケースはWindows専用である。tools-listは対応するLinux・macOS・Windows、runnerはWindowsで実行し、Unix側の別形状の既存ケースも残す。テストを通す目的で自動昇格やsandbox緩和を加えない。 → `container/runner/tests.rs` の symlink skip を `skip_unless_required` へ統一
+- [x] 変更した判定経路ごとに代表的な前提不足・起動失敗・応答不正・タイムアウトを制御して与え、必須ゲート下で失敗することを確認する。全live testに同じ故障の直積を追加せず、共通判定と固有のprobe経路を必要な範囲で検査する。 → 空白入り `TEMP` で前提不足を制御付与: `MCP_WRIT_REQUIRE_E2E_TESTS=1` で `test prerequisite failed` FAILED、無ゲートで `SKIP`+pass を実行確認済み。probe 通過後の spawn/wait/read 失敗経路は `expect`/`panic` 構造でゲート無関係に失敗（log-and-pass 経路は残存なし）
+- [x] 修正したコードと同じPRで、development.mdの「Windows spawn失敗をログに出してpassする」という現状説明を更新する。既知の前提不足のみ明示skip、必須ゲート下では失敗、前提成立後の予期しないspawn／probe失敗は常に失敗、という区別を記す。検証済みOSの範囲と前提権限も維持し、skipされた経路を保証済みと記載しない。 → `development.md` の記述を前提 probe + 必須ゲートの説明へ更新済み
 
 **確認コマンド:** 必須前提を用意し、対象プロセスに`MCP_WRIT_REQUIRE_E2E_TESTS=1`を設定して実行する。
 

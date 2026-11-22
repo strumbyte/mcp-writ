@@ -1196,6 +1196,84 @@ async fn hyperv_vm_stdio_session() {
         "a descendant that escaped containment would leave \
          C:\\writ-deny\\child.txt or type CHILD_ESCAPE back: {spawn_leg}"
     );
+    if spawn_leg.contains("spawn ok:") {
+        // The denied write is the effect; the descendant's *own*
+        // security context is the containment-inheritance evidence —
+        // interrogated on the child's process handle, not inferred.
+        assert!(
+            spawn_leg.contains("child_token_ac=true"),
+            "a spawned descendant must carry the AppContainer token: {spawn_leg}"
+        );
+        assert!(
+            spawn_leg.contains("child_job=true"),
+            "a spawned descendant must remain inside a Job: {spawn_leg}"
+        );
+        // `child_warden_job` is job-specific: the probe lists the PIDs
+        // of *its own* job — the one the launch put the workload in —
+        // and checks the child's PID is among them, so a descendant in
+        // an unrelated job cannot pass as contained. (The warden's job
+        // sets KILL_ON_JOB_CLOSE without BREAKAWAY flags, so leaving it
+        // is impossible anyway — this pins that rather than trusts it.)
+        assert!(
+            spawn_leg.contains("child_warden_job=true"),
+            "a spawned descendant must join the warden's Job, not just \
+             any Job: {spawn_leg}"
+        );
+    }
+    // The comm leg is independent of the cmd outcome — its descendant
+    // is the probe's own `--net-check` re-spawn, a different binary
+    // with its own image/ACL surface, so `spawn failed:` for cmd.exe
+    // can coexist with a successful comm descendant and these checks
+    // must not sit behind the `spawn ok:` guard.
+    assert!(
+        spawn_leg.contains("comm_control="),
+        "spawn_child must run the comm leg: {spawn_leg}"
+    );
+    // The leg must also name its descendant outcome — `comm_control`
+    // alone proves nothing. `child_net_out=` means a descendant ran
+    // and is checked below; `child_net=spawn:`/`child_net=exe:` are
+    // the documented creation-failure shapes (descendant creation is
+    // not policy-guaranteed, so they are tolerated). Anything else —
+    // a control-only report — is a defect, not evidence.
+    assert!(
+        spawn_leg.contains("child_net_out=")
+            || spawn_leg.contains("child_net=spawn:")
+            || spawn_leg.contains("child_net=exe:"),
+        "the comm leg must report a descendant outcome or a documented \
+         creation failure — control-only output is no evidence: {spawn_leg}"
+    );
+    if spawn_leg.contains("child_net_out=") {
+        // The outbound denial needs no reachable endpoint — WSAEACCES
+        // fires *before* routing, so the error code itself is the
+        // capability gate's verdict and cannot be an
+        // unavailable-endpoint failure passing as containment.
+        assert!(
+            spawn_leg.contains("child_net_out=denied:10013"),
+            "a contained descendant's outbound connect must hit the \
+             capability deny (WSAEACCES/10013) — any other result \
+             means TCP left unconfined: {spawn_leg}"
+        );
+        // The loopback target is a *listening* endpoint (the parent's
+        // bind succeeded), so the child's posture there must equal the
+        // parent's own control verdict — inherited rights, not escape.
+        if spawn_leg.contains("comm_control=ok") {
+            assert!(
+                spawn_leg.contains("child_net_loop=ok"),
+                "intra-package loopback worked for the workload — its \
+                 descendant must reach it too: {spawn_leg}"
+            );
+        } else if !spawn_leg.contains("comm_control=unavailable") {
+            assert!(
+                spawn_leg.contains("child_net_loop=denied"),
+                "the descendant must inherit the parent's comm posture \
+                 (the same gate verdict): {spawn_leg}"
+            );
+        }
+        // `comm_control=unavailable` — the endpoint itself could not
+        // be created; the loopback check is unverifiable there and the
+        // outbound deny above is the comm evidence (it fires
+        // pre-route, so it stays meaningful without a live endpoint).
+    }
     // The probe lists every `MCP_*` variable in its own environment —
     // an empty list checks the whole surface, not just the two sentinel
     // names a substring check would cover.
