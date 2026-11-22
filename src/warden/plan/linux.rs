@@ -6,8 +6,7 @@ use std::path::Path;
 
 use crate::enforcement::{
     ControlLayer, ControlPhase, ControlState, EgressLayerStatus, EnforcementObservation,
-    LANDLOCK_FULLY_ENFORCED, LANDLOCK_NOT_ENFORCED, LANDLOCK_PARTIALLY_ENFORCED, ObservationBasis,
-    PlannedControl, ProcessGrant, RESTRICT_SELF_REPORTED,
+    ObservationBasis, PlannedControl, ProcessGrant, RestrictionLevel,
 };
 use crate::execution::WindowsNativeMechanism;
 use crate::policy::Policy;
@@ -183,6 +182,50 @@ pub(crate) fn os_spawn_observations(
         .collect()
 }
 
+/// Controls whose mechanism consults the launch's Landlock apply —
+/// the observations that carry the kernel-reported
+/// [`RestrictionLevel`] fact.
+fn landlock_backed(id: &str) -> bool {
+    matches!(
+        id,
+        "os.fs" | "os.net.outbound" | "os.ipc.unix" | "os.ipc.signal"
+    )
+}
+
+/// The typed restriction fact an apply record carries: the
+/// kernel-reported `RulesetStatus` level when one was recorded.
+/// `NOT_RUN` (the stage stored no status), `NO_RULESET` (nothing was
+/// applied — absence, not a level), and unrecognized codes map to
+/// `None` — an unobserved level is never filled in from the plan's
+/// intent.
+fn landlock_fact(snap: &linux_spawn::ApplySnapshot) -> Option<RestrictionLevel> {
+    use super::super::linux_spawn::landlock_level;
+    match snap.landlock {
+        landlock_level::FULL => Some(RestrictionLevel::FullyEnforced),
+        landlock_level::PARTIAL => Some(RestrictionLevel::PartiallyEnforced),
+        landlock_level::NOT_ENFORCED => Some(RestrictionLevel::NotEnforced),
+        _ => None,
+    }
+}
+
+/// The restriction fact a failed pipeline's observation may carry.
+/// The Landlock stage stores the kernel status before the gate can
+/// refuse (`linux_spawn` writes `landlock` ahead of `failed_stage`), so
+/// the level is still fact for controls whose own stage failed later
+/// or never ran. Two pairings cannot be produced honestly and report
+/// none: `FULL` beside a *Landlock-stage* failure (the gate always
+/// passes `FullyEnforced`), and any stored status where the Landlock
+/// stage was never entered.
+fn failed_landlock_fact(snap: &linux_spawn::ApplySnapshot) -> Option<RestrictionLevel> {
+    use super::super::linux_spawn::stage;
+    if snap.failed_stage < stage::LANDLOCK {
+        return None;
+    }
+    landlock_fact(snap).filter(|l| {
+        snap.failed_stage != stage::LANDLOCK || !matches!(l, RestrictionLevel::FullyEnforced)
+    })
+}
+
 /// The fixed pipeline stage a control's mechanism occupies — same order
 /// as `linux_spawn::apply_in_child`. Controls with no stage mapping get
 /// an `Unknown` observation rather than a guessed success.
@@ -249,34 +292,45 @@ fn linux_control_observation(
     }
 
     if snap.failed_stage == my_stage {
-        return observation(
+        let mut o = observation(
             c.id,
             ControlState::Failed,
             ObservationBasis::MechanismResult,
             ControlPhase::Spawn,
             Some(linux_stage_failure_reason(snap)),
         );
+        // A Landlock-backed control carries the level the apply
+        // recorded even when its own stage is the one that failed —
+        // the scope its mechanism consults was applied (or refused by
+        // the gate) independently of where the pipeline stopped.
+        if landlock_backed(c.id) {
+            o.restriction = failed_landlock_fact(snap);
+        }
+        return o;
     }
 
     if snap.stage >= my_stage {
         // This stage verifiably completed. A spawn error afterwards
         // (e.g. execve ENOENT) does not undo the apply — the reason
         // names it so a verified control is never read as a live launch.
-        let (state, mut reason) = linux_stage_outcome(policy, c.id, snap, requested_rights);
+        let (state, restriction, mut reason) =
+            linux_stage_outcome(policy, c.id, snap, requested_rights);
         if let Some(e) = spawn_err {
             reason.push_str(&format!("; the spawn itself then failed: {e}"));
         }
-        return observation(
+        let mut o = observation(
             c.id,
             state,
             ObservationBasis::MechanismResult,
             ControlPhase::Spawn,
             Some(reason),
         );
+        o.restriction = restriction;
+        return o;
     }
 
     if snap.failed_stage != linux_spawn::stage::NONE {
-        return observation(
+        let mut o = observation(
             c.id,
             ControlState::Failed,
             ObservationBasis::MechanismResult,
@@ -286,6 +340,13 @@ fn linux_control_observation(
                 snap.errno
             )),
         );
+        // A control past the failed stage still carries the recorded
+        // level when its mechanism consults Landlock — the fact belongs
+        // to the launch's apply, not to where the pipeline stopped.
+        if landlock_backed(c.id) {
+            o.restriction = failed_landlock_fact(snap);
+        }
+        return o;
     }
 
     observation(
@@ -330,12 +391,12 @@ fn linux_stage_failure_reason(snap: &linux_spawn::ApplySnapshot) -> String {
     if snap.failed_stage == stage::LANDLOCK {
         match snap.landlock {
             landlock_level::PARTIAL => reason.push_str(&format!(
-                "; {RESTRICT_SELF_REPORTED}{LANDLOCK_PARTIALLY_ENFORCED} and \
-                 sandbox.allow_degraded is off"
+                "; {} and sandbox.allow_degraded is off",
+                RestrictionLevel::PartiallyEnforced.reason_marker()
             )),
             landlock_level::NOT_ENFORCED => reason.push_str(&format!(
-                "; {RESTRICT_SELF_REPORTED}{LANDLOCK_NOT_ENFORCED} and \
-                 sandbox.allow_degraded is off"
+                "; {} and sandbox.allow_degraded is off",
+                RestrictionLevel::NotEnforced.reason_marker()
             )),
             _ => {}
         }
@@ -343,24 +404,34 @@ fn linux_stage_failure_reason(snap: &linux_spawn::ApplySnapshot) -> String {
     reason
 }
 
-/// Observation for a control whose stage the record marks complete.
-/// For Landlock-backed controls this maps the kernel-reported
-/// enforcement level; `os.net.outbound` additionally splits on the
-/// kernel ABI — Landlock network rules exist only since ABI v4.
-/// `os.ipc.*` splits on the policy posture (the seccomp family pin
-/// only exists under deny-all) and the ABI the scope rights need (v6).
+/// Observation for a control whose stage the record marks complete —
+/// the control's effective state, the restriction fact the mechanism
+/// recorded, and the human reason generated beside it. For
+/// Landlock-backed controls this maps the kernel-reported enforcement
+/// level; `os.net.outbound` additionally splits on the kernel ABI —
+/// Landlock network rules exist only since ABI v4. `os.ipc.*` splits on
+/// the policy posture (the seccomp family pin only exists under
+/// deny-all) and the ABI the scope rights need (v6).
 fn linux_stage_outcome(
     policy: &Policy,
     id: &str,
     snap: &linux_spawn::ApplySnapshot,
     requested_rights: Option<&str>,
-) -> (ControlState, String) {
+) -> (ControlState, Option<RestrictionLevel>, String) {
     use super::super::linux_spawn::landlock_level;
+    // The kernel-reported level is a fact of the launch's Landlock
+    // apply; only controls whose mechanism consults it carry the fact.
+    // Mechanisms that never query Landlock record none.
+    let level = if landlock_backed(id) {
+        landlock_fact(snap)
+    } else {
+        None
+    };
     let requested = |base: String| match requested_rights {
         Some(r) => format!("{base}; requested: {r}"),
         None => base,
     };
-    match id {
+    let (state, reason) = match id {
         "os.privileges" => (
             ControlState::Verified,
             "no_new_privs confirmed set in the child's pre_exec".to_string(),
@@ -405,8 +476,8 @@ fn linux_stage_outcome(
                             ControlState::Verified,
                             requested(format!(
                                 "{pin}; {scoped_text} \
-                                 ({RESTRICT_SELF_REPORTED}{LANDLOCK_FULLY_ENFORCED}, \
-                                 kernel Landlock ABI v{})",
+                                 ({}, kernel Landlock ABI v{})",
+                                RestrictionLevel::FullyEnforced.reason_marker(),
                                 snap.landlock_abi
                             )),
                         )
@@ -428,9 +499,9 @@ fn linux_stage_outcome(
                             ControlState::Verified,
                             requested(format!(
                                 "{pin}; {scoped_text} — the scope request \
-                                 landed ({RESTRICT_SELF_REPORTED}{LANDLOCK_PARTIALLY_ENFORCED}, \
-                                 kernel Landlock ABI v{}); the dropped piece is \
+                                 landed ({}, kernel Landlock ABI v{}); the dropped piece is \
                                  elsewhere in the ruleset",
+                                RestrictionLevel::PartiallyEnforced.reason_marker(),
                                 snap.landlock_abi
                             )),
                         )
@@ -453,8 +524,9 @@ fn linux_stage_outcome(
                         ControlState::NotApplied
                     },
                     format!(
-                        "{pin}; {RESTRICT_SELF_REPORTED}{LANDLOCK_NOT_ENFORCED} — \
-                         no abstract-socket or unix-path scoping is in effect"
+                        "{pin}; {} — \
+                         no abstract-socket or unix-path scoping is in effect",
+                        RestrictionLevel::NotEnforced.reason_marker()
                     ),
                 ),
                 landlock_level::NO_RULESET => (
@@ -475,22 +547,23 @@ fn linux_stage_outcome(
             landlock_level::FULL | landlock_level::PARTIAL if snap.landlock_abi >= 6 => (
                 ControlState::Verified,
                 requested(format!(
-                    "Scope::Signal applied ({RESTRICT_SELF_REPORTED}{}, kernel \
+                    "Scope::Signal applied ({}, kernel \
                      Landlock ABI v{}) — kill-family syscalls cannot reach \
                      outside the sandbox",
                     if snap.landlock == landlock_level::FULL {
-                        LANDLOCK_FULLY_ENFORCED
+                        RestrictionLevel::FullyEnforced
                     } else {
-                        LANDLOCK_PARTIALLY_ENFORCED
-                    },
+                        RestrictionLevel::PartiallyEnforced
+                    }
+                    .reason_marker(),
                     snap.landlock_abi
                 )),
             ),
             landlock_level::NOT_ENFORCED => (
                 ControlState::NotApplied,
                 format!(
-                    "{RESTRICT_SELF_REPORTED}{LANDLOCK_NOT_ENFORCED} — no signal \
-                     scoping is in effect"
+                    "{} — no signal scoping is in effect",
+                    RestrictionLevel::NotEnforced.reason_marker()
                 ),
             ),
             landlock_level::NO_RULESET => (
@@ -520,7 +593,8 @@ fn linux_stage_outcome(
                 landlock_level::FULL => (
                     ControlState::Verified,
                     requested(format!(
-                        "{RESTRICT_SELF_REPORTED}{LANDLOCK_FULLY_ENFORCED}{abi}"
+                        "{}{abi}",
+                        RestrictionLevel::FullyEnforced.reason_marker()
                     )),
                 ),
                 landlock_level::PARTIAL => {
@@ -537,9 +611,10 @@ fn linux_stage_outcome(
                         (
                             ControlState::PartiallyApplied,
                             requested(format!(
-                                "{RESTRICT_SELF_REPORTED}{LANDLOCK_PARTIALLY_ENFORCED}{abi}; \
+                                "{}{abi}; \
                                  tolerated by sandbox.allow_degraded — which rules were \
-                                 dropped is not decomposed per control"
+                                 dropped is not decomposed per control",
+                                RestrictionLevel::PartiallyEnforced.reason_marker()
                             )),
                         )
                     }
@@ -547,8 +622,9 @@ fn linux_stage_outcome(
                 landlock_level::NOT_ENFORCED => (
                     ControlState::NotApplied,
                     requested(format!(
-                        "{RESTRICT_SELF_REPORTED}{LANDLOCK_NOT_ENFORCED}{abi}; tolerated by \
-                         sandbox.allow_degraded — no Landlock enforcement is in effect"
+                        "{}{abi}; tolerated by \
+                         sandbox.allow_degraded — no Landlock enforcement is in effect",
+                        RestrictionLevel::NotEnforced.reason_marker()
                     )),
                 ),
                 // Currently unreachable: `prepare_linux_child_sandbox`
@@ -573,7 +649,8 @@ fn linux_stage_outcome(
             ControlState::Unknown,
             "no outcome mapping for this control".to_string(),
         ),
-    }
+    };
+    (state, level, reason)
 }
 
 /// Plan-mode grants for the sandboxed case: runs the same rule builders

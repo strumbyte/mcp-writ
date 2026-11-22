@@ -88,6 +88,7 @@ fn sample_report() -> LaunchReport {
             state: ControlState::Verified,
             basis: ObservationBasis::SpawnResult,
             phase: ControlPhase::Spawn,
+            restriction: None,
             reason: None,
         }],
         result: Some(LaunchOutcome {
@@ -753,6 +754,7 @@ fn sobs(
         state,
         basis: ObservationBasis::MechanismResult,
         phase: ControlPhase::Spawn,
+        restriction: None,
         reason,
     }
 }
@@ -796,11 +798,12 @@ fn summary_controls_take_observation_over_plan_state() {
     assert_eq!(s.controls_applied, 1);
 }
 
-/// The Landlock `restrict_self reported <level>` marker in an
-/// observation reason parses back to `restriction` — the same
-/// vocabulary the report reason carries, not a second judgment.
+/// `restriction` reads the typed level the observation carries — the
+/// same vocabulary `restrict_self` reported, never parsed back out of
+/// the human `reason`. The first observation with a recorded level
+/// stands: Landlock-backed controls share the one apply result.
 #[test]
-fn summary_restriction_reads_landlock_marker() {
+fn summary_restriction_reads_typed_level() {
     let plan = EnforcementPlan {
         controls: vec![],
         grants: vec![],
@@ -809,29 +812,71 @@ fn summary_restriction_reads_landlock_marker() {
         egress_layers: None,
         mechanism: None,
     };
-    for (reason, want) in [
-        (
-            "restrict_self reported FullyEnforced (kernel Landlock ABI v3)",
-            Some("fully_enforced"),
-        ),
-        (
-            "restrict_self reported PartiallyEnforced; tolerated by sandbox.allow_degraded",
-            Some("partially_enforced"),
-        ),
-        (
-            "restrict_self reported NotEnforced; tolerated by sandbox.allow_degraded",
-            Some("not_enforced"),
-        ),
-        ("no marker here", None),
+    for (level, want) in [
+        (RestrictionLevel::FullyEnforced, "fully_enforced"),
+        (RestrictionLevel::PartiallyEnforced, "partially_enforced"),
+        (RestrictionLevel::NotEnforced, "not_enforced"),
     ] {
-        let obs = vec![sobs(
-            "os.fs",
-            ControlState::Verified,
-            Some(reason.to_string()),
-        )];
-        let s = EnforcementSummary::build(&plan, &obs, SandboxBackend::LandlockSeccomp, false);
-        assert_eq!(s.restriction, want, "reason: {reason}");
+        let mut o = sobs("os.fs", ControlState::Verified, None);
+        o.restriction = Some(level);
+        let s = EnforcementSummary::build(&plan, &[o], SandboxBackend::LandlockSeccomp, false);
+        assert_eq!(s.restriction, Some(level));
+        assert_eq!(level.as_str(), want);
     }
+    // No observation carries a level → null, never a guessed success.
+    let obs = vec![sobs("os.fs", ControlState::Verified, None)];
+    let s = EnforcementSummary::build(&plan, &obs, SandboxBackend::LandlockSeccomp, false);
+    assert_eq!(s.restriction, None);
+}
+
+/// The machine result is independent of the display text: the same
+/// typed fact with differently worded reasons produces the same
+/// `restriction`, and a marker-looking `reason` without the fact
+/// reports null rather than a level.
+#[test]
+fn summary_restriction_ignores_reason_text() {
+    let plan = EnforcementPlan {
+        controls: vec![],
+        grants: vec![],
+        tools: vec![],
+        limitations: vec![],
+        egress_layers: None,
+        mechanism: None,
+    };
+    let mut levelled = sobs(
+        "os.fs",
+        ControlState::Verified,
+        Some("any wording at all".to_string()),
+    );
+    levelled.restriction = Some(RestrictionLevel::PartiallyEnforced);
+    let s = EnforcementSummary::build(
+        &plan,
+        std::slice::from_ref(&levelled),
+        SandboxBackend::LandlockSeccomp,
+        false,
+    );
+    assert_eq!(s.restriction, Some(RestrictionLevel::PartiallyEnforced));
+    levelled.reason = Some("a differently phrased description".to_string());
+    let s = EnforcementSummary::build(&plan, &[levelled], SandboxBackend::LandlockSeccomp, false);
+    assert_eq!(
+        s.restriction,
+        Some(RestrictionLevel::PartiallyEnforced),
+        "reworded reason must not change the machine result"
+    );
+
+    // Marker-looking reason text alone carries no level.
+    let marker_only = sobs(
+        "os.fs",
+        ControlState::Verified,
+        Some("restrict_self reported FullyEnforced".to_string()),
+    );
+    let s = EnforcementSummary::build(
+        &plan,
+        &[marker_only],
+        SandboxBackend::LandlockSeccomp,
+        false,
+    );
+    assert_eq!(s.restriction, None);
 }
 
 /// Grant counts split per state; `skipped` entries get bounded
@@ -995,11 +1040,13 @@ fn summary_to_json_shape() {
         egress_layers: None,
         mechanism: None,
     };
-    let observations = vec![sobs(
+    let mut full = sobs(
         "os.fs",
         ControlState::Verified,
-        Some("restrict_self reported FullyEnforced".to_string()),
-    )];
+        Some("kernel reported the ruleset level".to_string()),
+    );
+    full.restriction = Some(RestrictionLevel::FullyEnforced);
+    let observations = vec![full];
     let s = EnforcementSummary::build(&plan, &observations, SandboxBackend::LandlockSeccomp, false);
     let json = s.to_json();
     let parsed = nojson::RawJson::parse(json.as_str()).expect("valid json");

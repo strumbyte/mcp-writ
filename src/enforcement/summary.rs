@@ -3,10 +3,6 @@
 
 use super::json::JsonNull;
 use super::model::*;
-use super::{
-    LANDLOCK_FULLY_ENFORCED, LANDLOCK_NOT_ENFORCED, LANDLOCK_PARTIALLY_ENFORCED,
-    RESTRICT_SELF_REPORTED,
-};
 use crate::audit_log::EmbeddedJson;
 
 // ---------------------------------------------------------------------------
@@ -128,11 +124,11 @@ pub struct EnforcementSummary {
     /// Mirrors `LaunchReport::dry_run` — a dry-run launch never applied
     /// OS enforcement regardless of what `controls` show.
     pub dry_run: bool,
-    /// Landlock `RulesetStatus` level parsed back from observation
-    /// reasons: `fully_enforced` | `partially_enforced` | `not_enforced`,
-    /// or null when no Landlock observation reported a level (other
-    /// platforms, or no apply attempted).
-    pub restriction: Option<&'static str>,
+    /// Landlock `RulesetStatus` level carried on the launch's
+    /// observations: `fully_enforced` | `partially_enforced` |
+    /// `not_enforced`, or null when no Landlock observation recorded a
+    /// level (other platforms, or no apply attempted).
+    pub restriction: Option<RestrictionLevel>,
     /// Every planned control with its effective state — the observation
     /// where recorded, else the plan state.
     pub controls: Vec<ControlOutcome>,
@@ -189,20 +185,11 @@ impl EnforcementSummary {
             .filter(|c| c.state == ControlState::Verified)
             .count();
 
-        let restriction = observations.iter().find_map(|o| {
-            let reason = o.reason.as_deref()?;
-            let at = reason.find(RESTRICT_SELF_REPORTED)?;
-            let level = &reason[at + RESTRICT_SELF_REPORTED.len()..];
-            if level.starts_with(LANDLOCK_FULLY_ENFORCED) {
-                Some("fully_enforced")
-            } else if level.starts_with(LANDLOCK_PARTIALLY_ENFORCED) {
-                Some("partially_enforced")
-            } else if level.starts_with(LANDLOCK_NOT_ENFORCED) {
-                Some("not_enforced")
-            } else {
-                None
-            }
-        });
+        // The kernel-reported level rides the observation's typed fact —
+        // `reason` is display text and is never parsed back into a
+        // result. The first recorded level stands: Landlock-backed
+        // controls share the one `restrict_self` result.
+        let restriction = observations.iter().find_map(|o| o.restriction);
 
         let mut grants = GrantStateCounts::default();
         for g in &plan.grants {
@@ -284,7 +271,7 @@ impl EnforcementSummary {
             f.member("backend", self.backend.as_str())?;
             f.member("dry_run", self.dry_run)?;
             match self.restriction {
-                Some(r) => f.member("restriction", r)?,
+                Some(r) => f.member("restriction", r.as_str())?,
                 None => f.member("restriction", JsonNull)?,
             }
             f.member("controls_applied", self.controls_applied as u64)?;
