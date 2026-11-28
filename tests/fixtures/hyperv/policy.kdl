@@ -71,19 +71,24 @@ server "hyperv-probe" {
     }
     tool "create_file" side_effect="write" {
         filesystem {
-            allow "C:/**"
             // A `C:/**` *write* spelling resolves to the drive root —
             // unlike kata's `/*` it is not an empty base — and trips
             // the runner's audit-sink write-conflict guard, so the
             // write coverage is spelled out instead. Per-tool grants
             // feed only the auditor (the DACL comes from `defaults`),
             // so enumerating the deny-target dirs still lets those
-            // legs record the kernel-layer `os error 5`.
+            // legs record the kernel-layer `os error 5`. The narrower
+            // write rules precede the broad default-read spelling.
             allow "C:/workspace" mode="write"
+            // The literal directory grant feeds the DACL layer; the auditor's
+            // path matcher also needs the descendant spelling so create_file
+            // calls beneath the workspace are authorized without a drive-wide write.
+            allow "C:/workspace/**" mode="write"
             allow "C:/Windows/Temp" mode="write"
             allow "C:/Windows/**" mode="write"
             allow "C:/writ-deny/**" mode="write"
             allow "C:/share/**" mode="write"
+            allow "C:/**"
         }
     }
     // Declared read_only but its implementation attempts a TCP connect —
@@ -97,16 +102,16 @@ server "hyperv-probe" {
     }
     tool "spawn_child" side_effect="write" {
         filesystem {
-            allow "C:/**"
             allow "C:/workspace" mode="write"
             allow "C:/Windows/Temp" mode="write"
+            allow "C:/**"
         }
     }
     tool "exit_child" side_effect="write" {
         filesystem {
-            allow "C:/**"
             allow "C:/workspace" mode="write"
             allow "C:/Windows/Temp" mode="write"
+            allow "C:/**"
         }
     }
     tool "exec_shell" deny=#true

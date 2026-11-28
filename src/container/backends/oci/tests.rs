@@ -7,6 +7,7 @@ fn spec(image: &str) -> LaunchSpec {
     LaunchSpec {
         isolation: IsolationKind::Container,
         image: Some(image.to_string()),
+        authorized_image_digest: None,
         command: None,
         guest_os: TargetOs::Linux,
         guest_arch: TargetArch::X86_64,

@@ -575,6 +575,12 @@ async fn real_main() {
                 },
             )
             .await;
+        // `abort` closes this audit bracket itself. If the initial reap
+        // could not confirm termination, its child+pins moved to the
+        // process-wide deferred cleanup registry; do not let
+        // `std::process::exit` abandon that owner. When the reap succeeded
+        // the registry is empty and this returns immediately.
+        mcp_writ::runtime::launch::wait_for_deferred_cleanups().await;
         std::process::exit(1);
     }
     let report_target = args

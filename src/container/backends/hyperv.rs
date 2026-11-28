@@ -616,6 +616,7 @@ impl IsolationBackend for HypervBackend {
                 self.engine.clone(),
                 spec.unit_id_file.clone(),
                 spec.unit_name.clone(),
+                None,
             )
             .await;
             // The unit id is both the cleanup target and the launch-time
@@ -695,6 +696,7 @@ mod tests {
         LaunchSpec {
             isolation: IsolationKind::HyperV,
             image: Some(image.to_string()),
+            authorized_image_digest: None,
             command: None,
             guest_os: TargetOs::Windows,
             guest_arch: TargetArch::X86_64,

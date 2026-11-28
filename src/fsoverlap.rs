@@ -156,7 +156,7 @@ fn canonicalize_deep(path: &Path) -> PathBuf {
 /// `None` — fail-closed consumers may skip the former but must keep
 /// refusing the latter.
 pub fn reduces_to_empty_base(spelling: &str) -> bool {
-    let mut p = spelling.trim();
+    let mut p = spelling;
     if p.is_empty() {
         return false;
     }
@@ -182,7 +182,10 @@ pub fn reduces_to_empty_base(spelling: &str) -> bool {
 /// reduce to a base directory); callers treat `None` as "cannot be
 /// proven disjoint".
 pub fn glob_base(spelling: &str) -> Option<&str> {
-    let mut p = spelling.trim();
+    // The spelling is literal path content: trimming here would make a
+    // trailing-space component indistinguishable from its unspaced sibling
+    // (significant on Unix and inside a Windows `\?\` verbatim path).
+    let mut p = spelling;
     if p.is_empty() {
         return None;
     }

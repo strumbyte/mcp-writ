@@ -9,7 +9,7 @@
 //! descendants the leader spawned cannot outlive the session.
 
 #[cfg(target_os = "linux")]
-use super::cgroup::LifetimeCgroup;
+use super::cgroup::{CgroupView, LifetimeCgroup};
 #[cfg(target_os = "macos")]
 use super::macos_sandbox;
 #[cfg(target_os = "windows")]
@@ -369,6 +369,19 @@ pub struct NamespacedLaunchCtx {
     pub policy_ctx: Option<crate::audit_log::PolicyAuditContext>,
 }
 
+/// Descendant-cleanup evidence for a child whose leader has exited.
+/// Only `ConfirmedEmpty` is proof; `Unsupported` and `Unconfirmed` are
+/// distinct non-proofs so cleanup can apply the caller's pin-retention
+/// policy instead of mistaking a missing/failed check for an empty tree.
+#[allow(dead_code)] // supported-backend variants are Linux/Windows-only
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DescendantCleanupState {
+    ConfirmedEmpty,
+    Live,
+    Unsupported,
+    Unconfirmed,
+}
+
 /// A running child process wrapped for asynchronous proxying.
 pub struct RunningChild {
     pub stdin: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>,
@@ -419,6 +432,67 @@ pub(super) enum RunningChildInner {
     Tokio(Box<tokio::process::Child>),
     #[cfg(target_os = "windows")]
     Windows(std::sync::Arc<windows_sandbox::WindowsChild>),
+}
+
+/// Owned inputs for one Unix descendant sweep. Moving the sweep onto a
+/// blocking thread lets async teardown await it cooperatively: a `/proc`
+/// walk or cgroup drain can then be cancelled by the caller's deadline
+/// without monopolising the runtime, while the detached sweep still
+/// completes the same kill work in the background.
+#[cfg(unix)]
+struct DescendantSweep {
+    leader_pid: Option<u32>,
+    pgid: u32,
+    reaped: bool,
+    signal_group: bool,
+    #[cfg(target_os = "linux")]
+    lifetime_cgroup: Option<CgroupView>,
+}
+
+#[cfg(unix)]
+impl DescendantSweep {
+    fn run(self) {
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = &self.lifetime_cgroup {
+            // cgroup membership cannot be shed by setsid/setpgid or
+            // reparenting — this is the authoritative descendant sweep.
+            // A residue means members outlived the bounded drain: warn
+            // rather than let teardown read as clean.
+            if cg.kill_members() > 0 {
+                tracing::warn!(
+                    "lifetime cgroup still lists workload members after \
+                     the kill sweep — orphaned descendants may outlive \
+                     this teardown"
+                );
+            }
+        }
+        if self.reaped {
+            return;
+        }
+        // Snapshot the tree *before* the group kill: while the leader
+        // is still alive a `setsid`/`setpgid` escapee is still
+        // ppid-linked and collectible — after the kill it reparents
+        // and a post-mortem walk can no longer name it.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let descendants = self
+            .leader_pid
+            .map(collect_proc_descendants)
+            .unwrap_or_default();
+        if self.signal_group {
+            kill_unix_process_group(self.pgid);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        kill_pids(&descendants);
+        #[cfg(target_os = "linux")]
+        if self.lifetime_cgroup.is_none() {
+            // Anything orphaned onto this guard (subreaper) before or
+            // during the kill, plus descendants forked between the
+            // snapshot and the group kill — scoped to foreign-group
+            // children so a plainly spawned child of this process is
+            // never touched.
+            kill_orphan_descendants(self.pgid);
+        }
+    }
 }
 
 /// The result of [`RunningChild::wait_for_natural_exit`] — a natural
@@ -547,44 +621,32 @@ impl RunningChild {
     /// after the leader was reaped — a reaped leader says nothing
     /// about orphaned members still alive in the cgroup.
     #[cfg(unix)]
+    fn descendant_sweep(&self, signal_group: bool) -> DescendantSweep {
+        DescendantSweep {
+            leader_pid: self.id(),
+            pgid: self.pgid,
+            reaped: self.reaped,
+            signal_group,
+            #[cfg(target_os = "linux")]
+            lifetime_cgroup: self.lifetime_cgroup.as_ref().map(|cg| cg.view()),
+        }
+    }
+
+    #[cfg(unix)]
     fn kill_descendants(&self) {
-        #[cfg(target_os = "linux")]
-        if let Some(cg) = &self.lifetime_cgroup {
-            // cgroup membership cannot be shed by setsid/setpgid or
-            // reparenting — this is the authoritative descendant sweep.
-            // A residue means members outlived the bounded drain: warn
-            // rather than let teardown read as clean.
-            if cg.kill_members() > 0 {
-                tracing::warn!(
-                    "lifetime cgroup still lists workload members after \
-                     the kill sweep — orphaned descendants may outlive \
-                     this teardown"
-                );
-            }
-        }
-        if self.reaped {
-            return;
-        }
-        // Snapshot the tree *before* the group kill: while the leader
-        // is still alive a `setsid`/`setpgid` escapee is still
-        // ppid-linked and collectible — after the kill it reparents
-        // and a post-mortem walk can no longer name it.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let descendants = self.id().map(collect_proc_descendants).unwrap_or_default();
-        if let Some(pgid) = self.process_group_id() {
-            kill_unix_process_group(pgid);
-        }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        kill_pids(&descendants);
-        #[cfg(target_os = "linux")]
-        if self.lifetime_cgroup.is_none() {
-            // Anything orphaned onto this guard (subreaper) before or
-            // during the kill, plus descendants forked between the
-            // snapshot and the group kill — scoped to foreign-group
-            // children so a plainly spawned child of this process is
-            // never touched.
-            kill_orphan_descendants(self.pgid);
-        }
+        self.descendant_sweep(true).run();
+    }
+
+    /// The same sweep as [`Self::kill_descendants`], spawned as blocking
+    /// work rather than performed inside the async caller's poll. If the
+    /// caller's deadline cancels this future, the blocking sweep is already
+    /// owned by the runtime and continues in the background; the caller can
+    /// therefore make progress and hand the child to deferred cleanup
+    /// instead of being trapped inside one synchronous `/proc`/cgroup pass.
+    #[cfg(unix)]
+    fn spawn_descendant_sweep(&self) -> tokio::task::JoinHandle<()> {
+        let sweep = self.descendant_sweep(false);
+        tokio::task::spawn_blocking(move || sweep.run())
     }
 
     pub async fn kill(&mut self) -> std::io::Result<()> {
@@ -596,9 +658,30 @@ impl RunningChild {
         #[cfg(target_os = "linux")]
         self.quiesce_namespaced_proxy().await;
         #[cfg(unix)]
-        self.kill_descendants();
+        let sweep_task = self.spawn_descendant_sweep();
+        #[cfg(unix)]
+        if !self.reaped {
+            // The group signal itself is a single bounded syscall and is
+            // safe while the unreaped leader pins the pgid. Doing it here
+            // lets the slower cgroup/process scans move off the runtime
+            // without ever needing a late `kill(-pgid)` after the reap.
+            kill_unix_process_group(self.pgid);
+        }
         let result = match &mut self.inner {
-            RunningChildInner::Tokio(child) => child.kill().await,
+            RunningChildInner::Tokio(child) => {
+                // Start the leader's kill without reaping it: the unreaped
+                // pid keeps the process-group id pinned while the detached
+                // descendant sweep runs, so a late group signal cannot hit a
+                // recycled group. A slow `/proc`/cgroup sweep therefore can
+                // never postpone the leader's own termination.
+                #[cfg(unix)]
+                match child.start_kill() {
+                    Ok(()) => child.wait().await.map(|_| ()),
+                    Err(e) => Err(e),
+                }
+                #[cfg(windows)]
+                child.kill().await
+            }
             #[cfg(target_os = "windows")]
             RunningChildInner::Windows(child) => {
                 let c = child.clone();
@@ -611,6 +694,8 @@ impl RunningChild {
         if result.is_ok() {
             self.reaped = true;
         }
+        #[cfg(unix)]
+        let _ = sweep_task.await;
         result
     }
 
@@ -813,6 +898,36 @@ impl RunningChild {
             // descendants; the inner call reaps only after it ran.
             self.kill_descendants();
         }
+        self.try_wait_inner()
+    }
+
+    /// Cleanup-path variant of [`Self::try_wait`] used when the caller is
+    /// about to release session pins. On Unix the leader's unreaped zombie
+    /// still pins the process-group id, so retry the descendant sweep before
+    /// the inner status call reaps it; after the reap the same numeric pgid
+    /// can no longer be signaled safely. The probe therefore never treats
+    /// leader exit alone as descendant cleanup. Windows descendant teardown
+    /// is Job-wide and is retried asynchronously by the caller's bounded
+    /// `kill` attempts.
+    pub(crate) fn try_wait_after_descendant_retry(
+        &mut self,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        #[cfg(unix)]
+        if !self.reaped {
+            if !self.exited_unreaped()? {
+                return Ok(None);
+            }
+            // The zombie pins the pgid across both passes. A descendant
+            // forked or observed between them is still inside this launch's
+            // group/lineage window; once the inner call reaps the leader,
+            // that numeric group must never be signaled again.
+            self.kill_descendants();
+            self.kill_descendants();
+        }
+        self.try_wait_inner()
+    }
+
+    fn try_wait_inner(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         let status = match &mut self.inner {
             RunningChildInner::Tokio(child) => child.try_wait(),
             #[cfg(target_os = "windows")]
@@ -834,7 +949,11 @@ impl RunningChild {
         // Kill leftovers while this PID is still allocated. Signaling after
         // wait() reaps the child can hit an unrelated process group.
         #[cfg(unix)]
-        self.kill_descendants();
+        let sweep_task = self.spawn_descendant_sweep();
+        #[cfg(unix)]
+        if !self.reaped {
+            kill_unix_process_group(self.pgid);
+        }
         let status = match &mut self.inner {
             RunningChildInner::Tokio(child) => child.wait().await,
             #[cfg(target_os = "windows")]
@@ -849,7 +968,44 @@ impl RunningChild {
         if status.is_ok() {
             self.reaped = true;
         }
+        #[cfg(unix)]
+        let _ = sweep_task.await;
         status
+    }
+
+    /// Whether the backend can prove no workload descendant remains active.
+    /// Linux uses the lifetime cgroup roster when that authoritative boundary
+    /// is armed; Windows uses the owning Job's active-process accounting,
+    /// which aggregates nested child jobs. The process-group/macOS fallback
+    /// cannot prove this condition, so it answers `false` and cleanup keeps
+    /// the session pins rather than widening the entrypoint replace window.
+    pub(crate) fn descendant_cleanup_state(&self) -> DescendantCleanupState {
+        #[cfg(target_os = "linux")]
+        {
+            match &self.lifetime_cgroup {
+                Some(cg) => match cg.view().subtree_populated() {
+                    Ok(false) => DescendantCleanupState::ConfirmedEmpty,
+                    Ok(true) => DescendantCleanupState::Live,
+                    Err(_) => DescendantCleanupState::Unconfirmed,
+                },
+                None => DescendantCleanupState::Unsupported,
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            return match &self.inner {
+                RunningChildInner::Windows(child) => match child.active_job_processes() {
+                    Ok(0) => DescendantCleanupState::ConfirmedEmpty,
+                    Ok(_) => DescendantCleanupState::Live,
+                    Err(_) => DescendantCleanupState::Unconfirmed,
+                },
+                RunningChildInner::Tokio(_) => DescendantCleanupState::Unsupported,
+            };
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            DescendantCleanupState::Unsupported
+        }
     }
 
     pub fn id(&self) -> Option<u32> {

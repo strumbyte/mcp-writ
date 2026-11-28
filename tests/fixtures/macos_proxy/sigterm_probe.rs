@@ -18,7 +18,7 @@ use std::io::Write;
 
 extern "C" {
     fn signal(signum: i32, handler: extern "C" fn(i32)) -> isize;
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
     fn pause() -> i32;
     fn _exit(status: i32) -> !;
 }
@@ -30,7 +30,7 @@ extern "C" fn on_term(_signum: i32) {
     // Handler context — only async-signal-safe calls: write(2) and
     // _exit(2). println!/malloc/locks are not permitted here.
     unsafe {
-        write(1, b"GOT_TERM\n".as_ptr(), 9);
+        write(1, b"GOT_TERM\n".as_ptr().cast(), 9);
         _exit(0);
     }
 }

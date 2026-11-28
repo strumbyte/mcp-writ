@@ -19,7 +19,7 @@ use crate::policy::Policy;
 use crate::verifier::fail_on::FailOn;
 use crate::verifier::hash::{self, VerifyError};
 use crate::verifier::identity::LaunchIdentity;
-use crate::warden::{RunningChild, Warden, WardenReport};
+use crate::warden::{DescendantCleanupState, RunningChild, Warden, WardenReport};
 
 /// The binary a launch's records are emitted by. Selects both the
 /// `guard.*` audit stamp and the stderr wording
@@ -125,6 +125,113 @@ pub struct LaunchConfig {
 /// records `kill_unconfirmed` rather than `killed`.
 const ABORT_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Deferred child-cleanup tasks that must complete before a failing CLI may
+/// exit. `std::process::exit` would otherwise abandon both the workload and
+/// the pins that keep its verified entrypoint stable.
+static DEFERRED_CLEANUPS: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Move an unconfirmed child and its session pins to a cleanup owner. The
+/// task retries termination rather than merely observing exit: Unix `kill`
+/// sweeps process-group descendants before signaling, and Windows job
+/// termination is retried through the same operation. The pins drop only
+/// after leader exit is observed and one final bounded descendant/job
+/// cleanup retry has run; an unkillable workload therefore never reopens
+/// the pinned-entrypoint replace window.
+fn defer_child_cleanup(mut child: Box<RunningChild>, keeps: Box<SessionKeeps>) {
+    async fn finish_confirmed_exit(child: &mut RunningChild, pins_required: bool) {
+        // `try_wait`/`wait` confirm only the leader's status. Keep retrying
+        // bounded termination while a supported backend still reports live
+        // descendants or cannot produce its roster. An unsupported backend
+        // is *not* proof of cleanup: unpinned best-effort sessions may end
+        // after the pre-reap safe sweep (nothing depends on the path staying
+        // pinned), while pinned sessions stay owned by this task rather than
+        // widening the verified-entrypoint replace window behind a descendant
+        // the platform cannot account for.
+        loop {
+            match child.descendant_cleanup_state() {
+                DescendantCleanupState::ConfirmedEmpty => return,
+                DescendantCleanupState::Live | DescendantCleanupState::Unconfirmed => {
+                    let _ = tokio::time::timeout(ABORT_REAP_GRACE, child.kill()).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                DescendantCleanupState::Unsupported if !pins_required => return,
+                // Unsupported can never become `ConfirmedEmpty`, but the
+                // pinned session must remain owned rather than release its
+                // path-stability objects. Keep issuing the bounded best-effort
+                // termination sweep instead of merely parking the resources.
+                DescendantCleanupState::Unsupported => {
+                    let _ = tokio::time::timeout(ABORT_REAP_GRACE, child.kill()).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    let pins_required = keeps.requires_confirmed_descendants();
+    let task = tokio::spawn(async move {
+        // Neither backend's `wait` is a bounded operation here: Unix
+        // `child.kill()` itself waits for the leader and Windows `wait`
+        // parks a blocking thread on `WaitForSingleObject`. An unkillable
+        // or driver-wedged child would therefore prevent termination from
+        // being retried. Poll the non-blocking status probe instead, bound
+        // every termination attempt, and loop back to another sweep when
+        // the leader does not become observable.
+        'cleanup: loop {
+            if matches!(child.try_wait_after_descendant_retry(), Ok(Some(_))) {
+                finish_confirmed_exit(&mut child, pins_required).await;
+                break;
+            }
+            let _ = tokio::time::timeout(ABORT_REAP_GRACE, child.kill()).await;
+            let deadline = std::time::Instant::now() + ABORT_REAP_GRACE;
+            while std::time::Instant::now() < deadline {
+                match child.try_wait_after_descendant_retry() {
+                    Ok(Some(_)) => {
+                        finish_confirmed_exit(&mut child, pins_required).await;
+                        break 'cleanup;
+                    }
+                    Ok(None) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    // A wait-probe error is not proof of exit. Stop polling
+                    // this attempt and retry termination instead of waiting
+                    // forever behind an unanswerable status.
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        break;
+                    }
+                }
+            }
+        }
+        drop(keeps);
+    });
+    DEFERRED_CLEANUPS
+        .lock()
+        .expect("deferred cleanup registry poisoned")
+        .push(task);
+}
+
+/// Wait until every deferred child cleanup has confirmed termination. The
+/// failing-exit path calls this after report/audit publication, preserving
+/// the fast user-visible failure while making `std::process::exit` unable to
+/// abandon a live workload or release its pins early.
+#[doc(hidden)]
+pub async fn wait_for_deferred_cleanups() {
+    loop {
+        let tasks = std::mem::take(
+            &mut *DEFERRED_CLEANUPS
+                .lock()
+                .expect("deferred cleanup registry poisoned"),
+        );
+        if tasks.is_empty() {
+            return;
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+}
+
 /// Kill → wait a spawned child under [`ABORT_REAP_GRACE`], reporting
 /// whether the reap was confirmed. `kill()` already sweeps descendants
 /// and reaps on Unix, and the Windows Job terminate is synchronous —
@@ -133,15 +240,28 @@ const ABORT_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// best-effort `start_kill`. Shared by [`Launched::abort`], whose audit
 /// reason depends on the outcome, and [`LaunchError::into_report`],
 /// which must not let a wedged child hold the failure path forever.
-async fn reaped_within_grace(child: &mut RunningChild) -> bool {
-    matches!(
+async fn reaped_within_grace(child: &mut RunningChild, pins_required: bool) -> bool {
+    let leader_reaped = matches!(
         tokio::time::timeout(ABORT_REAP_GRACE, async {
             child.kill().await.ok()?;
             child.wait().await.ok()
         })
         .await,
         Ok(Some(_))
-    )
+    );
+    if !leader_reaped {
+        return false;
+    }
+    // A reaped leader is not, by itself, descendant-cleanup evidence.
+    // Confirm through the backend when it can answer; a supported live or
+    // inconclusive answer keeps the child/pins in deferred cleanup. The
+    // unsupported best-effort backend may complete only for unpinned
+    // sessions — the final safe sweep already ran before the leader reap.
+    match child.descendant_cleanup_state() {
+        DescendantCleanupState::ConfirmedEmpty => true,
+        DescendantCleanupState::Unsupported => !pins_required,
+        DescendantCleanupState::Live | DescendantCleanupState::Unconfirmed => false,
+    }
 }
 
 /// A spawned MCP server child plus its running Auditor relay task.
@@ -190,6 +310,20 @@ pub struct SessionKeeps {
     _exec_staging: Option<crate::verifier::hash::FdExecPlan>,
 }
 
+impl SessionKeeps {
+    /// Whether any held object makes post-exec path stability load-bearing.
+    /// If no pin/staging object exists, descendant termination is a
+    /// best-effort cleanliness property rather than a requirement for safely
+    /// releasing session resources.
+    fn requires_confirmed_descendants(&self) -> bool {
+        #[cfg(all(unix, not(target_os = "linux")))]
+        if self._exec_staging.is_some() {
+            return true;
+        }
+        self._spawn_pin.is_some()
+    }
+}
+
 impl Launched {
     /// Kill the running child, abort the Auditor relay, and close the
     /// audit bracket under `outcome` — the shared post-launch abort for
@@ -205,8 +339,13 @@ impl Launched {
         // timed-out or failed kill leaves Drop's best-effort `start_kill`
         // and the bracket cannot claim a dead workload that may still
         // run.
-        let reaped = reaped_within_grace(&mut child).await;
-        drop(child);
+        let reaped =
+            reaped_within_grace(&mut child, self.keeps.requires_confirmed_descendants()).await;
+        if reaped {
+            drop(child);
+        } else {
+            defer_child_cleanup(Box::new(child), Box::new(self.keeps));
+        }
         self.auditor_handle.abort();
         // Await the aborted task — `abort()` only schedules the stop,
         // and the audit bracket below must not close while the relay
@@ -259,7 +398,7 @@ pub enum LaunchErrorKind {
     /// window while the child is still being killed.
     TakeIo {
         child: Box<RunningChild>,
-        keeps: SessionKeeps,
+        keeps: Box<SessionKeeps>,
     },
 }
 
@@ -280,6 +419,9 @@ pub struct LaunchError {
     pub report: Box<LaunchReport>,
     /// The emitting binary — `describe` renders its stderr wording.
     component: Emitter,
+    /// Present only when the stage deferred `server.error` because its
+    /// detail is finalized inside `into_report` (the TakeIo cleanup state).
+    failure_audit: Option<FailureAudit>,
 }
 
 impl LaunchError {
@@ -366,15 +508,83 @@ impl LaunchError {
     /// variant's `keeps` stays inside `self` until it drops — after the
     /// reap — so the pins still name the verified object while the
     /// child is killed.
-    pub async fn into_report(self) -> Box<LaunchReport> {
-        if let LaunchErrorKind::TakeIo { mut child, .. } = self.kind {
+    pub async fn into_report(mut self) -> Box<LaunchReport> {
+        if let LaunchErrorKind::TakeIo { mut child, keeps } = self.kind {
             // Bounded like `Launched::abort` — a child that refuses to
             // die cannot hold the failure path forever, and `Drop`
             // still issues its best-effort kill when we walk away.
-            let _ = reaped_within_grace(&mut child).await;
-            drop(child);
+            let reaped =
+                reaped_within_grace(&mut child, keeps.requires_confirmed_descendants()).await;
+            if !reaped && let Some(result) = self.report.result.as_mut() {
+                // The stdio failure stays the primary error; the cleanup
+                // state rides its detail so both the `--report` outcome
+                // and the guard.stopped record derived from it can never
+                // claim an unconfirmed reap. A confirmed reap needs no
+                // extra diagnostic — it is the expected teardown shape.
+                let detail = result.detail.take().unwrap_or_default();
+                result.detail = Some(format!("{detail}; child cleanup kill_unconfirmed"));
+            }
+            if reaped {
+                drop(child);
+                drop(keeps);
+            } else {
+                // An unconfirmed kill means the child may still execute and
+                // may still open the pinned entrypoint. Keep both the child
+                // handle and the pins in a detached completion task: the
+                // failure path stays bounded, while the share-mode/staging
+                // pins are released only after the child is confirmed unable
+                // to open the path (or never, if it truly never exits).
+                defer_child_cleanup(child, keeps);
+            }
+        }
+        if let Some(audit) = self.failure_audit.take() {
+            audit.emit(&self.report);
         }
         self.report
+    }
+}
+
+/// The audit identity needed to emit a deferred failure event after a
+/// stage finalizes its report detail. Used only by `TakeIo`; all other
+/// stages emit through `FailCtx::fail` immediately as before.
+struct FailureAudit {
+    audit_logger: AuditLogger,
+    launch_id: uuid::Uuid,
+    policy_context: Option<PolicyAuditContext>,
+    backend: SandboxBackend,
+    dry_run: bool,
+}
+
+impl FailureAudit {
+    fn emit(&self, report: &LaunchReport) {
+        let mut event = AuditEvent::new(
+            self.launch_id,
+            EventType::ServerError,
+            Severity::High,
+            Outcome::Failure,
+            Action::Observed,
+        );
+        event.policy_context = self.policy_context.clone();
+        if let Some(ctx) = &self.policy_context
+            && ctx.id != "default"
+        {
+            event.target_server = Some(ctx.id.clone());
+        }
+        let mut details = format!("session_id={}", self.audit_logger.session_id());
+        if let Some(detail) = report.result.as_ref().and_then(|r| r.detail.as_deref()) {
+            details.push_str(&format!(" {detail}"));
+        }
+        event.details = Some(details);
+        event.enforcement = Some(
+            EnforcementSummary::build(
+                &report.plan,
+                &report.observations,
+                self.backend,
+                self.dry_run,
+            )
+            .to_json(),
+        );
+        self.audit_logger.log(event);
     }
 }
 
@@ -404,14 +614,14 @@ impl FailCtx<'_> {
     /// event correlated under the same launch id, so a failed launch is
     /// auditable under the same id and the record carries the same
     /// plan/observations the `--report` file does.
-    fn fail(
+    fn fail_report(
         &self,
         plan: EnforcementPlan,
         observations: Vec<EnforcementObservation>,
         code_identity: CodeIdentity,
         detail: String,
     ) -> Box<LaunchReport> {
-        let report = Box::new(LaunchReport {
+        Box::new(LaunchReport {
             schema_version: LAUNCH_REPORT_SCHEMA_VERSION,
             launch_id: self.launch_id,
             created_at: now_iso8601_millis(),
@@ -431,43 +641,28 @@ impl FailCtx<'_> {
             guest: None,
             isolation: None,
             correction_candidates: None,
-        });
-        let mut event = AuditEvent::new(
-            self.launch_id,
-            EventType::ServerError,
-            Severity::High,
-            Outcome::Failure,
-            Action::Observed,
-        );
-        event.policy_context = self.policy_context.clone();
-        // The bound server name only — never the "default" label a
-        // server-less policy reports.
-        if let Some(ctx) = &self.policy_context
-            && ctx.id != "default"
-        {
-            event.target_server = Some(ctx.id.clone());
+        })
+    }
+
+    fn failure_audit(&self) -> FailureAudit {
+        FailureAudit {
+            audit_logger: self.audit_logger.clone(),
+            launch_id: self.launch_id,
+            policy_context: self.policy_context.clone(),
+            backend: self.backend,
+            dry_run: self.dry_run,
         }
-        // `session_id` keeps the record attributable when the host's
-        // and the guest runner's JSONL streams merge under one launch
-        // id; the failure detail follows verbatim.
-        let mut details = format!("session_id={}", self.audit_logger.session_id());
-        if let Some(detail) = report.result.as_ref().and_then(|r| r.detail.as_deref()) {
-            details.push_str(&format!(" {detail}"));
-        }
-        event.details = Some(details);
-        // The same plan/observations the `--report` file carries, as the
-        // record's structured `enforcement` member — a failed launch
-        // states what it attempted, not just the error string.
-        event.enforcement = Some(
-            EnforcementSummary::build(
-                &report.plan,
-                &report.observations,
-                self.backend,
-                self.dry_run,
-            )
-            .to_json(),
-        );
-        self.audit_logger.log(event);
+    }
+
+    fn fail(
+        &self,
+        plan: EnforcementPlan,
+        observations: Vec<EnforcementObservation>,
+        code_identity: CodeIdentity,
+        detail: String,
+    ) -> Box<LaunchReport> {
+        let report = self.fail_report(plan, observations, code_identity, detail);
+        self.failure_audit().emit(&report);
         report
     }
 
@@ -479,6 +674,18 @@ impl FailCtx<'_> {
             kind,
             report,
             component: self.component,
+            failure_audit: None,
+        }
+    }
+
+    /// Like `err`, but `into_report` emits the single `server.error` after
+    /// finalizing cleanup-dependent detail.
+    fn err_deferred(&self, kind: LaunchErrorKind, report: Box<LaunchReport>) -> LaunchError {
+        LaunchError {
+            kind,
+            report,
+            component: self.component,
+            failure_audit: Some(self.failure_audit()),
         }
     }
 }
@@ -562,6 +769,12 @@ struct PreparedLaunch<'a> {
     /// turns it into the launch refusal.
     #[cfg(target_os = "linux")]
     linux_refusal: Option<String>,
+    /// The argv resolution the Linux route selection screened. Reusing it
+    /// for dispatch closes the race where a second PATH/shebang resolution
+    /// could select a different executable after the namespaced route was
+    /// chosen for the first one.
+    #[cfg(target_os = "linux")]
+    route_resolution: Option<crate::workload::LaunchResolution>,
 }
 
 // The error path runs once per process — the struct stays whole rather
@@ -621,6 +834,8 @@ impl<'a> PreparedLaunch<'a> {
         // in-guest runner's contract; the host `run`/`plan` path always
         // passes an explicit request (`auto` by default).
         #[cfg(target_os = "linux")]
+        let mut route_resolution = None;
+        #[cfg(target_os = "linux")]
         let linux_selection = if sandbox_skip_reason.is_some() {
             None
         } else {
@@ -634,7 +849,12 @@ impl<'a> PreparedLaunch<'a> {
                 // execs through `/proc/self/fd/N`. Best-effort: an
                 // unresolvable argv[0] carries no visibility and the
                 // launch's own resolve step reports that error instead.
-                let visibility = crate::workload::resolve_launch(&argv0, has_hashes)
+                // The successful resolution is retained and dispatch reuses
+                // it verbatim: a second lookup could otherwise select a
+                // different executable after the route was chosen.
+                route_resolution = crate::workload::resolve_launch(&argv0, has_hashes).ok();
+                let visibility = route_resolution
+                    .as_ref()
                     .map(|resolution| {
                         let eff_argv = resolution.into_argv(&argv);
                         // An exe a hash entry pins execs the verified
@@ -732,6 +952,8 @@ impl<'a> PreparedLaunch<'a> {
             linux_mechanism,
             #[cfg(target_os = "linux")]
             linux_refusal,
+            #[cfg(target_os = "linux")]
+            route_resolution,
         }
     }
 
@@ -819,8 +1041,56 @@ impl<'a> PreparedLaunch<'a> {
     /// kernel-selected interpreter runs unpinned. Unpinned launches
     /// keep the historical direct-exec contract.
     fn resolve_command(&self) -> Result<(Vec<String>, PathBuf), LaunchError> {
+        #[cfg(target_os = "linux")]
+        if let Some(resolution) = &self.route_resolution {
+            return Ok((resolution.into_argv(&self.argv), resolution.exe.clone()));
+        }
         match crate::workload::resolve_launch(&self.argv0, self.has_hashes) {
-            Ok(resolution) => Ok((resolution.into_argv(&self.argv), resolution.exe)),
+            Ok(resolution) => {
+                #[cfg(target_os = "linux")]
+                if self.route_resolution.is_none()
+                    && self.warden.linux_selected_mechanism()
+                        == Some(crate::execution::LinuxNativeMechanism::Namespaced)
+                {
+                    let eff_argv = resolution.into_argv(&self.argv);
+                    let visibility = crate::warden::select::workload_visibility(
+                        &eff_argv,
+                        &resolution.exe,
+                        None,
+                        crate::warden::select::exe_pin_fd_exec(
+                            &self.policy.hash_entries,
+                            &resolution.exe,
+                        ),
+                    );
+                    if let Some(masked) = visibility.first_masked() {
+                        let detail = format!(
+                            "cannot resolve command '{}' under the selected namespaced route: {} '{}' resolves under a masked tree (workload_masked:{})",
+                            self.argv0,
+                            masked.what,
+                            masked.path.display(),
+                            masked.masked.root
+                        );
+                        let report = self.fail.fail(
+                            self.launch_plan(Some(&resolution.exe)),
+                            Vec::new(),
+                            LaunchIdentity::for_launch(&self.argv, &self.policy.hash_entries)
+                                .finish(),
+                            detail.clone(),
+                        );
+                        return Err(self.fail.err(
+                            LaunchErrorKind::ResolveCommand {
+                                command: self.argv0.clone(),
+                                source: std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    detail,
+                                ),
+                            },
+                            report,
+                        ));
+                    }
+                }
+                Ok((resolution.into_argv(&self.argv), resolution.exe))
+            }
             Err(source) => {
                 let detail = format!("cannot resolve command '{}': {source}", self.argv0);
                 let report = self.fail.fail(
@@ -1250,20 +1520,20 @@ impl<'a> PreparedLaunch<'a> {
                 if self.has_hashes {
                     observations.insert(0, identity_observation(&code_identity));
                 }
-                let report = self.fail.fail(
+                let report = self.fail.fail_report(
                     plan,
                     observations,
                     code_identity,
                     "failed to capture child process stdin/stdout".to_string(),
                 );
-                return Err(self.fail.err(
+                return Err(self.fail.err_deferred(
                     LaunchErrorKind::TakeIo {
                         child: Box::new(child),
-                        keeps: SessionKeeps {
+                        keeps: Box::new(SessionKeeps {
                             _spawn_pin: self.spawn_pin,
                             #[cfg(all(unix, not(target_os = "linux")))]
                             _exec_staging: exec.fd_exec,
-                        },
+                        }),
                     },
                     report,
                 ));
@@ -1492,7 +1762,7 @@ impl<'a> PreparedLaunch<'a> {
     }
 }
 
-/// Shared sequence — each stage a [`PreparedLaunch`] method, in order:
+/// Shared sequence — each stage a `PreparedLaunch` method, in order:
 /// `new` (Warden, mechanism selection, spawn options) →
 /// `refuse_unenforceable_linux` (Linux only: refused selection or dead
 /// legacy policy) → `resolve_command` → `verify_and_bind` (verify →

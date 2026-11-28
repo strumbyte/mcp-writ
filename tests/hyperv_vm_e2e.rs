@@ -65,6 +65,18 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hyperv")
 }
 
+/// Record descendant-containment evidence as inconclusive without
+/// letting it masquerade as a pass. The certification host sets
+/// `MCP_WRIT_REQUIRE_HYPERV_TESTS=1`; there the descendant probe must
+/// actually run, so an inconclusive platform refusal fails the test.
+fn descendant_inconclusive(leg: &str, reason: &str) {
+    assert!(
+        std::env::var("MCP_WRIT_REQUIRE_HYPERV_TESTS").as_deref() != Ok("1"),
+        "{leg} descendant validation is required on the certification host: {reason}"
+    );
+    eprintln!("INCONCLUSIVE: {leg} descendant validation did not run: {reason}");
+}
+
 // ─── prerequisites ─────────────────────────────────────────────────────
 
 /// Run a blocking step (subprocess probe, fixture compile, dir setup)
@@ -490,6 +502,19 @@ fn run_image_session_dirs() -> SessionDirs {
         dirs.policy.join("policy.kdl"),
     )
     .expect("copy run-image policy");
+    // The policy mount's host source is NOT `dirs.policy`: the runner
+    // exports the bound policy into its private launch staging dir and
+    // binds that read-only (`runner.rs` `policy_share_host`). Leg 5's
+    // matching `sub/` + ACE prep therefore happens in the stdio session
+    // against the daemon-recorded mount `Source`, not here.
+    dirs
+}
+
+/// Session dirs for the stdio test, including the writable audit-mount
+/// subtree only that test uses. The external-kill test intentionally does
+/// not depend on icacls/DACL verification to reach `docker kill`.
+fn run_image_stdio_session_dirs() -> SessionDirs {
+    let dirs = run_image_session_dirs();
     // The allowed-write leg targets `sub/` inside the writable audit
     // mount — `dirs.logs` is that bind's actual host source (the launch
     // pins and mounts it as-is), so the dir must exist before launch
@@ -502,11 +527,6 @@ fn run_image_session_dirs() -> SessionDirs {
     // on `sub/` so "guest DACL allows it" is verified, not assumed.
     std::fs::create_dir_all(dirs.logs.join("sub")).expect("create audit-mount sub");
     grant_all_app_packages(&dirs.logs.join("sub"));
-    // The policy mount's host source is NOT `dirs.policy`: the runner
-    // exports the bound policy into its private launch staging dir and
-    // binds that read-only (`runner.rs` `policy_share_host`). Leg 5's
-    // matching `sub/` + ACE prep therefore happens in the session
-    // against the daemon-recorded mount `Source`, not here.
     dirs
 }
 
@@ -655,31 +675,48 @@ fn verify_sid_write_grant(dir: &Path, sddl: &str) {
 #[cfg(not(windows))]
 fn grant_all_app_packages(_dir: &Path) {}
 
-/// Extract one mount's `RW`/`Source` fields from a
-/// `{{range .Mounts}}Dest|RW|Source;{{end}}` listing — slash/case-
-/// normalized because inspect echoes the `-v` spelling the launch
-/// passed.
-fn mount_entry<'m>(mounts: &'m str, guest_path: &str) -> Option<(&'m str, &'m str)> {
+/// Extract one mount's typed `RW`/`Source` fields from `{{json .Mounts}}`
+/// — slash/case-normalized because inspect echoes the `-v` spelling the
+/// launch passed. JSON keeps a Windows source containing `;` intact, which
+/// the old delimiter rendering could not.
+fn mount_entry(mounts: &str, guest_path: &str) -> Option<(bool, String)> {
     let want = guest_path.replace('/', "\\");
-    mounts
-        .split(';')
-        .filter_map(|m| {
-            let mut fields = m.split('|');
-            Some((fields.next()?, fields.next()?, fields.next()?))
-        })
-        .find(|(dest, ..)| dest.replace('/', "\\").eq_ignore_ascii_case(&want))
-        .map(|(_, rw, source)| (rw, source))
+    let json = nojson::RawJson::parse(mounts).ok()?;
+    for mount in json.value().to_array().ok()? {
+        let dest = mount
+            .to_member("Destination")
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|v| v.to_unquoted_string_str().ok())?;
+        if !dest.replace('/', "\\").eq_ignore_ascii_case(&want) {
+            continue;
+        }
+        let rw = mount
+            .to_member("RW")
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|v| v.as_boolean_str().ok())?
+            == "true";
+        let source = mount
+            .to_member("Source")
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|v| v.to_unquoted_string_str().ok())?
+            .into_owned();
+        return Some((rw, source));
+    }
+    None
 }
 
 fn mount_rw(mounts: &str, guest_path: &str) -> Option<bool> {
-    mount_entry(mounts, guest_path).map(|(rw, _)| rw.trim() == "true")
+    mount_entry(mounts, guest_path).map(|(rw, _)| rw)
 }
 
 /// The bind's host `Source` — for the product's policy mount this is
 /// the runner's private launch staging dir, not the harness policy dir
 /// the `--policy` file came from.
 fn mount_source(mounts: &str, guest_path: &str) -> Option<PathBuf> {
-    mount_entry(mounts, guest_path).map(|(_, s)| PathBuf::from(s.trim()))
+    mount_entry(mounts, guest_path).map(|(_, s)| PathBuf::from(s))
 }
 
 /// `-v` argument `host:guest`. `display()` emits `C:\…`-style paths on
@@ -1135,7 +1172,7 @@ async fn hyperv_vm_stdio_session() {
     );
 
     assert!(
-        text_of(3).contains("created C:/workspace/hyperv-ok.txt"),
+        text_of(3).contains("create_ok C:/workspace/hyperv-ok.txt"),
         "write inside the workspace grant must succeed: {}",
         text_of(3)
     );
@@ -1181,20 +1218,41 @@ async fn hyperv_vm_stdio_session() {
     // leg must first be a real tool result — an RPC error here would
     // satisfy the escape check vacuously. Then only two outcomes count:
     // the permitted spawn refusal, or a spawned descendant whose denied
-    // write provably left no file (`child_txt=false` — the probe checks
+    // write provably left no file (`child_txt=absent` — the probe checks
     // the path itself, so no stderr wording is parsed).
     let spawn_leg = text_of(9);
     assert!(
         spawn_leg.contains("\"result\""),
         "spawn_child must return a tool result, not an RPC error: {spawn_leg}"
     );
+    let write_spawn_refusal = spawn_leg
+        .split_once("spawn failed:")
+        .map(|(_, rest)| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .as_deref()
+        == Some("5");
     assert!(
-        spawn_leg.contains("spawn failed:")
+        !spawn_leg.contains("spawn failed:") || write_spawn_refusal,
+        "only the documented access-denied platform refusal is tolerated; \
+         executable-format and other fixture launch errors fail the test: {spawn_leg}"
+    );
+    if write_spawn_refusal {
+        descendant_inconclusive(
+            "write",
+            "the platform refused the probe spawn with os error 5",
+        );
+    }
+    assert!(
+        write_spawn_refusal
             || (spawn_leg.contains("spawn ok:")
-                && spawn_leg.contains("child_txt=false")
-                && !spawn_leg.contains("CHILD_ESCAPE")),
-        "a descendant that escaped containment would leave \
-         C:\\writ-deny\\child.txt or type CHILD_ESCAPE back: {spawn_leg}"
+                && spawn_leg.contains("child_write=denied:5")
+                && spawn_leg.contains("child_txt=absent")),
+        "the descendant write must report the explicit access-denied verdict; \
+         success, a missing directory, another OS error, or an unreported \
+         attempt is not containment evidence: {spawn_leg}"
     );
     if spawn_leg.contains("spawn ok:") {
         // The denied write is the effect; the descendant's *own*
@@ -1220,9 +1278,9 @@ async fn hyperv_vm_stdio_session() {
              any Job: {spawn_leg}"
         );
     }
-    // The comm leg is independent of the cmd outcome — its descendant
-    // is the probe's own `--net-check` re-spawn, a different binary
-    // with its own image/ACL surface, so `spawn failed:` for cmd.exe
+    // The comm leg is independent of the write-descendant outcome — its
+    // descendant is the probe's own `--net-check` re-spawn, so `spawn failed:`
+    // for the write-check process
     // can coexist with a successful comm descendant and these checks
     // must not sit behind the `spawn ok:` guard.
     assert!(
@@ -1236,13 +1294,40 @@ async fn hyperv_vm_stdio_session() {
     // not policy-guaranteed, so they are tolerated). Anything else —
     // a control-only report — is a defect, not evidence.
     assert!(
-        spawn_leg.contains("child_net_out=")
-            || spawn_leg.contains("child_net=spawn:")
-            || spawn_leg.contains("child_net=exe:"),
-        "the comm leg must report a descendant outcome or a documented \
-         creation failure — control-only output is no evidence: {spawn_leg}"
+        !spawn_leg.contains("child_net_fixture="),
+        "comm-leg fixture setup/collection must not be mistaken for a spawn refusal: {spawn_leg}"
     );
+    let net_spawn_refusal = spawn_leg.contains("child_net=spawn:5:");
+    assert!(
+        !spawn_leg.contains("child_net=spawn:") || net_spawn_refusal,
+        "only the documented access-denied platform refusal is tolerated for \
+         the network descendant; executable-format and other fixture launch \
+         errors fail the test: {spawn_leg}"
+    );
+    assert!(
+        spawn_leg.contains("child_net_out=") || net_spawn_refusal,
+        "the comm leg must report a descendant outcome or a documented spawn \
+         refusal — control-only output is no evidence: {spawn_leg}"
+    );
+    if net_spawn_refusal {
+        descendant_inconclusive(
+            "network",
+            "the platform refused the network probe spawn with os error 5",
+        );
+    }
     if spawn_leg.contains("child_net_out=") {
+        assert!(
+            spawn_leg.contains("child_net_token_ac=true"),
+            "the network descendant itself must carry the AppContainer token: {spawn_leg}"
+        );
+        assert!(
+            spawn_leg.contains("child_net_job=true"),
+            "the network descendant itself must remain inside a Job: {spawn_leg}"
+        );
+        assert!(
+            spawn_leg.contains("child_net_warden_job=true"),
+            "the network descendant itself must join the warden's Job: {spawn_leg}"
+        );
         // The outbound denial needs no reachable endpoint — WSAEACCES
         // fires *before* routing, so the error code itself is the
         // capability gate's verdict and cannot be an
@@ -1262,11 +1347,17 @@ async fn hyperv_vm_stdio_session() {
                 "intra-package loopback worked for the workload — its \
                  descendant must reach it too: {spawn_leg}"
             );
-        } else if !spawn_leg.contains("comm_control=unavailable") {
+        } else if spawn_leg.contains("comm_control=fail:10013") {
             assert!(
-                spawn_leg.contains("child_net_loop=denied"),
-                "the descendant must inherit the parent's comm posture \
-                 (the same gate verdict): {spawn_leg}"
+                spawn_leg.contains("child_net_loop=denied:10013")
+                    || spawn_leg.contains("child_net_loop=fail:10013"),
+                "a 10013 loopback control denial must carry the same denial \
+                 code into the descendant: {spawn_leg}"
+            );
+        } else if !spawn_leg.contains("comm_control=unavailable") {
+            panic!(
+                "loopback control failed in a non-permission way — the \
+                 comparison is inconclusive, not containment evidence: {spawn_leg}"
             );
         }
         // `comm_control=unavailable` — the endpoint itself could not
@@ -1292,11 +1383,24 @@ async fn hyperv_vm_stdio_session() {
     // record names it (a created file must be visible; a denial must not
     // leave one).
     let share_probe = dirs.share.join("probe.txt").is_file();
+    let share_text = text_of(12);
+    let share_create_ok = share_text.contains("create_ok C:/share/probe.txt");
+    let share_create_denied = share_text.contains("create_denied:5 C:/share/probe.txt");
+    assert!(
+        share_create_ok || share_create_denied,
+        "the share write must produce an explicit create_ok or access-denied verdict: {share_text}"
+    );
+    assert!(
+        !(share_create_ok && share_create_denied),
+        "the share write verdicts must be unambiguous: {share_text}"
+    );
     assert_eq!(
-        text_of(12).contains("created C:/share/probe.txt"),
-        share_probe,
-        "guest claim and host view of the share write must agree: {}",
-        text_of(12)
+        share_create_ok, share_probe,
+        "a successful share write must be host-visible: {share_text}"
+    );
+    assert!(
+        !share_create_denied || !share_probe,
+        "an access-denied share write must leave no host file: {share_text}"
     );
     assert!(
         text_of(13).contains("unknown-method"),
@@ -1761,7 +1865,7 @@ async fn hyperv_wrap_image_product_path() {
         "the wrapped image's warden must apply AppContainer+Job: {ident}"
     );
     assert!(
-        write.contains("created C:/workspace/wrap-ok.txt"),
+        write.contains("create_ok C:/workspace/wrap-ok.txt"),
         "workspace write through the wrapped runner must succeed: {write}"
     );
     assert!(
@@ -1921,6 +2025,59 @@ async fn running_container_for(image: &str) -> Option<String> {
     (ids.len() == 1).then(|| ids[0].clone())
 }
 
+/// Host-path comparison for docker's recorded mount source — inspect may
+/// echo slash/case spelling differently from the harness's `PathBuf`.
+fn same_host_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        // Resolve junction/symlink aliases when the path exists; inspect's
+        // recorded source and the harness spelling can differ only by that
+        // alias. Fall back to lexical normalization for absent paths.
+        let resolved = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        resolved
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+/// The running container for *this* launch, not merely this shared image:
+/// another concurrently certified session uses the same ancestor tag, so
+/// selection is keyed by the launch-unique audit bind source as well.
+async fn running_container_for_launch(image: &str, audit_source: &Path) -> Option<String> {
+    let out = Command::new("docker")
+        .args([
+            "ps",
+            "-q",
+            "--no-trunc",
+            "--filter",
+            &format!("ancestor={image}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut matches = Vec::new();
+    for id in ids {
+        let Some(mounts) = inspect_field(&id, "{{json .Mounts}}").await else {
+            continue;
+        };
+        if mount_source(&mounts, "C:\\var\\log\\mcp-secure")
+            .is_some_and(|source| same_host_path(&source, audit_source))
+        {
+            matches.push(id);
+        }
+    }
+    (matches.len() == 1).then(|| matches[0].clone())
+}
+
 /// Poll `f` until it yields `Some` or `secs` elapse.
 async fn poll_some<T, Fut>(secs: u64, ms: u64, mut f: impl FnMut() -> Fut) -> Option<T>
 where
@@ -1943,6 +2100,35 @@ fn json_str(v: &nojson::RawJsonValue<'_, '_>, name: &str) -> String {
         .unwrap()
         .to_unquoted_string_str()
         .expect("expected a JSON string")
+        .into_owned()
+}
+
+/// Decode the first text content item of a raw JSON-RPC tool response.
+/// Assertions must compare this decoded text, not the JSON spelling, so
+/// escaping in the wire encoding cannot hide a successful read.
+fn tool_response_text(line: &str) -> String {
+    let json = nojson::RawJson::parse(line).expect("tool response is valid JSON");
+    let result = json
+        .value()
+        .to_member("result")
+        .expect("result member")
+        .required()
+        .expect("result present");
+    let mut content = result
+        .to_member("content")
+        .expect("content member")
+        .required()
+        .expect("content present")
+        .to_array()
+        .expect("content array");
+    let first = content.next().expect("first content item");
+    first
+        .to_member("text")
+        .expect("text member")
+        .required()
+        .expect("text present")
+        .to_unquoted_string_str()
+        .expect("text string")
         .into_owned()
 }
 
@@ -1969,7 +2155,7 @@ async fn run_image_hyperv_stdio_session() {
         return;
     };
 
-    let dirs = blocking(run_image_session_dirs).await;
+    let dirs = blocking(run_image_stdio_session_dirs).await;
     let host_report = dirs.report.join("host-launch-report.json");
     let t0 = Instant::now();
     let (mut child, stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "docker", &runner);
@@ -2001,7 +2187,8 @@ async fn run_image_hyperv_stdio_session() {
     // alive — the host-side VM-boundary proof, not a report claim.
     let cid = poll_some(STOP_TIMEOUT_SECS, 500, || {
         let image = image.clone();
-        async move { running_container_for(&image).await }
+        let audit_source = dirs.logs.clone();
+        async move { running_container_for_launch(&image, &audit_source).await }
     })
     .await
     .expect("no running container for the hyperv image");
@@ -2024,12 +2211,9 @@ async fn run_image_hyperv_stdio_session() {
     // and the audit bind `RW=true`. A policy mount recorded writable
     // would make leg 5's failure attributable to the DACL, not the
     // mount; this check pins the attribution before the legs run.
-    let mounts = inspect_field(
-        &cid,
-        "{{range .Mounts}}{{.Destination}}|{{.RW}}|{{.Source}};{{end}}",
-    )
-    .await
-    .expect("docker inspect .Mounts must enumerate the launch's binds");
+    let mounts = inspect_field(&cid, "{{json .Mounts}}")
+        .await
+        .expect("docker inspect .Mounts must enumerate the launch's binds");
     assert_eq!(
         mount_rw(&mounts, "C:\\etc\\mcp-secure"),
         Some(false),
@@ -2053,6 +2237,8 @@ async fn run_image_hyperv_stdio_session() {
         .expect("docker inspect must name the policy bind's host Source")
         .join("sub");
     std::fs::create_dir_all(&policy_sub).expect("create `sub` inside the mounted policy source");
+    std::fs::write(policy_sub.join("sentinel.txt"), "sentinel")
+        .expect("write the policy-sub sentinel");
     grant_all_app_packages(&policy_sub);
 
     // Guest-side probe legs through the product path's stdio relay.
@@ -2110,6 +2296,11 @@ async fn run_image_hyperv_stdio_session() {
             "create_file",
             "{\"path\":\"C:/etc/mcp-secure/sub/evil.txt\",\"content\":\"x\"}",
         ),
+        (
+            10,
+            "read_file",
+            "{\"path\":\"C:/etc/mcp-secure/sub/sentinel.txt\"}",
+        ),
         // AppContainer capability deny — no network SIDs granted.
         // `addr` is omitted — the probe defaults to 192.0.2.1:80 —
         // because a `read_only` tool carrying a host/URL argument is
@@ -2144,7 +2335,7 @@ async fn run_image_hyperv_stdio_session() {
         "the in-guest warden must apply AppContainer+Job: {ident}"
     );
     assert!(
-        text_of(2).contains("created C:/var/log/mcp-secure/sub/run-image-ok.txt"),
+        text_of(2).contains("create_ok C:/var/log/mcp-secure/sub/run-image-ok.txt"),
         "write inside the granted audit-mount subtree must succeed: {}",
         text_of(2)
     );
@@ -2162,6 +2353,12 @@ async fn run_image_hyperv_stdio_session() {
         "secret paths must deny at the RPC layer: {}",
         text_of(4)
     );
+    assert!(
+        tool_response_text(&text_of(10))
+            .contains("opened C:/etc/mcp-secure/sub/sentinel.txt: head=\"sentinel\""),
+        "the guest must reach the exact policy sub directory before its write denial means anything: {}",
+        text_of(10)
+    );
     // Mount-mode evidence stacked three ways: the daemon recorded the
     // policy bind `RW=false` at session start, leg 2 ran the same
     // `create_file` shape through a writable mount and landed the file
@@ -2171,9 +2368,15 @@ async fn run_image_hyperv_stdio_session() {
     // misconfigured writable mount would let the write land as a
     // host-visible file.
     assert!(
-        text_of(5).contains("evil.txt") && text_of(5).contains("failed"),
-        "the tool-level write into the read-only policy mount must fail \
-         at the mount layer: {}",
+        text_of(5).contains("create_denied:5"),
+        "the tool-level create into the read-only policy mount must report \
+         ERROR_ACCESS_DENIED; lookup errors such as ERROR_PATH_NOT_FOUND are \
+         fixture failures, not mount enforcement: {}",
+        text_of(5)
+    );
+    assert!(
+        !text_of(5).contains("create_ok"),
+        "the read-only policy mount must not accept the create: {}",
         text_of(5)
     );
     // The host-side absence check inspects the same source the bind
@@ -2331,7 +2534,8 @@ async fn run_image_hyperv_external_kill_cleans_up() {
         .expect("initialize response never arrived — the hyperv unit failed to come up");
     let cid = poll_some(STOP_TIMEOUT_SECS, 500, || {
         let image = image.clone();
-        async move { running_container_for(&image).await }
+        let audit_source = dirs.logs.clone();
+        async move { running_container_for_launch(&image, &audit_source).await }
     })
     .await
     .expect("no running container for the hyperv image");

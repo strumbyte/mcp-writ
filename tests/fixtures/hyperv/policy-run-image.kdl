@@ -43,30 +43,35 @@ defaults {
 server "hyperv-probe" {
     tool "read_file" side_effect="read_only" {
         filesystem {
+            allow "C:/etc/mcp-secure"
             allow "C:/etc/mcp-secure/**"
             allow "C:/var/log/mcp-secure/**"
         }
     }
     tool "vm_identity" side_effect="read_only" {
         filesystem {
+            allow "C:/etc/mcp-secure"
             allow "C:/etc/mcp-secure/**"
         }
     }
     tool "env_probe" side_effect="read_only" {
         filesystem {
+            allow "C:/etc/mcp-secure"
             allow "C:/etc/mcp-secure/**"
         }
     }
     tool "create_file" side_effect="write" {
         filesystem {
-            allow "C:/etc/mcp-secure/**"
-            allow "C:/var/log/mcp-secure/**"
             // The allowed-write leg lands in the audit mount's `sub/`
             // subtree; the deny leg targets the read-only policy
             // mount's `sub/` — granted by the auditor so the write
-            // reaches the mount layer's kernel refusal.
+            // reaches the mount layer's kernel refusal. Narrow write
+            // rules precede the broad default-read spellings.
             allow "C:/var/log/mcp-secure/sub/**" mode="write"
             allow "C:/etc/mcp-secure/sub/**" mode="write"
+            allow "C:/etc/mcp-secure"
+            allow "C:/etc/mcp-secure/**"
+            allow "C:/var/log/mcp-secure/**"
         }
     }
     // Declared read_only but its implementation attempts a TCP connect —
@@ -75,11 +80,13 @@ server "hyperv-probe" {
     // must carry a path argument, hence `path`.
     tool "net_probe" side_effect="read_only" {
         filesystem {
+            allow "C:/etc/mcp-secure"
             allow "C:/etc/mcp-secure/**"
         }
     }
     tool "spawn_child" side_effect="write" {
         filesystem {
+            allow "C:/etc/mcp-secure"
             allow "C:/etc/mcp-secure/**"
             allow "C:/var/log/mcp-secure/**"
             allow "C:/var/log/mcp-secure/sub/**" mode="write"
@@ -87,6 +94,7 @@ server "hyperv-probe" {
     }
     tool "exit_child" side_effect="write" {
         filesystem {
+            allow "C:/etc/mcp-secure"
             allow "C:/etc/mcp-secure/**"
             allow "C:/var/log/mcp-secure/**"
             allow "C:/var/log/mcp-secure/sub/**" mode="write"

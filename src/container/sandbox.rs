@@ -700,6 +700,7 @@ async fn run_inner(
     let spec = LaunchSpec {
         isolation: IsolationKind::WindowsSandbox,
         image: None,
+        authorized_image_digest: None,
         command: Some(prepared.command),
         guest_os: TargetOs::Windows,
         guest_arch: TargetArch::X86_64,

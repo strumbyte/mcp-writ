@@ -32,6 +32,11 @@ pub enum EngineError {
     CommandFailed { engine: String, message: String },
     /// The requested operation is not supported by this engine.
     Unsupported(String),
+    /// A unit/resource the operation created could not be proven removed.
+    /// This stays distinct from the operation's own failure so backend
+    /// callers can propagate their cleanup-failure contract instead of
+    /// releasing session resources as though the refusal were ordinary.
+    CleanupFailed(String),
     /// No container engine was found on PATH.
     NotFound,
     /// The engine kind string could not be parsed.
@@ -49,9 +54,10 @@ impl fmt::Display for EngineError {
                 write!(f, "{engine} command failed: {message}")
             }
             Self::Unsupported(msg) => write!(f, "unsupported operation: {msg}"),
+            Self::CleanupFailed(msg) => write!(f, "cleanup failed: {msg}"),
             Self::NotFound => write!(f, "no container engine found on PATH"),
             Self::UnknownKind(s) => write!(f, "unknown engine kind: {s}"),
-            Self::NotAvailable(name) => write!(f, "engine not available on PATH: {name}"),
+            Self::NotAvailable(name) => write!(f, "engine not available on PATH: '{name}'"),
             Self::Io(e) => write!(f, "IO error: {e}"),
         }
     }
@@ -174,6 +180,49 @@ pub trait ContainerEngine: Send + Sync {
         args: &'a [&'a str],
         stdin_pipe: bool,
     ) -> BoxFuture<'a, Result<tokio::process::Child, EngineError>>;
+
+    /// Create a unit without starting its init process, returning the
+    /// substrate's unit id. Engines whose CLI has no create/start split
+    /// keep the default refusal; the attached `run` path remains their
+    /// contract.
+    fn create_unit<'a>(
+        &'a self,
+        _image: &'a str,
+        _args: &'a [&'a str],
+    ) -> BoxFuture<'a, Result<String, EngineError>> {
+        Box::pin(async move {
+            Err(EngineError::Unsupported(
+                "this engine has no create-without-start launch step".to_string(),
+            ))
+        })
+    }
+
+    /// Start a previously created unit with attached stdin/stdout.
+    fn start_unit<'a>(
+        &'a self,
+        _unit: &'a str,
+    ) -> BoxFuture<'a, Result<tokio::process::Child, EngineError>> {
+        Box::pin(async move {
+            Err(EngineError::Unsupported(
+                "this engine has no attached start step for a created unit".to_string(),
+            ))
+        })
+    }
+
+    /// Whether a created unit's recorded image descriptor matches the
+    /// digest inspected before launch. Substrates that cannot launch by
+    /// a local digest spelling use this post-create fact as the binding
+    /// check; engines that launch digest spellings directly leave the
+    /// default fail-closed answer unused. The probe is asynchronous and
+    /// deadline-bound by the implementation — launch must never block an
+    /// executor thread inside a synchronous inspect.
+    fn unit_image_matches<'a>(
+        &'a self,
+        _unit: &'a str,
+        _expected_digest: &'a str,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move { false })
+    }
 
     /// Check whether the engine CLI binary exists on PATH.
     fn is_available(&self) -> bool;

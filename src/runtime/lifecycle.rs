@@ -355,8 +355,11 @@ pub async fn launch_failed_exit(
         report.result.as_ref().and_then(|r| r.detail.as_deref()),
     );
     // The launch already failed — a terminal audit fault cannot lower
-    // the result further.
+    // the result further. Deferred cleanup is awaited after the report and
+    // audit bracket are durable, but before process exit can abandon a live
+    // workload or release its entrypoint pins.
     let _ = logger.shutdown().await;
+    crate::runtime::launch::wait_for_deferred_cleanups().await;
     std::process::exit(1);
 }
 

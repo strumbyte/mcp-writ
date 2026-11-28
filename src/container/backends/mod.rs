@@ -100,6 +100,11 @@ pub struct LaunchSpec {
     /// Backends without `oci_image` reject `Some(..)`; image backends
     /// reject `None`.
     pub image: Option<String>,
+    /// Descriptor digest the caller's initial image inspection and policy
+    /// check authorized. Backends whose CLI cannot spell a local image by
+    /// digest verify the created unit against this value; they never
+    /// re-inspect the mutable tag at launch time to derive it.
+    pub authorized_image_digest: Option<String>,
     /// Guest command for a payload backend. Image backends reject this field.
     pub command: Option<Vec<String>>,
     /// Workload OS the spec requires in the guest.
@@ -206,7 +211,10 @@ impl From<std::io::Error> for BackendError {
 
 impl From<EngineError> for BackendError {
     fn from(e: EngineError) -> Self {
-        Self::LaunchFailed(e.to_string())
+        match e {
+            EngineError::CleanupFailed(msg) => Self::CleanupFailed(msg),
+            other => Self::LaunchFailed(other.to_string()),
+        }
     }
 }
 
@@ -458,10 +466,11 @@ pub fn resolve_backend(
 /// spawned, and again after `attach` — and keep a [`SharePinWatch`]
 /// armed across the whole window so a repoint-and-restore the path
 /// checks would miss is still detected before the session proceeds.
-/// VM-mediated backends (`apple`, `hyperv`) verify at the top of
-/// `launch` only; the mount resolves inside their guest/remote
-/// substrate, where a post-create check of the local path proves
-/// nothing about the object actually bound.
+/// VM-mediated backends re-check at the point their substrate is about
+/// to resolve the spelling (`apple` again immediately before `start`;
+/// `hyperv` passes its path to the remote engine in one launch step).
+/// A post-create check cannot prove which object an already-running VM
+/// bound, so it is evidence only while still before startup.
 pub(crate) fn verify_share_pins(spec: &LaunchSpec) -> Result<(), BackendError> {
     for share in &spec.shares {
         let Some(expected) = share.pin else { continue };
@@ -1068,6 +1077,7 @@ mod tests {
         LaunchSpec {
             isolation: kind,
             image: Some("img@sha256:0".to_string()),
+            authorized_image_digest: None,
             command: None,
             guest_os: TargetOs::Linux,
             guest_arch: TargetArch::X86_64,

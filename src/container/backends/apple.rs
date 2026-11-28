@@ -60,6 +60,12 @@ const MIN_MACOS_MAJOR: u64 = 26;
 /// must not stall `check`/`plan` indefinitely.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Attached-start settle window. A healthy `container start -a -i` stays
+/// alive while the VM boot/workload session runs; a CLI that exits inside
+/// this window never established the session and is a launch failure, not
+/// a successful empty session.
+const START_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The apple backend's declared capability set: a macOS host only (the
 /// Virtualization.framework substrate is Apple-only), the same Linux
 /// guest contract as the OCI path (`mcp-secure-runner` is a Linux ELF),
@@ -101,6 +107,78 @@ pub struct AppleContainerEngine {
     /// binary replaced after resolution fails closed rather than
     /// running under the resolved name.
     exe: crate::trusted_path::BoundDriver,
+}
+
+/// Inspect `unit` after a removal attempt and return `Ok(true)` only when
+/// the substrate's error positively says the identity is absent. A still-
+/// resolvable unit is `Ok(false)`; every spawn/timeout/ambiguous answer is
+/// an error because it proves nothing either way.
+async fn unit_confirmed_absent(engine: &dyn ContainerEngine, unit: &str) -> Result<bool, String> {
+    let mut inspect = engine
+        .driver_command()
+        .map_err(|e| format!("cannot build the unit-removal inspection command: {e}"))?;
+    inspect.args(["inspect", unit]);
+    let check = bounded_cmd_output(&mut inspect, true);
+    let check = tokio::time::timeout(std::time::Duration::from_secs(5), check)
+        .await
+        .map_err(|_| "unit-removal confirmation timed out".to_string())?
+        .map_err(|e| format!("unit-removal confirmation failed: {e}"))?;
+    if check.status.success() {
+        return Ok(false);
+    }
+    if crate::container::common::inspect_error_is_absent(&String::from_utf8_lossy(&check.stderr)) {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    Err(format!(
+        "unit-removal inspection did not prove absence: {}",
+        stderr.trim()
+    ))
+}
+
+/// Removal of a created unit whose verification or start failed before an
+/// [`EngineRunHandle`] existed to own teardown. `Ok` means a forced removal
+/// completed and the unit no longer resolves; every failure, timeout, or
+/// inconclusive inspection is an error so the caller cannot leak it silently.
+async fn remove_created_unit(engine: &dyn ContainerEngine, unit: &str) -> Result<(), String> {
+    let mut cmd = engine
+        .driver_command()
+        .map_err(|e| format!("cannot build the unit-removal command: {e}"))?;
+    cmd.args(["rm", "-f", unit]);
+    let rm = bounded_cmd_output(&mut cmd, false);
+    let rm = tokio::time::timeout(std::time::Duration::from_secs(10), rm)
+        .await
+        .map_err(|_| "unit removal timed out".to_string())?
+        .map_err(|e| format!("unit removal command failed: {e}"))?;
+    if !rm.status.success() {
+        // `rm` may itself report the already-removed unit as absent; only an
+        // inspect-shaped absence answer proves that fact. Otherwise preserve
+        // the removal failure rather than treating an unanswerable cleanup as
+        // success.
+        if matches!(unit_confirmed_absent(engine, unit).await, Ok(true)) {
+            return Ok(());
+        }
+        return Err(format!(
+            "unit removal failed: {}",
+            String::from_utf8_lossy(&rm.stderr)
+        ));
+    }
+    match unit_confirmed_absent(engine, unit).await? {
+        true => Ok(()),
+        false => Err("the unit still resolves after removal".to_string()),
+    }
+}
+
+/// Preserve the launch-stage error when the pre-handle unit cleanup is
+/// confirmed; when cleanup cannot prove absence, cleanup is the failure the
+/// caller must see because a created unit may still exist.
+fn cleanup_then_error(cleanup: Result<(), String>, primary: BackendError) -> BackendError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(e) => BackendError::CleanupFailed(format!(
+            "{primary}; the created unit could not be proven gone: {e}"
+        )),
+    }
 }
 
 impl AppleContainerEngine {
@@ -185,6 +263,16 @@ pub(crate) fn apple_run_args(options: &[String], image: &str) -> Vec<String> {
     }
     args.extend(options.iter().cloned());
     args.push(image.to_string());
+    args
+}
+
+/// `container create` arguments for the same launch. Apple's CLI accepts
+/// the run contract's process/resource/management flags on `create` too;
+/// only the subcommand changes. The unit is created stopped, so `--rm`
+/// cannot drop it before its recorded image digest is verified.
+pub(crate) fn apple_create_args(options: &[String], image: &str) -> Vec<String> {
+    let mut args = apple_run_args(options, image);
+    args[0] = "create".to_string();
     args
 }
 
@@ -603,6 +691,213 @@ async fn probe_with(
     ))
 }
 
+fn unit_image_digest(stdout: &str) -> Option<String> {
+    let json = nojson::RawJson::parse(stdout).ok()?;
+    let mut arr = json.value().to_array().ok()?;
+    let root = arr.next()?;
+    root.to_member("configuration")
+        .ok()
+        .and_then(|m| m.optional())
+        .and_then(|c| c.to_member("image").ok().and_then(|m| m.optional()))
+        .and_then(|i| i.to_member("descriptor").ok().and_then(|m| m.optional()))
+        .and_then(|d| d.to_member("digest").ok().and_then(|m| m.optional()))
+        .and_then(|d| d.to_unquoted_string_str().ok())
+        .map(|s| s.into_owned())
+}
+
+impl AppleContainerEngine {
+    /// Create the unit without starting its init process. The CLI prints
+    /// the created unit id on stdout; progress output stays off that
+    /// stream, so the final non-empty line is the id.
+    async fn create_stopped_unit(&self, image: &str, args: &[&str]) -> Result<String, EngineError> {
+        let option_owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let argv = apple_create_args(&option_owned, image);
+        let mut cmd = self.exe.tokio_command()?;
+        cmd.args(&argv);
+        let named = args
+            .windows(2)
+            .find_map(|w| (w[0] == "--name").then(|| w[1].to_string()));
+        let cidfile = args
+            .windows(2)
+            .find_map(|w| (w[0] == "--cidfile").then(|| w[1].to_string()));
+        // A pre-existing cidfile is not evidence that *this* create
+        // registered a unit. Compare content before crediting it as a
+        // cleanup identity; only a newly written/changed id can belong
+        // to this attempt.
+        let cidfile_before = cidfile
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let output = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            bounded_cmd_output(&mut cmd, true),
+        )
+        .await
+        {
+            Ok(output) => output?,
+            Err(_) => {
+                // Cancellation kills the CLI child, but apiserver-side
+                // registration may already have landed — and may land only
+                // after that first cleanup pass. Keep the reserved name and
+                // cidfile identities owned for a short settle window,
+                // refreshing the cidfile and retrying until every identity
+                // is confirmed absent. A unit registered late is therefore
+                // removed rather than orphaned behind the deadline report.
+                let deadline = "container create exceeded the 30s completion deadline".to_string();
+                let settle_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                let mut cleanup_failures = Vec::new();
+                loop {
+                    let mut units = std::collections::BTreeSet::new();
+                    if let Some(unit) = &named {
+                        units.insert(unit.clone());
+                    }
+                    if let Some(path) = &cidfile
+                        && let Ok(id) = std::fs::read_to_string(path)
+                    {
+                        let id = id.trim();
+                        if !id.is_empty() && cidfile_before.as_deref() != Some(id) {
+                            units.insert(id.to_string());
+                        }
+                    }
+                    cleanup_failures.clear();
+                    for unit in units {
+                        if matches!(unit_confirmed_absent(self, &unit).await, Ok(true)) {
+                            continue;
+                        }
+                        if let Err(cleanup) = remove_created_unit(self, &unit).await {
+                            cleanup_failures.push(format!("unit '{unit}': {cleanup}"));
+                        }
+                    }
+                    if std::time::Instant::now() >= settle_until {
+                        break;
+                    }
+                    // An absent answer is not settle proof: apiserver-side
+                    // registration can land after it. Keep the identities
+                    // owned for the whole settle window and re-check.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                return Err(if cleanup_failures.is_empty() {
+                    EngineError::CommandFailed {
+                        engine: APPLE_CLI.into(),
+                        message: deadline,
+                    }
+                } else {
+                    EngineError::CleanupFailed(format!(
+                        "{deadline}; cleanup of the partially created unit failed: {}",
+                        cleanup_failures.join("; ")
+                    ))
+                });
+            }
+        };
+        if !output.status.success() {
+            let message = String::from_utf8_lossy(&output.stderr).into_owned();
+            // A failed create can still have registered the unit before
+            // reporting a bootstrap error. Positive evidence of registration
+            // is the printed id or a published cidfile. The requested name is
+            // only a cleanup identity for non-duplicate failures: when the CLI
+            // rejected the name as already present, that name belongs to the
+            // pre-existing unit and must survive this attempt's cleanup.
+            let printed = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_string);
+            let lower = message.to_ascii_lowercase();
+            let duplicate_name = lower.contains("container already exists")
+                || lower.contains("already in use")
+                || lower.contains("duplicate");
+            let mut units = printed
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            if let Some(path) = &cidfile
+                && let Ok(id) = std::fs::read_to_string(path)
+            {
+                let id = id.trim();
+                if !id.is_empty() && cidfile_before.as_deref() != Some(id) {
+                    units.insert(id.to_string());
+                }
+            }
+            if !duplicate_name {
+                units.extend(named);
+            }
+            let mut cleanup_failures = Vec::new();
+            for unit in units {
+                if let Err(cleanup) = remove_created_unit(self, &unit).await {
+                    cleanup_failures.push(format!("unit '{unit}': {cleanup}"));
+                }
+            }
+            return Err(if cleanup_failures.is_empty() {
+                EngineError::CommandFailed {
+                    engine: APPLE_CLI.into(),
+                    message,
+                }
+            } else {
+                EngineError::CleanupFailed(format!(
+                    "{message}; cleanup of the partially created unit failed: {}",
+                    cleanup_failures.join("; ")
+                ))
+            });
+        }
+        let printed = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string);
+        if let Some(unit) = printed {
+            return Ok(unit);
+        }
+        // A zero-exit create without a printed id is ambiguous: the
+        // apiserver may still have registered the requested/new-cidfile
+        // identity. Clean those identities before returning the failure.
+        let message = "container create succeeded without printing a unit id".to_string();
+        let mut units = named.into_iter().collect::<std::collections::BTreeSet<_>>();
+        if let Some(path) = &cidfile
+            && let Ok(id) = std::fs::read_to_string(path)
+        {
+            let id = id.trim();
+            if !id.is_empty() && cidfile_before.as_deref() != Some(id) {
+                units.insert(id.to_string());
+            }
+        }
+        let mut cleanup_failures = Vec::new();
+        for unit in units {
+            if let Err(cleanup) = remove_created_unit(self, &unit).await {
+                cleanup_failures.push(format!("unit '{unit}': {cleanup}"));
+            }
+        }
+        Err(if cleanup_failures.is_empty() {
+            EngineError::CommandFailed {
+                engine: APPLE_CLI.into(),
+                message,
+            }
+        } else {
+            EngineError::CleanupFailed(format!(
+                "{message}; cleanup of the ambiguously registered unit failed: {}",
+                cleanup_failures.join("; ")
+            ))
+        })
+    }
+
+    /// Start a created unit with the session attached. `-a` attaches
+    /// stdout/stderr and `-i` attaches stdin; unlike a detached start,
+    /// the CLI does not print the unit id onto the workload stream.
+    async fn start_created_unit(&self, unit: &str) -> Result<tokio::process::Child, EngineError> {
+        let mut cmd = self.exe.tokio_command()?;
+        cmd.args(["start", "-a", "-i", unit]);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        // stderr inherits — the CLI's progress/diagnostic lines stay
+        // visible and a piped-but-undrained stderr cannot deadlock the
+        // session. The attached workload stderr is multiplexed by the
+        // CLI's own stdio protocol, not this process-level stream.
+        cmd.stderr(std::process::Stdio::inherit());
+        Ok(cmd.spawn()?)
+    }
+}
+
 impl ContainerEngine for AppleContainerEngine {
     fn name(&self) -> &str {
         APPLE_CLI
@@ -618,6 +913,35 @@ impl ContainerEngine for AppleContainerEngine {
 
     fn driver_std_command(&self) -> std::io::Result<std::process::Command> {
         self.exe.std_command()
+    }
+
+    fn unit_image_matches<'a>(
+        &'a self,
+        unit: &'a str,
+        expected_digest: &'a str,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let Ok(mut cmd) = self.exe.tokio_command() else {
+                return false;
+            };
+            cmd.args(["inspect", unit]);
+            // `bounded_cmd_output` drains both pipes while the CLI runs;
+            // the outer deadline drops the future on timeout, and the
+            // command's kill-on-drop then reaps the inspect instead of
+            // parking the async launch path.
+            let output = match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                bounded_cmd_output(&mut cmd, true),
+            )
+            .await
+            {
+                Ok(Ok(output)) => output,
+                _ => return false,
+            };
+            output.status.success()
+                && unit_image_digest(&String::from_utf8_lossy(&output.stdout)).as_deref()
+                    == Some(expected_digest)
+        })
     }
 
     /// The apple substrate is a launch runtime, not a builder — the
@@ -733,6 +1057,21 @@ impl ContainerEngine for AppleContainerEngine {
         })
     }
 
+    fn create_unit<'a>(
+        &'a self,
+        image: &'a str,
+        args: &'a [&'a str],
+    ) -> BoxFuture<'a, Result<String, EngineError>> {
+        Box::pin(async move { self.create_stopped_unit(image, args).await })
+    }
+
+    fn start_unit<'a>(
+        &'a self,
+        unit: &'a str,
+    ) -> BoxFuture<'a, Result<tokio::process::Child, EngineError>> {
+        Box::pin(async move { self.start_created_unit(unit).await })
+    }
+
     fn is_available(&self) -> bool {
         crate::container::engine::bounded_driver_output(&self.exe, &["--version"])
             .map(|o| {
@@ -814,22 +1153,114 @@ impl IsolationBackend for AppleContainerBackend {
                 )
             })?;
             super::verify_share_pins(spec)?;
-            let options = run_options(spec);
+            let mut options = run_options(spec);
+            // A cidfile-only spec still needs a caller-known identity.
+            // Reserve the unique name before create so timeout/failure
+            // cleanup can name a late-registered unit even before the
+            // substrate publishes the cidfile.
+            let generated_name = spec
+                .unit_name
+                .is_none()
+                .then(|| format!("mcp-writ-{}", uuid::Uuid::now_v7().simple()));
+            if let Some(name) = &generated_name {
+                options.push("--name".to_string());
+                options.push(name.clone());
+            }
+            let unit_name = spec.unit_name.clone().or(generated_name);
             let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
-            let child = self.engine.run(image, &option_refs, true).await?;
-            Ok(Box::new(
-                EngineRunHandle::attach(
-                    child,
-                    // The shared engine — the handle's lifecycle
-                    // commands (`kill`/`rm`/`inspect`) spawn through
-                    // the bound, identity-verified driver, so a CLI
-                    // replaced after launch can never answer teardown.
-                    self.engine.clone(),
-                    spec.unit_id_file.clone(),
-                    spec.unit_name.clone(),
-                )
-                .await,
-            ) as Box<dyn IsolationHandle>)
+            let expected_digest = spec
+                .authorized_image_digest
+                .as_deref()
+                .filter(|d| crate::container::image_ref::is_sha256_digest(d))
+                .ok_or_else(|| {
+                    BackendError::LaunchFailed(
+                        "the launch spec carries no authorized image descriptor digest".to_string(),
+                    )
+                })?;
+            let unit = self.engine.create_unit(image, &option_refs).await?;
+            if let Some(name) = &unit_name
+                && name != &unit
+            {
+                let cleanup = remove_created_unit(&*self.engine, &unit).await;
+                return Err(cleanup_then_error(
+                    cleanup,
+                    BackendError::LaunchFailed(format!(
+                        "container create returned unit '{unit}' instead of the requested '{name}'"
+                    )),
+                ));
+            }
+            // Verify the created unit itself while it is still stopped:
+            // `--rm` cannot auto-remove it before this inspection, and
+            // `start` below launches the same unit record rather than
+            // re-resolving the mutable tag. The digest is the one the
+            // caller's initial policy check authorized — never a fresh
+            // inspect of that tag at launch time.
+            if !self.engine.unit_image_matches(&unit, expected_digest).await {
+                let cleanup = remove_created_unit(&*self.engine, &unit).await;
+                return Err(cleanup_then_error(
+                    cleanup,
+                    BackendError::LaunchFailed(
+                        "container unit image does not match the authorized digest — refusing the substituted image"
+                            .into(),
+                    ),
+                ));
+            }
+            // Apple stores mount spellings in the stopped unit and the
+            // VM resolves them as startup binds the shares. Re-open and
+            // compare every pinned directory at that point: a directory
+            // replaced after create must not be mounted under the pinned
+            // share's identity.
+            if let Err(e) = super::verify_share_pins(spec) {
+                let cleanup = remove_created_unit(&*self.engine, &unit).await;
+                return Err(cleanup_then_error(cleanup, e));
+            }
+            let mut child = match self.engine.start_unit(&unit).await {
+                Ok(child) => child,
+                Err(e) => {
+                    let cleanup = remove_created_unit(&*self.engine, &unit).await;
+                    return Err(cleanup_then_error(cleanup, e.into()));
+                }
+            };
+            // `start` returns a child as soon as the CLI is spawned. A CLI
+            // that exits in the settle window never established the
+            // attached workload session; report that as a failed launch and
+            // remove the stopped unit instead of handing stdio pipes for a
+            // dead substrate client to the session driver.
+            tokio::time::sleep(START_SETTLE).await;
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let cleanup = remove_created_unit(&*self.engine, &unit).await;
+                    return Err(cleanup_then_error(
+                        cleanup,
+                        BackendError::LaunchFailed(format!(
+                            "container start exited before the workload session started ({status})"
+                        )),
+                    ));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let cleanup = remove_created_unit(&*self.engine, &unit).await;
+                    return Err(cleanup_then_error(
+                        cleanup,
+                        BackendError::LaunchFailed(format!(
+                            "container start status could not be probed: {e}"
+                        )),
+                    ));
+                }
+            }
+            let handle = EngineRunHandle::attach(
+                child,
+                // The shared engine — the handle's lifecycle
+                // commands (`kill`/`rm`/`inspect`) spawn through
+                // the bound, identity-verified driver, so a CLI
+                // replaced after launch can never answer teardown.
+                self.engine.clone(),
+                spec.unit_id_file.clone(),
+                unit_name,
+                Some(unit.clone()),
+            )
+            .await;
+            Ok(Box::new(handle) as Box<dyn IsolationHandle>)
         })
     }
 }
@@ -842,6 +1273,7 @@ mod tests {
         LaunchSpec {
             isolation: IsolationKind::AppleContainer,
             image: Some(image.to_string()),
+            authorized_image_digest: None,
             command: None,
             guest_os: TargetOs::Linux,
             guest_arch: TargetArch::host(),
@@ -964,6 +1396,19 @@ mod tests {
     }
 
     // -- small parsers ---------------------------------------------------
+
+    #[test]
+    fn unit_image_digest_reads_the_recorded_image_descriptor() {
+        // Apple 1.5 records the image reference descriptor here. For an
+        // unchanged multi-platform image this is the OCI index digest —
+        // the same digest level `container image inspect` reports at
+        // `configuration.descriptor.digest` — not the selected arm64
+        // manifest digest.
+        let json = r#"[{"configuration":{"image":{"descriptor":{"digest":"sha256:index","mediaType":"application/vnd.oci.image.index.v1+json"}}}}]"#;
+        assert_eq!(unit_image_digest(json).as_deref(), Some("sha256:index"));
+        assert_eq!(unit_image_digest("[]"), None);
+        assert_eq!(unit_image_digest("not json"), None);
+    }
 
     #[test]
     fn version_parses_dotted_and_rejects_garbage() {

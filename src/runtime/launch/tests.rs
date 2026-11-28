@@ -260,9 +260,22 @@ async fn into_report_reaps_the_take_io_child() {
         vec!["cmd.exe".to_string(), "/d".to_string(), "/q".to_string()],
     );
     #[cfg(unix)]
+    let descendant_dir = tempfile::tempdir().expect("create descendant fixture directory");
+    #[cfg(unix)]
+    let descendant_pidfile = descendant_dir.path().join("descendant.pid");
+    // Unix: make the direct child exit immediately after spawning a
+    // descendant. Cleanup must not treat the leader's own exit as proof
+    // that the descendant tree is gone.
+    #[cfg(unix)]
     let (exe, argv) = (
-        std::path::PathBuf::from("/bin/cat"),
-        vec!["cat".to_string()],
+        std::path::PathBuf::from("/bin/sh"),
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 120 & echo $! > \"$1\"; exit 0".to_string(),
+            "sh".to_string(),
+            descendant_pidfile.display().to_string(),
+        ],
     );
     let attempt = warden.spawn_unsandboxed_async_exe_with_report(
         &exe,
@@ -273,21 +286,68 @@ async fn into_report_reaps_the_take_io_child() {
     );
     let child = attempt.outcome.expect("unsandboxed spawn must succeed");
     let pid = child.id().expect("spawned child must carry a pid");
+    #[cfg(unix)]
+    {
+        // Let the fixture reach its descendant-spawn/leader-exit point
+        // before cleanup starts; otherwise the test would only repeat the
+        // live-leader case.
+        for _ in 0..20 {
+            if descendant_pidfile.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            descendant_pidfile.exists(),
+            "the fixture did not spawn/publish its descendant before cleanup"
+        );
+        for _ in 0..20 {
+            if unix_leader_exited_unreaped(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            unix_leader_exited_unreaped(pid),
+            "the fixture leader did not exit before cleanup"
+        );
+    }
+    #[cfg(unix)]
+    let descendant: u32 = std::fs::read_to_string(&descendant_pidfile)
+        .expect("the fixture must publish its descendant pid")
+        .trim()
+        .parse()
+        .expect("descendant pid must be numeric");
+    #[cfg(target_os = "linux")]
+    let descendant_pidfd = linux_pidfd(descendant);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let descendant_pidfd = None::<std::os::fd::OwnedFd>;
+    #[cfg(unix)]
+    assert!(
+        !descendant_exited(descendant, descendant_pidfd.as_ref()),
+        "the descendant must be alive before cleanup"
+    );
+    #[cfg(unix)]
+    let mut descendant_guard = DescendantCleanupGuard {
+        pid: descendant,
+        #[cfg(target_os = "linux")]
+        pidfd: descendant_pidfd.as_ref().map(|fd| {
+            use std::os::fd::AsRawFd;
+            fd.as_raw_fd()
+        }),
+    };
     // A `SYNCHRONIZE`-only handle to the *original* process object,
     // opened before cleanup hands the child to the error — after
     // `into_report` its signaled state tells whether that process
     // exited, which reopen-by-pid can never prove (a reused pid or a
     // surviving stray handle would still open).
     #[cfg(windows)]
-    let exit_probe = take_io_test_exit_probe(pid);
+    let mut exit_probe = take_io_test_exit_probe(pid);
+    #[cfg(unix)]
+    let mut cleanup_guard = TakeIoCleanupGuard::new(pid);
     // The fixture must be alive *and* blocked before cleanup — a child
     // that already exited would let `into_report` pass without proving
     // anything about a live workload's reap.
-    #[cfg(unix)]
-    assert!(
-        take_io_test_process_alive(pid),
-        "the fixture child must be alive before into_report"
-    );
     #[cfg(windows)]
     assert!(
         !exit_probe.exited(),
@@ -319,11 +379,11 @@ async fn into_report_reaps_the_take_io_child() {
     let err = fail.err(
         LaunchErrorKind::TakeIo {
             child: Box::new(child),
-            keeps: SessionKeeps {
+            keeps: Box::new(SessionKeeps {
                 _spawn_pin: None,
                 #[cfg(all(unix, not(target_os = "linux")))]
                 _exec_staging: None,
-            },
+            }),
         },
         report,
     );
@@ -332,34 +392,152 @@ async fn into_report_reaps_the_take_io_child() {
     // fixture is terminated through a fresh pid-level handle —
     // independent of whatever `into_report` left behind — so the test
     // fails without leaving a stray child running.
-    let report =
-        match tokio::time::timeout(std::time::Duration::from_secs(30), err.into_report()).await {
-            Ok(report) => report,
-            Err(_) => {
-                take_io_test_force_kill(pid);
-                panic!("into_report did not reap the TakeIo child within 30s");
-            }
-        };
-    assert_eq!(
-        report.result.as_ref().map(|r| r.status),
-        Some("failed"),
-        "the TakeIo report must still record the launch as failed"
-    );
+    let mut cleanup = Box::pin(err.into_report());
+    let report = match tokio::time::timeout(std::time::Duration::from_secs(30), &mut cleanup).await
+    {
+        Ok(report) => report,
+        Err(_) => {
+            // Dropping the timed-out future drops the RunningChild it owns:
+            // Unix start_kill does not reap, so the pid still names this
+            // fixture when the guard unwinds; Windows cleanup uses the
+            // original object handle, never a reopened pid.
+            drop(cleanup);
+            panic!("into_report did not reap the TakeIo child within 30s");
+        }
+    };
 
-    // `into_report` ran kill → wait → drop — the original process object
-    // must already be signaled *now*. Checking the pre-cleanup probe
-    // immediately proves the reap happened inside cleanup; an exit that
-    // lands afterwards must not satisfy the assertion.
+    // The guard stays armed across exactly the liveness assertion, then is
+    // disarmed before later report assertions where the child is known dead.
     #[cfg(unix)]
     assert!(
         !take_io_test_process_alive(pid),
         "the TakeIo child (pid {pid}) is still running after into_report"
     );
+    #[cfg(unix)]
+    cleanup_guard.disarm();
+    #[cfg(unix)]
+    {
+        let mut gone = descendant_exited(descendant, descendant_pidfd.as_ref());
+        for _ in 0..20 {
+            if gone {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            gone = descendant_exited(descendant, descendant_pidfd.as_ref());
+        }
+        assert!(
+            gone,
+            "the descendant (pid {descendant}) survived direct-child cleanup"
+        );
+        descendant_guard.disarm();
+    }
     #[cfg(windows)]
     assert!(
         exit_probe.exited(),
         "the TakeIo child (pid {pid}) is still running after into_report"
     );
+    #[cfg(windows)]
+    exit_probe.disarm();
+    assert_eq!(
+        report.result.as_ref().map(|r| r.status),
+        Some("failed"),
+        "the TakeIo report must still record the launch as failed"
+    );
+}
+
+#[cfg(unix)]
+struct DescendantCleanupGuard {
+    pid: u32,
+    #[cfg(target_os = "linux")]
+    pidfd: Option<i32>,
+}
+
+#[cfg(unix)]
+impl DescendantCleanupGuard {
+    fn disarm(&mut self) {
+        self.pid = 0;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DescendantCleanupGuard {
+    fn drop(&mut self) {
+        if self.pid == 0 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = self.pidfd {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd,
+                    libc::SIGKILL,
+                    std::ptr::null_mut::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            return;
+        }
+        // Without a pidfd there is no process-bound handle here. A raw
+        // pid becomes unsafe as soon as the descendant exits and the
+        // integer can be recycled, so — as in `TakeIoCleanupGuard` —
+        // the guard is deliberately inert rather than risking an
+        // unrelated process. The fixture's bounded 120 s sleep is the
+        // fallback cleanup in that case.
+        let _ = self.pid;
+    }
+}
+
+/// Non-consuming exit notification for a direct child: WNOWAIT leaves
+/// the zombie for the product's owner to reap.
+#[cfg(unix)]
+fn unix_leader_exited_unreaped(pid: u32) -> bool {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        ) == 0
+            && info.si_pid() == pid as libc::pid_t
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pidfd(pid: u32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
+#[cfg(target_os = "linux")]
+fn descendant_exited(pid: u32, pidfd: Option<&std::os::fd::OwnedFd>) -> bool {
+    use std::os::fd::AsRawFd;
+    // pidfd is the precise probe, but supported test hosts can deny or
+    // lack pidfd_open. The descendant outlives the whole test deadline,
+    // so the kill-0 fallback still distinguishes cleanup termination
+    // from the fixture's natural exit.
+    let Some(fd) = pidfd else {
+        return !take_io_test_process_alive(pid);
+    };
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { libc::poll(&mut pfd, 1, 0) == 1 && pfd.revents & libc::POLLIN != 0 }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn descendant_exited(pid: u32, _pidfd: Option<&std::os::fd::OwnedFd>) -> bool {
+    !take_io_test_process_alive(pid)
 }
 
 /// Whether `pid` still names a live process: signal-0 probe — a reaped
@@ -370,31 +548,83 @@ fn take_io_test_process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-/// Pid-level termination independent of the child object — the escape
-/// hatch when the bounded `into_report` times out, so a wedged fixture
-/// can never outlive the failing test.
+/// Unix cleanup owner for the fixture child. Once the child is moved into
+/// `LaunchErrorKind::TakeIo`, the fixture no longer owns reap/termination.
+/// A raw pid is therefore never signalled on platforms without a stable
+/// process handle: after the product reaps the child, that integer can name
+/// an unrelated reused process. Linux uses a pidfd, which remains bound to
+/// the original process even after it is reaped; other Unix platforms rely
+/// on the process-bound `RunningChild`/product cleanup and the guard is
+/// intentionally inert rather than unsafe.
 #[cfg(unix)]
-fn take_io_test_force_kill(pid: u32) {
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+struct TakeIoCleanupGuard {
+    #[cfg(target_os = "linux")]
+    pidfd: Option<std::os::fd::OwnedFd>,
+    #[cfg(not(target_os = "linux"))]
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl TakeIoCleanupGuard {
+    fn new(pid: u32) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::FromRawFd;
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            // libc exposes the pidfd wrappers only on some libcs/targets;
+            // the syscall numbers are part of the stable Linux ABI everywhere
+            // this test builds.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let pidfd = (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) });
+            Self { pidfd }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            Self { armed: true }
+        }
+    }
+    fn disarm(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.pidfd = None;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.armed = false;
+        }
     }
 }
 
-/// Windows counterpart — a fresh `PROCESS_TERMINATE` handle on the pid,
-/// not any handle the child object or the probe owns.
-#[cfg(windows)]
-fn take_io_test_force_kill(pid: u32) {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let Ok(handle) = (unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }) else {
-        return;
-    };
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe {
-        let _ = TerminateProcess(handle, 1);
-        let _ = CloseHandle(handle);
+#[cfg(unix)]
+impl Drop for TakeIoCleanupGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = self.pidfd.take() {
+            use std::os::fd::AsRawFd;
+            // pidfd_send_signal is process-bound: signalling after another
+            // owner reaps the child is harmless and cannot hit a reused pid.
+            // The fixture does not waitpid here because reaping ownership
+            // belongs to the product cleanup path.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null_mut::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // No stable process handle exists here. Do not signal the raw
+            // pid: if `into_report` reaped the fixture, that integer may
+            // already have been recycled by an unrelated process.
+            let _ = self.armed;
+        }
     }
 }
 
@@ -403,19 +633,28 @@ fn take_io_test_force_kill(pid: u32) {
 /// can never prove (a reused pid or a surviving stray handle would
 /// still open).
 #[cfg(windows)]
-struct TakeIoExitProbe(windows::Win32::Foundation::HANDLE);
+struct TakeIoExitProbe {
+    handle: windows::Win32::Foundation::HANDLE,
+    armed: bool,
+}
 
 #[cfg(windows)]
 fn take_io_test_exit_probe(pid: u32) -> TakeIoExitProbe {
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
-        .expect("the just-spawned child must open with SYNCHRONIZE access");
-    TakeIoExitProbe(handle)
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) }
+        .expect("the just-spawned child must open with SYNCHRONIZE|TERMINATE access");
+    TakeIoExitProbe {
+        handle,
+        armed: true,
+    }
 }
 
 #[cfg(windows)]
 impl TakeIoExitProbe {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
     /// `true` once the original process object is signaled — i.e. the
     /// child actually terminated. Independent of pid reuse and of any
     /// handle the warden itself still holds.
@@ -423,7 +662,7 @@ impl TakeIoExitProbe {
         use windows::Win32::Foundation::WAIT_OBJECT_0;
         use windows::Win32::System::Threading::WaitForSingleObject;
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+        unsafe { WaitForSingleObject(self.handle, 0) == WAIT_OBJECT_0 }
     }
 }
 
@@ -431,6 +670,11 @@ impl TakeIoExitProbe {
 impl Drop for TakeIoExitProbe {
     fn drop(&mut self) {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+        if self.armed {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let _ = unsafe { windows::Win32::System::Threading::TerminateProcess(self.handle, 1) };
+        }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.handle) };
     }
 }

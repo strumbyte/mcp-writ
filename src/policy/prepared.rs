@@ -3,12 +3,12 @@
 //! `Policy` stays the document: KDL emission, the effective hash,
 //! provenance, and validation all read it in the same order and
 //! meaning as before. The per-request path instead consults a
-//! [`PreparedPolicy`], built once where the tool set becomes final
+//! `PreparedPolicy`, built once where the tool set becomes final
 //! (`Auditor::new`, a session's policy swap) and shared across both
 //! relay directions behind an `Arc`.
 //!
 //! The view carries only what is derivable from the policy itself —
-//! the tool-name index and each tool's [`PreparedTool`]. No OS state,
+//! the tool-name index and each tool's `PreparedTool`. No OS state,
 //! no request state, no session state: nothing in here can go stale
 //! while the document it wraps is unchanged, and a policy update path
 //! replaces the whole view rather than re-preparing in place, so a

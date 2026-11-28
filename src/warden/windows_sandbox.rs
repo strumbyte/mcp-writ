@@ -637,7 +637,12 @@ pub fn spawn_sandboxed(
         .next()
         .unwrap_or(command)
         .replace('.', "_");
-    let sandbox_name = format!("{sanitized_cmd}-{}", std::process::id());
+    // Concurrent launches in one process share its pid, and a stale profile
+    // can survive a crashed earlier process — pid-only naming is neither
+    // isolated nor cleanup-safe. A random per-launch suffix keeps each
+    // profile owned by exactly this launch.
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let sandbox_name = format!("{sanitized_cmd}-{}", &unique[..12]);
 
     let mut sandbox = AppContainerSandbox::new(&sandbox_name).map_err(|e| {
         let err = WinSpawnError {
@@ -800,9 +805,12 @@ mod tests {
 
         static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *PROBE.get_or_init(|| {
+            // Random per probe creation, not pid-only: pid reuse must never
+            // make cleanup delete a profile left by an earlier process. The
+            // spelling stays below the API's 64-character profile-name limit.
             let name = windows::core::HSTRING::from(format!(
                 "mcp-writ-prereq-probe-{}",
-                std::process::id()
+                uuid::Uuid::new_v4().simple()
             ));
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let sid = match unsafe { CreateAppContainerProfile(&name, &name, &name, None) } {
@@ -821,9 +829,21 @@ mod tests {
                 }
             };
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let deleted = unsafe { DeleteAppContainerProfile(&name) };
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
-                let _ = DeleteAppContainerProfile(&name);
                 let _ = FreeSid(sid);
+            }
+            if let Err(e) = deleted {
+                if PREREQUISITE_CODES.contains(&(e.code().0 as u32)) {
+                    crate::testutil::skip_unless_required(&format!(
+                        "AppContainer probe profile deletion unavailable: {e}"
+                    ));
+                    return false;
+                }
+                panic!(
+                    "unexpected AppContainer probe cleanup failure — the test                      profile may remain installed and prerequisite success is                      not cached: {e}"
+                );
             }
             true
         })
@@ -872,7 +892,7 @@ mod tests {
             return;
         }
         std::fs::create_dir_all(&tmp).expect("fixture dir");
-        let allowed_file = tmp.join("allowed.txt");
+        let allowed_file = tmp.join(format!("allowed-{}.txt", uuid::Uuid::new_v4().simple()));
         let test_file = tmp.join("denied.txt");
 
         // Positive control — the grant makes the fixture dir writable
@@ -897,7 +917,11 @@ mod tests {
         )
         .map_err(WinSpawnError::into_warden_error)
         .expect("granted control spawn must succeed once the probe passed");
-        control.wait().expect("granted control must be waitable");
+        let control_status = control.wait().expect("granted control must be waitable");
+        assert!(
+            control_status.success(),
+            "granted control must exit successfully — a failing control cannot prove write access: {control_status}"
+        );
         // Release the control before the denial probe — `wait` only
         // joins the process; the sandbox (and its granted ACE) lives
         // until the child drops. AppContainer profile names are unique
@@ -962,8 +986,13 @@ mod tests {
             None,
             "cmd.exe",
             &[
+                // `/v` makes `!VAR!` expand when each command runs, after
+                // `chcp` selects UTF-8 — otherwise cmd's default OEM output
+                // encoding cannot be consumed by `read_to_string` when the
+                // profile path is non-ASCII.
+                "/v".to_string(),
                 "/c".to_string(),
-                format!("echo SENTINEL=%{sentinel_key}%& echo TEMP=%TEMP%"),
+                format!("chcp 65001>nul& echo SENTINEL=!{sentinel_key}!& echo TEMP=!TEMP!"),
             ],
             &opts,
             &mut grants,
@@ -987,13 +1016,24 @@ mod tests {
         // block (required for AppContainer spawn) CreateProcessW
         // remaps TMP/TEMP to the container-private `Packages\<name>\
         // AC\Temp` — a private temp directory managed by the OS.
-        let tmp_s = tmp.to_string_lossy().to_ascii_lowercase();
-        let container_tmp = buf
-            .to_ascii_lowercase()
-            .contains("\\appdata\\local\\packages\\mcp-writ-cmd_exe-");
+        let temp = buf
+            .lines()
+            .find_map(|line| line.strip_prefix("TEMP="))
+            .expect("the env probe must emit a complete TEMP= line");
+        let tmp_s = tmp.to_string_lossy();
+        let exact_tmp = temp.eq_ignore_ascii_case(&tmp_s);
+        let normalized_temp = temp.replace('/', "\\").to_ascii_lowercase();
+        let local_app_data = std::env::var("LOCALAPPDATA")
+            .expect("LOCALAPPDATA must be present for the AppContainer spawn")
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase();
+        let package_prefix = format!("{local_app_data}\\packages\\mcp-writ-cmd_exe-");
+        let container_tmp =
+            normalized_temp.ends_with("\\ac\\temp") && normalized_temp.starts_with(&package_prefix);
         assert!(
-            lower.contains(&tmp_s) || buf.contains(&*tmp.to_string_lossy()) || container_tmp,
-            "child TEMP must be a private tmpdir {tmp_s} or the AppContainer AC\\Temp, got {buf:?}"
+            exact_tmp || container_tmp,
+            "child TEMP must equal the supplied private tmpdir {tmp_s} or be a complete              AppContainer package path ending in AC\\Temp, got TEMP={temp:?} in {buf:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1021,6 +1061,20 @@ mod tests {
         }
         std::fs::create_dir_all(&tmp).expect("fixture dir");
         let write = |file: &PathBuf| -> String { format!("echo ok > {}", file.display()) };
+        let dacl_text = || {
+            let out = std::process::Command::new("icacls")
+                .arg(&tmp)
+                .output()
+                .expect("icacls must run on the fixture dir");
+            assert!(
+                out.status.success(),
+                "icacls must read the fixture DACL: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let original_dacl = dacl_text();
 
         // Phase 1 — the policy grant makes the fixture dir writable
         // inside the container (proves the ACE was actually written, not
@@ -1077,7 +1131,12 @@ mod tests {
             child.wait().expect("the deny child must be waitable");
         }
         let leaked = probe_restored.exists();
+        let restored_dacl = dacl_text();
         let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            restored_dacl, original_dacl,
+            "dropping the granted sandbox must restore the fixture DACL exactly"
+        );
         assert!(
             !leaked,
             "DACL restore failed — a container without the grant could still write"

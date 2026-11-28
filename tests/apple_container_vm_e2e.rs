@@ -1331,6 +1331,20 @@ async fn shared_secure_image(runner: &Path, probe: &Path) -> Result<String, Stri
 /// available to assert on. `engine`, when passed, is forwarded as
 /// `--engine` — the apple substrate drives its own CLI, so any value
 /// must refuse.
+#[cfg(unix)]
+fn first_executable_container_on_path() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("container"))
+        .find(|candidate| {
+            candidate.is_absolute()
+                && std::fs::metadata(candidate)
+                    .map(|md| md.is_file() && md.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+        })
+}
+
 fn spawn_run_image(
     image: &str,
     dirs: &SessionDirs,
@@ -1339,6 +1353,12 @@ fn spawn_run_image(
     runner: Option<&Path>,
 ) -> (tokio::process::Child, tokio::task::JoinHandle<Vec<u8>>) {
     let mut cmd = Command::new(common::mcp_writ_bin());
+    #[cfg(unix)]
+    if std::env::var_os("MCP_WRIT_CONTAINER_EXE").is_none()
+        && let Some(container) = first_executable_container_on_path()
+    {
+        cmd.env("MCP_WRIT_CONTAINER_EXE", container);
+    }
     cmd.args([
         "run-image",
         "--isolation",

@@ -17,8 +17,9 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::SECURITY_CAPABILITIES;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
@@ -679,6 +680,32 @@ impl WindowsChild {
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Active process count in this launch's Job, including nested child
+    /// jobs. Job membership is authoritative for descendants on the supported
+    /// launch because breakaway is not permitted; `0` is therefore the
+    /// backend's proof that no Job descendant can still execute the workload.
+    pub fn active_job_processes(&self) -> std::io::Result<u32> {
+        if self.job_handle.is_invalid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "child has no job handle",
+            ));
+        }
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            QueryInformationJobObject(
+                Some(self.job_handle),
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut c_void,
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                None,
+            )
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        Ok(info.ActiveProcesses)
     }
 
     /// Get the OS-assigned process ID, if the process is still running.

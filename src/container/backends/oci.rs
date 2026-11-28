@@ -144,6 +144,7 @@ impl IsolationBackend for OciBackend {
                 self.engine.clone(),
                 spec.unit_id_file.clone(),
                 spec.unit_name.clone(),
+                None,
             )
             .await;
             // `attach` can return before the substrate has finished
@@ -301,28 +302,36 @@ pub(crate) struct EngineRunHandle {
 }
 
 impl EngineRunHandle {
-    /// Wrap a spawned `<engine> run` child and wait briefly for the
-    /// substrate to record the unit id — the `--cidfile` appears when
-    /// the unit is created, which races the spawn return. A substrate
-    /// that never writes one leaves `unit_id` empty rather than
-    /// stalling the launch.
+    /// Wrap a spawned `<engine> run` child. With `verified_unit_id`
+    /// (Apple's pre-start-inspected unit) that id is authoritative and
+    /// no cidfile poll runs; without one, wait briefly for the substrate
+    /// to record the id — the `--cidfile` appears when the unit is
+    /// created, which races the spawn return. A substrate that never
+    /// writes one leaves `unit_id` empty rather than stalling the launch.
     pub(crate) async fn attach(
         child: tokio::process::Child,
         engine: std::sync::Arc<dyn ContainerEngine>,
         cid_path: Option<PathBuf>,
         unit_name: Option<String>,
+        verified_unit_id: Option<String>,
     ) -> Self {
+        let verified = verified_unit_id.is_some();
         let mut handle = Self {
             child,
             engine,
             cid_path,
-            unit_id: None,
+            unit_id: verified_unit_id,
             unit_name,
             graceful_signal: None,
             share_watch: None,
             cleaned: false,
         };
-        handle.wait_for_unit_id().await;
+        // A backend-verified id is authoritative: polling the cidfile could
+        // only replace it with an unverified substrate spelling. Backends
+        // without that proof still use the cidfile as before.
+        if !verified {
+            handle.wait_for_unit_id().await;
+        }
         handle
     }
 

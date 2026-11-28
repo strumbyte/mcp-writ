@@ -568,10 +568,19 @@ fn tool_create_file(args: &J) -> String {
     let content = args.get("content").and_then(J::as_str).unwrap_or("");
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(mut f) => match f.write_all(content.as_bytes()) {
-            Ok(()) => format!("created {path} ({} bytes)", content.len()),
-            Err(e) => format!("write {path} failed: {e}"),
+            Ok(()) => format!("create_ok {path} ({} bytes)", content.len()),
+            Err(e) => format!(
+                "write_fail:{} {path} ({e})",
+                e.raw_os_error().unwrap_or_default()
+            ),
         },
-        Err(e) => format!("create {path} failed: {e}"),
+        Err(e) if e.raw_os_error() == Some(5) => {
+            format!("create_denied:5 {path} ({e})")
+        }
+        Err(e) => format!(
+            "create_fail:{} {path} ({e})",
+            e.raw_os_error().unwrap_or_default()
+        ),
     }
 }
 
@@ -646,11 +655,16 @@ fn tool_net_probe(args: &J) -> String {
 /// 3. Communication — see `comm_leg`.
 fn tool_spawn_child() -> String {
     let mut parts = Vec::new();
-    match std::process::Command::new("cmd.exe")
-        .args([
-            "/c",
-            "echo CHILD_ESCAPE > C:\\writ-deny\\child.txt && type C:\\writ-deny\\child.txt & set /p W=",
-        ])
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            parts.push(format!("spawn fixture-error: current_exe: {e}"));
+            parts.push(comm_leg());
+            return parts.join(" ");
+        }
+    };
+    match std::process::Command::new(&exe)
+        .args(["--write-check", r"C:\writ-deny\child.txt", "CHILD_ESCAPE"])
         // `output()` defaults stdin to `Stdio::null`, which opens the NUL
         // device — denied under some AppContainer profiles before the
         // spawn is even attempted. A pipe mirrors the warden's launch
@@ -666,11 +680,11 @@ fn tool_spawn_child() -> String {
         Ok(mut child) => {
             // Interrogate the descendant's own security context — the
             // token/job facts, not just their visible effects. The
-            // child is parked on `set /p` reading our pipe, so it is
-            // still alive (and still in the job's PID list) here.
+            // child is parked reading our pipe before its write attempt,
+            // so it is still alive (and still in the job's PID list) here.
             let facts = descendant_facts(&child);
-            // Closing the write end releases `set /p` on EOF so the
-            // descendant can exit and `wait_with_output` can reap it.
+            // Closing the write end releases the probe's stdin wait on EOF
+            // so it performs the write, exits, and can be reaped.
             drop(child.stdin.take());
             match child.wait_with_output() {
                 Ok(out) => {
@@ -681,8 +695,14 @@ fn tool_spawn_child() -> String {
                     // of how cmd phrases the refusal (locale, stream
                     // placement). `stdout` carrying CHILD_ESCAPE is the
                     // same fact from the `type` side.
-                    let child_txt =
-                        std::path::Path::new(r"C:\writ-deny\child.txt").exists();
+                    let child_txt = match std::fs::metadata(r"C:\writ-deny\child.txt") {
+                        Ok(_) => "present".to_string(),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "absent".to_string(),
+                        Err(e) => format!(
+                            "inconclusive:{}",
+                            e.raw_os_error().unwrap_or_default()
+                        ),
+                    };
                     parts.push(format!(
                         "spawn ok: status={} stdout={:?} stderr={:?} child_txt={child_txt} {facts}",
                         out.status.code().map_or("?".into(), |c| c.to_string()),
@@ -693,7 +713,10 @@ fn tool_spawn_child() -> String {
                 Err(e) => parts.push(format!("spawn ok(no-output): {facts} wait={e}")),
             }
         }
-        Err(e) => parts.push(format!("spawn failed: {e}")),
+        Err(e) => parts.push(format!(
+            "spawn failed:{} {e}",
+            e.raw_os_error().unwrap_or_default()
+        )),
     }
     parts.push(comm_leg());
     parts.join(" ")
@@ -718,11 +741,12 @@ fn descendant_facts(child: &std::process::Child) -> String {
                 std::mem::size_of::<ffi::DWORD>() as u32,
                 &mut retlen,
             );
+            let gle = ffi::GetLastError();
             ffi::CloseHandle(token);
             if r != 0 {
                 (is_ac != 0).to_string()
             } else {
-                format!("gle{}", ffi::GetLastError())
+                format!("gle{gle}")
             }
         } else {
             format!("open-gle{}", ffi::GetLastError())
@@ -739,13 +763,29 @@ fn descendant_facts(child: &std::process::Child) -> String {
 }
 
 /// Whether `pid` sits in this process's *own* job — the one the warden
-/// assigned the workload to, counting its nested child jobs. This is
-/// the job-specific evidence `IsProcessInJob(.., NULL, ..)` cannot
+/// assigned the workload to, counting its nested child jobs. In the
+/// supported Hyper-V run-image launch the warden assigns its job before
+/// the workload starts — there is no earlier substrate-job-only window in
+/// which this probe can execute. This is the job-specific evidence
+/// `IsProcessInJob(.., NULL, ..)` cannot
 /// give: "in some job somewhere" vs "in the job the launch put us in".
 /// The warden's job carries `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` only —
 /// no `BREAKAWAY` flags — so a descendant cannot leave it at all
 /// (`CREATE_BREAKAWAY_FROM_JOB` would fail), but this check proves
 /// membership directly rather than trusting that enforcement.
+/// Decode the PID list out of the original `Vec<usize>` allocation.
+/// The header's offset is preserved exactly, and the slice is formed by
+/// bounds-checked indexing rather than a provenance-losing flexible-array
+/// pointer derivation. `None` means the reported count cannot fit in the
+/// allocation — a malformed kernel answer, never a partial truth.
+fn job_pid_slice(buf: &[usize], count: usize) -> Option<&[usize]> {
+    let header = std::mem::offset_of!(
+        ffi::JOBOBJECT_BASIC_PROCESS_ID_LIST_,
+        process_id_list
+    ) / std::mem::size_of::<usize>();
+    buf.get(header..header.checked_add(count)?)
+}
+
 fn in_own_job(pid: u32) -> String {
     unsafe {
         let mut cap = 64usize;
@@ -763,7 +803,13 @@ fn in_own_job(pid: u32) -> String {
                 &mut retlen,
             ) == 0
             {
-                return format!("gle{}", ffi::GetLastError());
+                const ERROR_MORE_DATA: ffi::DWORD = 234;
+                let gle = ffi::GetLastError();
+                if gle == ERROR_MORE_DATA {
+                    cap *= 2;
+                    continue;
+                }
+                return format!("gle{gle}");
             }
             let list = &*buf
                 .as_ptr()
@@ -773,7 +819,9 @@ fn in_own_job(pid: u32) -> String {
                 cap = list.number_of_assigned_processes as usize;
                 continue;
             }
-            let ids = std::slice::from_raw_parts(list.process_id_list.as_ptr(), n);
+            let Some(ids) = job_pid_slice(&buf, n) else {
+                return "bad-layout".to_string();
+            };
             return ids.contains(&(pid as usize)).to_string();
         }
     }
@@ -805,8 +853,12 @@ fn comm_leg() -> String {
             // The connect handshake completes against a listening
             // socket with no `accept` — the backlog holds the
             // connections until the listener drops.
-            let control = match std::net::TcpStream::connect(addr) {
+            let control = match std::net::TcpStream::connect_timeout(
+                &addr,
+                std::time::Duration::from_secs(2),
+            ) {
                 Ok(_) => "ok".to_string(),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => "timeout".to_string(),
                 Err(e) => format!("fail:{}", e.raw_os_error().unwrap_or_default()),
             };
             (control, addr.to_string(), Some(l))
@@ -819,18 +871,60 @@ fn comm_leg() -> String {
     };
     let exe = match std::env::current_exe() {
         Ok(p) => p,
-        Err(e) => return format!("comm_control={control} child_net=exe:{e}"),
+        Err(e) => return format!("comm_control={control} child_net_fixture=exe:{e}"),
     };
     match std::process::Command::new(exe)
         .args(["--net-check", &loop_addr, "192.0.2.1:80"])
         .stdin(std::process::Stdio::piped())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
     {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            format!("comm_control={control} {}", stdout.trim())
+        Ok(mut child) => {
+            // Inspect this exact process while it is parked on the stdin
+            // gate, then release it to perform the socket probes.
+            let facts = descendant_facts(&child)
+                .replace("child_warden_job", "child_net_warden_job")
+                .replace("child_token_ac", "child_net_token_ac")
+                .replace("child_job", "child_net_job");
+            drop(child.stdin.take());
+            match child.wait_with_output() {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    format!("comm_control={control} {} {facts}", stdout.trim())
+                }
+                Err(e) => format!("comm_control={control} child_net_fixture=collect:{e}"),
+            }
         }
-        Err(e) => format!("comm_control={control} child_net=spawn:{e}"),
+        Err(e) => format!(
+            "comm_control={control} child_net=spawn:{}:{e}",
+            e.raw_os_error().unwrap_or_default()
+        ),
+    }
+}
+
+/// `--write-check <path> <content>` — the descendant file-create half of
+/// `spawn_child`. The parent needs the kernel verdict, not cmd's localized
+/// redirection text: `denied:5` is the only containment pass, other OS
+/// errors are fixture/environment failures, and success is an escape.
+fn mode_write_check(args: &[String]) {
+    let Some(path) = args.first() else {
+        println!("child_write=fail:no-path");
+        return;
+    };
+    // The parent inspects this exact process before closing stdin; do not
+    // attempt the write until that EOF releases the gate.
+    let mut stdin = std::io::stdin().lock();
+    let mut sink = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut stdin, &mut sink);
+    let content = args.get(1).map(String::as_str).unwrap_or("");
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut f) => match f.write_all(content.as_bytes()) {
+            Ok(()) => println!("child_write=ok"),
+            Err(e) => println!("child_write=fail:{}", e.raw_os_error().unwrap_or_default()),
+        },
+        Err(e) if e.raw_os_error() == Some(5) => println!("child_write=denied:5"),
+        Err(e) => println!("child_write=fail:{}", e.raw_os_error().unwrap_or_default()),
     }
 }
 
@@ -841,6 +935,11 @@ fn comm_leg() -> String {
 /// before routing, so endpoint reachability is irrelevant), `fail:<c>`
 /// otherwise.
 fn mode_net_check(args: &[String]) {
+    // As with --write-check, the parent inspects this exact process before
+    // closing stdin; only then may the socket probes run.
+    let mut stdin = std::io::stdin().lock();
+    let mut sink = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut stdin, &mut sink);
     let connect = |raw: &str| match raw.parse::<std::net::SocketAddr>() {
         Ok(sa) => {
             match std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(2)) {
@@ -910,6 +1009,10 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("--net-check") {
         mode_net_check(&argv[2..]);
+        return;
+    }
+    if argv.get(1).map(String::as_str) == Some("--write-check") {
+        mode_write_check(&argv[2..]);
         return;
     }
     let stdin = io::stdin();

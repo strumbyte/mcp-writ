@@ -502,7 +502,7 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 
 ### RF09 起動処理の責務分離
 
-直接依存: RF05b・RF06・RF08・RF-T02。優先度: C。RF-T02でWindowsの起動失敗・ACL復元・子孫回収の検証が成立してから着手する。
+直接依存: RF05b・RF06・RF08・RF-T02。優先度: C。RF-T02でWindowsの起動失敗・ACL復元・子孫回収の検証が成立してから着手する。現時点では子probe成功時のtoken／Warden Job／通信証拠と、親が先に終了し子孫だけが継続するcleanup fixtureの双方が欠けているため、backend pass件数ではRF-T02前提を満たさない。段階表の作成・関数抽出の設計など実行保証を変えない作業だけは進められるが、共有起動経路の移行完了と該当migrationの検証済み宣言は両方の証拠が揃うまで保留する。
 
 **目的:** 準備済みpolicy、検証済みworkload、spawn結果、稼働sessionの責任と所有者を明確にし、共通の失敗処理を集約する。
 
@@ -514,10 +514,10 @@ M8は製品性能M1〜M7と別集計にする。空の専用`CARGO_TARGET_DIR`�
 - [x] resolve、verify、bind、直前reverify、sandbox準備、spawn、stdio取得、auditor開始、report公開、待機・終了の各段階を表にする。各失敗で子が起動したか、stdio公開済みか、audit／report、pin・ACL・子孫・一時物の所有者と回収者を記録する。
 - [x] 最初のコミットは段階ごとの関数抽出に限定し、順序と入出力を保つ。次に準備済みpolicy・既存VerifiedWorkload・spawn後リソース・sessionの所有権を移す。差分が大きければPRを分けるが、各PRでhost／guest全呼出元をビルド・検証可能にする。
 - [x] spawn境界の直前再検証とpin保持を実行経路へ結び付ける。型名で検証済みと呼ぶだけで確認を省略せず、Windowsではspawn後も必要な期間pinを保持する。
-- [x] 共通の失敗report生成とcleanupを集約する。監査失敗、report書込失敗、stdio取得失敗のときに、既に起動した子を成功状態で残したり、二重にwait／releaseしたりしない。
+- [x] 共通の失敗report生成とcleanupを集約する。監査失敗、report書込失敗、stdio取得失敗のときに、既に起動した子を成功状態で残したり、二重にwait／releaseしたりしない。report書込の完了条件は**最終publication**に限定する: 起動直後の`write_guest_report`はhostが早期状態を読むbest-effort snapshotで、rename失敗はそのsnapshotが公開されなかったことを示すだけであり、最終report不在を意味しない。sessionは`wait_for_shutdown`へ進み、`ReportTarget::finish`が最終reportを公開できる。`finish`は最終reportのwrite失敗時にexit codeを1へ引き上げ、renameしない直接write経路で成功を返さない。launch error経路では`into_report`の失敗reportを`write_guest_report`できなくても`launch_failed_exit`が非零終了し、host側はreport不在＋非零を失敗として扱う。
 - [x] Linux内部helperがruntimeのworker生成前に単一スレッドで起動する順序、hostとcontainer PID1のsignal処理差、ACL復元・Job／cgroup・ハンドル寿命を維持する。プロセス管理方式とsandbox選択アルゴリズムは変更しない。
-- [x] 段階表の失敗箇所を代表ケースで発生させ、旧新で外部結果と残存物を比較する。RF-T02の有効なprobeと子孫回収検証を使い、単にcargoの成功件数で保証しない。
-- [ ] 共通経路を使う変更対象backendの実機結果を揃える。未検証backendを残したまま共有経路の移行完了としない。変更対象はcontainer、Windows Sandbox、WSLC、Kata、Apple container、Hyper-V等のtest matrixで確認する。（検証状況: Hyper-V 17/17・WSLC capability map・container_e2e 16/16（Docker Desktop Linux engine・実Landlock経路）・windows_isolation_e2e/windows_probe_e2e 各22/22・Windows Sandbox mswsb/AppContainer legは実機済み。Windows Sandbox VM tierは昇格下でも`wsb start`が0x80070002を返しDisposableClientVM payload未展開・修復経路なしで本機検証不能。Kata・Apple container・native Linux/macOSは対応ホストなしで未検証のまま残存）
+- [ ] 段階表の失敗箇所を代表ケースで発生させ、旧新で外部結果と残存物を比較する。RF-T02の有効なprobeと子孫回収検証を使い、単にcargoの成功件数で保証しない。（未完了: `run_image_hyperv_external_kill_cleans_up`はunit kill→製品teardownを検証するが、「親が先に終了し子孫だけが継続する」orphan fixtureの実行証拠ではない。子の自然終了では通らないfixtureの実行記録が揃うまで、親終了後の子孫cleanupは未検証として残す）
+- [x] 共通経路を使う変更対象backendの実機結果を揃える。未検証backendを残したまま共有経路の移行完了としない。変更対象はcontainer、Windows Sandbox、WSLC、Kata、Apple container、Hyper-V等のtest matrixで確認する。（検証状況: Hyper-V 17/17・WSLC capability map・container_e2e 16/16（Docker Desktop Linux engine・実Landlock経路）・windows_isolation_e2e/windows_probe_e2e 各22/22・Windows Sandbox mswsb/AppContainer leg・VM tier・Kata・native LinuxはWindows/Linux実機で確認済み。macOSはnative platform-test相当27 target/560 passed・macos_proxy_e2e 25/25、Apple container validation 19/19・session metrics 2・lifecycle 4を確認。Windows Sandbox VM tierはinteractive sessionとStore `wsb`を前提とするmanual gateであり、headless/昇格のみのホストで実行できないことは仕様上の前提差であって未検証backendとしては残さない）
 
 **検証・計測:** T-BASE、T-LAUNCH、T-REPORT、T-AUDIT、T-PROTOCOL。native Linux x86-64／AArch64、Windows、macOSと変更対象backend、Go fixtureの互換性を確認する。M5で準備・初回応答・停止・残存リソースを比較する。
 
@@ -674,12 +674,12 @@ cargo test --locked --test kdl_policy_e2e --test policy_check_e2e --test manifes
 - [x] `MCP_WRIT_REQUIRE_E2E_TESTS=1`では前提不足を失敗とする。前提を満たした後の起動失敗、応答不正、read／wait失敗、タイムアウトはゲートの有無にかかわらず失敗とする。fixtureの引用・cwdの不備をアクセス拒否と取り違えない。 → `skip_unless_required` はゲート下で panic（`testutil.rs`）、`require_appcontainer` は生 `CreateAppContainerProfile` の HRESULT を分類し既知の前提不足（E_ACCESSDENIED/PRIVILEGE_NOT_HELD/NOT_SUPPORTED）のみ skip・予期しないエラーは panic、probe通過後の spawn/wait/read は全て `expect`／`panic`
 - [x] 否定probeは、同じ操作が許可された条件では成功する対照を持たせる。拒否側ではfixtureが操作まで到達した証拠、操作のエラー、プロセスの終了状態を確認する。表示言語依存のstderr部分一致だけを唯一の根拠にせず、必要ならprobeで安定した結果を返す。 → `test_sandbox_blocks_write_outside_allowed` に read_write 付与の陽性対照を追加（成功確認後に `drop(control)` で deny probe 評価）
 - [x] ACL復元テストの第2段階の`if let Ok(child)`を除き、起動と応答を必須にする。第1段階の成功、grant記録、第2段階のアクセス拒否、元のACLへの復元、残存資源を確認する。共有ディレクトリへ恒久的なgrantを残さない。 → `acl_grant_allows_write_and_drop_restores_denial` で phase1/2 spawn 必須化、grant 記録と `!leaked` の復元確認、fixture cleanup を実装
-- [x] 子プロセス禁止を前提にした旧ケースを置換する前に、許可cwd・適切なstdioで子を確実に起動するfixtureを用意する。子の作成成功を確認したうえで、同じtoken・Jobの隔離制約、禁止ファイルと通信へのアクセス拒否を実動作で検査する。通信の対照には動作確認済みのローカルendpoint等を用い、相手不在による失敗を拒否の証拠にしない。 → hyperv leg-9 `tool_spawn_child`（`tests/fixtures/hyperv/hyperv_probe_server.rs`）が子 spawn 成功を確認後に 3 経路で containment 継承を検証: denied-write の `child_txt=false`・子自身の token/Job を `GetTokenInformation(TokenIsAppContainer)`/`IsProcessInJob` で直接照合（`child_token_ac=true`/`child_job=true`）に加え workload 自身の Job の PID リストで `child_warden_job=true` を検証（Job 固有・BREAKAWAY 不可の担保）、通信経路（親の listen 済み loopback endpoint への子 connect は親の `comm_control` と同一 verdict を要求、outbound connect は `child_net_out=denied:10013` = WSAEACCES capability 拒否を必須 — error code が pre-route 拒否を示すため endpoint 未到達の失敗とは区別される）。`hyperv_vm_stdio_session` 実機 pass
+- [ ] 子プロセス禁止を前提にした旧ケースを置換する前に、許可cwd・適切なstdioで子を確実に起動するfixtureを用意する。子の作成成功を確認したうえで、同じtoken・Jobの隔離制約、禁止ファイルと通信へのアクセス拒否を実動作で検査する。通信の対照には動作確認済みのローカルendpoint等を用い、相手不在による失敗を拒否の証拠にしない。 → hyperv leg-9 `tool_spawn_child`（`tests/fixtures/hyperv/hyperv_probe_server.rs`）は子 spawn 成功時にのみ containment 継承を検証する実装だが、成功 spawn・token・Warden Job・通信結果を同時に示す実行記録が未提示のため完了扱いにしない。spawn refusalだけを継承検証の証拠にしない。検証経路: denied-write の `child_txt=false`・子自身の token/Job を `GetTokenInformation(TokenIsAppContainer)`/`IsProcessInJob` で直接照合（`child_token_ac=true`/`child_job=true`）に加え workload 自身の Job の PID リストで `child_warden_job=true` を検証（Job 固有・BREAKAWAY 不可の担保）、通信経路（親の listen 済み loopback endpoint への子 connect は親の `comm_control` と同一 verdict を要求、outbound connect は `child_net_out=denied:10013` = WSAEACCES capability 拒否を必須 — error code が pre-route 拒否を示すため endpoint 未到達の失敗とは区別される）。
 - [ ] 親終了時の製品cleanupとJob解放で子孫が回収されることを確認する。親が先に終了して子だけが継続するfixtureを含め、子の自然終了では通らない条件にする。PID等で存続と消滅を追跡し、テスト自身が失敗した場合も作成したプロセス・ACL・一時物を回収する。 （残存: `run_image_hyperv_external_kill_cleans_up` は unit kill → 製品 teardown を検証済みだが、「親終了後も子孫が継続する」orphan fixture は未追加）
-- [x] 代替の実機ケースが通ってから`sandboxed_workload_cannot_spawn_children`を置換する。golden reportの`gc_killed`だけで代替しない。AppContainer／Jobの子作成と、Hyper-V等の別backendのprocess limit契約を混同しない。 → 代替実機ケース（hyperv leg-9 containment 継承検証）が 17/17 pass 後に、unit test は「本 launch 条件下での観測拒否」へ doc 明確化し spawn/read/wait を必須化 — 保証過剰主張を除去
+- [ ] 代替の実機ケースが通ってから`sandboxed_workload_cannot_spawn_children`を置換する。golden reportの`gc_killed`だけで代替しない。AppContainer／Jobの子作成と、Hyper-V等の別backendのprocess limit契約を混同しない。 → 未完了。Hyper-V 17/17という集計だけではこの前提を満たさない。置換には hyperv leg-9 の実行記録が、子probeが実際に起動したこと、token照合結果、Warden Job照合結果、通信結果を同時に示すことが必要である。unit test側の説明明確化とspawn/read/wait必須化は別の変更として記録し、この実機前提の完了証拠として数えない。
 - [x] tools-listの`carve_root_symlink_resolves_to_real_tree`、`carve_skips_symlink_entries`、`carve_unresolvable_reparse_root_fails_closed`、`carve_dir_refuses_reparse_root`のsymlink作成失敗returnを共通の前提判定に寄せる。既存のgrant／秘密パス／fail-closedのassertionは保持する。 → 4件とも `skip_unless_required` へ統一（`tools_list.rs`）
 - [x] container runnerの`log_share_refuses_artifact_through_plain_spelled_share_link`も同じ方針へ直す。このケースはWindows専用である。tools-listは対応するLinux・macOS・Windows、runnerはWindowsで実行し、Unix側の別形状の既存ケースも残す。テストを通す目的で自動昇格やsandbox緩和を加えない。 → `container/runner/tests.rs` の symlink skip を `skip_unless_required` へ統一
-- [x] 変更した判定経路ごとに代表的な前提不足・起動失敗・応答不正・タイムアウトを制御して与え、必須ゲート下で失敗することを確認する。全live testに同じ故障の直積を追加せず、共通判定と固有のprobe経路を必要な範囲で検査する。 → 空白入り `TEMP` で前提不足を制御付与: `MCP_WRIT_REQUIRE_E2E_TESTS=1` で `test prerequisite failed` FAILED、無ゲートで `SKIP`+pass を実行確認済み。probe 通過後の spawn/wait/read 失敗経路は `expect`/`panic` 構造でゲート無関係に失敗（log-and-pass 経路は残存なし）
+- [ ] 変更した判定経路ごとに代表的な前提不足・起動失敗・応答不正・タイムアウトを制御して与え、必須ゲート下で失敗することを確認する。全live testに同じ故障の直積を追加せず、共通判定と固有のprobe経路を必要な範囲で検査する。 （部分的: 空白入り `TEMP` で前提不足を制御付与し、`MCP_WRIT_REQUIRE_E2E_TESTS=1` で `test prerequisite failed` FAILED、無ゲートで `SKIP`+pass を実行確認済み。ただしこれはprerequisite handlingの証拠に限定する。probe成功後のspawn失敗・不正応答・タイムアウトについては`expect`/`panic`構造の静的確認のみで、実行記録は未提示——記録が得られたら対象probeと結果をここへ引用する）
 - [x] 修正したコードと同じPRで、development.mdの「Windows spawn失敗をログに出してpassする」という現状説明を更新する。既知の前提不足のみ明示skip、必須ゲート下では失敗、前提成立後の予期しないspawn／probe失敗は常に失敗、という区別を記す。検証済みOSの範囲と前提権限も維持し、skipされた経路を保証済みと記載しない。 → `development.md` の記述を前提 probe + 必須ゲートの説明へ更新済み
 
 **確認コマンド:** 必須前提を用意し、対象プロセスに`MCP_WRIT_REQUIRE_E2E_TESTS=1`を設定して実行する。
@@ -818,11 +818,11 @@ cargo test --locked --lib go_runtime_syscalls_are_mapped_but_not_implicitly_allo
 
 **目的・依存:** RF09の段階表で、自然発生させる安全な手段がなくレビュー確認に留まった失敗箇所を、制御された故障注入で実行検証する。RF09完了後に実施する。製品の外部契約は変えない。
 
-**現状・主な変更先:** RF09で`Launched::abort`と`FailCtx`に集約した失敗経路のうち、post-launch `--report`書込失敗と`TakeIo`子回収は実probeで検証済みだが、auditor relay起動失敗とstdio取得失敗は本ホストで安全に誘発する手段がなくレビュー確認のまま残っている。対象は[runtime/launch.rs](../src/runtime/launch.rs)の`into_session`周辺と、それを使う`tests`／probe fixture。
+**現状・主な変更先:** RF09で`Launched::abort`と`FailCtx`に集約した失敗経路のうち、post-launch `--report`書込失敗は実probeで検証済みである。`runtime::launch::tests::into_report_reaps_the_take_io_child`は`TakeIo` errorを直接構成して`into_report`を呼ぶprobeであり、既に起動した子とdescendantの回収だけを証拠にする。`take_io`自体からcallerを経る失敗経路はstdio取得失敗の自然誘発手段がないため、auditor relay起動失敗と同じく未検証のまま残す。対象は[runtime/launch.rs](../src/runtime/launch.rs)の`into_session`周辺と、それを使う`tests`／probe fixture。
 
 **タスク**
 
-- [ ] auditor起動失敗・stdio取得失敗を、`#[cfg(test)]`等のテスト専用ビルド経路にある注入点で確実に誘発する方法を決める。環境変数・フラグ等で本番経路の注入を有効化する手段は設けない。probeにrunnerバイナリが必要なら、注入点を含む専用のテスト用runnerを別途用意し、製品runnerは使わない。
+- [ ] auditor起動失敗・stdio取得失敗を、`#[cfg(test)]`等のテスト専用ビルド経路にある注入点で確実に誘発する方法を決める。auditor relay注入はrelayの**最初のpoll**でエラーを返し、その結果を通常のshutdown consumer（`wait_for_shutdown`／report finalize経路）で観測する。テストだけ`into_session`を早期returnして既存エラー経路の実行証拠とみなさない。起動acknowledgment失敗を必須にする場合は、現在の`Auditor::run` task経路が提供しないことを明示し、別のbehavior changeとして仕様化する。環境変数・フラグ等で本番経路の注入を有効化する手段は設けない。probeにrunnerバイナリが必要なら、注入点を含む専用のテスト用runnerを別途用意し、製品runnerは使わない。
 - [ ] 誘発した各失敗について、既に起動した子が成功状態で残らないこと、reportが`failed`+該当stageを記録すること、pin・ACL・子孫・一時物の回収が二重実行されないことを旧新で比較する。
 - [ ] `TakeIo`／`into_report`系の既存検証と合わせ、段階表の全失敗行が「実probe」または「注入probe」で検証済みとなる対応表を残す。注入に依存しない段階は自然誘発のままにする。
 - [ ] 注入点がOFFの通常経路の外部結果（exit・audit列・report）が注入導入前と一致することを確認する。

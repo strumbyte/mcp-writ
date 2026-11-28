@@ -162,11 +162,16 @@ pub const WSLC_VALIDATED_PATCH: u64 = 1;
 /// a fourth (build) component is ignored. `None` on any other shape —
 /// an unrecognized answer never yields a guessed version.
 pub fn parse_wslc_version(text: &str) -> Option<(u64, u64, u64)> {
+    fn component(part: &str) -> Option<u64> {
+        // `wslc --version` uses semver-shaped answers on some builds
+        // (`3.0.5+abc123`). Build metadata / prerelease suffixes are not
+        // part of the numeric release triple the capability gate compares.
+        let end = part.find(['+', '-']).unwrap_or(part.len());
+        part[..end].parse::<u64>().ok()
+    }
     text.split_whitespace().find_map(|tok| {
         let mut parts = tok.split('.');
-        let triple: Option<Vec<u64>> = (0..3)
-            .map(|_| parts.next().and_then(|p| p.parse::<u64>().ok()))
-            .collect();
+        let triple: Option<Vec<u64>> = (0..3).map(|_| parts.next().and_then(component)).collect();
         let v = triple?;
         Some((v[0], v[1], v[2]))
     })
@@ -704,6 +709,10 @@ mod tests {
         assert_eq!(parse_wslc_version("wslc 3.0.1.0"), Some((3, 0, 1)));
         assert_eq!(parse_wslc_version("wslc 2.4.12.0"), Some((2, 4, 12)));
         assert_eq!(parse_wslc_version("wslc: 3.0.1"), Some((3, 0, 1)));
+        assert_eq!(
+            parse_wslc_version("wslc version 3.0.5+abc1234"),
+            Some((3, 0, 5))
+        );
         // A leading token that is not numeric is skipped for the one
         // that is.
         assert_eq!(

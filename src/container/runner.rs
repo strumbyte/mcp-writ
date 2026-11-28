@@ -676,20 +676,50 @@ async fn run_image_inner(
     // image id for a digest-less store entry; a launch that can form
     // neither refuses rather than letting a re-resolvable name through.
     rec.stage = "bind image identity";
-    let launch_image = match crate::container::image_ref::immutable_image_ref(&options.image, &meta)
+    // Apple Container 1.5.0 cannot resolve a synthesized `repo@digest`
+    // for a locally-built tagged image without contacting the registry
+    // (verified: inspect/create of `mcp-writ-apple-secure@sha256:…` tries
+    // docker.io and fails unauthenticated). It does accept a digest spelling
+    // when that spelling is the local image's stored name — the distroless
+    // fixture — but not as a generic immutable re-spelling. Apple therefore
+    // keeps the exact inspected local spelling; every other engine uses the
+    // immutable reference. The Apple digest requirement remains because the
+    // stopped unit is verified against the inspected descriptor digest.
+    let launch_image = if rec.isolation.configured
+        == crate::execution::IsolationKind::AppleContainer
     {
-        Some(reference) => reference,
-        None => {
+        if meta
+            .digest
+            .as_deref()
+            .is_none_or(|d| !crate::container::image_ref::is_sha256_digest(d))
+        {
             rec.observe(
                 "launch.image",
                 ControlState::Failed,
                 ObservationBasis::MechanismResult,
                 ControlPhase::Build,
-                Some("no immutable image binding (digest or image id)".to_string()),
+                Some("apple image inspect reported no descriptor digest".to_string()),
             );
-            return Err("cannot bind the launch to an immutable image reference — \
-                 inspect reported neither a repo digest nor an image id"
-                .into());
+            return Err(
+                "cannot verify the apple launch image — inspect reported no descriptor digest"
+                    .into(),
+            );
+        }
+        options.image.clone()
+    } else {
+        match crate::container::image_ref::immutable_image_ref(&options.image, &meta) {
+            Some(reference) => reference,
+            None => {
+                rec.observe(
+                    "launch.image",
+                    ControlState::Failed,
+                    ObservationBasis::MechanismResult,
+                    ControlPhase::Build,
+                    Some("no immutable image binding (digest or image id)".to_string()),
+                );
+                return Err("cannot bind the launch to an immutable image reference —                  inspect reported neither a repo digest nor an image id"
+                        .into());
+            }
         }
     };
     if launch_image != options.image && options.verbose {
@@ -1007,6 +1037,10 @@ async fn run_image_inner(
     let mut spec = LaunchSpec {
         isolation: rec.isolation.configured,
         image: Some(launch_image),
+        // The digest the initial inspect/policy check authorized. The
+        // apple backend cannot spell a local image by digest and verifies
+        // the created unit against this exact value before starting it.
+        authorized_image_digest: meta.digest.clone(),
         command: None,
         guest_os: rec.target.workload_os,
         guest_arch: rec.target.workload_arch.clone(),

@@ -927,6 +927,7 @@ pub(crate) fn inspect_error_is_absent(text: &str) -> bool {
         "image not known",
         "error locating item",
         "container_not_found",
+        "container not found",
         "image_not_found",
     ]
     .iter()
@@ -1003,6 +1004,8 @@ mod tests {
         // wslc
         assert!(inspect_error_is_absent("WSLC_E_CONTAINER_NOT_FOUND"));
         assert!(inspect_error_is_absent("WSLC_E_IMAGE_NOT_FOUND"));
+        // apple container
+        assert!(inspect_error_is_absent("Error: container not found: abc"));
     }
 
     /// Broad or unrelated failures must never be read as "gone" — a

@@ -284,10 +284,6 @@ impl LifetimeCgroup {
         }
     }
 
-    pub(crate) fn member_pids(&self) -> Vec<i32> {
-        self.view().member_pids()
-    }
-
     /// See [`CgroupView::kill_members`].
     pub(crate) fn kill_members(&self) -> usize {
         self.view().kill_members()
@@ -298,27 +294,65 @@ impl CgroupView {
     /// Every pid listed by `cgroup.procs` under `dir`, recursing into
     /// descendant cgroups (a workload with write access could have
     /// created sub-cgroups and moved into one — enforcement applies
-    /// to the subtree, so the sweep must too).
-    fn collect_pids(dir: &Path, out: &mut Vec<i32>, depth: usize) {
+    /// to the subtree, so the sweep must too). The roster read is
+    /// fallible: an unreadable or disappearing node is *unknown*, never
+    /// the same fact as a successfully read empty roster.
+    fn collect_pids(dir: &Path, out: &mut Vec<i32>, depth: usize) -> bool {
         if depth > 16 {
-            return;
+            return false;
         }
-        if let Ok(body) = std::fs::read_to_string(dir.join("cgroup.procs")) {
-            out.extend(body.lines().filter_map(|l| l.trim().parse::<i32>().ok()));
+        let mut complete = true;
+        match std::fs::read_to_string(dir.join("cgroup.procs")) {
+            Ok(body) => out.extend(body.lines().filter_map(|l| l.trim().parse::<i32>().ok())),
+            Err(_) => complete = false,
         }
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    Self::collect_pids(&e.path(), out, depth + 1);
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) => {
+                            complete &= Self::collect_pids(&entry.path(), out, depth + 1);
+                        }
+                        Ok(_) => {}
+                        Err(_) => complete = false,
+                    }
                 }
             }
+            Err(_) => complete = false,
         }
+        complete
     }
 
-    pub(crate) fn member_pids(&self) -> Vec<i32> {
+    /// The kernel's recursive populated bit. `Ok(true)` means live
+    /// processes remain somewhere in the subtree; `Ok(false)` is the only
+    /// empty evidence. An unreadable/missing events file is unknown.
+    pub(crate) fn subtree_populated(&self) -> io::Result<bool> {
+        let body = std::fs::read_to_string(self.dir.join("cgroup.events"))?;
+        body.lines()
+            .find_map(|line| line.strip_prefix("populated "))
+            .and_then(|v| match v.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "cgroup.events lacks populated")
+            })
+    }
+
+    /// Best-effort member roster plus completeness. Partially collected
+    /// pids remain useful for targeting fallback signals, but incomplete
+    /// is never empty evidence.
+    pub(crate) fn member_roster(&self) -> (Vec<i32>, bool) {
         let mut v = Vec::new();
-        Self::collect_pids(&self.dir, &mut v, 0);
-        v
+        let complete = Self::collect_pids(&self.dir, &mut v, 0);
+        (v, complete)
+    }
+
+    /// Whether the subtree is proven empty. Read failure is deliberately
+    /// not empty.
+    fn known_empty(&self) -> bool {
+        matches!(self.subtree_populated(), Ok(false))
     }
 
     /// Whether `pid` still sits inside this cgroup subtree — checked
@@ -355,7 +389,7 @@ impl CgroupView {
     /// either alive or zombies mid-reap; the caller must not detach
     /// beneath either.
     pub(crate) fn kill_members(&self) -> usize {
-        if self.member_pids().is_empty() {
+        if self.known_empty() {
             return 0;
         }
         let cgroup_kill = std::fs::write(self.dir.join("cgroup.kill"), b"1").is_ok();
@@ -367,7 +401,7 @@ impl CgroupView {
                 // below lets the roster drain.
                 let freeze = self.dir.join("cgroup.freeze");
                 let frozen = std::fs::write(&freeze, b"1").is_ok();
-                for pid in self.member_pids() {
+                for pid in self.member_roster().0 {
                     // Safety: signal by pid; membership is re-verified
                     // so a recycled pid cannot hit an unrelated
                     // process, and ESRCH on an exited member is the
@@ -385,16 +419,23 @@ impl CgroupView {
             // roster so the rmdir below does not lose to a reaping
             // delay.
             for _ in 0..100 {
-                if self.member_pids().is_empty() {
+                if self.known_empty() {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            if self.member_pids().is_empty() {
+            if self.known_empty() {
                 break;
             }
         }
-        self.member_pids().len()
+        if self.known_empty() {
+            return 0;
+        }
+        let (pids, complete) = self.member_roster();
+        // Populated/unknown evidence is conservative residue even when the
+        // pid roster is empty or partial; the roster is for targeting, not
+        // proof of emptiness.
+        pids.len().max(1) + usize::from(!complete)
     }
 }
 
@@ -408,7 +449,7 @@ impl Drop for LifetimeCgroup {
             if std::fs::remove_dir(&self.dir).is_ok() {
                 return;
             }
-            if !self.member_pids().is_empty() {
+            if !self.view().known_empty() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));

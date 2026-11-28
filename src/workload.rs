@@ -114,6 +114,7 @@ pub fn resolve_command_path(argv0: &str) -> io::Result<PathBuf> {
 
 /// The outcome of resolving a launch's `argv[0]`: the image to exec and
 /// the argv head that replaces the caller's `argv[0]` token.
+#[derive(Clone)]
 pub struct LaunchResolution {
     /// The executable image — the resolved `argv[0]`, or (on Unix) the
     /// interpreter the kernel would select through the file's `#!`

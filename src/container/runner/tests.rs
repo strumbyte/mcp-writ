@@ -619,6 +619,49 @@ fn log_share_verbatim_audit_dot_dir_is_not_normalized_away() {
     );
 }
 
+/// A verbatim `\\?\…\audit ` component (trailing space) is likewise a
+/// different object from its unspaced sibling. `grant_spellings` must not
+/// trim the space away before the overlap comparison, or a policy inside
+/// the literal trailing-space mount would be judged against `audit`.
+#[cfg(windows)]
+#[test]
+fn log_share_verbatim_trailing_space_dir_is_not_trimmed_to_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap(); // `\\?\…` verbatim
+    let audit_space = PathBuf::from(format!(r"{}\audit ", base.display()));
+    std::fs::create_dir(&audit_space).expect("create the literal trailing-space dir");
+    let audit_plain = PathBuf::from(format!(r"{}\audit", base.display()));
+    std::fs::create_dir(&audit_plain).expect("create the sibling `audit` dir");
+    let policy = audit_space.join("policy.kdl");
+    std::fs::write(&policy, b"policy").unwrap();
+    let artifact = std::fs::canonicalize(&policy).unwrap();
+    assert!(
+        artifact.to_string_lossy().contains("audit \\"),
+        "fixture must keep the trailing-space component: {}",
+        artifact.display()
+    );
+
+    let audit_space_resolved =
+        crate::fsoverlap::resolve_grant_spelling(&audit_space.to_string_lossy())
+            .expect("a verbatim trailing-space dir must resolve");
+    assert!(
+        audit_space_resolved.to_string_lossy().ends_with("audit "),
+        "resolution must preserve the trailing-space component, got {}",
+        audit_space_resolved.display()
+    );
+    assert!(
+        log_share_conflicts_artifact(&audit_space_resolved, &artifact),
+        "a policy inside the trailing-space mount must conflict with that mount"
+    );
+    let audit_plain_resolved =
+        crate::fsoverlap::resolve_grant_spelling(&audit_plain.to_string_lossy())
+            .expect("the plain sibling must resolve");
+    assert!(
+        !log_share_conflicts_artifact(&audit_plain_resolved, &artifact),
+        "`audit` and `audit ` are different objects — no whitespace trimming"
+    );
+}
+
 #[test]
 fn test_image_ref_is_digest_pinned() {
     assert!(image_ref_is_digest_pinned(

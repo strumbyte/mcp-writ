@@ -392,6 +392,7 @@ impl IsolationBackend for KataBackend {
                 self.engine.clone(),
                 spec.unit_id_file.clone(),
                 spec.unit_name.clone(),
+                None,
             )
             .await;
             // The runtime resolves the share spelling host-side before
@@ -421,6 +422,7 @@ mod tests {
         LaunchSpec {
             isolation: IsolationKind::Kata,
             image: Some(image.to_string()),
+            authorized_image_digest: None,
             command: None,
             guest_os: TargetOs::Linux,
             guest_arch: TargetArch::host(),

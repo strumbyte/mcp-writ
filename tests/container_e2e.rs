@@ -347,6 +347,12 @@ fn create_temp_dir() -> std::io::Result<PathBuf> {
 /// not OS temp — so nothing reaps them unless a guard is held.
 struct TestDirGuard(PathBuf);
 
+impl TestDirGuard {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
 impl Drop for TestDirGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -688,10 +694,11 @@ RUN mkdir -p .cargo && \
 
 /// Build a minimal base image with echo_server.sh as entrypoint.
 async fn build_base_echo_image(engine: &str, image_name: &str) -> Result<(), String> {
-    let temp_dir = create_temp_dir().map_err(|e| format!("failed to create temp dir: {e}"))?;
-    let dockerfile_path = temp_dir.join("Dockerfile");
-    let echo_script_path = temp_dir.join("echo_server.sh");
-    let policy_path = temp_dir.join("policy.kdl");
+    let temp_dir =
+        TestDirGuard(create_temp_dir().map_err(|e| format!("failed to create temp dir: {e}"))?);
+    let dockerfile_path = temp_dir.path().join("Dockerfile");
+    let echo_script_path = temp_dir.path().join("echo_server.sh");
+    let policy_path = temp_dir.path().join("policy.kdl");
 
     // Copy echo_server.sh to temp dir
     let src_echo = fixtures_dir().join("echo_server.sh");
@@ -723,7 +730,7 @@ ENTRYPOINT ["/bin/sh", "/usr/local/bin/echo_server.sh"]
         Command::new(engine)
             .args(["build", "-t", image_name, "."])
             .env("DOCKER_BUILDKIT", "1")
-            .current_dir(&temp_dir)
+            .current_dir(temp_dir.path())
             .kill_on_drop(true)
             .output(),
     )
@@ -740,9 +747,7 @@ ENTRYPOINT ["/bin/sh", "/usr/local/bin/echo_server.sh"]
         ));
     }
 
-    // Clean up temp dir
-    let _ = std::fs::remove_dir_all(&temp_dir);
-
+    // The guard removes the build context on success and failure.
     Ok(())
 }
 
@@ -758,16 +763,17 @@ async fn build_secure_image(
     runner_path: &std::path::Path,
     runner_caps_env: Option<&str>,
 ) -> Result<(), String> {
-    let temp_dir = create_temp_dir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+    let temp_dir =
+        TestDirGuard(create_temp_dir().map_err(|e| format!("failed to create temp dir: {e}"))?);
 
     let runner_src = runner_path;
     let runner_name = "mcp-secure-runner";
-    let runner_dest = temp_dir.join(runner_name);
+    let runner_dest = temp_dir.path().join(runner_name);
 
     std::fs::copy(runner_src, &runner_dest)
         .map_err(|e| format!("failed to copy mcp-secure-runner: {e}"))?;
 
-    let policy_dest = temp_dir.join("policy.kdl");
+    let policy_dest = temp_dir.path().join("policy.kdl");
     // The probe runs the runner inside the just-built base image — the
     // same kernel and userland lineage the secure image will run on.
     copy_test_policy(&policy_dest, engine, Some((base_image, runner_path))).await?;
@@ -792,7 +798,7 @@ ENV MCP_ORIG_ENTRYPOINT="[\"/bin/sh\",\"/usr/local/bin/echo_server.sh\"]" MCP_OR
         base_image, runner_name, caps_line
     );
 
-    let dockerfile_path = temp_dir.join("Dockerfile");
+    let dockerfile_path = temp_dir.path().join("Dockerfile");
     std::fs::write(&dockerfile_path, dockerfile)
         .map_err(|e| format!("failed to write Dockerfile: {e}"))?;
 
@@ -806,7 +812,7 @@ ENV MCP_ORIG_ENTRYPOINT="[\"/bin/sh\",\"/usr/local/bin/echo_server.sh\"]" MCP_OR
         Command::new(engine)
             .args(["build", "-t", secure_image, "."])
             .env("DOCKER_BUILDKIT", "1")
-            .current_dir(&temp_dir)
+            .current_dir(temp_dir.path())
             .kill_on_drop(true)
             .output(),
     )
@@ -823,9 +829,7 @@ ENV MCP_ORIG_ENTRYPOINT="[\"/bin/sh\",\"/usr/local/bin/echo_server.sh\"]" MCP_OR
         ));
     }
 
-    // Clean up
-    let _ = std::fs::remove_dir_all(&temp_dir);
-
+    // The guard removes the build context on success and failure.
     Ok(())
 }
 
@@ -1207,17 +1211,17 @@ async fn test_container_run_image_guest_report_attached() {
     }
 
     let temp_dir = match create_temp_dir() {
-        Ok(d) => d,
+        Ok(d) => TestDirGuard(d),
         Err(e) => {
             delete_image(engine, &base_image).await;
             delete_image(engine, &secure_image).await;
             panic!("failed to create temp dir: {e}");
         }
     };
-    let log_dir = temp_dir.join("logs");
+    let log_dir = temp_dir.path().join("logs");
     std::fs::create_dir_all(&log_dir).unwrap();
-    let report_path = temp_dir.join("report.json");
-    let policy_path = temp_dir.join("policy.kdl");
+    let report_path = temp_dir.path().join("report.json");
+    let policy_path = temp_dir.path().join("policy.kdl");
     if let Err(e) =
         copy_test_policy(&policy_path, engine, Some((&secure_image, &runner_path))).await
     {
@@ -1386,13 +1390,13 @@ async fn test_container_run_image_report_refuses_legacy_runner() {
     // image records no MCP_WRIT_RUNNER_CAPS — run-image cannot tell it
     // from a pre-report-channel runner.
     let fake_dir = match create_temp_dir() {
-        Ok(d) => d,
+        Ok(d) => TestDirGuard(d),
         Err(e) => {
             delete_image(engine, &base_image).await;
             panic!("failed to create temp dir: {e}");
         }
     };
-    let fake_runner = fake_dir.join("fake-runner");
+    let fake_runner = fake_dir.path().join("fake-runner");
     std::fs::write(&fake_runner, "#!/bin/sh\nexec \"$@\"\n").unwrap();
     #[cfg(unix)]
     {
@@ -1408,15 +1412,15 @@ async fn test_container_run_image_report_refuses_legacy_runner() {
     }
 
     let temp_dir = match create_temp_dir() {
-        Ok(d) => d,
+        Ok(d) => TestDirGuard(d),
         Err(e) => {
             delete_image(engine, &base_image).await;
             delete_image(engine, &secure_image).await;
             panic!("failed to create temp dir: {e}");
         }
     };
-    let report_path = temp_dir.join("report.json");
-    let policy_path = temp_dir.join("policy.kdl");
+    let report_path = temp_dir.path().join("report.json");
+    let policy_path = temp_dir.path().join("policy.kdl");
     // No ABI probe — the fake runner is a shell script that cannot
     // answer one; the kernel-version fallback still applies.
     if let Err(e) = copy_test_policy(&policy_path, engine, None).await {

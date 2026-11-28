@@ -377,6 +377,7 @@ pub use child::{
 };
 pub use plan::{SpawnAttempt, WardenReport};
 
+pub(crate) use child::DescendantCleanupState;
 use child::{RunningChildInner, apply_unix_process_group, apply_unix_process_group_tokio};
 use env::apply_spawn_env;
 
